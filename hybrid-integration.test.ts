@@ -257,7 +257,7 @@ describe("auto-capture and auto-recall workflow", () => {
   test("auto-recall injects relevant context", async () => {
     const { formatRelevantMemoriesContext } = await import("./index.js");
 
-    const memories: Array<{ category: MemoryCategory; text: string; createdAt: number }> = [
+    const memories: Array<{ id: string; category: MemoryCategory; text: string; createdAt: number }> = [
       {
         id: "1",
         text: "用户偏好深色模式",

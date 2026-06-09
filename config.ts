@@ -39,11 +39,33 @@ export type MemoryConfig = {
     baseURL?: string;
     apiKey: string;
   };
-  dbType?: "lancedb" | "supabase";
+  mode?: "embedded" | "server" | "remote" | "backend-proxy";
+  server?: {
+    enabled?: boolean;
+    host?: string;
+    port?: number;
+    secret?: string;
+    requireHttps?: boolean;
+  };
+  features?: {
+    bm25?: boolean;
+    graph?: boolean;
+    summaryTree?: boolean;
+    webConsole?: boolean;
+  };
+  dbType?: "lancedb" | "supabase" | "postgres";
   dbPath?: string;
   supabase?: {
     url: string;
     serviceKey: string;
+  };
+  postgres?: {
+    host: string;
+    port: number;
+    database: string;
+    user: string;
+    password: string;
+    ssl?: boolean;
   };
   scanner?: {
     defaultIgnorePaths?: string[];
@@ -125,6 +147,9 @@ export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 
 const DEFAULT_MODEL = "text-embedding-3-small";
 export const DEFAULT_CAPTURE_MAX_CHARS = 500;
+const DEFAULT_SERVER_HOST = "127.0.0.1";
+const DEFAULT_SERVER_PORT = 3847;
+const VALID_MODES = ["embedded", "server", "remote", "backend-proxy"] as const;
 const LEGACY_STATE_DIRS: string[] = [];
 
 function resolveDefaultDbPath(): string {
@@ -177,6 +202,7 @@ const EMBEDDING_DIMENSIONS: Record<string, number> = {
 
   // Ollama Open API 兼容模式（使用 openai 模型名）
   "modelscope.cn/Qwen/Qwen3-Embedding-0.6B-GGUF:latest": 1024,
+  "Qwen/Qwen3-Embedding-0.6B":1024
 };
 
 function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], label: string) {
@@ -219,7 +245,7 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "dbType", "dbPath", "supabase", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules"],
+      ["embedding", "mode", "server", "features", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules"],
       "memory config",
     );
 
@@ -234,6 +260,44 @@ export const memoryConfigSchema = {
 
     const model = resolveEmbeddingModel(embedding);
 
+    const mode = typeof cfg.mode === "string" ? cfg.mode : "embedded";
+    if (!VALID_MODES.includes(mode as (typeof VALID_MODES)[number])) {
+      throw new Error("mode must be one of: embedded, server, remote, backend-proxy");
+    }
+
+    const server = cfg.server as Record<string, unknown> | undefined;
+    if (server) {
+      assertAllowedKeys(server, ["enabled", "host", "port", "secret", "requireHttps"], "server config");
+      if (server.enabled !== undefined && typeof server.enabled !== "boolean") {
+        throw new Error("server.enabled must be a boolean");
+      }
+      if (server.host !== undefined && typeof server.host !== "string") {
+        throw new Error("server.host must be a string");
+      }
+      if (
+        server.port !== undefined &&
+        (typeof server.port !== "number" || !Number.isInteger(server.port) || server.port < 1 || server.port > 65535)
+      ) {
+        throw new Error("server.port must be between 1 and 65535");
+      }
+      if (server.secret !== undefined && typeof server.secret !== "string") {
+        throw new Error("server.secret must be a string");
+      }
+      if (server.requireHttps !== undefined && typeof server.requireHttps !== "boolean") {
+        throw new Error("server.requireHttps must be a boolean");
+      }
+    }
+
+    const features = cfg.features as Record<string, unknown> | undefined;
+    if (features) {
+      assertAllowedKeys(features, ["bm25", "graph", "summaryTree", "webConsole"], "features config");
+      for (const key of ["bm25", "graph", "summaryTree", "webConsole"]) {
+        if (features[key] !== undefined && typeof features[key] !== "boolean") {
+          throw new Error(`features.${key} must be a boolean`);
+        }
+      }
+    }
+
     // Validate supabase config if provided
     const supabase = cfg.supabase as Record<string, unknown> | undefined;
     if (supabase) {
@@ -243,6 +307,30 @@ export const memoryConfigSchema = {
       }
       if (typeof supabase.serviceKey !== "string" || !supabase.serviceKey) {
         throw new Error("supabase.serviceKey is required when supabase config is provided");
+      }
+    }
+
+    // Validate postgres config if provided
+    const postgres = cfg.postgres as Record<string, unknown> | undefined;
+    if (postgres) {
+      assertAllowedKeys(postgres, ["host", "port", "database", "user", "password", "ssl"], "postgres config");
+      if (typeof postgres.host !== "string" || !postgres.host) {
+        throw new Error("postgres.host is required when postgres config is provided");
+      }
+      if (typeof postgres.port !== "number") {
+        throw new Error("postgres.port is required and must be a number");
+      }
+      if (typeof postgres.database !== "string" || !postgres.database) {
+        throw new Error("postgres.database is required when postgres config is provided");
+      }
+      if (typeof postgres.user !== "string" || !postgres.user) {
+        throw new Error("postgres.user is required when postgres config is provided");
+      }
+      if (typeof postgres.password !== "string" || !postgres.password) {
+        throw new Error("postgres.password is required when postgres config is provided");
+      }
+      if (postgres.ssl !== undefined && typeof postgres.ssl !== "boolean") {
+        throw new Error("postgres.ssl must be a boolean");
       }
     }
 
@@ -368,11 +456,33 @@ export const memoryConfigSchema = {
         apiKey: resolveEnvVars(String(embedding.apiKey)),
         baseURL: resolveEnvVars(String(embedding.baseURL)),
       },
-      dbType: (cfg.dbType === "supabase" ? "supabase" : "lancedb"),
+      mode: mode as MemoryConfig["mode"],
+      server: {
+        enabled: server?.enabled === true,
+        host: typeof server?.host === "string" ? server.host : DEFAULT_SERVER_HOST,
+        port: typeof server?.port === "number" ? server.port : DEFAULT_SERVER_PORT,
+        secret: typeof server?.secret === "string" ? resolveEnvVars(server.secret) : undefined,
+        requireHttps: server?.requireHttps === true,
+      },
+      features: {
+        bm25: features?.bm25 === true,
+        graph: features?.graph === true,
+        summaryTree: features?.summaryTree === true,
+        webConsole: features?.webConsole === true,
+      },
+      dbType: (cfg.dbType === "supabase" ? "supabase" : cfg.dbType === "postgres" ? "postgres" : "lancedb"),
       dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : DEFAULT_DB_PATH,
       supabase: supabase ? {
         url: resolveEnvVars(String(supabase.url)),
         serviceKey: resolveEnvVars(String(supabase.serviceKey)),
+      } : undefined,
+      postgres: postgres ? {
+        host: resolveEnvVars(String(postgres.host)),
+        port: postgres.port as number,
+        database: resolveEnvVars(String(postgres.database)),
+        user: resolveEnvVars(String(postgres.user)),
+        password: resolveEnvVars(String(postgres.password)),
+        ssl: postgres.ssl as boolean | undefined,
       } : undefined,
       scanner: scanner ? {
         defaultIgnorePaths: scanner.defaultIgnorePaths as string[] | undefined,
@@ -430,8 +540,8 @@ export const memoryConfigSchema = {
     dbType: {
       label: "Database Type",
       placeholder: "lancedb",
-      help: "Database type to use: lancedb (local) or supabase (cloud)",
-      enum: ["lancedb", "supabase"],
+      help: "Database type to use: lancedb (local), supabase (cloud), or postgres (PostgreSQL with pgvector)",
+      enum: ["lancedb", "supabase", "postgres"],
     },
     dbPath: {
       label: "LanceDB Path",
@@ -449,6 +559,37 @@ export const memoryConfigSchema = {
       sensitive: true,
       placeholder: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
       help: "Supabase service role key (only for supabase type, or use ${SUPABASE_SERVICE_KEY})",
+    },
+    "postgres.host": {
+      label: "PostgreSQL Host",
+      placeholder: "localhost",
+      help: "PostgreSQL server host (only for postgres type, or use ${PG_HOST})",
+    },
+    "postgres.port": {
+      label: "PostgreSQL Port",
+      placeholder: "5432",
+      help: "PostgreSQL server port (only for postgres type)",
+    },
+    "postgres.database": {
+      label: "PostgreSQL Database",
+      placeholder: "memory",
+      help: "PostgreSQL database name (only for postgres type, or use ${PG_DATABASE})",
+    },
+    "postgres.user": {
+      label: "PostgreSQL User",
+      placeholder: "postgres",
+      help: "PostgreSQL user (only for postgres type, or use ${PG_USER})",
+    },
+    "postgres.password": {
+      label: "PostgreSQL Password",
+      sensitive: true,
+      placeholder: "",
+      help: "PostgreSQL password (only for postgres type, or use ${PG_PASSWORD})",
+    },
+    "postgres.ssl": {
+      label: "PostgreSQL SSL",
+      advanced: true,
+      help: "Enable SSL for PostgreSQL connection (default: false)",
     },
     "scanner.defaultIgnorePaths": {
       label: "Default Ignore Paths",

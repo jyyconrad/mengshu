@@ -22,8 +22,8 @@
     "dbType": {
       "label": "Database Type",
       "placeholder": "lancedb",
-      "help": "Database type to use: lancedb (local) or supabase (cloud)",
-      "enum": ["lancedb", "supabase"]
+      "help": "Database type to use: lancedb (local), supabase (cloud), or postgres (PostgreSQL with pgvector)",
+      "enum": ["lancedb", "supabase", "postgres"]
     },
     "dbPath": {
       "label": "LanceDB Path",
@@ -41,6 +41,37 @@
       "sensitive": true,
       "placeholder": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
       "help": "Supabase service role key (only for supabase type, or use ${SUPABASE_SERVICE_KEY})"
+    },
+    "postgres.host": {
+      "label": "PostgreSQL Host",
+      "placeholder": "localhost",
+      "help": "PostgreSQL server host (only for postgres type, or use ${PG_HOST})"
+    },
+    "postgres.port": {
+      "label": "PostgreSQL Port",
+      "placeholder": "5432",
+      "help": "PostgreSQL server port (only for postgres type)"
+    },
+    "postgres.database": {
+      "label": "PostgreSQL Database",
+      "placeholder": "memory",
+      "help": "PostgreSQL database name (only for postgres type, or use ${PG_DATABASE})"
+    },
+    "postgres.user": {
+      "label": "PostgreSQL User",
+      "placeholder": "postgres",
+      "help": "PostgreSQL user (only for postgres type, or use ${PG_USER})"
+    },
+    "postgres.password": {
+      "label": "PostgreSQL Password",
+      "sensitive": true,
+      "placeholder": "",
+      "help": "PostgreSQL password (only for postgres type, or use ${PG_PASSWORD})"
+    },
+    "postgres.ssl": {
+      "label": "PostgreSQL SSL",
+      "advanced": true,
+      "help": "Enable SSL for PostgreSQL connection (default: false)"
     },
     "scanner.defaultIgnorePaths": {
       "label": "Default Ignore Paths",
@@ -121,7 +152,8 @@
               "snowflake-arctic-embed:l",
               "snowflake-arctic-embed:m",
               "snowflake-arctic-embed:s",
-              "modelscope.cn/Qwen/Qwen3-Embedding-0.6B-GGUF:latest"
+              "modelscope.cn/Qwen/Qwen3-Embedding-0.6B-GGUF:latest",
+              "Qwen/Qwen3-Embedding-0.6B"
             ]
           }
         },
@@ -129,7 +161,7 @@
       },
       "dbType": {
         "type": "string",
-        "enum": ["lancedb", "supabase"],
+        "enum": ["lancedb", "supabase", "postgres"],
         "default": "lancedb"
       },
       "dbPath": {
@@ -146,6 +178,33 @@
             "type": "string"
           }
         }
+      },
+      "postgres": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "number",
+            "default": 5432
+          },
+          "database": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          },
+          "ssl": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": ["host", "port", "database", "user", "password"]
       },
       "scanner": {
         "type": "object",

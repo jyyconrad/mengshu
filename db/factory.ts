@@ -3,6 +3,7 @@ import type { DatabaseProvider } from "./types";
 import { LanceDBProvider } from "./providers/lancedb";
 import { SupabaseProvider } from "./providers/supabase";
 import { HybridProvider } from "./providers/hybrid";
+import { PostgresProvider } from "./providers/postgres";
 
 /**
  * 数据库工厂类
@@ -20,6 +21,16 @@ export class DatabaseFactory {
         return new SupabaseProvider(
           config.supabase.url,
           config.supabase.serviceKey,
+          embeddingModel,
+          config.knowledgeBases,
+        );
+
+      case "postgres":
+        if (!config.postgres) {
+          throw new Error("Postgres config is required when dbType is 'postgres'");
+        }
+        return new PostgresProvider(
+          config.postgres,
           embeddingModel,
           config.knowledgeBases,
         );
