@@ -93,10 +93,10 @@ source:
 
 ```markdown
 ## feedback
-- [feedback_prefer-concise-output.md](feedback_prefer-concise-output.md) — 用户偏好简洁输出 (2026-05-28)
+- `feedback_prefer-concise-output.md` — 用户偏好简洁输出 (2026-05-28)
 
 ## user
-- [user_frontend-engineer.md](user_frontend-engineer.md) — 用户是前端工程师 (2026-05-20)
+- `user_frontend-engineer.md` — 用户是前端工程师 (2026-05-20)
 ```
 
 ---

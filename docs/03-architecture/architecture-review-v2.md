@@ -192,7 +192,7 @@
    - jobKey 重算 → 所有旧 job 失效 → 需要重新 enqueue 全部历史数据
    - → 对 token 预算（§13.2）的严重冲击
 3. **in-memory job repository 不 durable**：
-   - 当前 [storage/repositories/in-memory.ts](../storage/repositories/in-memory.ts) 是内存 Map
+   - 当前 [storage/repositories/in-memory.ts](../../storage/repositories/in-memory.ts) 是内存 Map
    - 单机 daemon 重启 → 所有 queued/running job 丢失
 
 **建议**：

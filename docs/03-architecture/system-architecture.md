@@ -1,181 +1,123 @@
 # 系统架构
 
-## 架构概述
+本文描述当前 memory-autodb 的代码架构。更完整的中间件化路线见 [memory-middleware-architecture.md](./memory-middleware-architecture.md)。
 
-OpenClaw 内存插件采用分层架构设计，包含以下核心模块：
+## 总体结构
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    OpenClaw Plugin API                   │
-├─────────────────────────────────────────────────────────┤
-│                     插件入口 (index.ts)                   │
-│  - 工具注册 (memory_store, memory_recall, etc.)          │
-│  - 钩子注册 (before_agent_start, agent_end)              │
-│  - CLI 命令注册 (ltm 命令组)                              │
-├─────────────────────────────────────────────────────────┤
-│                      业务逻辑层                           │
-│  - Embeddings (向量化)                                   │
-│  - ScannerCoordinator (扫描协调)                         │
-│  - RoutingEngine (路由引擎)                              │
-│  - TextSplitter (文本切分)                               │
-├─────────────────────────────────────────────────────────┤
-│                      数据库抽象层                          │
-│  - DatabaseFactory (数据库工厂)                           │
-│  - DatabaseProvider (数据库提供者接口)                    │
-├─────────────────────────────────────────────────────────┤
-│                      数据存储层                           │
-│  - LanceDB Provider (本地向量数据库)                      │
-│  - Supabase Provider (云端 PostgreSQL+pgvector)           │
-│  - Hybrid Provider (混合模式)                            │
-└─────────────────────────────────────────────────────────┘
+```text
+OpenClaw Plugin
+  index.ts
+    ├─ adapters/openclaw/        # OpenClaw tools、hooks、CLI adapter
+    ├─ core/                     # MemoryService、scope、核心领域类型
+    ├─ storage/                  # LegacyDatabaseAdapter、in-memory repository/index
+    ├─ db/providers/             # LanceDB、Supabase、Postgres provider
+    ├─ processing/               # embedding、hash、legacy text splitter
+    ├─ ingest/                   # canonicalize、chunk、job pipeline
+    ├─ retrieval/                # prompt safety、RRF、context packer
+    ├─ api/rest/ + server/        # REST router 和 Node HTTP daemon
+    ├─ adapters/mcp/             # transport-agnostic MCP facade
+    ├─ sdk/js/                   # JS client
+    ├─ graph/ + tree/             # graph/tree baseline
+    └─ console/                  # console API 和静态页面
 ```
 
-## 技术栈
+## 运行模式
 
-| 层次 | 技术选型 | 说明 |
-|------|----------|------|
-| 语言 | TypeScript | 严格类型检查 |
-| 运行环境 | Node.js 18+ | CommonJS/ESM 混合 |
-| 向量数据库 | LanceDB | 本地快速向量搜索 |
-| 云端存储 | Supabase | PostgreSQL + pgvector |
-| 嵌入模型 | OpenAI/BAAI | text-embedding-3-small 等 |
-| 文本处理 | 自研 | Markdown 解析、文本切分 |
+| 模式 | 状态 | 说明 |
+|------|------|------|
+| Embedded OpenClaw plugin | 当前主路径 | `index.ts` 注册工具、钩子和 CLI |
+| 本机 server | 已有基线 | `ltm serve` 启动 Node HTTP server，默认 `127.0.0.1:3847` |
+| MCP facade | 已有基线 | 提供工具注册表和调用映射，尚不启动 transport |
+| JS SDK | 已有基线 | 面向 REST API 的 client |
+| Remote/backend-proxy | 方案中 | 配置类型已保留，完整实现后续推进 |
 
-## 模块划分
+## 核心链路
 
-### 1. 入口模块 (`index.ts`)
+### 保存记忆
 
-**职责**：
-- 插件注册和初始化
-- 工具函数注册
-- 生命周期钩子处理
-- CLI 命令注册
-
-**核心函数**：
-- `registerTools()` - 注册工具函数
-- `registerCliCommands()` - 注册 CLI 命令
-- `before_agent_start()` - 自动召回钩子
-- `agent_end()` - 自动捕获钩子
-
-### 2. 配置模块 (`config.ts`)
-
-**职责**：
-- 配置 Schema 定义和验证
-- 环境变量解析
-- 默认值管理
-
-### 3. 数据库模块 (`db/`)
-
-**职责**：
-- 数据库连接管理
-- CRUD 操作实现
-- 向量搜索
-
-**文件结构**：
-```
-db/
-├── factory.ts         # 数据库工厂
-├── types.ts           # 类型定义
-├── providers/
-│   ├── lancedb.ts     # LanceDB 提供者
-│   ├── supabase.ts    # Supabase 提供者
-│   └── hybrid.ts      # 混合模式提供者
+```text
+memory_store / REST / MCP
+  -> DefaultMemoryService.storeMemory()
+  -> LegacyDatabaseAdapter
+  -> DatabaseProvider
+  -> LanceDB / Supabase / Postgres
 ```
 
-### 4. 处理模块 (`processing/`)
+OpenClaw 工具层会在调用 service 前生成 embedding、content hash、category 和 metadata。
 
-**职责**：
-- 嵌入生成
-- 文本切分
-- 哈希计算
+### 召回记忆
 
-**文件结构**：
-```
-processing/
-├── embeddings.ts      # 嵌入生成
-├── text-splitter.ts   # 文本切分器
-└── hash-utils.ts      # 哈希工具
+```text
+memory_recall / REST / MCP
+  -> DefaultMemoryService.recall()
+  -> embeddings.embed(query)
+  -> repository.query(vector + filters + scope)
+  -> RecallResult
 ```
 
-### 5. 扫描模块 (`scanner/`)
+上下文构建再经过 `retrieval/context-packer.ts`，输出 prompt-safe context block。
 
-**职责**：
-- 目录扫描
-- 文件处理
-- Markdown 解析
+### Agent 快路径
 
-**文件结构**：
-```
-scanner/
-├── scanner-coordinator.ts  # 扫描协调器
-├── file-scanner.ts         # 文件扫描器
-└── markdown-processor.ts   # Markdown 处理器
+```text
+memory_context_fast / POST /v1/agent/context
+  -> api/agent-fast-path.ts
+  -> core/slot-context-builder.ts
+  -> core/slot-snapshot.ts
+  -> 5 slot context + telemetry
 ```
 
-### 6. 路由模块 (`routing/`)
+5 问题语义协议是 Agent 上下文视图，不是 legacy 主表的硬约束。
 
-**职责**：
-- 内容路由到指定表
-- 模式匹配
+### 目录扫描
+
+```text
+memory_scan_directory / ltm scan
+  -> ingest/adapters/file-system.ts
+  -> ingest/canonicalize.ts
+  -> ingest/chunker.ts
+  -> ingest/pipeline.ts
+  -> documents / chunks / jobs / audit baseline
+```
+
+当前 pipeline 先建立可回放的 document/chunk/job 基线；legacy provider 写入和完整持久化迁移按阶段推进。
+
+## 存储层
+
+| 层 | 文件 | 说明 |
+|----|------|------|
+| Provider contract | `db/types.ts` | legacy `MemoryEntry` 和 `DatabaseProvider` |
+| Provider factory | `db/factory.ts` | 根据配置创建 LanceDB、Supabase、Postgres 或 hybrid provider |
+| Legacy adapter | `storage/legacy-database-adapter.ts` | 将 legacy provider 暴露为 core repository |
+| In-memory baseline | `storage/repositories/in-memory.ts` | 中间件 contract 测试和 baseline |
+| Text index | `storage/indexes/in-memory-bm25.ts` | BM25/文本检索 baseline |
+
+## 对外接口
+
+| 接口 | 文件 | 当前状态 |
+|------|------|----------|
+| OpenClaw tools | `index.ts`、`adapters/openclaw/tools.ts` | 当前可用 |
+| OpenClaw hooks | `adapters/openclaw/hooks.ts` | 自动召回和自动捕获 |
+| CLI | `index.ts`、`adapters/openclaw/cli.ts` | 当前可用 |
+| REST | `api/rest/router.ts`、`server/daemon.ts` | 当前可用 |
+| MCP facade | `adapters/mcp/server.ts`、`adapters/mcp/tools.ts` | facade 可用，transport 未绑定 |
+| JS SDK | `sdk/js/client.ts` | REST client baseline |
+| Console | `console/api.ts`、`console/web/` | Overview/Lookup/Graph/Jobs baseline |
 
 ## 架构决策
 
-### 决策 1：多存储架构
+### 1. OpenClaw 只是 adapter
 
-**背景**：用户需要灵活的存储方案，包括本地快速访问和云端持久化。
+业务逻辑逐步迁入 `core/`、`ingest/`、`retrieval/`、`storage/`。`index.ts` 保留插件注册、配置装配和兼容入口。
 
-**选项**：
-1. 仅本地 LanceDB
-2. 仅云端 Supabase
-3. 混合模式 + 抽象层
+### 2. 保留 legacy provider
 
-**决策**：选项 3
+LanceDB、Supabase、Postgres provider 已存在，短期不重写存储层。中间件能力通过 `LegacyDatabaseAdapter` 和新 in-memory baseline 增量落地。
 
-**理由**：
-- LanceDB 提供快速的本地向量搜索
-- Supabase 提供云端持久化和完整元数据
-- 抽象层便于扩展其他数据库
+### 3. Scope 是新 API 的强边界
 
-### 决策 2：多表存储
+REST、MCP、SDK、console 和 graph/tree 查询都应使用 `MemoryScope` 或可规范化的 scope input。server/remote 模式不得绕过 scope filter。
 
-**背景**：对话记忆和文档知识有不同的使用场景。
+### 4. 快路径不等待重语义处理
 
-**选项**：
-1. 单表存储所有数据
-2. 多表按类型存储
-
-**决策**：选项 2
-
-**理由**：
-- 隔离查询提高性能
-- 独立的索引策略
-- 更灵活的权限管理
-
-### 决策 3：批量处理
-
-**背景**：大量文档扫描需要高效处理。
-
-**决策**：
-- 批量向量化（20 条/批）
-- 并发控制（3 个并发）
-- 自动重试（3 次）
-
-## 部署架构
-
-```
-┌─────────────────┐     ┌─────────────────┐
-│   OpenClaw App  │────▶│  Memory Plugin  │
-└─────────────────┘     └────────┬────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    │            │            │
-             ┌──────▼──────┐ ┌──▼──────┐ ┌──▼──────┐
-             │  LanceDB    │ │Supabase │ │ OpenAI  │
-             │  (本地)      │ │ (云端)   │ │  (API)  │
-             └─────────────┘ └─────────┘ └─────────┘
-```
-
-## 创建信息
-
-- 创建日期：2026-03-11
-- 最后更新：2026-03-11
+Agent 启动上下文优先走缓存和轻量构建；embedding、抽取、graph/tree、summary 等重处理放到 warm/cold path。

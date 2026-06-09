@@ -1,49 +1,24 @@
-# 06-database 数据库设计
+# 数据库设计
 
-## 用途
-数据表结构、字段说明、索引设计
+本目录记录 legacy 表结构、中间件 schema 草案、索引和迁移注意事项。
 
-## 文件命名
-`{设计主题}.md`
+## 当前文档
 
-## 文件模板
-```markdown
-# {表名}
+| 文档 | 状态 | 说明 |
+|------|------|------|
+| [schema.md](./schema.md) | 当前 | `memories`、`knowledge` legacy 表，中间件 v4 schema 草案，索引和 RPC |
 
-## 表结构
-| 字段 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| id | UUID | 是 | | 主键 |
-| created_at | TIMESTAMP | 是 | NOW() | 创建时间 |
-| updated_at | TIMESTAMP | 是 | NOW() | 更新时间 |
+## 当前存储边界
 
-## 索引设计
-| 索引名 | 字段 | 类型 | 说明 |
-|--------|------|------|------|
-| idx_{field} | {field} | BTREE | 加速查询 |
+| 层 | 状态 |
+|----|------|
+| Legacy provider | LanceDB、Supabase、Postgres provider 由 `db/providers/` 实现 |
+| Core service | `storage/legacy-database-adapter.ts` 把 legacy 数据映射到 `MemoryRecord` |
+| Middleware baseline | documents/chunks/jobs/audit/graph/tree 以 in-memory contract baseline 为主 |
+| 持久化迁移 | `ltm migrate --to-schema v4 --dry-run` 当前提供迁移估算 |
 
-## 约束
-| 约束名 | 类型 | 说明 |
-|--------|------|------|
-| pk_{table} | PRIMARY KEY | 主键约束 |
+## 维护规则
 
-## 表关系
-{与其他表的关系}
-
-## 示例数据
-```sql
-INSERT INTO {table} (id, field) VALUES ('uuid', 'value');
-```
-```
-
-## 示例
-```
-06-database/
-├── schema.md
-├── scan-result-table.md
-├── scanner-config-table.md
-└── index-design.md
-```
-
-## 维护方式
-AI 随开发同步更新
+- 改 `db/types.ts`、`core/types.ts`、`storage/` 或 provider 时更新 schema。
+- 写向量维度时必须注明模型来源，并提醒迁移成本。
+- 方案表和已持久化表要分开写，避免误导部署。

@@ -1,50 +1,24 @@
 # 数据库 Schema
 
-## 概述
+本文区分两层 schema：已经由 legacy provider 使用的 `memories` / `knowledge` 表，以及 v4 中间件的结构化 schema 草案。
 
-本插件使用多表存储架构，支持两种数据库后端：
-- **LanceDB**: 本地向量数据库
-- **Supabase**: PostgreSQL + pgvector
+## 后端状态
 
-## 表列表
+| 后端 | 状态 | 说明 |
+|------|------|------|
+| LanceDB | 已支持 | 默认本地向量存储，路径由 `dbPath` 决定 |
+| Supabase | 已支持 | PostgreSQL + pgvector，需要 `SUPABASE_URL` 和 `SUPABASE_SERVICE_KEY` |
+| Postgres | 已支持 | provider 已存在，适合 server 部署 |
+| In-memory | 已支持 | 中间件 contract baseline 和测试 |
 
-| 表名 | 用途 | 数据前缀 |
-|------|------|----------|
-| `memories` | 对话记忆 | `mem_` |
-| `knowledge` | 文档知识 | `know_` |
+## Legacy 表
 
-## v4 Middleware Schema 草案
+| 表名 | 用途 | 默认数据类型 |
+|------|------|--------------|
+| `memories` | 对话记忆、用户偏好、事实、决策 | `memory` |
+| `knowledge` | 扫描文档和知识条目 | `knowledge` / `document` |
 
-v4 在保留 `memories` / `knowledge` legacy 表的基础上，新增 middleware 结构化表。第一阶段代码已提供 in-memory contract baseline，持久化 provider 后续按以下 schema 落地。
-
-| 表名 | 作用 |
-|------|------|
-| `documents` | source/document 元数据 |
-| `chunks` | deterministic chunk，graph/tree/vector/text 的 evidence 单位 |
-| `jobs` | embed/extract/seal/digest 等后台任务 |
-| `audit` | store/forget/migrate/retention/rebuild 审计 |
-| `entities` | 结构化实体 |
-| `relations` | 带 evidence 的关系 |
-| `tree_buffers` | source/topic/global L0 buffer |
-| `summary_nodes` | sealed source/topic/global summary |
-
-核心索引建议：
-
-```sql
-CREATE INDEX chunks_scope_source_idx ON chunks(scope_key, source_id, created_at DESC);
-CREATE INDEX entities_scope_hotness_idx ON entities(scope_key, hotness DESC);
-CREATE INDEX relations_subject_idx ON relations(scope_key, subject_id, predicate);
-CREATE INDEX relations_object_idx ON relations(scope_key, object_id, predicate);
-CREATE INDEX summary_tree_idx ON summary_nodes(scope_key, tree_type, tree_key, level, sealed_at DESC);
-```
-
-所有新表必须包含 `scope_key` 或可从 `scope` 派生的等价字段；server/remote 模式不得绕过 scope filter 查询。
-
-## 表结构
-
-### memories 表
-
-存储对话记忆（用户偏好、决策、实体信息等）
+### `memories`
 
 ```sql
 CREATE TABLE memories (
@@ -60,23 +34,7 @@ CREATE TABLE memories (
 );
 ```
 
-**字段说明**:
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | UUID | 主键 |
-| `text` | TEXT | 文本内容 |
-| `content_hash` | TEXT | SHA256 哈希（去重） |
-| `vector` | vector(1536) | 嵌入向量 |
-| `importance` | FLOAT | 重要性 (0-1) |
-| `category` | TEXT | 分类 |
-| `data_type` | TEXT | 数据类型 |
-| `metadata` | JSONB | 元数据 |
-| `created_at` | TIMESTAMP | 创建时间 |
-
-### knowledge 表
-
-存储文档知识（扫描的 Markdown 文件）
+### `knowledge`
 
 ```sql
 CREATE TABLE knowledge (
@@ -92,186 +50,118 @@ CREATE TABLE knowledge (
 );
 ```
 
-**字段说明**:
+### 字段说明
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `id` | UUID | 主键 |
-| `text` | TEXT | 文本内容 |
-| `content_hash` | TEXT | SHA256 哈希（去重） |
-| `vector` | vector(1536) | 嵌入向量 |
-| `importance` | FLOAT | 重要性 (0-1) |
-| `category` | TEXT | 分类 |
-| `data_type` | TEXT | 数据类型 |
-| `metadata` | JSONB | 元数据 |
-| `created_at` | TIMESTAMP | 创建时间 |
+| `id` | UUID/string | 主键，具体格式由 provider 决定 |
+| `text` | text | 记忆或知识片段正文 |
+| `content_hash` | text | 内容去重 hash |
+| `vector` | vector | embedding 向量，维度必须和模型一致 |
+| `importance` | float | 重要性，范围 0-1 |
+| `category` | text | legacy 分类 |
+| `data_type` | text | `memory`、`document`、`knowledge` |
+| `metadata` | json | OpenClaw 上下文、文件路径、用户自定义信息 |
+| `created_at` | timestamp/number | 创建时间 |
 
-## 索引设计
-
-### memories 表索引
+## Legacy 索引
 
 ```sql
--- 向量索引（IVFFlat 算法）
 CREATE INDEX memories_vector_idx
 ON memories USING ivfflat (vector vector_cosine_ops)
 WITH (lists = 100);
 
--- 唯一哈希索引
 CREATE UNIQUE INDEX memories_content_hash_idx
 ON memories (content_hash);
 
--- 数据类型索引
 CREATE INDEX memories_data_type_idx
 ON memories (data_type);
 
--- 时间索引（倒序）
 CREATE INDEX memories_created_at_idx
 ON memories (created_at DESC);
 ```
 
-### knowledge 表索引
-
 ```sql
--- 向量索引（IVFFlat 算法）
 CREATE INDEX knowledge_vector_idx
 ON knowledge USING ivfflat (vector vector_cosine_ops)
 WITH (lists = 100);
 
--- 唯一哈希索引
 CREATE UNIQUE INDEX knowledge_content_hash_idx
 ON knowledge (content_hash);
 
--- 数据类型索引
 CREATE INDEX knowledge_data_type_idx
 ON knowledge (data_type);
 
--- 时间索引（倒序）
 CREATE INDEX knowledge_created_at_idx
 ON knowledge (created_at DESC);
 ```
 
-## 表关系
+## Supabase RPC
 
-```
-memories          knowledge
-    │                 │
-    │                 │
-    └────────┬────────┘
-             │
-    共享相同的 Schema 结构
-    独立的数据和索引
-```
+Supabase provider 使用 `match_memories` 和 `match_knowledge` 做向量搜索。仓库根目录保留两份脚本：
+
+| 脚本 | 说明 |
+|------|------|
+| [supabase-rpc-functions.sql](../../supabase-rpc-functions.sql) | 1536 维默认脚本 |
+| [supabase-rpc-functions-1024.sql](../../supabase-rpc-functions-1024.sql) | 1024 维模型脚本 |
+
+维度必须和 embedding 模型一致。
 
 ## 向量维度
 
-**重要**: 向量维度必须与嵌入模型匹配！
+常用模型维度见 [技术栈](../03-architecture/technology-stack.md)。更换模型时需要同时处理：
 
-| 模型 | 维度 |
+1. provider 表结构或 LanceDB schema。
+2. Supabase RPC 函数参数维度。
+3. 已有向量数据的迁移或重建。
+
+## v4 中间件 schema 草案
+
+v4 在 legacy 表之上新增结构化数据模型。当前代码已提供 in-memory contract baseline；持久化 provider 后续按下表落地。
+
+| 表名 | 作用 |
 |------|------|
-| text-embedding-3-small | 1536 |
-| text-embedding-3-large | 3072 |
-| BAAI/bge-m3 | 1024 |
+| `documents` | source/document 元数据 |
+| `chunks` | deterministic chunk，graph/tree/vector/text 的 evidence 单位 |
+| `jobs` | embed/extract/seal/digest 等后台任务 |
+| `audit` | store/forget/migrate/retention/rebuild 审计 |
+| `entities` | 结构化实体 |
+| `relations` | 带 evidence 的关系 |
+| `tree_buffers` | source/topic/global L0 buffer |
+| `summary_nodes` | sealed source/topic/global summary |
 
-修改向量维度需要：
-1. 删除现有表
-2. 修改 SQL 脚本中的维度
-3. 重新创建表
+核心约束：
 
-## RPC 函数
+- 所有新表必须包含 `scope_key`，或包含可稳定派生 `scope_key` 的 `scope` 字段。
+- server/remote 模式不得绕过 scope filter 查询。
+- graph/tree/summary 必须保留 evidence id，不能只有模型生成文本。
+- L0 evidence 不应因摘要折叠被系统主动删除；删除属于治理操作，应写 audit。
 
-### match_memories
-
-用于向量搜索的存储过程：
-
-```sql
-CREATE OR REPLACE FUNCTION match_memories(
-  query_embedding vector(1536),
-  match_count INT DEFAULT 5,
-  min_similarity FLOAT DEFAULT 0.1,
-  filter_data_type TEXT[] DEFAULT NULL
-)
-RETURNS TABLE (
-  id UUID,
-  text TEXT,
-  content_hash TEXT,
-  vector vector(1536),
-  importance FLOAT,
-  category TEXT,
-  data_type TEXT,
-  metadata JSONB,
-  created_at TIMESTAMP WITH TIME ZONE,
-  similarity FLOAT
-)
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  RETURN QUERY
-  SELECT
-    m.id,
-    m.text,
-    m.content_hash,
-    m.vector,
-    m.importance,
-    m.category,
-    m.data_type,
-    m.metadata,
-    m.created_at,
-    (1 - (m.vector <=> query_embedding)) AS similarity
-  FROM memories m
-  WHERE (1 - (m.vector <=> query_embedding)) >= min_similarity
-    AND (filter_data_type IS NULL OR m.data_type = ANY(filter_data_type))
-  ORDER BY m.vector <=> query_embedding
-  LIMIT match_count;
-END;
-$$;
-```
-
-### match_knowledge
+建议索引：
 
 ```sql
-CREATE OR REPLACE FUNCTION match_knowledge(
-  query_embedding vector(1536),
-  match_count INT DEFAULT 5,
-  min_similarity FLOAT DEFAULT 0.1,
-  filter_data_type TEXT[] DEFAULT NULL
-)
-RETURNS TABLE (
-  id UUID,
-  text TEXT,
-  content_hash TEXT,
-  vector vector(1536),
-  importance FLOAT,
-  category TEXT,
-  data_type TEXT,
-  metadata JSONB,
-  created_at TIMESTAMP WITH TIME ZONE,
-  similarity FLOAT
-)
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  RETURN QUERY
-  SELECT
-    k.id,
-    k.text,
-    k.content_hash,
-    k.vector,
-    k.importance,
-    k.category,
-    k.data_type,
-    k.metadata,
-    k.created_at,
-    (1 - (k.vector <=> query_embedding)) AS similarity
-  FROM knowledge k
-  WHERE (1 - (k.vector <=> query_embedding)) >= min_similarity
-    AND (filter_data_type IS NULL OR k.data_type = ANY(filter_data_type))
-  ORDER BY k.vector <=> query_embedding
-  LIMIT match_count;
-END;
-$$;
+CREATE INDEX chunks_scope_source_idx
+ON chunks(scope_key, source_id, created_at DESC);
+
+CREATE INDEX entities_scope_hotness_idx
+ON entities(scope_key, hotness DESC);
+
+CREATE INDEX relations_subject_idx
+ON relations(scope_key, subject_id, predicate);
+
+CREATE INDEX relations_object_idx
+ON relations(scope_key, object_id, predicate);
+
+CREATE INDEX summary_tree_idx
+ON summary_nodes(scope_key, tree_type, tree_key, level, sealed_at DESC);
 ```
 
-## 创建信息
+## 迁移
 
-- 创建日期：2026-03-11
-- 最后更新：2026-03-11
+当前迁移命令：
+
+```bash
+ltm migrate --to-schema v4 --dry-run
+```
+
+该命令当前提供迁移估算，不执行真实数据迁移。真实迁移需要按表、namespace、scope 分批执行，并保留旧表回滚窗口。

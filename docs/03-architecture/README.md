@@ -1,60 +1,29 @@
-# 03-architecture 架构设计
+# 架构设计
 
-## 用途
-系统技术架构、模块划分、技术选型，全局视角
+本目录记录 memory-autodb 的系统架构、长期方案和架构评审。阅读时先区分当前实现、方案设计和外部参考。
 
-## 文件命名
-`{架构主题}.md`
+## 当前真源
 
-## 文件模板
-```markdown
-# {架构主题}
+| 文档 | 状态 | 说明 |
+|------|------|------|
+| [memory-middleware-architecture.md](./memory-middleware-architecture.md) | 当前架构方案 | MemoryService、adapter、REST/MCP/SDK、ingestion、retrieval、graph/tree、console 的中间件化架构 |
+| [memory-autodb-deep-optimization-architecture.md](./memory-autodb-deep-optimization-architecture.md) | 长期优化方案 | 5 问题、5 type、SlotSnapshot、候选治理、图谱和记忆树路线 |
+| [architecture-review-v2.md](./architecture-review-v2.md) | 架构评审 | 对深层优化方案的可行性和阶段边界评审 |
+| [system-architecture.md](./system-architecture.md) | 基线架构 | OpenClaw 插件和中间件演进后的模块总览 |
+| [technology-stack.md](./technology-stack.md) | 当前技术栈 | 依赖、运行时、数据库和 embedding 模型 |
 
-## 架构概述
-{整体架构图和说明}
+## 参考材料
 
-## 技术栈
-| 层次 | 技术选型 | 说明 |
-|------|----------|------|
-| 前端 | | |
-| 后端 | | |
-| 数据库 | | |
+| 路径 | 状态 | 使用方式 |
+|------|------|----------|
+| [copy-from-mate/](./copy-from-mate/) | 外部参考 | Banto/iFlyMate 记忆系统设计输入，不是 memory-autodb 当前实现承诺 |
+| [../UPGRADE-v3.0-graph-requirements.md](../UPGRADE-v3.0-graph-requirements.md) | 历史需求 | v3.0 图谱检索升级需求，保留用于追溯 |
+| [../UPGRADE-v3.0-technical-plan.md](../UPGRADE-v3.0-technical-plan.md) | 历史方案 | v3.0 技术升级方案，后续以当前架构文档为准 |
+| [../AUTODB-FULL-DOC.md](../AUTODB-FULL-DOC.md) | 历史完整说明 | 旧 AutoDB provider 说明 |
+| [../PORT-TO-HERMES.md](../PORT-TO-HERMES.md) | 移植方案 | Hermes 移植参考 |
 
-## 模块划分
-{模块列表和职责说明}
+## 维护规则
 
-## 架构决策
-### 决策 1：{决策标题}
-- 背景：{描述背景}
-- 选项：{可选方案}
-- 决策：{最终选择}
-- 理由：{选择理由}
-
-## 部署架构
-{部署架构图和说明}
-
-## 创建信息
-- 创建日期：{YYYY-MM-DD}
-- 最后更新：{YYYY-MM-DD}
-```
-
-## 示例
-```
-03-architecture/
-├── system-architecture.md
-├── memory-middleware-architecture.md
-├── memory-autodb-deep-optimization-architecture.md
-├── technology-stack.md
-├── module-design.md
-└── deployment-architecture.md
-```
-
-## 当前重点文档
-
-| 文档 | 说明 |
-|------|------|
-| [memory-middleware-architecture.md](./memory-middleware-architecture.md) | v4 中间件化架构：从 OpenClaw 插件拆分为 MemoryService、REST/MCP/SDK/Console 的工程骨架 |
-| [memory-autodb-deep-optimization-architecture.md](./memory-autodb-deep-optimization-architecture.md) | vNext 深层优化架构：吸收 copy-from-mate 记忆系统的 5 问题、5 type、记忆树、图谱、升格治理和 Console 预览方案 |
-
-## 维护方式
-架构变化时更新
+- 当前实现变化优先更新 `memory-middleware-architecture.md`。
+- 未来路线或评审结论优先更新 `memory-autodb-deep-optimization-architecture.md` 和对应评审文档。
+- `copy-from-mate/` 下内容默认保持参考材料身份，除非明确把其中结论吸收到当前方案。

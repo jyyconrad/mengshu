@@ -1,69 +1,25 @@
-# 05-api API 文档
+# API 文档
 
-## 用途
-所有 REST 接口的请求/响应格式、状态码
+本目录记录 OpenClaw 工具、CLI、REST server 和 MCP facade 的调用契约。修改 `index.ts`、`api/rest/`、`adapters/openclaw/`、`adapters/mcp/` 或 `sdk/js/` 后，应同步检查这里。
 
-## 文件命名
-`{API 主题}-api.md`
+## 当前文档
 
-## 文件模板
-```markdown
-# {API 主题} API
-
-## 接口列表
-| 方法 | 路径 | 描述 |
+| 文档 | 状态 | 说明 |
 |------|------|------|
-| GET | /api/v1/{resource} | 获取资源列表 |
-| POST | /api/v1/{resource} | 创建资源 |
+| [memory-api.md](./memory-api.md) | 当前 | OpenClaw 工具、REST `/v1/*`、Agent 快路径和 MCP facade |
+| [cli-commands.md](./cli-commands.md) | 当前 | `ltm` 命令组、参数、输出和注意事项 |
 
-## 接口详情
+## 当前入口
 
-### GET /api/v1/{resource}
+| 类型 | 入口 |
+|------|------|
+| OpenClaw 工具 | `memory_store`、`memory_recall`、`memory_forget`、`memory_scan_directory`、`memory_cleanup`、`memory_context_fast` |
+| CLI | `ltm list/stats/tables/search/query/export/scan/cleanup/kb:list/serve/status/health/migrate` |
+| REST | `/v1/health`、`/v1/memories`、`/v1/recall`、`/v1/context`、`/v1/agent/*`、`/v1/console/*`、`/v1/graph/query` |
+| MCP facade | `memory_save`、`memory_recall`、`memory_context`、`memory_observe`、`memory_namespaces`、`memory_forget`、`memory_health` |
 
-**描述**: {接口描述}
+## 维护规则
 
-**请求 Headers**:
-```
-Authorization: Bearer {token}
-Content-Type: application/json
-```
-
-**请求参数**:
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| page | number | 否 | 页码 |
-| limit | number | 否 | 每页数量 |
-
-**响应示例**:
-```json
-{
-  "data": [],
-  "meta": {
-    "total": 100,
-    "page": 1,
-    "limit": 10
-  }
-}
-```
-
-**状态码**:
-| 状态码 | 说明 |
-|--------|------|
-| 200 | 成功 |
-| 400 | 请求参数错误 |
-| 401 | 未授权 |
-| 404 | 资源不存在 |
-| 500 | 服务器错误 |
-```
-
-## 示例
-```
-05-api/
-├── scan-api.md
-├── scanner-management-api.md
-├── result-api.md
-└── error-codes.md
-```
-
-## 维护方式
-AI 随开发同步更新
+- 参数名必须和代码一致，不写不存在的短参数。
+- REST 文档必须说明鉴权默认值：无 `server.secret` 时只允许 loopback；配置 secret 后使用 Bearer token。
+- 尚未实现的能力必须标注为 facade、baseline 或方案，不写成可直接使用的服务。

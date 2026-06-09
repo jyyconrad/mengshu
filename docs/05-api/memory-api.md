@@ -1,31 +1,259 @@
 # Memory API
 
-## 工具函数列表
+本页记录当前代码中可调用的 OpenClaw 工具、REST API 和 MCP facade。参数以 [index.ts](../../index.ts)、[api/rest/router.ts](../../api/rest/router.ts) 和 [adapters/mcp/tools.ts](../../adapters/mcp/tools.ts) 为准。
 
-| 工具 | 方法 | 描述 |
-|------|------|------|
-| `memory_store` | POST | 存储记忆 |
-| `memory_recall` | POST | 检索记忆 |
-| `memory_scan_directory` | POST | 扫描目录 |
-| `memory_cleanup` | POST | 清理数据 |
+## OpenClaw 工具
 
-## v4 REST / Middleware API
+| 工具 | 作用 |
+|------|------|
+| `memory_store` | 保存一条长期记忆 |
+| `memory_recall` | 召回相关记忆 |
+| `memory_forget` | 按 ID、查询或过滤条件删除记忆 |
+| `memory_scan_directory` | 扫描 Markdown 目录并写入 ingestion pipeline |
+| `memory_cleanup` | 按数据类型、时间或过滤条件清理数据 |
+| `memory_context_fast` | Agent 启动快路径，返回 5 槽位上下文 |
 
-本机 server 由 `ltm serve` 启动，默认监听 `127.0.0.1:3847`。无 `server.secret` 时只允许 loopback；配置 secret 后需要 `Authorization: Bearer <secret>`。
+### `memory_store`
 
-| 方法 | 路径 | 描述 |
+```json
+{
+  "text": "用户偏好使用 TypeScript",
+  "importance": 0.8,
+  "category": "preference",
+  "metadata": {
+    "source": "manual"
+  },
+  "storageCategory": "核心记忆"
+}
+```
+
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `text` | 是 | - | 要保存的文本 |
+| `importance` | 否 | `0.7` | 重要性，范围 0-1 |
+| `category` | 否 | 自动分类或 `other` | `core`、`preference`、`fact`、`entity`、`decision`、`task`、`plan`、`goal`、`other` |
+| `metadata` | 否 | `{}` | 自定义元数据 |
+| `storageCategory` | 否 | `核心记忆` | 用户友好分类，映射到底层表 |
+
+### `memory_recall`
+
+```json
+{
+  "query": "用户喜欢什么代码风格",
+  "limit": 5,
+  "minScore": 0.1,
+  "includeDocuments": false,
+  "filter": {
+    "category": "preference"
+  },
+  "category": "核心记忆",
+  "searchAll": false
+}
+```
+
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `query` | 是 | - | 检索查询 |
+| `limit` | 否 | `5` | 返回数量 |
+| `minScore` | 否 | `0.1` | 最低相似度 |
+| `includeDocuments` | 否 | `false` | 是否包含扫描文档数据 |
+| `filter` | 否 | - | 元数据过滤条件 |
+| `category` | 否 | - | 存储分类 |
+| `searchAll` | 否 | `false` | 跨分类搜索 |
+| `knowledgeBase` | 否 | - | 指定 `knowledge_*` 表 |
+
+### `memory_forget`
+
+```json
+{
+  "memoryId": "mem_123"
+}
+```
+
+也可以传入：
+
+```json
+{
+  "query": "旧的数据库方案"
+}
+```
+
+或：
+
+```json
+{
+  "filter": {
+    "category": "obsolete"
+  }
+}
+```
+
+### `memory_scan_directory`
+
+```json
+{
+  "directory": "./docs",
+  "ignorePaths": ["node_modules", "dist"],
+  "ignoreRules": ["*.draft.md"],
+  "targetTable": "knowledge",
+  "autoEnrichMetadata": true
+}
+```
+
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `directory` | 是 | - | 要扫描的目录 |
+| `ignorePaths` | 否 | `[]` | 额外忽略路径 |
+| `ignoreRules` | 否 | `[]` | gitignore 风格规则 |
+| `targetTable` | 否 | `knowledge` | 目标表 |
+| `autoEnrichMetadata` | 否 | `true` | 是否补充文件路径、更新时间等元数据 |
+
+### `memory_cleanup`
+
+```json
+{
+  "dataType": "document",
+  "olderThanDays": 30,
+  "filter": {
+    "source": "scan"
+  }
+}
+```
+
+### `memory_context_fast`
+
+```json
+{
+  "task": "整理 memory-autodb 文档",
+  "tokenBudget": 4000,
+  "latencyBudgetMs": 80
+}
+```
+
+返回结构包含：
+
+- `slots.profile`
+- `slots.task_context`
+- `slots.rules`
+- `slots.experience`
+- `slots.resource`
+- `content`
+- `taskHints`
+- `actions`
+- `freshness`
+- `warnings`
+- `telemetry`
+
+## REST API
+
+本机 server 由 `ltm serve` 启动，默认监听 `127.0.0.1:3847`。
+
+安全默认值：
+
+- 没有 `server.secret` 时，只允许 loopback 请求。
+- 配置 `server.secret` 后，需要 `Authorization: Bearer <secret>`。
+
+| 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/v1/health` | 服务健康和记录数 |
-| `POST` | `/v1/memories` | 写入核心 `MemoryRecord` |
-| `POST` | `/v1/recall` | 召回记忆，返回 hits、score breakdown、provenance |
+| `POST` | `/v1/memories` | 写入 `MemoryRecord` |
+| `POST` | `/v1/recall` | 召回记忆 |
 | `POST` | `/v1/context` | 召回并打包 prompt-safe context |
-| `POST` | `/v1/graph/query` | 可选图谱查询，返回 entities、relations、evidenceChunkIds |
-| `POST` | `/v1/console/overview` | Web Console 总览指标 |
-| `POST` | `/v1/console/lookup` | 知识速查 |
-| `POST` | `/v1/console/graph` | Console 局部图查询 |
-| `GET` | `/v1/console/jobs` | Job 队列列表和状态统计 |
+| `POST` | `/v1/graph/query` | 可选图谱查询 |
+| `POST` | `/v1/console/overview` | Web Console 总览 |
+| `POST` | `/v1/console/lookup` | Web Console 速查 |
+| `POST` | `/v1/console/graph` | Web Console 图查询 |
+| `GET` | `/v1/console/jobs` | Job 队列状态 |
+| `POST` | `/v1/agent/context` | Agent 快路径上下文 |
+| `POST` | `/v1/agent/observe` | Agent 运行中轻量 observation |
+| `POST` | `/v1/agent/lookup` | Agent 运行中速查 |
+| `POST` | `/v1/agent/session/commit` | Agent 会话结束提交 |
 
-### /v1/console/lookup 示例
+### `GET /v1/health`
+
+```bash
+curl http://127.0.0.1:3847/v1/health
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "records": 42
+}
+```
+
+### `POST /v1/memories`
+
+```json
+{
+  "record": {
+    "id": "mem_1",
+    "scope": {
+      "tenantId": "local",
+      "appId": "openclaw",
+      "userId": "default",
+      "projectId": "default",
+      "agentId": "default",
+      "namespace": "memories"
+    },
+    "kind": "fact",
+    "text": "memory-autodb 默认使用本机 LanceDB",
+    "contentHash": "hash_1",
+    "importance": 0.7,
+    "category": "fact",
+    "dataType": "memory",
+    "tableName": "memories",
+    "metadata": {},
+    "provenance": {
+      "source": "user"
+    },
+    "createdAt": 1760000000000
+  }
+}
+```
+
+### `POST /v1/recall`
+
+```json
+{
+  "query": "默认数据库是什么",
+  "limit": 5,
+  "scope": {
+    "appId": "openclaw",
+    "namespace": "memories"
+  }
+}
+```
+
+### `POST /v1/context`
+
+```json
+{
+  "query": "整理项目文档",
+  "limit": 5,
+  "title": "Retrieved Context"
+}
+```
+
+### `POST /v1/agent/context`
+
+```json
+{
+  "scope": {
+    "appId": "openclaw",
+    "namespace": "memories"
+  },
+  "task": "准备一次架构评审",
+  "intent": "writing",
+  "constraints": ["只使用当前仓库文档"],
+  "tokenBudget": 4000,
+  "latencyBudgetMs": 80
+}
+```
+
+### `POST /v1/console/lookup`
 
 ```json
 {
@@ -44,213 +272,38 @@
 
 private 内容不会返回 raw，只显示 `[private]` 预览。
 
----
+## MCP facade
 
-## memory_store
+[adapters/mcp/server.ts](../../adapters/mcp/server.ts) 当前是 transport-agnostic facade，不直接启动 stdio 或 HTTP MCP transport。
 
-### 接口定义
+| MCP tool | 状态 | 说明 |
+|----------|------|------|
+| `memory_save` | 可用 | 转调 `MemoryService.storeMemory()` |
+| `memory_recall` | 可用 | 转调 `MemoryService.recall()` |
+| `memory_context` | 可用 | 转调 `MemoryService.buildContext()` |
+| `memory_observe` | 可用 | 当前同样转调 `storeMemory()` |
+| `memory_ingest` | 占位 | 返回未实现提示 |
+| `memory_namespaces` | 可用 | 返回静态 namespace 列表 |
+| `memory_forget` | 可用 | 转调 `MemoryService.delete()` |
+| `memory_health` | 可用 | 转调 `MemoryService.health()` |
 
-**描述**: 存储单条记忆到数据库
+## 错误格式
 
-**工具调用**:
-```typescript
-{
-  "name": "memory_store",
-  "parameters": {
-    "text": "string",
-    "storageCategory": "核心记忆" | "知识库",  // 可选
-    "importance": number,                       // 可选，默认 0.7
-    "category": string,                         // 可选
-    "metadata": object                          // 可选
-  }
-}
-```
-
-**参数说明**:
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `text` | string | 是 | - | 要存储的文本内容 |
-| `storageCategory` | string | 否 | "核心记忆" | 存储分类 |
-| `importance` | number | 否 | 0.7 | 重要性分数 (0-1) |
-| `category` | string | 否 | "other" | 记忆分类 |
-| `metadata` | object | 否 | {} | 自定义元数据 |
-
-**响应示例**:
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "记忆已存储:\n- ID: mem_123456789\n- 分类：核心记忆\n- 重要性：0.8\n- 创建时间：2026-03-11T10:00:00Z"
-    }
-  ]
-}
-```
-
-**状态码**:
-| 状态 | 说明 |
-|------|------|
-| 成功 | 记忆存储成功 |
-| 错误 | 嵌入生成失败/数据库错误 |
-
----
-
-## memory_recall
-
-### 接口定义
-
-**描述**: 检索相关记忆
-
-**工具调用**:
-```typescript
-{
-  "name": "memory_recall",
-  "parameters": {
-    "query": "string",
-    "category": "核心记忆" | "知识库",  // 可选
-    "limit": number,                    // 可选，默认 5
-    "includeDocuments": boolean,        // 可选，默认 false
-    "filter": object                    // 可选
-  }
-}
-```
-
-**参数说明**:
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `query` | string | 是 | - | 搜索查询 |
-| `category` | string | 否 | "核心记忆" | 存储分类 |
-| `limit` | number | 否 | 5 | 返回数量 |
-| `includeDocuments` | boolean | 否 | false | 包含文档 |
-| `filter` | object | 否 | - | 元数据过滤 |
-
-**响应示例**:
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "找到 3 条相关记忆:\n\n[1] [相似度：0.92] 用户偏好使用 TypeScript 编写代码\n    分类：preference | 重要性：0.8\n\n[2] [相似度：0.85] 项目使用 PostgreSQL 数据库\n    分类：fact | 重要性：0.9\n\n[3] [相似度：0.78] 每天上午 10 点执行数据备份\n    分类：task | 重要性：0.7"
-    }
-  ]
-}
-```
-
----
-
-## memory_scan_directory
-
-### 接口定义
-
-**描述**: 扫描目录构建知识库
-
-**工具调用**:
-```typescript
-{
-  "name": "memory_scan_directory",
-  "parameters": {
-    "directory": "string",
-    "category": "知识库",           // 可选
-    "autoEnrichMetadata": true,     // 可选
-    "ignorePaths": string[],        // 可选
-    "ignoreRules": string[]         // 可选
-  }
-}
-```
-
-**参数说明**:
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `directory` | string | 是 | - | 要扫描的目录 |
-| `category` | string | 否 | "知识库" | 存储分类 |
-| `autoEnrichMetadata` | boolean | 否 | true | 自动丰富元数据 |
-| `ignorePaths` | string[] | 否 | [] | 忽略路径 |
-| `ignoreRules` | string[] | 否 | [] | 忽略规则 |
-
-**响应示例**:
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "目录扫描完成:\n- 扫描目录：/path/to/docs\n- 总文件数：156\n- 成功处理：152\n- 失败：4\n- 总块数：892\n- 新增存储：821\n- 重复跳过：71"
-    }
-  ]
-}
-```
-
----
-
-## memory_cleanup
-
-### 接口定义
-
-**描述**: 清理旧数据
-
-**工具调用**:
-```typescript
-{
-  "name": "memory_cleanup",
-  "parameters": {
-    "category": "核心记忆" | "知识库",  // 可选
-    "dataType": "memory" | "document",  // 可选
-    "olderThanDays": number,            // 可选
-    "filter": object                    // 可选
-  }
-}
-```
-
-**参数说明**:
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `category` | string | 否 | - | 存储分类 |
-| `dataType` | string | 否 | - | 数据类型 |
-| `olderThanDays` | number | 否 | - | 清理 N 天前的数据 |
-| `filter` | object | 否 | - | 额外过滤条件 |
-
-**响应示例**:
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "数据清理完成:\n- 清理条件：> 30 天\n- 删除条目：125\n- 释放空间：2.5 MB"
-    }
-  ]
-}
-```
-
----
-
-## 错误响应
-
-### 通用错误格式
+OpenClaw 工具返回 tool content 文本；REST API 返回 JSON：
 
 ```json
 {
-  "content": [
-    {
-      "type": "text",
-      "text": "错误：{错误信息}"
-    }
-  ]
+  "error": "query is required"
 }
 ```
 
-### 常见错误
+常见 HTTP 状态：
 
-| 错误 | 原因 | 解决 |
-|------|------|------|
-| 嵌入生成失败 | API 限额/网络问题 | 检查 API 密钥/重试 |
-| 数据库连接失败 | 数据库不可用 | 检查连接配置 |
-| 目录不存在 | 路径错误 | 检查路径 |
-| 权限不足 | Supabase 权限问题 | 检查 service key |
-
-## 创建信息
-
-- 创建日期：2026-03-11
-- 最后更新：2026-03-11
+| 状态码 | 说明 |
+|--------|------|
+| `400` | 请求体缺失或字段类型错误 |
+| `401` | Bearer token 缺失或不匹配 |
+| `403` | 非 loopback、非 HTTPS 或路径访问被拒绝 |
+| `404` | 路由不存在或可选模块未注入 |
+| `405` | HTTP 方法不允许 |
+| `500` | 服务内部错误 |

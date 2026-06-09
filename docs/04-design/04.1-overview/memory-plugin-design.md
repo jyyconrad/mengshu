@@ -1,215 +1,74 @@
-# Memory Plugin Design
+# OpenClaw 插件设计
+
+本文描述 OpenClaw 插件层的职责。中间件核心服务见 [系统架构](../../03-architecture/system-architecture.md)。
 
 ## 模块职责
 
-OpenClaw 内存插件提供长期记忆存储和检索功能，支持向量相似度搜索。
+`index.ts` 是 OpenClaw 插件注册入口，负责把配置、provider、embedding、service、pipeline 和 adapter 装配起来，并向 OpenClaw 暴露工具、钩子和 CLI。
 
-## 核心功能
+插件层只做三类事情：
 
-### 1. 记忆存储 (`memory_store`)
+1. 注册 OpenClaw 能识别的工具、hooks 和 `ltm` 命令。
+2. 将 OpenClaw 参数映射到 core service、legacy provider 或 ingestion pipeline。
+3. 保持旧工具和旧配置兼容。
 
-**输入**：
-- `text`: 要存储的文本
-- `importance`: 重要性分数 (0-1)
-- `category`: 分类 (core, preference, fact, entity, decision, task, plan, goal, other)
-- `storageCategory`: 存储分类 (核心记忆/知识库)
-- `metadata`: 自定义元数据
+## 初始化流程
 
-**处理流程**：
-```
-用户调用 memory_store
-    │
-    ▼
-生成内容哈希 (SHA256)
-    │
-    ▼
-检查是否重复
-    │
-    ├── 已存在 ──▶ 返回现有 ID
-    │
-    ▼
-生成嵌入向量
-    │
-    ▼
-存储到数据库
-    │
-    ├── LanceDB (向量索引)
-    └── Supabase (完整数据)
-    │
-    ▼
-返回存储结果
+```text
+memoryConfigSchema.parse(api.pluginConfig)
+  -> api.resolvePath(dbPath)
+  -> DatabaseFactory.createProvider()
+  -> new Embeddings()
+  -> new LegacyDatabaseAdapter()
+  -> new DefaultMemoryService()
+  -> new InMemoryMemoryStore()
+  -> new IngestionPipeline()
+  -> register tools / hooks / CLI
 ```
 
-### 2. 记忆检索 (`memory_recall`)
+## 工具
 
-**输入**：
-- `query`: 搜索查询
-- `limit`: 返回数量
-- `category`: 存储分类
-- `filter`: 元数据过滤
-- `includeDocuments`: 是否包含文档
+| 工具 | Handler | 说明 |
+|------|---------|------|
+| `memory_store` | `handleMemoryStore()` | 生成 embedding、hash、metadata，写入 service/provider |
+| `memory_recall` | `handleMemoryRecall()` | 查询 core service |
+| `memory_forget` | `handleMemoryForget()` | 删除指定记忆 |
+| `memory_scan_directory` | `handleMemoryScanDirectory()` | 扫描文件并进入 ingestion pipeline |
+| `memory_cleanup` | `handleMemoryCleanup()` | 按条件清理数据 |
+| `memory_context_fast` | `handleMemoryContextFast()` | Agent 快路径 5 槽位上下文 |
 
-**处理流程**：
-```
-用户调用 memory_recall
-    │
-    ▼
-生成查询向量
-    │
-    ▼
-向量相似度搜索
-    │
-    ├── LanceDB: 快速搜索
-    └── Supabase: RPC 函数
-    │
-    ▼
-应用元数据过滤
-    │
-    ▼
-返回结果
-```
+参数和示例见 [Memory API](../../05-api/memory-api.md)。
 
-### 3. 目录扫描 (`memory_scan_directory`)
+## Hooks
 
-**处理流程**：
-```
-用户调用 memory_scan_directory
-    │
-    ▼
-扫描目录 (递归)
-    │
-    ▼
-过滤文件 (.gitignore 规则)
-    │
-    ▼
-读取文件内容
-    │
-    ▼
-Markdown 解析
-    │
-    ▼
-文本切分 (1000 字符，重叠 200)
-    │
-    ▼
-批量向量化 (20 条/批)
-    │
-    ▼
-存储到数据库
-    │
-    ▼
-返回统计信息
-```
+| Hook | Handler | 开关 | 说明 |
+|------|---------|------|------|
+| `before_agent_start` | `handleBeforeAgentStartRecall()` | `autoRecall` | 根据当前消息召回相关记忆并注入上下文 |
+| `agent_end` | `handleAgentEndCapture()` | `autoCapture` | 根据触发规则捕获用户表达的稳定记忆 |
 
-### 4. 自动捕获 (`agent_end` 钩子)
+自动捕获会跳过过短、过长、疑似系统生成、emoji 过多、注入风险和已召回上下文内容。
 
-**触发条件**：
-- 对话结束
-- `autoCapture: true`
+## CLI
 
-**捕获规则**：
-- 用户偏好声明
-- 重要决策和共识
-- 实体信息（人名、地名等）
-- 任务和规划
+`ltm` 命令分两部分注册：
 
-### 5. 自动召回 (`before_agent_start` 钩子)
+- `index.ts` 注册 legacy 命令：`list`、`stats`、`tables`、`search`、`query`、`scan`、`cleanup`、`export`、`kb:list`。
+- `adapters/openclaw/cli.ts` 注册中间件命令：`serve`、`status`、`health`、`migrate`。
 
-**触发条件**：
-- 新对话开始
-- `autoRecall: true`
+完整说明见 [CLI 命令](../../05-api/cli-commands.md)。
 
-**召回逻辑**：
-- 提取用户消息关键词
-- 向量搜索相关记忆
-- 注入到系统上下文
+## 错误和安全边界
 
-## 模块接口
+| 风险 | 当前处理 |
+|------|----------|
+| Prompt 注入 | `retrieval/prompt-safety.ts` 检测和转义 |
+| 空/异常输入 | handler 层校验必填字段 |
+| 删除误操作 | `memory_cleanup` 要求至少一个过滤条件 |
+| REST 暴露 | `ltm serve` 默认 loopback，secret 可选 |
+| embedding 失败 | 由 embedding port/provider 抛出错误，调用侧返回失败 |
 
-### 工具函数
+## 已知边界
 
-| 工具 | 参数 | 返回 |
-|------|------|------|
-| `memory_store` | `StoreMemoryParams` | `MemoryEntry` |
-| `memory_recall` | `RecallMemoryParams` | `MemoryEntry[]` |
-| `memory_scan_directory` | `ScanDirectoryParams` | `ScanResult` |
-| `memory_cleanup` | `CleanupMemoryParams` | `CleanupResult` |
-
-### CLI 命令
-
-| 命令 | 参数 | 说明 |
-|------|------|------|
-| `ltm stats` | - | 显示统计 |
-| `ltm tables` | - | 列出所有表 |
-| `ltm search` | `query` | 搜索记忆 |
-| `ltm query` | `filter` | 高级查询 |
-| `ltm export` | `format` | 导出数据 |
-| `ltm scan` | `directory` | 扫描目录 |
-| `ltm cleanup` | `olderThan` | 清理数据 |
-
-## 错误处理
-
-### 错误类型
-
-| 错误 | 处理 |
-|------|------|
-| 嵌入 API 失败 | 自动重试 (3 次) |
-| 数据库连接失败 | 降级到本地存储 |
-| 向量维度不匹配 | 抛出明确错误 |
-| Prompt 注入检测 | 拒绝执行 |
-
-### 错误信息
-
-```typescript
-// 示例错误信息
-{
-  "error": "embedding_api_error",
-  "message": "Failed to generate embeddings: API rate limit exceeded",
-  "retryable": true,
-  "retryAfter": 60
-}
-```
-
-## 流程图
-
-### 存储流程
-
-```
-┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
-│  用户   │────▶│ 插件    │────▶│ Embedding│────▶│ 数据库  │
-│  调用   │     │  入口   │     │  生成    │     │  存储   │
-└─────────┘     └─────────┘     └─────────┘     └─────────┘
-     │               │               │               │
-     │ memory_store  │               │               │
-     │──────────────▶│               │               │
-     │               │  生成哈希      │               │
-     │               │──────────────▶│               │
-     │               │               │  向量化       │
-     │               │               │──────────────▶│
-     │               │               │               │
-     │◌─────────────┼───────────────┼───────────────┤
-     │  返回结果     │               │               │
-```
-
-### 检索流程
-
-```
-┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
-│  用户   │────▶│ 插件    │────▶│ 向量    │────▶│ 数据库  │
-│  调用   │     │  入口   │     │  搜索    │     │  检索   │
-└─────────┘     └─────────┘     └─────────┘     └─────────┘
-     │               │               │               │
-     │ memory_recall │               │               │
-     │──────────────▶│               │               │
-     │               │  生成查询向量  │               │
-     │               │──────────────▶│               │
-     │               │               │  相似度搜索    │
-     │               │               │──────────────▶│
-     │               │               │               │
-     │◌─────────────┼───────────────┼───────────────┤
-     │  返回结果     │               │               │
-```
-
-## 创建信息
-
-- 创建日期：2026-03-11
-- 最后更新：2026-03-11
+- MCP 当前是 facade，不负责启动 stdio/http transport。
+- `memory_scan_directory` 当前重点是 ingestion pipeline 基线，完整持久化和回放治理按阶段推进。
+- `memory_context_fast` 是 Agent 语义视图；无法映射到 5 type 的记录仍保留在通用检索链路中。

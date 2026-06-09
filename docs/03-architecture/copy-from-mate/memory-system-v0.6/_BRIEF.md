@@ -117,8 +117,8 @@
 
 ## 参考文档（所有 agent 可读）
 
-- [product-concept-0.3.1.md](../../../01-product/01-overview/product-concept-0.3.1.md) — banto 产品概念基线
-- [current-product-logic-baseline.md](../../../01-product/02-logic/current-product-logic-baseline.md) — 当前产品逻辑基线
+- `01-product/01-overview/product-concept-0.3.1.md` — banto 产品概念基线（源仓库路径）
+- `01-product/02-logic/current-product-logic-baseline.md` — 当前产品逻辑基线（源仓库路径）
 - [product-memory-think.md](../product-memory-think.md) — 企业 agent 记忆的产品思考（上下文连续性、双轴模型）
 - [memory-system-upgrade-design-appendix.md](../memory-system-upgrade-design-appendix.md) — 早期 harness 借鉴的实施细节（可参考但不照搬）
 

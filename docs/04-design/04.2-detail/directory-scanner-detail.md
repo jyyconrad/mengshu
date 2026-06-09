@@ -1,231 +1,83 @@
-# 目录扫描器详细设计
+# 目录扫描详细设计
 
-## 功能描述
+本文描述 `memory_scan_directory` 和 `ltm scan` 的当前扫描链路。
 
-扫描指定目录下的 Markdown 文件，解析内容并存储到知识库。
+## 入口
 
-## 扫描流程
+| 入口 | 参数 |
+|------|------|
+| OpenClaw 工具 `memory_scan_directory` | `directory`、`ignorePaths`、`ignoreRules`、`targetTable`、`autoEnrichMetadata` |
+| CLI `ltm scan` | `<directory>`、`--ignore <paths...>`、`--category <name>` |
 
+## 当前流程
+
+```text
+resolve directory
+  -> merge defaultIgnorePaths / customIgnoreRules / call arguments
+  -> file-system adapter scans Markdown files
+  -> canonicalize content
+  -> deterministic chunking
+  -> dedupe by content hash
+  -> store document/chunk baseline
+  -> enqueue jobs
+  -> return scan statistics
 ```
-1. 递归扫描目录
-        │
-2. 应用过滤规则
-   ├── .gitignore 规则
-   ├── 默认忽略路径
-   └── 自定义忽略规则
-        │
-3. 读取文件内容
-        │
-4. Markdown 解析
-   ├── 提取标题
-   ├── 提取代码块
-   └── 提取文本
-        │
-5. 文本切分
-   ├── 每块 1000 字符
-   └── 重叠 200 字符
-        │
-6. 批量向量化
-   ├── 每批 20 条
-   └── 并发 3 个
-        │
-7. 存储到数据库
-        │
-8. 返回统计
-```
+
+## 模块职责
+
+| 文件 | 职责 |
+|------|------|
+| `adapters/openclaw/tools.ts` | 解析工具参数，调用扫描 handler |
+| `ingest/adapters/file-system.ts` | 扫描文件系统并读取 Markdown |
+| `ingest/canonicalize.ts` | 规范化 source content |
+| `ingest/chunker.ts` | 切分为 deterministic chunks |
+| `ingest/pipeline.ts` | 入库、去重、job enqueue 和审计 |
+| `ingest/jobs.ts` | job 类型和状态 |
+
+legacy `scanner/` 目录仍保留，用于兼容和旧能力参考；当前新扫描路径优先看 `ingest/`。
 
 ## 忽略规则
 
-### 默认忽略路径
+忽略规则来源按顺序合并：
 
-```typescript
-const DEFAULT_IGNORE_PATHS = [
-  'node_modules',
-  '.git',
-  '.github',
-  '.vscode',
-  'dist',
-  'build',
-  'coverage',
-];
-```
+1. `config.scanner.defaultIgnorePaths`
+2. `config.scanner.customIgnoreRules`
+3. 工具或 CLI 传入的 `ignorePaths` / `ignoreRules`
 
-### 自定义忽略规则
+CLI 当前只暴露 `--ignore <paths...>`；更复杂的 gitignore 风格规则通过配置或工具参数传入。
 
-```typescript
-const customIgnoreRules = [
-  '*.log',
-  '*.tmp',
-  '*.temp',
-  '*.test.md',
-  '*draft*',
-];
-```
+## 输出统计
 
-### 过滤逻辑
+扫描返回两组信息：
 
-```typescript
-function shouldIgnore(filePath: string): boolean {
-  // 1. 检查路径匹配
-  if (DEFAULT_IGNORE_PATHS.some(p => filePath.includes(p))) {
-    return true;
-  }
+| 字段 | 说明 |
+|------|------|
+| `totalFiles` | 发现的文件数 |
+| `processedFiles` | 成功处理文件数 |
+| `failedFiles` | 失败文件数 |
+| `totalChunks` | 总 chunk 数 |
+| `storedChunks` | 新存储 chunk 数 |
+| `duplicateChunks` | 重复跳过数 |
+| `jobsQueued` | 入队任务数 |
+| `chunksAdmitted` | 进入 pipeline 的 chunk 数 |
+| `chunksDropped` | pipeline 丢弃 chunk 数 |
 
-  // 2. 检查 .gitignore
-  if (gitignoreFilter.ignores(filePath)) {
-    return true;
-  }
+## 元数据
 
-  // 3. 检查自定义规则
-  if (customRules.some(rule => minimatch(filePath, rule))) {
-    return true;
-  }
-
-  return false;
-}
-```
-
-## 文本切分
-
-### 切分策略
-
-```typescript
-interface TextSplitterOptions {
-  chunkSize: number;      // 每块大小（默认 1000）
-  chunkOverlap: number;   // 重叠大小（默认 200）
-  separators: string[];   // 分隔符（默认 ['\n\n', '\n', '。', '！', '？']）
-}
-```
-
-### 切分算法
-
-```typescript
-function splitText(text: string, options: TextSplitterOptions): string[] {
-  const chunks = [];
-  let start = 0;
-
-  while (start < text.length) {
-    let end = start + options.chunkSize;
-
-    if (end >= text.length) {
-      chunks.push(text.slice(start));
-      break;
-    }
-
-    // 尝试在句子边界切分
-    for (const sep of options.separators) {
-      const lastSep = text.slice(start, end).lastIndexOf(sep);
-      if (lastSep > 0) {
-        end = start + lastSep + sep.length;
-        break;
-      }
-    }
-
-    chunks.push(text.slice(start, end));
-    start = end - options.chunkOverlap;
-  }
-
-  return chunks;
-}
-```
-
-## 批量处理
-
-### 配置
-
-```typescript
-interface BatchProcessingConfig {
-  maxBatchSize: number;   // 每批最多 20 条
-  concurrency: number;    // 最多 3 个并发
-  retryAttempts: number;  // 最多重试 3 次
-}
-```
-
-### 处理逻辑
-
-```typescript
-async function processInBatches(
-  chunks: string[],
-  config: BatchProcessingConfig
-): Promise<ProcessResult> {
-  const results = [];
-  const batches = chunkArray(chunks, config.maxBatchSize);
-
-  // 限流处理
-  const limiter = pLimit(config.concurrency);
-
-  const promises = batches.map(batch =>
-    limiter(async () => {
-      try {
-        // 批量生成嵌入
-        const vectors = await embeddings.generateBatch(batch);
-
-        // 批量存储
-        const stored = await db.insertBatch(batch, vectors);
-        results.push(...stored);
-      } catch (error) {
-        // 重试逻辑
-        await retry(() => processBatch(batch), config.retryAttempts);
-      }
-    })
-  );
-
-  await Promise.all(promises);
-  return { total: results.length, stored: results };
-}
-```
-
-## 元数据丰富
-
-### 自动添加的元数据
-
-```typescript
-function enrichMetadata(
-  base: Record<string, any>,
-  fileInfo: FileInfo
-): Record<string, any> {
-  return {
-    ...base,
-    filePath: fileInfo.path,
-    fileModifiedAt: fileInfo.mtime.toISOString(),
-    directoryPath: fileInfo.dir,
-    fileName: fileInfo.name,
-    tokenCount: estimateTokens(fileInfo.content),
-    source: 'scan',
-  };
-}
-```
+`autoEnrichMetadata` 开启时，扫描会补充文件路径、目录、文件修改时间、来源等元数据。具体字段以 handler 和 ingestion adapter 的返回为准。
 
 ## 错误处理
 
-### 错误类型
-
-| 错误 | 处理 |
+| 场景 | 处理 |
 |------|------|
-| 文件读取失败 | 记录日志，继续处理 |
-| Markdown 解析失败 | 使用纯文本 |
-| 嵌入生成失败 | 重试 3 次 |
-| 存储失败 | 记录失败文件 |
+| 目录不存在或不可读 | 返回失败 |
+| 单文件读取失败 | 记录失败并继续处理其他文件 |
+| 重复内容 | 跳过并计入 `duplicateChunks` |
+| pipeline 拒绝 chunk | 计入 `chunksDropped` |
+| 后台 job 失败 | 后续由 jobs/audit 链路追踪 |
 
-### 错误报告
+## 已知边界
 
-```typescript
-interface ScanResult {
-  directory: string;
-  totalFiles: number;
-  processed: number;
-  failed: number;
-  totalChunks: number;
-  stored: number;
-  duplicates: number;
-  failures: Array<{
-    file: string;
-    error: string;
-  }>;
-}
-```
-
-## 创建信息
-
-- 创建日期：2026-03-11
-- 最后更新：2026-03-11
+- 当前扫描重点是 Markdown 文件。
+- 完整 embedding、实体抽取、tree seal 等重处理属于后续 warm/cold path。
+- 持久化 schema 迁移和 replay 能力以 v4 schema 计划为准。

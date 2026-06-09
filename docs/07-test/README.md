@@ -1,62 +1,24 @@
-# 07-test 测试用例
+# 测试文档
 
-## 用途
-功能测试用例，覆盖正常流程和边界场景
+本目录记录测试范围、稳定验证命令和已知环境依赖。
 
-## 文件命名
-`{测试主题}-test.md`
+## 当前文档
 
-## 文件模板
-```markdown
-# {测试主题} Test
+| 文档 | 状态 | 说明 |
+|------|------|------|
+| [plugin-test.md](./plugin-test.md) | 当前 | OpenClaw 插件、中间件、REST、MCP、SDK、ingestion、retrieval、graph、tree、console、migration、lifecycle 的验证命令 |
 
-## 测试范围
-{测试覆盖的功能范围}
+## 推荐验证
 
-## 单元测试
-
-### Test Case 1: {测试名称}
-**目的**: {测试目的}
-
-**前置条件**:
-- 条件 1
-- 条件 2
-
-**测试步骤**:
-1. 步骤 1
-2. 步骤 2
-
-**预期结果**:
-- 结果 1
-- 结果 2
-
-**实际结果**: {执行后填写}
-
-**状态**: PASS/FAIL
-
-## 集成测试
-{集成测试用例}
-
-## 边界测试
-{边界条件测试}
-
-## 性能测试
-{性能测试用例}
-
-## 测试覆盖率
-| 模块 | 行覆盖率 | 分支覆盖率 |
-|------|----------|------------|
-| {module} | 85% | 80% |
+```bash
+npx tsc --noEmit
+npx vitest run config.middleware.test.ts api/rest/auth.test.ts api/rest/router.test.ts server/daemon.test.ts server/health.test.ts sdk/js/client.test.ts adapters/mcp/tools.test.ts adapters/mcp/server.test.ts adapters/openclaw/cli.test.ts index.test.ts adapters/openclaw/tools.test.ts adapters/openclaw/hooks.test.ts adapters/openclaw/scope.test.ts core/memory-service.test.ts storage/legacy-database-adapter.test.ts storage/repositories/in-memory.test.ts storage/indexes/in-memory-bm25.test.ts core/scope.test.ts core/legacy-mapping.test.ts retrieval/prompt-safety.test.ts retrieval/fusion.test.ts retrieval/orchestrator.test.ts retrieval/context-packer.test.ts ingest/canonicalize.test.ts ingest/chunker.test.ts ingest/pipeline.test.ts ingest/jobs.test.ts ingest/adapters/file-system.test.ts server/workers.test.ts graph/extractor.test.ts graph/repository.test.ts graph/query.test.ts tree/buffer.test.ts tree/seal.test.ts tree/topic.test.ts tree/global.test.ts console/api.test.ts console/web-smoke.test.ts migration/v4.test.ts lifecycle/audit.test.ts lifecycle/retention.test.ts
 ```
 
-## 示例
-```
-07-test/
-├── scanner-test.md
-├── api-test.md
-├── integration-test.md
-└── performance-test.md
-```
+`npm test` 会运行更广的测试集，其中部分测试依赖本机 embedding 服务。
 
-## 维护方式
-AI 随开发同步生成
+## 维护规则
+
+- 新模块必须有相邻测试或明确的集成测试覆盖。
+- 如果验证失败来自环境依赖，需要记录具体依赖和失败现象。
+- 测试文档只记录可复现命令，不写无法核验的覆盖率数字。

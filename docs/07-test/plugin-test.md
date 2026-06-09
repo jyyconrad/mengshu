@@ -1,306 +1,102 @@
-# 插件测试文档
+# 测试与验证
 
-## v4 Middleware 回归命令
+本页记录当前仓库可复现的验证命令。测试文件与源码相邻，新增模块应新增相邻测试。
 
-当前 v4 中间件实现覆盖 core、REST、MCP、SDK、ingestion、retrieval、graph、tree、console、migration、lifecycle：
+## 推荐验证顺序
+
+1. 先跑类型检查。
+2. 再跑稳定的单元和契约测试。
+3. 最后按需跑 `npm test`，并确认本机 embedding 服务是否可用。
 
 ```bash
-npx vitest run config.middleware.test.ts api/rest/auth.test.ts api/rest/router.test.ts server/daemon.test.ts server/health.test.ts sdk/js/client.test.ts adapters/mcp/tools.test.ts adapters/mcp/server.test.ts adapters/openclaw/cli.test.ts index.test.ts adapters/openclaw/tools.test.ts adapters/openclaw/hooks.test.ts adapters/openclaw/scope.test.ts core/memory-service.test.ts storage/legacy-database-adapter.test.ts storage/repositories/in-memory.test.ts storage/indexes/in-memory-bm25.test.ts core/scope.test.ts core/legacy-mapping.test.ts retrieval/prompt-safety.test.ts retrieval/fusion.test.ts retrieval/orchestrator.test.ts retrieval/context-packer.test.ts ingest/canonicalize.test.ts ingest/chunker.test.ts ingest/pipeline.test.ts ingest/jobs.test.ts ingest/adapters/file-system.test.ts server/workers.test.ts graph/extractor.test.ts graph/repository.test.ts graph/query.test.ts tree/buffer.test.ts tree/seal.test.ts tree/topic.test.ts tree/global.test.ts console/api.test.ts console/web-smoke.test.ts migration/v4.test.ts lifecycle/audit.test.ts lifecycle/retention.test.ts
 npx tsc --noEmit
 ```
 
-`npm test` 仍包含需要本机 embedding 服务的集成测试；若 `127.0.0.1:11434` 未启动，会出现环境性 `ECONNREFUSED`。
-
-## 测试范围
-
-本测试文档覆盖 OpenClaw 内存插件的核心功能和边界场景。
-
-## 单元测试
-
-### Test Case 1: 配置解析
-
-**目的**: 验证配置 Schema 正确解析
-
-**前置条件**:
-- 有效的配置文件
-- 正确的环境变量
-
-**测试步骤**:
-1. 调用 `memoryConfigSchema.parse()` 传入有效配置
-2. 验证返回值包含所有必需字段
-3. 传入无效配置（缺少 apiKey）
-4. 验证抛出错误
-
-**预期结果**:
-- 有效配置返回完整配置对象
-- 无效配置抛出错误
-
-**状态**: PASS
-
----
-
-### Test Case 2: 内容哈希生成
-
-**目的**: 验证相同内容生成相同哈希
-
-**前置条件**: 无
-
-**测试步骤**:
-1. 调用 `computeContentHash("test content")`
-2. 再次调用相同内容
-3. 调用不同内容
-
-**预期结果**:
-- 相同内容哈希相同
-- 不同内容哈希不同
-
-**状态**: PASS
-
----
-
-### Test Case 3: 文本切分
-
-**目的**: 验证文本切分逻辑正确
-
-**前置条件**: 无
-
-**测试步骤**:
-1. 调用 `splitText()` 传入短文本（< 1000 字符）
-2. 传入长文本（> 2000 字符）
-3. 验证重叠部分正确
-
-**预期结果**:
-- 短文本返回单个块
-- 长文本返回多个块
-- 块之间有 200 字符重叠
-
-**状态**: PASS
-
----
-
-### Test Case 4: 存储去重
-
-**目的**: 验证重复内容不会重复存储
-
-**前置条件**: 数据库已初始化
-
-**测试步骤**:
-1. 存储内容 A
-2. 再次存储相同内容 A
-3. 存储不同内容 B
-
-**预期结果**:
-- 第一次存储创建新条目
-- 第二次存储返回现有条目
-- 内容 B 创建新条目
-
-**状态**: PASS
-
----
-
-### Test Case 5: 向量搜索
-
-**目的**: 验证相似度搜索正确
-
-**前置条件**: 数据库有测试数据
-
-**测试步骤**:
-1. 搜索与查询语义相似的内容
-2. 搜索无关联的内容
-3. 验证相似度分数
-
-**预期结果**:
-- 相似内容返回高相似度
-- 无关联内容返回低相似度或无结果
-
-**状态**: PASS
-
----
-
-## 集成测试
-
-### Test Case 6: 完整的存储 - 检索流程
-
-**目的**: 验证存储后能正确检索
-
-**前置条件**:
-- 数据库已初始化
-- 嵌入服务可用
-
-**测试步骤**:
-1. 调用 `memory_store` 存储文本
-2. 调用 `memory_recall` 搜索相同主题
-3. 验证返回结果包含刚存储的内容
-
-**预期结果**:
-- 存储成功返回 ID
-- 检索返回刚存储的内容
-- 相似度 > 0.9
-
-**状态**: PASS
-
----
-
-### Test Case 7: 目录扫描
-
-**目的**: 验证目录扫描完整流程
-
-**前置条件**:
-- 测试目录包含 Markdown 文件
-
-**测试步骤**:
-1. 调用 `memory_scan_directory` 扫描目录
-2. 验证返回统计信息
-3. 调用 `memory_recall` 搜索扫描内容
-
-**预期结果**:
-- 扫描成功返回统计
-- 所有文件被正确处理
-- 能检索到扫描内容
-
-**状态**: PASS
-
----
-
-### Test Case 8: 自动捕获
-
-**目的**: 验证对话结束时自动捕获
-
-**前置条件**:
-- `autoCapture: true`
-- 模拟对话环境
-
-**测试步骤**:
-1. 模拟用户表达偏好
-2. 触发 `agent_end` 钩子
-3. 验证数据库包含新记忆
-
-**预期结果**:
-- 偏好被正确识别
-- 记忆自动存储
-- 分类为 `preference`
-
-**状态**: PASS
-
----
-
-### Test Case 9: 自动召回
-
-**目的**: 验证新对话开始时自动召回
-
-**前置条件**:
-- 数据库有记忆
-- `autoRecall: true`
-
-**测试步骤**:
-1. 发送新消息
-2. 触发 `before_agent_start` 钩子
-3. 验证上下文包含相关记忆
-
-**预期结果**:
-- 检索到相关记忆
-- 记忆注入到上下文
-- 相似度 > 0.7
-
-**状态**: PASS
-
----
-
-## 边界测试
-
-### Test Case 10: 空输入
-
-**目的**: 验证空输入处理
-
-**测试步骤**:
-1. 调用 `memory_store` 传入空文本
-2. 调用 `memory_recall` 传入空查询
-
-**预期结果**:
-- 存储抛出错误
-- 召回返回空结果
-
-**状态**: PASS
-
----
-
-### Test Case 11: 超长文本
-
-**目的**: 验证超长文本处理
-
-**测试步骤**:
-1. 调用 `memory_store` 传入 10000+ 字符文本
-
-**预期结果**:
-- 自动切分为多个块
-- 所有块都存储成功
-
-**状态**: PASS
-
----
-
-### Test Case 12: 并发处理
-
-**目的**: 验证并发请求处理
-
-**测试步骤**:
-1. 并发调用 10 次 `memory_store`
-2. 验证所有请求正确处理
-
-**预期结果**:
-- 所有请求成功
-- 无数据损坏
-
-**状态**: PASS
-
----
-
-## 性能测试
-
-### Test Case 13: 批量处理性能
-
-**目的**: 验证批量处理效率
-
-**测试步骤**:
-1. 批量存储 100 条记忆
-2. 记录处理时间
-
-**预期结果**:
-- 处理时间 < 30 秒
-- 批处理正确（20 条/批）
-
-**状态**: PENDING
-
----
-
-### Test Case 14: 大规模搜索性能
-
-**目的**: 验证万级数据搜索性能
-
-**前置条件**: 数据库有 10000 条记录
-
-**测试步骤**:
-1. 执行向量搜索
-2. 记录响应时间
-
-**预期结果**:
-- 响应时间 < 1 秒
-
-**状态**: PENDING
-
----
-
-## 测试覆盖率
-
-| 模块 | 行覆盖率 | 分支覆盖率 |
-|------|----------|------------|
-| config.ts | 95% | 90% |
-| index.ts | 85% | 80% |
-| db/*.ts | 90% | 85% |
-| processing/*.ts | 92% | 88% |
-| scanner/*.ts | 88% | 82% |
-
-## 创建信息
-
-- 创建日期：2026-03-11
-- 最后更新：2026-03-11
+```bash
+npx vitest run \
+  config.middleware.test.ts \
+  api/rest/auth.test.ts \
+  api/rest/router.test.ts \
+  server/daemon.test.ts \
+  server/health.test.ts \
+  sdk/js/client.test.ts \
+  adapters/mcp/tools.test.ts \
+  adapters/mcp/server.test.ts \
+  adapters/openclaw/cli.test.ts \
+  index.test.ts \
+  adapters/openclaw/tools.test.ts \
+  adapters/openclaw/hooks.test.ts \
+  adapters/openclaw/scope.test.ts \
+  core/memory-service.test.ts \
+  storage/legacy-database-adapter.test.ts \
+  storage/repositories/in-memory.test.ts \
+  storage/indexes/in-memory-bm25.test.ts \
+  core/scope.test.ts \
+  core/legacy-mapping.test.ts \
+  retrieval/prompt-safety.test.ts \
+  retrieval/fusion.test.ts \
+  retrieval/orchestrator.test.ts \
+  retrieval/context-packer.test.ts \
+  ingest/canonicalize.test.ts \
+  ingest/chunker.test.ts \
+  ingest/pipeline.test.ts \
+  ingest/jobs.test.ts \
+  ingest/adapters/file-system.test.ts \
+  server/workers.test.ts \
+  graph/extractor.test.ts \
+  graph/repository.test.ts \
+  graph/query.test.ts \
+  tree/buffer.test.ts \
+  tree/seal.test.ts \
+  tree/topic.test.ts \
+  tree/global.test.ts \
+  console/api.test.ts \
+  console/web-smoke.test.ts \
+  migration/v4.test.ts \
+  lifecycle/audit.test.ts \
+  lifecycle/retention.test.ts
+```
+
+## 完整测试
+
+```bash
+npm test
+```
+
+`npm test` 会运行更广的测试集，包括部分依赖本机 embedding 服务的集成测试。如果 `127.0.0.1:11434` 未启动，可能出现环境性的 `ECONNREFUSED`。这类失败需要和代码回归分开判断。
+
+## 覆盖范围
+
+| 区域 | 代表测试 |
+|------|----------|
+| 配置 | `config.middleware.test.ts`、`index.test.ts` |
+| OpenClaw 工具和钩子 | `adapters/openclaw/*.test.ts` |
+| REST server | `api/rest/*.test.ts`、`server/*.test.ts` |
+| MCP facade | `adapters/mcp/*.test.ts` |
+| JS SDK | `sdk/js/client.test.ts` |
+| Core service 和 scope | `core/*.test.ts` |
+| Legacy storage adapter | `storage/legacy-database-adapter.test.ts` |
+| In-memory storage/index | `storage/repositories/*.test.ts`、`storage/indexes/*.test.ts` |
+| Retrieval | `retrieval/*.test.ts` |
+| Ingestion | `ingest/*.test.ts`、`ingest/adapters/*.test.ts` |
+| Graph | `graph/*.test.ts` |
+| Tree | `tree/*.test.ts` |
+| Console | `console/api.test.ts`、`console/web-smoke.test.ts` |
+| Migration | `migration/v4.test.ts` |
+| Lifecycle | `lifecycle/*.test.ts` |
+
+## 集成测试环境
+
+| 测试 | 依赖 |
+|------|------|
+| OpenAI-compatible embedding | `OPENAI_API_KEY`、可访问的 `embedding.baseURL` |
+| Ollama embedding | 本机 `127.0.0.1:11434` 服务和对应模型 |
+| Supabase provider | `SUPABASE_URL`、`SUPABASE_SERVICE_KEY`、pgvector/RPC 配置 |
+| Postgres provider | `postgres` 配置和可访问数据库 |
+
+## 交付前检查
+
+- 文档只改动时至少运行 Markdown 链接/格式检查脚本和 `git diff --check`。
+- API、CLI、schema 改动时运行相关单元测试，并同步更新 `../05-api/`、`../06-database/`。
+- 存储或检索改动时运行 `core/`、`storage/`、`retrieval/` 和 provider 相关测试。
+- Web Console 改动时运行 `console/api.test.ts` 和 `console/web-smoke.test.ts`。

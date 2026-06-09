@@ -307,30 +307,30 @@ TypeScript 代码中不得使用 any，必须显式声明类型。
 
 ## 最近更新（按 updatedAt 倒序）
 
-- [禁止使用 any 类型](mem_20260529_abc123.md) — TypeScript 约束，置信度 0.95
-- [项目采用 Electron 架构](mem_20260528_def456.md) — 技术选型决策，置信度 0.9
+- `禁止使用 any 类型` (`mem_20260529_abc123.md`) — TypeScript 约束，置信度 0.95
+- `项目采用 Electron 架构` (`mem_20260528_def456.md`) — 技术选型决策，置信度 0.9
 
 ## 按类型分组
 
 ### feedback（反馈与约束）
 
-- [禁止使用 any 类型](mem_20260529_abc123.md)
-- [优先使用组合式 API](mem_20260527_jkl012.md)
+- `禁止使用 any 类型` (`mem_20260529_abc123.md`)
+- `优先使用组合式 API` (`mem_20260527_jkl012.md`)
 
 ### project（项目事实与决策）
 
-- [项目采用 Electron 架构](mem_20260528_def456.md)
+- `项目采用 Electron 架构` (`mem_20260528_def456.md`)
 
 ## 按容器分组
 
 ### 全局记忆
 
-- [用户是前端工程师](mem_20260520_mno345.md)
+- `用户是前端工程师` (`mem_20260520_mno345.md`)
 
 ### Project 记忆（proj_xyz789）
 
-- [禁止使用 any 类型](mem_20260529_abc123.md)
-- [项目采用 Electron 架构](mem_20260528_def456.md)
+- `禁止使用 any 类型` (`mem_20260529_abc123.md`)
+- `项目采用 Electron 架构` (`mem_20260528_def456.md`)
 ```
 
 ---
