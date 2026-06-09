@@ -121,6 +121,345 @@ Agent 应看到任务时点接口，而不是内部记忆模型。
 4. 进入 `context_fast` 的记忆必须满足 lifecycle、visibility、scope 和 safety 过滤。
 5. candidate 默认不进入 5 slot，只有 approve/promote 后才可能被注入。
 
+### 3.4 存储视图
+
+存储视图回答的问题是：memory-autodb 到底保存什么，如何保证长期记忆可找、可追溯、可撤销、可重放。
+
+5 type 是运行视图；存储视图不能直接等同于 5 type。存储视图应分成四层：
+
+```text
+Source / Evidence Layer
+  -> 原始 observation、文档、chunk、工具结果、用户显式保存来源
+
+Durable Memory Layer
+  -> 可治理的 MemoryRecord，包含 kind、scope、lifecycle、provenance、evidence
+
+Enrichment / Structure Layer
+  -> entity、relation、summary、graph/tree、slot snapshot、索引
+
+Runtime View Layer
+  -> context_fast 的 5 slot，以及 lookup 的可追溯结果
+```
+
+#### 3.4.1 Source / Evidence Layer
+
+这一层保存“事实从哪里来”，不是直接给 Agent 注入的上下文。
+
+| 类型 | 说明 | 用途 |
+|------|------|------|
+| Observation | 用户输入、Agent 输出、工具结果、系统事件、会话摘要 | 作为抽取候选、审计和回放来源 |
+| Document | 文件、网页、连接器文档、手动导入内容 | 作为 knowledge/source 入口 |
+| Chunk | 文档或会话切分后的可索引片段 | 支撑 lookup、RAG、evidence 和摘要 |
+| Provenance | sessionId、messageId、filePath、sourceId、createdAt | 让每条记忆可追溯 |
+
+设计规则：
+
+1. Source / Evidence 可以不属于任何 5 type。
+2. Source / Evidence 不直接进入 `context_fast`。
+3. 所有长期记忆、摘要、关系和候选都应能回指 evidence。
+4. 原始 evidence 应保留稳定 id 和 contentHash，保证重放和去重。
+
+#### 3.4.2 Durable Memory Layer
+
+这一层保存“系统认为值得长期保留的工作上下文结论”。
+
+核心记录是 `MemoryRecord`：
+
+| 字段 | 作用 |
+|------|------|
+| `id` | 稳定记录 ID |
+| `scope` | 用户、workspace、project、app、namespace、visibility 边界 |
+| `kind` | 主库基础分类，必填 |
+| `semanticType?` | 可选 5 slot 语义视图 |
+| `container?` | personal / project / session_candidate / team / enterprise |
+| `lifecycleStatus?` | active / archived / revoked / superseded / promoted |
+| `confidence` | 置信度，显式保存通常高于自动抽取 |
+| `importance` | 重要性，用于排序和预算 |
+| `hotness` | 被召回或使用的热度 |
+| `text` | 可读记忆正文 |
+| `contentHash` | 去重和幂等处理 |
+| `provenance` | 来源信息 |
+| `sourceNodeIds` | evidence、chunk、observation 的引用 |
+| `supersededBy` | 被新记忆替代时的指针 |
+| `version` | schema 或内容版本 |
+
+`kind` 和 `semanticType?` 的关系：
+
+| `kind` | 常见 `semanticType?` | 说明 |
+|--------|----------------------|------|
+| preference | profile / rules | 用户偏好可能是画像，也可能是协作规则 |
+| decision | task_context / experience | 当前决策可能是任务背景，也可能成为历史经验 |
+| fact | task_context / resource / profile | 事实需要根据 scope 和内容进入不同 slot |
+| task | task_context | 当前任务、状态、计划 |
+| plan | task_context / experience | 当前计划或可复用做法 |
+| goal | task_context | 项目目标、阶段目标 |
+| document | resource | 资源指针，不直接塞全文 |
+| knowledge | resource / experience | 可复用知识或方法 |
+| observation | 通常为空 | 原始观察默认不进 slot |
+| other | 通常为空 | 保留可 lookup 的合规信息 |
+
+设计规则：
+
+1. 用户显式保存的信息必须可持久化，即使 `semanticType` 为空。
+2. 自动抽取的结论应先进入 candidate，除非达到明确的直接入库阈值。
+3. durable 主库只接受通过 scope、visibility、lifecycle、evidence 校验的记录。
+4. `active` 记录才是 `context_fast` 的主要候选；archived/revoked/superseded 只能用于 lookup、audit 或解释。
+5. `semanticType` 可以被重算或修正，但不能破坏原始 evidence 和 lifecycle。
+
+#### 3.4.3 Enrichment / Structure Layer
+
+这一层保存“为了更好查找、压缩、解释和导航而生成的结构”。
+
+| 类型 | 说明 | 是否直接进入 5 slot |
+|------|------|---------------------|
+| Entity | 人、项目、组织、工具、文件、主题 | 否，作为检索和图谱线索 |
+| Relation | supports / contradicts / supersedes / grounded_by 等关系 | 否，作为解释和 rerank 信号 |
+| SummaryNode | source/topic/global 摘要节点 | 可作为候选，但必须有 evidence |
+| SlotSnapshot | 某个 scope 下的 5 slot 快照 | 是，作为快路径缓存 |
+| Text / Vector / BM25 Index | 检索索引 | 否，只提供召回候选 |
+
+设计规则：
+
+1. 结构层是可重建的，不应成为唯一真源。
+2. graph/tree/summary 必须能回指 source/evidence。
+3. slot snapshot 是运行视图缓存，不是长期记忆主库。
+4. 索引失效时系统应能降级到 durable memory + text lookup。
+
+#### 3.4.4 Candidate / Governance Layer
+
+这一层保存“可能成为长期记忆，但还不应污染运行上下文”的内容。
+
+| 状态 | 含义 | Runtime 行为 |
+|------|------|--------------|
+| pending | 待审核 | 不进入 `context_fast` |
+| approved | 已接受并写入主库 | 可进入后续召回 |
+| rejected | 已拒绝 | 不召回，仅保留审计 |
+| archived | 暂不确认 | 不进入 `context_fast`，可在 Console 查看 |
+| expired | 超期清理 | 不召回 |
+
+设计规则：
+
+1. candidate 可以被 lookup 到用于解释，但默认不注入 Agent。
+2. approve 必须生成 durable `MemoryRecord` 并保留 candidate -> memory 的追溯关系。
+3. reject/archive/expire 必须写 audit，防止后续重复抽取同类错误。
+4. candidate 的 `semanticType` 是建议，不是事实。
+
+### 3.5 从存储视图召回到 5 type
+
+Recall-to-5type 管线回答的问题是：给定一个任务，系统如何从完整存储视图中选择少量可信记忆，组成 5 slot 运行视图。
+
+#### 3.5.1 总体流程
+
+```text
+context_fast(scope, task, intent, budget)
+  -> normalize scope and authorization
+  -> load fresh SlotSnapshot if available
+  -> collect active candidates from Durable Memory
+  -> retrieve task-relevant records from indexes
+  -> map records to semanticType candidates
+  -> filter by lifecycle / visibility / safety / conflicts
+  -> score by scope, relevance, importance, recency, confidence, evidence
+  -> allocate budget by slot priority
+  -> pack 5 slot blocks with sourceIds/evidence
+  -> return content + slots + warnings + filtered + telemetry
+  -> async refresh snapshot and enrichment jobs
+```
+
+#### 3.5.2 Step 1：Scope 归一化和授权展开
+
+输入 scope 先归一化为稳定 `scopeKey`。然后根据 slot 类型决定可搜索范围。
+
+| Slot | 可搜索范围 |
+|------|------------|
+| profile | `userId + workspaceId`，不依赖当前 appId |
+| rules | `userId + workspaceId`，private/revoked 强过滤 |
+| task_context | `userId + workspaceId + projectId` |
+| experience | 优先 project，其次 workspace 级高置信经验 |
+| resource | workspace/project 级资源指针 |
+
+处理规则：
+
+1. `userId` 缺失时只能使用当前 session/private 范围，并返回 warning。
+2. `workspaceId` 缺失时不做 workspace 级复用。
+3. `visibility=private` 默认只允许同用户同授权范围读取。
+4. 任何跨 scope 扩展都必须在 telemetry 中记录。
+
+#### 3.5.3 Step 2：读取 SlotSnapshot
+
+如果存在新鲜、scope 匹配、schemaVersion 匹配的 `SlotSnapshot`，优先读取。
+
+Snapshot 命中条件：
+
+1. scopeKey 完全匹配或符合授权扩展规则。
+2. 相关 slot 未过期。
+3. snapshot 生成时的 memory version 没有被 revoked/superseded 破坏。
+4. token budget 和安全策略版本可兼容。
+
+Snapshot miss 或部分 stale 时：
+
+1. 可先返回仍然有效的 slot。
+2. 对 stale slot 执行轻量重建。
+3. 异步触发完整 snapshot refresh。
+4. 在 `freshness.staleSlots` 和 warnings 中说明。
+
+#### 3.5.4 Step 3：候选召回
+
+候选来自三类来源：
+
+| 来源 | 作用 | 快路径要求 |
+|------|------|------------|
+| active MemoryRecord | 主候选池 | 必须过滤 lifecycle / visibility |
+| text/BM25/vector index | 任务相关性 | 只返回 id 和 score，不做重计算 |
+| recent/session summary | 补充当前上下文 | 只使用已持久化或已确认摘要 |
+
+不进入快路径的来源：
+
+1. pending candidate。
+2. 未完成 embedding 的新 observation。
+3. 需要 LLM 当场总结的长文档。
+4. 未通过 evidence 校验的 summary。
+
+#### 3.5.5 Step 4：映射到 5 slot
+
+映射优先级如下：
+
+```text
+explicit semanticType
+  -> high-confidence kindToSemanticType mapping
+  -> metadata / container / scope hints
+  -> task-aware lightweight rules
+  -> leave unassigned and keep lookup-only
+```
+
+映射原则：
+
+| 情况 | 处理 |
+|------|------|
+| 已有 `semanticType` | 直接进入对应 slot 候选 |
+| `kind=preference` | 根据内容进入 profile 或 rules |
+| `kind=decision` | 当前项目内进入 task_context；历史项目可进入 experience |
+| `kind=document/resource` | 进入 resource，但只放指针和摘要 |
+| `kind=observation` | 默认不进入 slot，除非被升格为 MemoryRecord |
+| 无法判断 | 保留为 lookup-only，不进入 5 slot |
+
+禁止规则：
+
+1. 不能为了填满 5 slot 强行分类。
+2. 不能把 pending candidate 当成 active memory。
+3. 不能把 raw chunk 全文直接塞进 resource。
+4. 不能让低置信自动映射覆盖显式用户规则。
+
+#### 3.5.6 Step 5：过滤与冲突处理
+
+过滤发生在 slot packing 之前。
+
+| 过滤项 | 行为 |
+|--------|------|
+| revoked | 永远不注入 |
+| superseded | 不注入旧记录，必要时注入新记录 |
+| archived | 不进入 context，可 lookup |
+| private mismatch | 不注入，记录 filtered reason |
+| stale | 默认不注入或降权，返回 warning |
+| conflict | 不自动二选一；优先注入被用户确认的新规则，或返回 warning |
+| prompt injection risk | 不注入原文，必要时只给安全摘要 |
+
+每条被过滤的记录应进入 `filtered`：
+
+```typescript
+interface FilteredMemory {
+  id: string;
+  reason:
+    | "revoked"
+    | "superseded"
+    | "visibility_mismatch"
+    | "stale"
+    | "conflict"
+    | "candidate_pending"
+    | "prompt_safety"
+    | "budget_exceeded";
+}
+```
+
+#### 3.5.7 Step 6：评分和预算分配
+
+候选评分不只看向量相似度，应组合多个信号：
+
+```text
+finalScore =
+  relevanceScore
+  + scopeFit
+  + importance
+  + confidence
+  + evidenceQuality
+  + recencyBoost
+  + hotnessBoost
+  - stalenessPenalty
+  - conflictPenalty
+```
+
+推荐信号：
+
+| 信号 | 说明 |
+|------|------|
+| relevanceScore | 与当前 task/query 的文本、BM25、vector 相关性 |
+| scopeFit | user/workspace/project/app 的匹配程度 |
+| importance | 用户显式保存和高重要度记忆优先 |
+| confidence | 自动抽取低置信降权 |
+| evidenceQuality | 有明确 source/evidence 的记录优先 |
+| recencyBoost | 当前项目近期状态优先 |
+| hotnessBoost | 多次命中的稳定偏好和规则优先 |
+| stalenessPenalty | 长期未更新或标记 stale 降权 |
+| conflictPenalty | 存在未解决冲突时降权或阻断 |
+
+预算分配不能平均五等分。默认优先级：
+
+```text
+rules >= task_context > experience > profile > resource
+```
+
+resource 默认给指针、标题、摘要和 source，不给全文。experience 默认要求有 why/outcome，否则不进入 slot。
+
+#### 3.5.8 Step 7：组装 5 slot 输出
+
+每个 slot block 必须包含：
+
+```typescript
+interface SlotContextBlock {
+  semanticType: MemorySemanticType;
+  question: string;
+  content: string;
+  sourceIds: string[];
+  nodeCount: number;
+  tokenEstimate?: number;
+  warnings?: string[];
+}
+```
+
+`context_fast` 顶层返回：
+
+1. prompt-safe `content`。
+2. 结构化 `slots`。
+3. `taskHints`。
+4. `warnings`。
+5. `filtered`。
+6. `evidence` 或 source references。
+7. `telemetry`，至少包含 latency、cacheHit、nodesUsed、tokenEstimate、scopeKey。
+
+#### 3.5.9 Step 8：反馈回存储视图
+
+运行视图不是只读结果，它会产生反馈：
+
+| 事件 | 写回 |
+|------|------|
+| 某条记忆被注入 | 增加 hotness / lastUsedAt |
+| 某条记忆被 lookup 后使用 | 增加 lookupHit / evidence usage |
+| 用户撤销 | lifecycle -> revoked，刷新 snapshot |
+| 用户纠正 | 新 MemoryRecord supersedes 旧记录 |
+| candidate 被批准 | promote 为 active MemoryRecord |
+| slot 过期 | 标记 snapshot stale，触发异步重建 |
+
+反馈写回必须异步、幂等、可审计，不能阻塞 `context_fast`。
+
 ---
 
 ## 4. 架构边界
@@ -279,9 +618,11 @@ Console 的核心不是“看表”，而是建立用户和研发对长期记忆
    - `evidence`
    - `telemetry`
 3. 冻结 scope policy 和 `scopeKey`。
-4. `context_fast` 优先使用 slot snapshot/cache，不退化成每次全量 recall。
-5. lookup 返回 evidence/source 和 score breakdown。
-6. OpenClaw tool、REST、SDK 输出字段保持一致。
+4. 冻结存储视图：Source/Evidence、Durable Memory、Enrichment/Structure、Candidate/Governance。
+5. 实现 Recall-to-5type 管线：scope -> snapshot -> active memory -> mapping -> filter -> score -> pack。
+6. `context_fast` 优先使用 slot snapshot/cache，不退化成每次全量 recall。
+7. lookup 返回 evidence/source 和 score breakdown。
+8. OpenClaw tool、REST、SDK 输出字段保持一致。
 
 验收：
 
@@ -416,6 +757,7 @@ Pre-release gate：
 | 能力 | 当前代码 | 判断 |
 |------|----------|------|
 | MemoryService | `core/memory-service.ts`、`core/service-types.ts` | 已有服务边界，需继续作为所有 adapter 共同入口 |
+| Storage View | `core/types.ts`、`ingest/*`、`lifecycle/*`、`graph/*`、`tree/*` | 已有核心类型和部分模块，需明确哪些是真源、候选、结构增强和运行缓存 |
 | Agent 快路径 | `api/agent-fast-path.ts` | 已有 context/observe/lookup/session_commit，需增强 evidence、filtered、telemetry |
 | 5 slot | `core/semantic-types.ts`、`core/slot-context-builder.ts` | 已有基础协议，需修正预算策略和 evidence 输出 |
 | Scope | `core/scope.ts`、`adapters/openclaw/scope.ts` | 已有 normalize，但 scope key 需纳入更多维度并冻结协议 |

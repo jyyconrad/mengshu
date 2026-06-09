@@ -132,7 +132,41 @@
 - OpenClaw adapter 支持传入或推导 `appId/workspaceId/projectId`。
 - REST/SDK 示例覆盖两个不同 `appId` 复用同一用户工作上下文。
 
-### 5.2 Agent Runtime 快路径增强
+### 5.2 存储视图与 5type 运行视图
+
+5type 是 Runtime 运行视图，不是长期记忆主库的全量存储模型。下一迭代需要明确从存储视图到 5 slot 的召回管线。
+
+存储视图分四层：
+
+| 层 | 保存什么 | 和 5type 的关系 |
+|----|----------|-----------------|
+| Source / Evidence | observation、document、chunk、tool result、provenance | 支撑追溯，不直接注入 |
+| Durable Memory | `MemoryRecord`，包含 `kind`、`semanticType?`、scope、lifecycle、evidence | 5 slot 的主候选池 |
+| Enrichment / Structure | entity、relation、summary、index、SlotSnapshot | 提供检索、解释和快路径 |
+| Candidate / Governance | pending/approved/rejected/archived/expired candidate 和 audit | 审核后才能进入 durable memory |
+
+召回到 5type 的流程：
+
+```text
+normalize scope
+  -> load fresh SlotSnapshot
+  -> retrieve active MemoryRecord
+  -> map kind / semanticType / metadata to slot candidates
+  -> filter lifecycle / visibility / safety / conflict
+  -> score by relevance, scopeFit, importance, confidence, evidence, recency
+  -> allocate slot budget
+  -> pack prompt-safe 5 slot context with evidence and telemetry
+```
+
+关键规则：
+
+1. `semanticType?` 是运行视图字段，不能作为主库强制要求。
+2. 无法映射到 5type 的合规记忆保留为 lookup-only。
+3. pending candidate、raw observation、raw chunk 不进入 `context_fast`。
+4. 每个 slot block 必须能回指 source/evidence。
+5. SlotSnapshot 是快路径缓存，不是长期记忆真源。
+
+### 5.3 Agent Runtime 快路径增强
 
 当前 `AgentFastPathService` 已有：
 
@@ -172,7 +206,7 @@ interface AgentContextFastResult {
 4. telemetry 记录 latency、cacheHit、scopeKey、nodesUsed。
 5. `memory_context_fast` 的 OpenClaw 工具、REST `/v1/agent/context` 和 SDK 输出保持一致。
 
-### 5.3 接入体验：connect / doctor / demo
+### 5.4 接入体验：connect / doctor / demo
 
 当前已有 `ltm serve/status/health/migrate`。下一迭代补三个产品化命令：
 
@@ -193,7 +227,7 @@ Memory AutoDB Doctor
 - scope sample: local:claw-project:default:...
 ```
 
-### 5.4 Console 最小可用治理闭环
+### 5.5 Console 最小可用治理闭环
 
 当前 Console API 有 Overview / Lookup / Graph / Jobs。下一迭代聚焦三个页面：
 
@@ -205,7 +239,7 @@ Memory AutoDB Doctor
 
 不要求做复杂图谱可视化。Graph 页面可以保留为 baseline，但不是验收主线。
 
-### 5.5 候选区闭环
+### 5.6 候选区闭环
 
 当前已有 `CandidateRecord`、`InMemoryCandidateRepository`、`CandidateReviewService` 和启发式 extractor。下一迭代要打通到 Runtime 和 Console：
 
@@ -216,7 +250,7 @@ Memory AutoDB Doctor
 5. reject/archive/expire 写 audit。
 6. `memory_lookup` 可命中已入主库的 fallback 记忆；pending candidate 默认不进入 Agent context。
 
-### 5.6 评测和验收
+### 5.7 评测和验收
 
 基于 [memory-evaluation-plan.md](../../07-test/memory-evaluation-plan.md)，本迭代先做 quick eval：
 
@@ -247,17 +281,21 @@ npx tsx eval/cli.ts compare --base baseline-v4 --candidate vnext
 交付：
 
 1. `scope policy` 实现和测试。
-2. OpenClaw adapter 支持 `appId/workspaceId/projectId` 推导或传入。
-3. `/v1/agent/context` 返回 warnings、filtered、evidence、telemetry。
-4. `memory_context_fast` 工具输出与 REST 对齐。
-5. 文档示例：一个 `appId` 写入，另一个 `appId` 在同一用户 scope 下召回。
+2. 存储视图和 Recall-to-5type 管线实现和测试。
+3. OpenClaw adapter 支持 `appId/workspaceId/projectId` 推导或传入。
+4. `/v1/agent/context` 返回 warnings、filtered、evidence、telemetry。
+5. `memory_context_fast` 工具输出与 REST 对齐。
+6. 文档示例：一个 `appId` 写入，另一个 `appId` 在同一用户 scope 下召回。
 
 验收：
 
 1. 两个 `appId` 在同一 `userId/workspaceId` 下复用 profile/rules。
 2. task_context 不跨 project 泄漏。
 3. private/revoked 不进入 context。
-4. `npx tsc --noEmit` 和相关 Vitest 通过。
+4. pending candidate、raw observation、raw chunk 不进入 `context_fast`。
+5. 无 `semanticType` 的合规记忆仍可通过 `memory_lookup` 命中。
+6. 每个 slot block 有 source/evidence 引用。
+7. `npx tsc --noEmit` 和相关 Vitest 通过。
 
 ### Milestone B：本机接入体验
 
