@@ -134,7 +134,18 @@
 
 ### 5.2 存储视图与 5type 运行视图
 
-5type 是 Runtime 运行视图，不是长期记忆主库的全量存储模型。下一迭代需要明确从存储视图到 5 slot 的召回管线。
+5type 是 Runtime 运行视图，不是长期记忆主库的全量存储模型。下一迭代需要明确输入、落盘、存储介质、记忆树和从存储视图到 5 slot 的召回管线。
+
+产品输入分六类：
+
+| 输入 | 入口 | 默认落盘路由 |
+|------|------|--------------|
+| Runtime observation | `memory_observe_light` | evidence + candidate job |
+| Explicit save | `memory_save_explicit` | evidence + MemoryRecord 或 candidate |
+| Session commit | `memory_session_commit` | session evidence + task/experience candidate |
+| Document ingest | scan / ingest API | local file + Document/Chunk + index/tree jobs |
+| Console governance | Console API | candidate/audit/lifecycle + snapshot invalidation |
+| Import / migration | import API / CLI | staged import + validation + durable memory |
 
 存储视图分四层：
 
@@ -144,6 +155,24 @@
 | Durable Memory | `MemoryRecord`，包含 `kind`、`semanticType?`、scope、lifecycle、evidence | 5 slot 的主候选池 |
 | Enrichment / Structure | entity、relation、summary、index、SlotSnapshot | 提供检索、解释和快路径 |
 | Candidate / Governance | pending/approved/rejected/archived/expired candidate 和 audit | 审核后才能进入 durable memory |
+
+存储介质边界：
+
+| 介质 | 放什么 | 不放什么 |
+|------|--------|----------|
+| Structured store | MemoryRecord、Candidate、Document/Chunk metadata、Job、Audit、Lifecycle | 原始大文件 |
+| Vector store | active memory、chunk、summary node、可选 entity/relation descriptor | audit、job、权限状态、pending candidate 默认不放 |
+| Local files | raw/canonical document、transcript、tree export、eval source、backup package | lifecycle 真源 |
+| Tree/graph store | entity、relation、TreeLeaf、TreeBuffer、TreeSummaryNode | 原始全文和权限真源 |
+| Text/BM25 index | memory/chunk/summary text | 审计和 job 状态 |
+
+记忆树保留三类：
+
+| Tree | 用途 |
+|------|------|
+| Source Tree | 来源追溯、文档/会话摘要、evidence drill-down |
+| Topic Tree | 围绕实体/项目/工具/文件的主题召回 |
+| Global Tree | 工作区、项目、日期维度的整体预览 |
 
 召回到 5type 的流程：
 
@@ -165,6 +194,16 @@ normalize scope
 3. pending candidate、raw observation、raw chunk 不进入 `context_fast`。
 4. 每个 slot block 必须能回指 source/evidence。
 5. SlotSnapshot 是快路径缓存，不是长期记忆真源。
+
+召回模式：
+
+| 模式 | 用途 | 主要数据 |
+|------|------|----------|
+| `context_fast` | Agent 启动 5 slot | SlotSnapshot、active MemoryRecord、轻量 text/BM25 |
+| `lookup_fast` | 速查具体记忆和证据 | MemoryRecord、chunk index、source/evidence |
+| `lookup_deep` | 复杂追溯和整体理解 | vector、BM25、source/topic/global tree、graph relation |
+
+LightRAG 的 `naive/local/global/mix` 可作为 `lookup_deep` 的理论参考：chunk/vector 对应 naive，Topic Tree 对应 local，Global/Source Tree 对应 global，tree + graph + vector 融合对应 mix。`context_fast` 不走 mix，避免延迟和成本失控。
 
 ### 5.3 Agent Runtime 快路径增强
 
@@ -214,7 +253,7 @@ interface AgentContextFastResult {
 |------|------|
 | `ltm doctor` | 检查配置、server、DB、embedding、scope、REST、Console 静态资源 |
 | `ltm demo` | 写入一组用户工作上下文 demo 记忆，并演示不同 `appId` 下的 context/lookup |
-| `ltm connect openclaw` | 输出 OpenClaw 类型产品接入配置、server URL、secret、scope 示例 |
+| `ltm connect openclaw` | 输出 OpenClaw adapter 接入配置、server URL、secret、scope 示例 |
 
 验收输出应面向产品开发者，而不是内部调试日志：
 
@@ -299,7 +338,7 @@ npx tsx eval/cli.ts compare --base baseline-v4 --candidate vnext
 
 ### Milestone B：本机接入体验
 
-目标：产品开发者能在 10 分钟内启动、诊断并接入一个 OpenClaw 类型产品。
+目标：产品开发者能在 10 分钟内启动、诊断并接入一个 OpenClaw adapter。
 
 交付：
 
@@ -388,4 +427,4 @@ npx tsx eval/cli.ts compare --base baseline-v4 --candidate vnext
 3. Milestone C：Console Candidates + candidate 审核闭环。
 4. Milestone D：quick eval + release gate。
 
-这四个里程碑完成后，memory-autodb 才算从“已有中间件模块”进入“可被多 OpenClaw 类产品稳定接入的 Agent Runtime 记忆方案”。
+这四个里程碑完成后，memory-autodb 才算从“已有中间件模块”进入“可被授权 Agent 产品稳定复用的用户工作上下文方案”。

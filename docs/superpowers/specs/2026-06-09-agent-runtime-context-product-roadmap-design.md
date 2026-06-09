@@ -125,7 +125,15 @@ Agent 应看到任务时点接口，而不是内部记忆模型。
 
 存储视图回答的问题是：memory-autodb 到底保存什么，如何保证长期记忆可找、可追溯、可撤销、可重放。
 
-5 type 是运行视图；存储视图不能直接等同于 5 type。存储视图应分成四层：
+5 type 是运行视图；存储视图不能直接等同于 5 type。结合 Mem0、Zep/Graphiti、Cognee、Letta、LangMem 和 LightRAG 的取舍，memory-autodb 的存储视图应遵循五个原则：
+
+1. **输入先落 evidence，再做智能加工**：任何 Agent 运行中 observation、文档、工具结果、显式记住，都先保存可追溯来源，再异步抽取记忆。
+2. **结构化状态和原始内容分开**：状态、scope、lifecycle、candidate、audit 进入结构化存储；原始大文本和可读导出进入本地文件；向量库只保存可重建索引。
+3. **记忆树不是 UI 目录**：source/topic/global tree 应参与 lookup deep、整体预览和 evidence 追溯。
+4. **向量库不是真源**：向量库只负责语义召回，不能保存唯一副本、权限状态、撤销状态或审计。
+5. **增量更新优先**：新输入、候选批准、撤销、替换都应局部更新相关 record/index/tree，而不是全量重建。
+
+存储视图分成四层：
 
 ```text
 Source / Evidence Layer
@@ -141,7 +149,136 @@ Runtime View Layer
   -> context_fast 的 5 slot，以及 lookup 的可追溯结果
 ```
 
-#### 3.4.1 Source / Evidence Layer
+#### 3.4.1 输入合同
+
+产品输入不是单一 “add memory”。不同输入的落盘策略不同。
+
+| 输入 | 入口 | 典型内容 | 默认落盘路由 |
+|------|------|----------|--------------|
+| Runtime observation | `memory_observe_light` | 用户输入、工具结果、Agent 输出、系统事件 | Source/Evidence + candidate job |
+| Explicit save | `memory_save_explicit` | 用户明确要求记住的偏好、规则、事实 | Source/Evidence + Durable Memory 或 candidate |
+| Session commit | `memory_session_commit` | 会话摘要、任务状态、决策和未完成项 | Source/Evidence + task_context/experience candidate |
+| Document ingest | `memory_scan_directory` / ingest API | 文档、Markdown、连接器内容 | Local file/CAS + Document/Chunk + index/tree jobs |
+| Console governance | Console API | approve/reject/revoke/archive/correct | Candidate/Governance + audit + snapshot invalidation |
+| Import / migration | import API / CLI | 外部记忆、导出包、历史数据 | staged import + validation + Durable Memory |
+
+统一输入 envelope：
+
+```typescript
+interface MemoryInputEnvelope {
+  id: string;
+  scope: MemoryScope;
+  inputType:
+    | "runtime_observation"
+    | "explicit_save"
+    | "session_commit"
+    | "document_ingest"
+    | "console_action"
+    | "import";
+  text?: string;
+  payloadRef?: string;
+  metadata: Record<string, unknown>;
+  privacyLevel: "private" | "workspace" | "team" | "public";
+  createdAt: number;
+  contentHash: string;
+}
+```
+
+输入规则：
+
+1. 所有输入必须先有 normalized scope。
+2. 没有 scope 的输入拒绝；scope 不完整的输入只能进入 private/session 范围。
+3. `contentHash` 是幂等和去重主键之一。
+4. 原始大 payload 不直接塞进向量库。
+5. Runtime observation 必须快速 ack，不等待 embedding、LLM 抽取或 tree seal。
+
+#### 3.4.2 落盘流程
+
+落盘采用 append-first、evidence-first 的流程：
+
+```text
+receive input
+  -> normalize scope / privacy / source
+  -> compute contentHash and stable source id
+  -> append input envelope and audit
+  -> persist raw/canonical content if needed
+  -> create or update structured records
+  -> enqueue async jobs
+  -> return ack / result
+
+async jobs
+  -> chunk
+  -> embed selected records/chunks
+  -> extract candidate memory
+  -> extract entity/relation
+  -> route leaves to source/topic/global tree
+  -> refresh SlotSnapshot
+```
+
+落盘路由：
+
+| 输入 | 同步写入 | 异步写入 |
+|------|----------|----------|
+| `observe_light` | input envelope、audit、可选 observation metadata | candidate extraction、embedding、tree leaf、summary |
+| `save_explicit` | evidence、MemoryRecord 或 CandidateRecord、audit | embedding、slot snapshot refresh、tree/graph update |
+| `session_commit` | session summary evidence、audit | task_context/experience candidate、global tree digest |
+| document ingest | raw/canonical file、DocumentRecord、ChunkRecord、job | chunk embedding、entity/relation、source tree、topic tree |
+| console approve | Candidate status、MemoryRecord、audit | vector index、slot snapshot invalidation、tree route |
+| console revoke | lifecycleStatus、audit | vector tombstone / snapshot invalidation |
+
+核心不变量：
+
+1. **write-audit-before-enrich**：先写来源和审计，再做智能加工。
+2. **index rebuildable**：向量、BM25、graph、tree summary 都应可由 source + durable record 重建。
+3. **revoked wins**：撤销状态优先于任何索引命中。
+4. **source immutable**：原始 evidence 不被覆盖；修正通过新 record supersede 旧 record。
+5. **job idempotent**：同一 `contentHash + jobType + schemaVersion` 重跑不产生重复记忆。
+
+#### 3.4.3 存储介质边界
+
+本地优先不等于所有东西都放一个本地向量库。推荐边界如下：
+
+| 介质 | 放什么 | 不放什么 | 原因 |
+|------|--------|----------|------|
+| Structured store | MemoryRecord、CandidateRecord、Document/Chunk metadata、Job、Audit、Scope、Lifecycle | 原始大文件、唯一向量副本 | 状态查询、事务、过滤、治理 |
+| Vector store | approved memory text、chunk summary/text、entity/relation descriptor、summary node text | audit、job、raw transcript、pending candidate 默认不放 | 语义召回，可重建 |
+| Local content-addressed files | raw/canonical document、transcript snapshot、large tool result、export package | lifecycle 状态真源 | 大内容、可读、可迁移、可 hash |
+| Tree/graph store | entity、relation、TreeLeaf、TreeBuffer、TreeSummaryNode | 原始文件全文、权限状态真源 | 结构化导航、关系召回、整体预览 |
+| Text/BM25 index | MemoryRecord text、chunk text、summary text | 审计和 job 状态 | 本地快速 fallback |
+
+优先实现形态：
+
+1. v0.x 可以用本地文件 + SQLite/Postgres/Supabase/LanceDB 组合，不强行引入 Neo4j。
+2. LanceDB 只作为 vector store；不能作为 audit、candidate、lifecycle 的唯一真源。
+3. 本地文件保存 raw/canonical evidence 和 Markdown/JSONL export；人类可读 tree export 是派生物，不是唯一真源。
+4. 结构化 store 保存所有状态和指针，保证 Console、eval、migration 可复现。
+
+哪些信息应进向量库：
+
+| 信息 | 是否进向量库 | 条件 |
+|------|--------------|------|
+| active MemoryRecord.text | 是 | 通过 lifecycle/visibility/evidence 校验 |
+| approved candidate promoted memory | 是 | promote 后作为 MemoryRecord |
+| document chunk | 是 | chunk 规模受控，带 documentId/sourceId |
+| summary node | 是 | 有 evidenceIds，summary 已 seal |
+| entity descriptor | 可选 | entity 足够热或用于 topic tree |
+| relation descriptor | 可选 | relation 有 evidence 且查询价值高 |
+| pending candidate | 默认否 | 可有 Console 专用临时索引，但不进 Agent context |
+| raw observation | 默认否 | 除非被 chunk 化且用于 lookup/evidence |
+| audit/job/lifecycle | 否 | 结构化过滤，不做语义召回 |
+
+哪些信息应放本地文件：
+
+| 信息 | 文件形态 | 用途 |
+|------|----------|------|
+| raw document | content-addressed blob | evidence、re-ingest、export |
+| canonical markdown | `.md` / `.json` | 可读、diff、迁移 |
+| transcript snapshot | `.jsonl` | 回放、debug、评测准备 |
+| tree readable export | `.md` | Console 预览、人类审查 |
+| eval source corpus | `.jsonl` / `.md` | 自动生成 golden |
+| package export | `.tar` / `.jsonl` | 迁移和备份 |
+
+#### 3.4.4 Source / Evidence Layer
 
 这一层保存“事实从哪里来”，不是直接给 Agent 注入的上下文。
 
@@ -159,7 +296,7 @@ Runtime View Layer
 3. 所有长期记忆、摘要、关系和候选都应能回指 evidence。
 4. 原始 evidence 应保留稳定 id 和 contentHash，保证重放和去重。
 
-#### 3.4.2 Durable Memory Layer
+#### 3.4.5 Durable Memory Layer
 
 这一层保存“系统认为值得长期保留的工作上下文结论”。
 
@@ -206,7 +343,7 @@ Runtime View Layer
 4. `active` 记录才是 `context_fast` 的主要候选；archived/revoked/superseded 只能用于 lookup、audit 或解释。
 5. `semanticType` 可以被重算或修正，但不能破坏原始 evidence 和 lifecycle。
 
-#### 3.4.3 Enrichment / Structure Layer
+#### 3.4.6 Enrichment / Structure Layer
 
 这一层保存“为了更好查找、压缩、解释和导航而生成的结构”。
 
@@ -225,7 +362,50 @@ Runtime View Layer
 3. slot snapshot 是运行视图缓存，不是长期记忆主库。
 4. 索引失效时系统应能降级到 durable memory + text lookup。
 
-#### 3.4.4 Candidate / Governance Layer
+#### 3.4.7 记忆树存储
+
+记忆树要解决三个问题：
+
+1. **来源追溯**：某条记忆来自哪个文档、会话、工具结果。
+2. **主题导航**：围绕某个人、项目、文件、工具、任务形成可压缩的上下文。
+3. **整体预览**：今天/本周/某项目发生了什么，当前工作上下文整体状态如何。
+
+因此保留三棵树：
+
+| Tree | Key | 存什么 | 用途 |
+|------|-----|--------|------|
+| Source Tree | `sourceId` / `documentId` / `sessionId` | 同一来源的 chunk leaf 和分层摘要 | evidence drill-down、来源摘要、re-ingest |
+| Topic Tree | `entityId` / `topicId` | 围绕高热实体/主题的 leaf、relation、summary | entity/topic lookup、LightRAG local 类召回 |
+| Global Tree | `date` / `workspaceId` / `projectId` | 工作区或项目的日/周/global 摘要 | 整体预览、LightRAG global 类召回 |
+
+Tree 存储对象：
+
+| 对象 | 说明 | 真源性 |
+|------|------|--------|
+| TreeLeaf | 指向 chunk/evidence 的叶子，包含 sourceId、entityIds、importance、eventAt | 可由 chunk + extraction 重建 |
+| TreeBuffer | L0 待 seal 缓冲区，控制 token 和 seal 时机 | 运行状态 |
+| TreeSummaryNode | seal 后摘要，包含 leafIds、childNodeIds、evidenceChunkIds、timeRange | 可重建的结构化摘要 |
+
+记忆树落盘规则：
+
+1. TreeLeaf 只保存指针和少量摘要，不保存不可追溯结论。
+2. Source Tree 对每个 source 默认存在；Topic Tree 只对 hotness 足够的 entity/topic 建立；Global Tree 按时间和 workspace/project 建立。
+3. TreeSummaryNode 必须带 `evidenceChunkIds`，否则不能参与召回。
+4. tree summary 可进入向量库，但必须以 source/tree node 为真源重建。
+5. revoke/supersede 某条 memory 时，要标记相关 TreeSummaryNode stale，而不是立即全量重建。
+6. Console 展示的记忆树是 TreeSummaryNode + evidence 的渲染结果，不是用户直接编辑的主库文件。
+
+LightRAG 映射：
+
+| LightRAG 模式 | memory-autodb 对应 |
+|---------------|--------------------|
+| `naive` | chunk/vector/BM25 基础搜索 |
+| `local` | Topic Tree + entity relation + related chunks |
+| `global` | Global Tree / Source Tree summary + relation patterns |
+| `hybrid` | topic + global 双路召回 |
+| `mix` | lookup deep 中融合 memory、chunk、tree、graph、vector |
+
+#### 3.4.8 Candidate / Governance Layer
 
 这一层保存“可能成为长期记忆，但还不应污染运行上下文”的内容。
 
@@ -247,6 +427,21 @@ Runtime View Layer
 ### 3.5 从存储视图召回到 5 type
 
 Recall-to-5type 管线回答的问题是：给定一个任务，系统如何从完整存储视图中选择少量可信记忆，组成 5 slot 运行视图。
+
+召回不是单一路径，而是三种模式：
+
+| 模式 | 入口 | 目标 | 使用的数据 |
+|------|------|------|------------|
+| `context_fast` | Agent 启动 | 低延迟构建 5 slot | SlotSnapshot、active MemoryRecord、轻量 text/BM25 |
+| `lookup_fast` | Agent 或 Console 速查 | 找到少量具体记忆和 evidence | MemoryRecord、chunk index、source/evidence |
+| `lookup_deep` | Console、人工追溯、复杂问答 | 融合长期记忆、文档、图谱、记忆树 | vector、BM25、source/topic/global tree、graph relations |
+
+原则：
+
+1. `context_fast` 只使用已确认、低延迟、prompt-safe 的结果。
+2. `lookup_fast` 可以返回更多 evidence，但仍不应触发 LLM 当场抽取。
+3. `lookup_deep` 可以使用 LightRAG 类 mix 思路，融合 tree/graph/vector，但必须显式触发。
+4. 任何模式都必须先执行 scope、visibility、lifecycle 过滤。
 
 #### 3.5.1 总体流程
 
@@ -304,7 +499,7 @@ Snapshot miss 或部分 stale 时：
 
 #### 3.5.4 Step 3：候选召回
 
-候选来自三类来源：
+`context_fast` 候选来自三类来源：
 
 | 来源 | 作用 | 快路径要求 |
 |------|------|------------|
@@ -318,6 +513,28 @@ Snapshot miss 或部分 stale 时：
 2. 未完成 embedding 的新 observation。
 3. 需要 LLM 当场总结的长文档。
 4. 未通过 evidence 校验的 summary。
+
+`lookup_fast` 候选来源：
+
+| 来源 | 作用 |
+|------|------|
+| MemoryRecord text/BM25/vector | 直接命中长期记忆 |
+| Chunk text/BM25/vector | 找到证据片段 |
+| Source metadata | 返回文件、会话、工具来源 |
+| Candidate metadata | 仅 Console 可选查看，不默认给 Agent |
+
+`lookup_deep` 候选来源：
+
+| 来源 | 类比 LightRAG | 作用 |
+|------|---------------|------|
+| Chunk vector/BM25 | naive | 找具体片段 |
+| Topic Tree | local | 找实体、项目、工具、文件相关上下文 |
+| Global Tree | global | 找宏观状态、时间线、整体摘要 |
+| Source Tree | global/source | 找同一来源的上下游证据 |
+| Graph relations | local/hybrid | 找 supports、contradicts、supersedes、uses 等关系 |
+| MemoryRecord | mix | 汇总已确认长期记忆 |
+
+`lookup_deep` 输出不能直接等同于 `context_fast`。如果 deep lookup 发现新的重要结论，应进入 candidate 或用户确认流程，再影响后续 5 slot。
 
 #### 3.5.5 Step 4：映射到 5 slot
 
@@ -444,6 +661,27 @@ interface SlotContextBlock {
 5. `filtered`。
 6. `evidence` 或 source references。
 7. `telemetry`，至少包含 latency、cacheHit、nodesUsed、tokenEstimate、scopeKey。
+
+#### 3.5.8.1 Tree / Graph 到 5 slot 的映射
+
+tree 和 graph 的召回结果必须经过“摘要化 + evidence 检查 + slot 映射”，不能把图谱路径或 tree summary 原样塞进 prompt。
+
+| 来源 | 进入 slot 的方式 |
+|------|------------------|
+| Source Tree summary | 通常进入 resource，提供来源摘要和引用 |
+| Topic Tree summary | 根据 topic 类型进入 task_context / experience / resource |
+| Global Tree digest | 进入 task_context，提供当前工作整体状态 |
+| Graph relation `prefers` | 可进入 profile / rules，需高置信 evidence |
+| Graph relation `decided` | 当前 project 进入 task_context，历史 project 进入 experience |
+| Graph relation `supersedes` | 用于过滤旧记忆，不直接展示 |
+| Graph relation `contradicts` | 触发 warning / conflict，不自动注入结论 |
+
+必须遵守：
+
+1. tree summary 进入 slot 时必须带 source/evidence。
+2. graph relation 只有 evidenceCount 和 confidence 达标才可影响 slot。
+3. `global` 摘要只作为任务背景，不覆盖用户显式 rules。
+4. `topic` 摘要适合 lookup 和 Console，下沉到 context_fast 时要严格预算。
 
 #### 3.5.9 Step 8：反馈回存储视图
 
