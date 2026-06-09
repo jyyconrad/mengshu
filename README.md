@@ -1,5 +1,19 @@
 # OpenClaw 内存插件 v2.1 使用指南
 
+## v4.0 记忆中间件能力预览
+
+当前代码已开始从单一 OpenClaw 插件演进为可复用的 memory middleware：
+
+- `MemoryService`：OpenClaw、REST、MCP、SDK 共用的核心服务边界。
+- 本机 REST server：`ltm serve` 启动后提供 `/v1/health`、`/v1/memories`、`/v1/recall`、`/v1/context`。
+- MCP/JS SDK：非 OpenClaw 产品可以通过 MCP tools 或 `sdk/js` client 接入。
+- Ingestion Pipeline：`memory_scan_directory` 和 `ltm scan` 走 deterministic chunk + job queue，返回 `Jobs queued`、`Chunks admitted`、`Chunks dropped`。
+- 混合检索基础：BM25 text index、RRF fusion、Context Packer，支持 provenance 和 prompt-safe context。
+- 结构化图谱与记忆树基础：规则抽取 entity/relation、graph query、source/topic/global tree buffer 与 digest。
+- Web Console：`/console` 提供 Overview、Quick Lookup、Graph、Jobs 基础界面。
+
+本阶段保持旧 `memory_store`、`memory_recall`、`memory_scan_directory`、`memory_cleanup` 参数兼容。v4 新 schema 的持久化迁移仍按 `ltm migrate --to-schema v4 --dry-run` 先做估算和灰度规划。
+
 ## v2.1 新功能概览
 
 v2.1 版本引入了**多存储分类架构**、**增强型 CLI 命令**、**元数据自动丰富**和**配置扩展**四大核心升级：

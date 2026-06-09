@@ -69,10 +69,13 @@
 04-design/
 ├── 04.1-overview/
 │   ├── scanner-module-design.md
-│   └── rule-engine-design.md
+│   ├── rule-engine-design.md
+│   └── web-console-design.md
 └── 04.2-detail/
     ├── python-scanner-detail.md
-    └── bandit-integration-detail.md
+    ├── bandit-integration-detail.md
+    ├── memory-middleware-development-plan.md
+    └── structured-knowledge-graph-memory-tree-detail.md
 ```
 
 ## 维护方式

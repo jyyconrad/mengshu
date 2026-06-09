@@ -1,5 +1,16 @@
 # 插件测试文档
 
+## v4 Middleware 回归命令
+
+当前 v4 中间件实现覆盖 core、REST、MCP、SDK、ingestion、retrieval、graph、tree、console、migration、lifecycle：
+
+```bash
+npx vitest run config.middleware.test.ts api/rest/auth.test.ts api/rest/router.test.ts server/daemon.test.ts server/health.test.ts sdk/js/client.test.ts adapters/mcp/tools.test.ts adapters/mcp/server.test.ts adapters/openclaw/cli.test.ts index.test.ts adapters/openclaw/tools.test.ts adapters/openclaw/hooks.test.ts adapters/openclaw/scope.test.ts core/memory-service.test.ts storage/legacy-database-adapter.test.ts storage/repositories/in-memory.test.ts storage/indexes/in-memory-bm25.test.ts core/scope.test.ts core/legacy-mapping.test.ts retrieval/prompt-safety.test.ts retrieval/fusion.test.ts retrieval/orchestrator.test.ts retrieval/context-packer.test.ts ingest/canonicalize.test.ts ingest/chunker.test.ts ingest/pipeline.test.ts ingest/jobs.test.ts ingest/adapters/file-system.test.ts server/workers.test.ts graph/extractor.test.ts graph/repository.test.ts graph/query.test.ts tree/buffer.test.ts tree/seal.test.ts tree/topic.test.ts tree/global.test.ts console/api.test.ts console/web-smoke.test.ts migration/v4.test.ts lifecycle/audit.test.ts lifecycle/retention.test.ts
+npx tsc --noEmit
+```
+
+`npm test` 仍包含需要本机 embedding 服务的集成测试；若 `127.0.0.1:11434` 未启动，会出现环境性 `ECONNREFUSED`。
+
 ## 测试范围
 
 本测试文档覆盖 OpenClaw 内存插件的核心功能和边界场景。

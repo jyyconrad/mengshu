@@ -13,6 +13,33 @@
 | `memories` | 对话记忆 | `mem_` |
 | `knowledge` | 文档知识 | `know_` |
 
+## v4 Middleware Schema 草案
+
+v4 在保留 `memories` / `knowledge` legacy 表的基础上，新增 middleware 结构化表。第一阶段代码已提供 in-memory contract baseline，持久化 provider 后续按以下 schema 落地。
+
+| 表名 | 作用 |
+|------|------|
+| `documents` | source/document 元数据 |
+| `chunks` | deterministic chunk，graph/tree/vector/text 的 evidence 单位 |
+| `jobs` | embed/extract/seal/digest 等后台任务 |
+| `audit` | store/forget/migrate/retention/rebuild 审计 |
+| `entities` | 结构化实体 |
+| `relations` | 带 evidence 的关系 |
+| `tree_buffers` | source/topic/global L0 buffer |
+| `summary_nodes` | sealed source/topic/global summary |
+
+核心索引建议：
+
+```sql
+CREATE INDEX chunks_scope_source_idx ON chunks(scope_key, source_id, created_at DESC);
+CREATE INDEX entities_scope_hotness_idx ON entities(scope_key, hotness DESC);
+CREATE INDEX relations_subject_idx ON relations(scope_key, subject_id, predicate);
+CREATE INDEX relations_object_idx ON relations(scope_key, object_id, predicate);
+CREATE INDEX summary_tree_idx ON summary_nodes(scope_key, tree_type, tree_key, level, sealed_at DESC);
+```
+
+所有新表必须包含 `scope_key` 或可从 `scope` 派生的等价字段；server/remote 模式不得绕过 scope filter 查询。
+
 ## 表结构
 
 ### memories 表

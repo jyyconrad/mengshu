@@ -9,6 +9,41 @@
 | `memory_scan_directory` | POST | 扫描目录 |
 | `memory_cleanup` | POST | 清理数据 |
 
+## v4 REST / Middleware API
+
+本机 server 由 `ltm serve` 启动，默认监听 `127.0.0.1:3847`。无 `server.secret` 时只允许 loopback；配置 secret 后需要 `Authorization: Bearer <secret>`。
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| `GET` | `/v1/health` | 服务健康和记录数 |
+| `POST` | `/v1/memories` | 写入核心 `MemoryRecord` |
+| `POST` | `/v1/recall` | 召回记忆，返回 hits、score breakdown、provenance |
+| `POST` | `/v1/context` | 召回并打包 prompt-safe context |
+| `POST` | `/v1/graph/query` | 可选图谱查询，返回 entities、relations、evidenceChunkIds |
+| `POST` | `/v1/console/overview` | Web Console 总览指标 |
+| `POST` | `/v1/console/lookup` | 知识速查 |
+| `POST` | `/v1/console/graph` | Console 局部图查询 |
+| `GET` | `/v1/console/jobs` | Job 队列列表和状态统计 |
+
+### /v1/console/lookup 示例
+
+```json
+{
+  "scope": {
+    "tenantId": "local",
+    "appId": "openclaw",
+    "userId": "default",
+    "projectId": "default",
+    "agentId": "default",
+    "namespace": "knowledge"
+  },
+  "query": "memory tree",
+  "limit": 10
+}
+```
+
+private 内容不会返回 raw，只显示 `[private]` 预览。
+
 ---
 
 ## memory_store

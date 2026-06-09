@@ -11,6 +11,10 @@
 | `ltm export` | `format` | 导出数据 |
 | `ltm scan` | `directory` | 扫描目录 |
 | `ltm cleanup` | `options` | 清理数据 |
+| `ltm serve` | `--host --port` | 启动本机 REST server 和 `/console` |
+| `ltm status` | - | 查看 middleware 状态 |
+| `ltm health` | - | 输出 service health JSON |
+| `ltm migrate` | `--to-schema v4 --dry-run` | 估算 v4 schema 迁移 |
 
 ---
 
@@ -184,6 +188,50 @@ ltm scan /path/to/docs --ignore node_modules --ignore dist
 # 扫描到核心记忆
 ltm scan /path/to/notes --category 核心记忆
 ```
+
+扫描现在走 v4 ingestion pipeline，输出会额外包含：
+
+```text
+- Jobs queued: 24
+- Chunks admitted: 24
+- Chunks dropped: 3
+```
+
+---
+
+## ltm serve / status / health
+
+### 功能
+
+启动本机 memory middleware，并通过 REST、SDK、MCP proxy 和 Web Console 给其他产品接入。
+
+### 用法
+
+```bash
+ltm serve --host 127.0.0.1 --port 3847
+ltm status
+ltm health
+```
+
+启动后访问：
+
+```text
+http://127.0.0.1:3847/console
+```
+
+---
+
+## ltm migrate
+
+### 功能
+
+估算或执行 v4 记忆中间件 schema 迁移。当前建议先 dry-run：
+
+```bash
+ltm migrate --to-schema v4 --dry-run
+```
+
+输出包含源记录、预计 chunks、entities、jobs 数量。迁移应按 namespace/table 灰度执行，并保留旧表回滚窗口。
 
 ---
 

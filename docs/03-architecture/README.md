@@ -42,10 +42,19 @@
 ```
 03-architecture/
 ├── system-architecture.md
+├── memory-middleware-architecture.md
+├── memory-autodb-deep-optimization-architecture.md
 ├── technology-stack.md
 ├── module-design.md
 └── deployment-architecture.md
 ```
+
+## 当前重点文档
+
+| 文档 | 说明 |
+|------|------|
+| [memory-middleware-architecture.md](./memory-middleware-architecture.md) | v4 中间件化架构：从 OpenClaw 插件拆分为 MemoryService、REST/MCP/SDK/Console 的工程骨架 |
+| [memory-autodb-deep-optimization-architecture.md](./memory-autodb-deep-optimization-architecture.md) | vNext 深层优化架构：吸收 copy-from-mate 记忆系统的 5 问题、5 type、记忆树、图谱、升格治理和 Console 预览方案 |
 
 ## 维护方式
 架构变化时更新
