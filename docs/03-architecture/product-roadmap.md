@@ -63,6 +63,10 @@ memory-autodb 的产品路线图只围绕两个主轴展开：
 
 | 缺口 | 影响 | 放入版本 |
 |------|------|----------|
+| 全局目录仍在 `~/.openclaw/` | 产品边界不清、跨客户端接入不自然、迁移备份困难 | v0.1.2 |
+| 配置和密钥未分离 | 密钥明文存储在配置文件中，不利于安全管理和备份 | v0.1.2 |
+| 项目 manifest 未指针化 | 项目目录包含过多长期状态，不利于 git 管理和目录移动 | v0.1.2 |
+| 多客户端接入无统一规范 | Codex/Claude/OpenClaw 各自配置方式不同，维护成本高 | v0.1.2 |
 | MCP 真实客户端未人工冒烟 | stdio 单测通过，但 Claude Desktop / Cursor 真实接入风险未消除 | v0.1.2 |
 | LLM 真实调用未冒烟 | fake client 覆盖，不代表真实 provider 配置可用 | v0.1.2 |
 | `package.json` 版本与产品版本线不一致 | 发布和 changelog 容易混乱 | v0.1.2 |
@@ -76,18 +80,24 @@ memory-autodb 的产品路线图只围绕两个主轴展开：
 
 ## 3. 版本路线图
 
-### v0.1.2：真实接入与发布治理收口
+### v0.1.2：全局配置目录升级与真实接入收口
 
-定位：把 v0.1.1 已完成的 MCP、LLM、tree 接线从“测试可用”推进到“真实本机可用”，并补齐发布治理。
+定位：把 memory-autodb 从 OpenClaw 插件路径演进为独立本地优先记忆中间件，建立 `~/.memory-autodb/` 全局目录体系，统一配置、密钥、项目 registry 和客户端接入；同时把 v0.1.1 已完成的 MCP、LLM、tree 接线从”测试可用”推进到”真实本机可用”。
 
 目标用户价值：
 
-> 开发者配置好本地服务、MCP 客户端和模型后，可以实际调用 memory-autodb 的 5 slot 上下文、lookup 和 observe 能力，并能用 doctor/eval 判断是否接入成功。
+> 开发者拥有独立的 `~/.memory-autodb/` 全局目录，配置和密钥分离管理，Codex/Claude/OpenClaw 等客户端统一指向同一记忆中间件实例；MCP/LLM 可真实调用，`doctor/eval` 可判断接入成功。
 
 范围：
 
 | 模块 | 交付 |
 |------|------|
+| 全局目录 | 建立 `~/.memory-autodb/` 目录结构：`config.json`、`.env`、`registry.json`、`memory/`、`projects/`、`logs/`、`backups/` |
+| 配置分离 | `config.json` 只存运行策略（不存密钥明文），`${...}` 占位符从 `.env` 解析 |
+| 项目指针 | 项目目录只保存轻量 `.memory-autodb.json` 指针，完整 manifest 存全局 `projects/<projectId>/` |
+| 客户端接入 | Codex、Claude Code、Claude Desktop、OpenClaw 统一接入配置示例和环境变量规范 |
+| 兼容迁移 | 兼容读取 `~/.openclaw/` 旧路径并输出迁移 warning；提供 `ltm migrate-home` 迁移命令 |
+| Registry | `registry.json` 本机项目快速索引，支持项目列表、目录移动重新绑定和孤儿清理 |
 | MCP | 用 Claude Desktop / Cursor 或 MCP inspector 做真实 stdio 冒烟；沉淀配置示例和排障清单 |
 | LLM | 用真实 OpenAI-compatible chat endpoint 跑 `summarize` 冒烟；失败时明确降级行为 |
 | tree | 验证 observe → build_tree → `lookup_deep` 的真实链路；确认 in-memory 边界 |
@@ -100,17 +110,21 @@ memory-autodb 的产品路线图只围绕两个主轴展开：
 1. 不做跨 appId 复用。
 2. 不做 source roots 完整索引。
 3. 不做 tree 持久化。
+4. 不做云端同步。
 
 Release gate：
 
 | 门槛 | 目标 |
 |------|------|
+| 全局目录 | `~/.memory-autodb/config.json` 和 `.env` 可正常加载；旧路径兼容读取有 warning |
+| 项目初始化 | `ltm init` 同时写项目指针和全局 `projects/<projectId>/manifest.json` |
+| 客户端接入 | Codex、Claude Code 通过统一配置可调用 MCP 工具 |
 | TypeScript | `npx tsc --noEmit` 通过 |
 | Unit / integration | `npx vitest run` 全绿 |
 | Eval | `memory-autodb-v0.1` 30/30 PASS，`memory-autodb-safety` 40/40 PASS |
 | MCP smoke | `listTools` 能看到 11 个工具；`memory_context_fast` / `memory_lookup` 可真实调用 |
 | LLM smoke | 真实 provider `summarize` 成功；无配置时 `NullLlmClient` 降级符合预期 |
-| Docs | README、CLI、MCP、config、changelog 同步 |
+| Docs | README、CLI、MCP、config、changelog、全局目录文档同步 |
 
 ### v0.2.0：跨产品 Working Context + 完整 Project Workspace
 
@@ -266,12 +280,16 @@ Release gate：
 
 ### 第一批：v0.1.2 收口
 
-1. MCP 真实客户端 smoke：记录配置、工具清单、调用结果和失败排障。
-2. LLM 真实 provider smoke：验证 `llm` 配置、摘要调用、降级行为。
-3. 版本治理：统一 `package.json`、changelog、README 的版本口径。
-4. LongMemEval small run：产出本地报告，不纳入硬 gate 前先观察。
-5. branch coverage 收口：补 console/tree/server 缺口。
-6. 发布 `v0.1.2` changelog。
+1. 全局配置目录升级：建立 `~/.memory-autodb/` 目录体系，实现 `config.json` + `.env` 分离加载。
+2. 配置解析扩展：支持 `configPath/envPath` 环境变量、`${...}` 占位符解析，保留旧路径兼容。
+3. 项目初始化重构：`ltm init` 同时写项目指针和全局 `projects/<projectId>/manifest.json` + `registry.json`。
+4. 客户端接入统一：更新 `scripts/memory-autodb-mcp.ts` 默认路径，沉淀 Codex/Claude/OpenClaw 配置示例。
+5. 迁移命令：实现 `ltm migrate-home --from ~/.openclaw --to ~/.memory-autodb --dry-run`。
+6. MCP 真实客户端 smoke：记录配置、工具清单、调用结果和失败排障。
+7. LLM 真实 provider smoke：验证 `llm` 配置、摘要调用、降级行为。
+8. 版本治理：统一 `package.json`、changelog、README 的版本口径。
+9. branch coverage 收口：补 console/tree/server 缺口。
+10. 发布 `v0.1.2` changelog。
 
 ### 第二批：v0.2.0 先导
 

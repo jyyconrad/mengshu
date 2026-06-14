@@ -8,7 +8,7 @@
 |------|------|------|
 | [product-positioning.md](./product-positioning.md) | 当前产品方向真源 | 多产品 Agent Runtime 记忆方案，主要服务 OpenClaw 类型产品之间的工作记忆连续性 |
 | [product-roadmap.md](./product-roadmap.md) | 当前版本规划真源 | v0.1.x 之后的版本节奏、发布门槛、能力边界和依赖关系 |
-| [global-config-directory-upgrade.md](./global-config-directory-upgrade.md) | 全局目录升级方案 | 从 `~/.openclaw/` 迁移到独立 `~/.memory-autodb/` 的配置、密钥、项目 registry 和兼容策略 |
+| [global-config-directory-upgrade.md](./global-config-directory-upgrade.md) | v0.1.2 核心交付方案 | 从 `~/.openclaw/` 迁移到独立 `~/.memory-autodb/` 的配置、密钥、项目 registry 和兼容策略（1.0.2 分支主要更新） |
 | [memory-middleware-architecture.md](./memory-middleware-architecture.md) | 当前架构方案 | MemoryService、adapter、REST/MCP/SDK、ingestion、retrieval、graph/tree、console 的中间件化架构 |
 | [memory-autodb-deep-optimization-architecture.md](./memory-autodb-deep-optimization-architecture.md) | 长期优化方案 | 5 问题、5 type、SlotSnapshot、候选治理、图谱和记忆树路线 |
 | [architecture-review-v2.md](./architecture-review-v2.md) | 架构评审 | 对深层优化方案的可行性和阶段边界评审 |

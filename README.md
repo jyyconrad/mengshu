@@ -107,6 +107,7 @@ curl -X POST http://127.0.0.1:3847/v1/context \
 | 快速了解文档结构 | [docs/README.md](./docs/README.md) |
 | 理解产品定位 | [product-positioning.md](./docs/03-architecture/product-positioning.md) |
 | 查看产品路线图 | [product-roadmap.md](./docs/03-architecture/product-roadmap.md) |
+| 了解全局配置目录升级 | [global-config-directory-upgrade.md](./docs/03-architecture/global-config-directory-upgrade.md) |
 | 使用 CLI、REST、OpenClaw 工具 | [docs/05-api](./docs/05-api/README.md) |
 | 理解当前中间件架构 | [memory-middleware-architecture.md](./docs/03-architecture/memory-middleware-architecture.md) |
 | 理解长期深层优化方案 | [memory-autodb-deep-optimization-architecture.md](./docs/03-architecture/memory-autodb-deep-optimization-architecture.md) |
@@ -144,6 +145,7 @@ curl -X POST http://127.0.0.1:3847/v1/context \
 | v3.0 | 5 问题语义协议、Agent 快路径、候选区和 Slot Context Builder |
 | v4.0 | MemoryService、REST/MCP/SDK/ingestion/retrieval/graph/tree/console 的多产品 runtime 记忆基线 |
 | v0.1.x | 产品方向重定位后的 Working Context 版本线；v0.1.1 已补 MCP stdio、LLM client 和 in-memory tree 自动构建 |
+| v0.1.2 | 全局配置目录升级（`~/.memory-autodb/`）、配置密钥分离、统一客户端接入、项目指针化、真实 MCP/LLM 接入收口 |
 | vNext | 以 [product-roadmap.md](./docs/03-architecture/product-roadmap.md) 为准，重点是跨 appId Working Context 和完整 Project Memory Workspace |
 
 发布和变更记录以 [docs/09-changelog](./docs/09-changelog/README.md) 为准。
