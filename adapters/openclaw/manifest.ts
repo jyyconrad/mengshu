@@ -14,20 +14,30 @@
  *   目录移动时靠 .memory-autodb.json 指针保留原 id（read 不重算）。因此 init 默认幂等不覆盖。
  * - v0.1 不强制目录索引，sourceRoots 默认空数组。
  * - 所有函数不修改入参，返回新对象。
+ *
+ * v0.1.2 升级：
+ * - 拆分项目指针（version: "0.2"，仅 workspaceId/projectId/manifestPath/createdAt）
+ *   与全局完整 manifest（version: "0.1"，包含 slotReusePolicy/sourceRoots 等长期状态）。
+ * - 项目目录 `.memory-autodb.json` 写轻量指针；全局 `~/.memory-autodb/projects/<projectId>/manifest.json` 写完整 manifest。
+ * - readProjectManifest 透明兼容旧 0.1 完整 manifest（legacy）与新 0.2 指针（pointer → 读全局）。
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { normalizeScope } from "../../core/scope.js";
 import { DEFAULT_SLOT_REUSE_POLICY, type ReuseLevel } from "../../core/scope-policy.js";
 import type { MemoryScope, MemoryScopeInput, MemorySemanticType, MemoryVisibility } from "../../core/types.js";
+import { resolveProjectManifestPath, type HomePathOptions } from "../../core/paths.js";
 
 /** manifest 指针文件名，放在 project 目录根部。 */
 export const MANIFEST_FILENAME = ".memory-autodb.json";
 
-/** 当前 manifest schema 版本。 */
+/** 完整 manifest schema 版本（全局目录）。 */
 export const MANIFEST_VERSION = "0.1";
+
+/** 项目指针 schema 版本。 */
+export const MANIFEST_POINTER_VERSION = "0.2";
 
 /**
  * .memory-autodb.json 的最小 schema（A2-lite）。
@@ -52,6 +62,22 @@ export interface MemoryAutodbManifest {
   createdAt: number;
   /** 最近更新时间戳（ms），可选 */
   updatedAt?: number;
+}
+
+/**
+ * 项目指针 schema（v0.2），只保存轻量身份信息，指向全局完整 manifest。
+ */
+export interface MemoryAutodbPointer {
+  /** 指针 schema 版本，固定 "0.2" */
+  version: "0.2";
+  /** 跨 project 复用边界 id */
+  workspaceId: string;
+  /** task_context/resource 默认隔离边界 id */
+  projectId: string;
+  /** 全局完整 manifest 绝对路径或 `~/...` */
+  manifestPath: string;
+  /** 创建时间戳（ms） */
+  createdAt: number;
 }
 
 /** createManifest 入参。 */
@@ -112,6 +138,105 @@ export function createManifest(options: CreateManifestOptions): MemoryAutodbMani
   };
 }
 
+/**
+ * 由完整 manifest 创建轻量指针。
+ * manifestPath 通过 resolveProjectManifestPath 计算得到。
+ */
+export function createPointer(
+  manifest: MemoryAutodbManifest,
+  options?: HomePathOptions,
+): MemoryAutodbPointer {
+  return {
+    version: MANIFEST_POINTER_VERSION,
+    workspaceId: manifest.workspaceId,
+    projectId: manifest.projectId,
+    manifestPath: resolveProjectManifestPath(manifest.projectId, options),
+    createdAt: manifest.createdAt,
+  };
+}
+
+/**
+ * 读取 dir 下的 .memory-autodb.json，区分指针与旧完整 manifest。
+ * - 返回 { kind: "pointer", pointer } 如果 version === "0.2" 或包含 manifestPath。
+ * - 返回 { kind: "legacy", manifest } 如果是旧格式（version === "0.1" 或无 manifestPath）。
+ * - 返回 null 如果文件不存在。
+ * - JSON 解析失败抛带路径的错误。
+ */
+export function readPointerOrLegacyManifest(
+  dir: string,
+): { kind: "pointer"; pointer: MemoryAutodbPointer } | { kind: "legacy"; manifest: MemoryAutodbManifest } | null {
+  const filePath = manifestPath(dir);
+  if (!existsSync(filePath)) {
+    return null;
+  }
+  const raw = readFileSync(filePath, "utf8");
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    // 判断是否为指针：version === "0.2" 或包含 manifestPath 字段
+    if (parsed.version === MANIFEST_POINTER_VERSION || typeof parsed.manifestPath === "string") {
+      return { kind: "pointer", pointer: parsed as unknown as MemoryAutodbPointer };
+    }
+    // 否则视为旧格式完整 manifest
+    return { kind: "legacy", manifest: parsed as unknown as MemoryAutodbManifest };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`解析 manifest 失败（${filePath}）：${reason}`);
+  }
+}
+
+/**
+ * 同时写项目指针和全局完整 manifest。
+ * - 项目目录：dir/.memory-autodb.json（轻量指针）
+ * - 全局目录：~/.memory-autodb/projects/<projectId>/manifest.json（完整 manifest）
+ * 全局目录不存在时自动创建。
+ */
+export function writeProjectIdentity(
+  dir: string,
+  manifest: MemoryAutodbManifest,
+  options?: HomePathOptions,
+): void {
+  // 写项目指针
+  const pointer = createPointer(manifest, options);
+  writeFileSync(manifestPath(dir), `${JSON.stringify(pointer, null, 2)}\n`, "utf8");
+
+  // 写全局完整 manifest
+  const globalManifestPath = resolveProjectManifestPath(manifest.projectId, options);
+  const globalDir = dirname(globalManifestPath);
+  mkdirSync(globalDir, { recursive: true });
+  writeFileSync(globalManifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+}
+
+/**
+ * 高层入口：读取项目 manifest（透明支持 pointer/legacy 两种格式）。
+ * - 如果是 pointer，读取全局 manifest；全局文件不存在时抛错。
+ * - 如果是 legacy，直接返回该 manifest（调用方决定是否升级）。
+ * - 文件不存在返回 null。
+ */
+export function readProjectManifest(dir: string, options?: HomePathOptions): MemoryAutodbManifest | null {
+  const result = readPointerOrLegacyManifest(dir);
+  if (!result) {
+    return null;
+  }
+  if (result.kind === "legacy") {
+    return result.manifest;
+  }
+  // pointer 场景：读取全局 manifest
+  const { pointer } = result;
+  const globalManifestPath = resolveProjectManifestPath(pointer.projectId, options);
+  if (!existsSync(globalManifestPath)) {
+    throw new Error(
+      `项目指针指向的全局 manifest 不存在（${globalManifestPath}），数据可能已被破坏。请检查或重新运行 ltm init。`,
+    );
+  }
+  const raw = readFileSync(globalManifestPath, "utf8");
+  try {
+    return JSON.parse(raw) as MemoryAutodbManifest;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`解析全局 manifest 失败（${globalManifestPath}）：${reason}`);
+  }
+}
+
 /** manifest 指针文件完整路径。 */
 export function manifestPath(dir: string): string {
   return join(resolve(dir), MANIFEST_FILENAME);
@@ -120,6 +245,7 @@ export function manifestPath(dir: string): string {
 /**
  * 读取 dir 下的 .memory-autodb.json。
  * 不存在返回 null；JSON 解析失败抛带文件路径的错误（便于排查）。
+ * @deprecated 优先使用 readProjectManifest，它透明支持 pointer/legacy 两种格式。
  */
 export function readManifest(dir: string): MemoryAutodbManifest | null {
   const filePath = manifestPath(dir);
@@ -135,7 +261,10 @@ export function readManifest(dir: string): MemoryAutodbManifest | null {
   }
 }
 
-/** 写入 manifest（2 空格缩进，末尾换行）。 */
+/**
+ * 写入 manifest（2 空格缩进，末尾换行）。
+ * @deprecated 优先使用 writeProjectIdentity，它同时写指针和全局 manifest。
+ */
 export function writeManifest(dir: string, manifest: MemoryAutodbManifest): void {
   writeFileSync(manifestPath(dir), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 }

@@ -29,10 +29,28 @@ npm install
     "model": "text-embedding-3-small"
   },
   "dbType": "lancedb",
-  "dbPath": "~/.openclaw/memory/lancedb",
+  "dbPath": "~/.memory-autodb/memory/lancedb",
   "autoCapture": true,
   "autoRecall": true
 }
+```
+
+**环境变量覆盖**：
+
+- `MEMORY_AUTODB_HOME`：覆盖全局目录（默认 `~/.memory-autodb`）
+- `MEMORY_AUTODB_CONFIG`：覆盖配置文件路径
+- `MEMORY_AUTODB_ENV`：覆盖 .env 文件路径
+
+**从旧路径迁移**：
+
+如果您之前使用 `~/.openclaw/` 路径，可使用以下命令一键迁移：
+
+```bash
+# 预览迁移计划（不执行）
+ltm migrate-home
+
+# 执行迁移并备份
+ltm migrate-home --execute --backup
 ```
 
 支持 OpenAI-compatible embedding endpoint。模型维度由 [config.ts](./config.ts) 中的 `vectorDimsForModel()` 校验；更换模型前先确认数据库向量维度一致。
@@ -69,6 +87,9 @@ ltm search "用户偏好" --limit 5
 
 # 扫描 Markdown 目录到知识库
 ltm scan ./docs --category 知识库 --ignore node_modules dist
+
+# 迁移旧配置（从 ~/.openclaw 迁移到 ~/.memory-autodb）
+ltm migrate-home --execute --backup
 
 # 启动本机 REST server，默认 127.0.0.1:3847
 ltm serve

@@ -46,6 +46,7 @@ import { registerMemoryServerCliCommands } from "./adapters/openclaw/cli.js";
 import { registerProjectCliCommands } from "./adapters/openclaw/cli-project.js";
 import { registerDoctorCliCommands } from "./adapters/openclaw/cli-doctor.js";
 import { registerMcpCliCommands } from "./adapters/openclaw/cli-mcp.js";
+import { registerMigrateHomeCommand } from "./adapters/openclaw/cli-migrate-home.js";
 import { createConsoleApi } from "./console/api.js";
 import { InMemoryCandidateRepository } from "./lifecycle/candidate-repository.js";
 import { CandidateReviewService } from "./lifecycle/candidate-review.js";
@@ -433,6 +434,9 @@ const memoryPlugin = {
           service: memoryService,
           getRecordCount: () => db.count(),
         });
+
+        // v0.1.2: ltm migrate-home（全局配置目录迁移）
+        registerMigrateHomeCommand(memory);
 
         // Milestone B: ltm doctor / demo / connect（本机接入体验）
         registerDoctorCliCommands(memory, {

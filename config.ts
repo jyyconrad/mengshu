@@ -1,6 +1,5 @@
 import fs from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { resolveDefaultLanceDbPath, resolveLegacyLanceDbPath } from "./core/paths.js";
 
 /**
  * 路由规则配置
@@ -162,11 +161,11 @@ export const DEFAULT_CAPTURE_MAX_CHARS = 500;
 const DEFAULT_SERVER_HOST = "127.0.0.1";
 const DEFAULT_SERVER_PORT = 3847;
 const VALID_MODES = ["embedded", "server", "remote", "backend-proxy"] as const;
-const LEGACY_STATE_DIRS: string[] = [];
+
+let warnedLegacyDbPath = false;
 
 function resolveDefaultDbPath(): string {
-  const home = homedir();
-  const preferred = join(home, ".openclaw", "memory", "lancedb");
+  const preferred = resolveDefaultLanceDbPath();
   try {
     if (fs.existsSync(preferred)) {
       return preferred;
@@ -175,11 +174,20 @@ function resolveDefaultDbPath(): string {
     // best-effort
   }
 
-  for (const legacy of LEGACY_STATE_DIRS) {
-    const candidate = join(home, legacy, "memory", "lancedb");
+  // 兼容回退：仅当用户未显式覆盖 MEMORY_AUTODB_HOME 时，才考虑旧路径。
+  // 显式覆盖代表用户已经选择新 home，不应被旧目录截胡。
+  const explicitHome = process.env.MEMORY_AUTODB_HOME;
+  if (!explicitHome || explicitHome.trim().length === 0) {
     try {
-      if (fs.existsSync(candidate)) {
-        return candidate;
+      const legacy = resolveLegacyLanceDbPath();
+      if (fs.existsSync(legacy)) {
+        if (!warnedLegacyDbPath) {
+          warnedLegacyDbPath = true;
+          console.warn(
+            "[memory-autodb] 检测到旧路径 ~/.openclaw/memory/lancedb，建议运行 `ltm migrate-home` 迁移到 ~/.memory-autodb/",
+          );
+        }
+        return legacy;
       }
     } catch {
       // best-effort
@@ -188,8 +196,6 @@ function resolveDefaultDbPath(): string {
 
   return preferred;
 }
-
-const DEFAULT_DB_PATH = resolveDefaultDbPath();
 
 const EMBEDDING_DIMENSIONS: Record<string, number> = {
   // OpenAI 模型
@@ -522,7 +528,7 @@ export const memoryConfigSchema = {
         webConsole: features?.webConsole === true,
       },
       dbType: (cfg.dbType === "supabase" ? "supabase" : cfg.dbType === "postgres" ? "postgres" : "lancedb"),
-      dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : DEFAULT_DB_PATH,
+      dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : resolveDefaultDbPath(),
       supabase: supabase ? {
         url: resolveEnvVars(String(supabase.url)),
         serviceKey: resolveEnvVars(String(supabase.serviceKey)),
@@ -596,7 +602,7 @@ export const memoryConfigSchema = {
     },
     dbPath: {
       label: "LanceDB Path",
-      placeholder: "~/.openclaw/memory/lancedb",
+      placeholder: "~/.memory-autodb/memory/lancedb",
       advanced: true,
       help: "Path to local LanceDB database (only for lancedb type)",
     },

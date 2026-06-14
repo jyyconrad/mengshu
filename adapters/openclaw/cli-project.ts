@@ -16,7 +16,7 @@
  * - 所有命令对缺失 manifest / 缺失 service 做友好提示，不抛未捕获异常。
  */
 
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import type { CommanderLike } from "./cli.js";
 import type { MemoryService } from "../../core/service-types.js";
 import type { MemoryVisibility } from "../../core/types.js";
@@ -28,10 +28,12 @@ import {
   createManifest,
   manifestPath,
   manifestToScope,
-  readManifest,
-  writeManifest,
+  readProjectManifest,
+  writeProjectIdentity,
   type MemoryAutodbManifest,
 } from "./manifest.js";
+import { readRegistry, writeRegistry, upsertProject, touchProjectOpenedAt } from "../../core/registry.js";
+import { resolveProjectManifestPath, type HomePathOptions } from "../../core/paths.js";
 
 /** project 命令依赖注入。service/getRecordCount 缺省时相关命令降级。 */
 export interface ProjectCliDeps {
@@ -41,6 +43,8 @@ export interface ProjectCliDeps {
   getRecordCount?: () => Promise<number>;
   /** 当前工作目录提供者，便于测试注入。 */
   cwd?: () => string;
+  /** 全局 home 路径选项，便于测试注入。 */
+  homePathOptions?: HomePathOptions;
 }
 
 interface InitOptions {
@@ -86,10 +90,18 @@ function printReusePolicy(manifest: MemoryAutodbManifest): void {
 
 function handleInit(positional: unknown, options: InitOptions, deps: ProjectCliDeps): void {
   const dir = resolveDir(positional, options, deps);
-  const existing = readManifest(dir);
+  const existing = readProjectManifest(dir, deps.homePathOptions);
   if (existing && !options.force) {
     console.log(`manifest 已存在（${manifestPath(dir)}），保留原 identity。使用 --force 覆盖。`);
     printIdentity(existing);
+    // 更新 registry 的 lastOpenedAt
+    try {
+      const registry = readRegistry(deps.homePathOptions);
+      const updated = touchProjectOpenedAt(registry, existing.projectId);
+      writeRegistry(updated, deps.homePathOptions);
+    } catch (error) {
+      // registry 更新失败不影响主流程，静默忽略
+    }
     return;
   }
 
@@ -100,14 +112,30 @@ function handleInit(positional: unknown, options: InitOptions, deps: ProjectCliD
     userId: options.userId,
     defaultVisibility: options.visibility,
   });
-  writeManifest(dir, manifest);
+  writeProjectIdentity(dir, manifest, deps.homePathOptions);
   console.log(`已创建 ${MANIFEST_FILENAME}（${manifestPath(dir)}）`);
   printIdentity(manifest);
+
+  // 注册到全局 registry
+  try {
+    const registry = readRegistry(deps.homePathOptions);
+    const updated = upsertProject(registry, manifest.projectId, {
+      workspaceId: manifest.workspaceId,
+      manifestPath: resolveProjectManifestPath(manifest.projectId, deps.homePathOptions),
+      lastSeenRoot: dir,
+      lastOpenedAt: Date.now(),
+      displayName: basename(dir),
+    });
+    writeRegistry(updated, deps.homePathOptions);
+    console.log(`已注册到全局 registry（projects/${manifest.projectId}）`);
+  } catch (error) {
+    console.log(`警告：registry 注册失败（${(error as Error).message}），不影响 manifest 创建。`);
+  }
 }
 
 async function handleStatus(positional: unknown, options: DirOptions, deps: ProjectCliDeps): Promise<void> {
   const dir = resolveDir(positional, options, deps);
-  const manifest = readManifest(dir);
+  const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
     console.log(`未找到 ${MANIFEST_FILENAME}，请先运行 \`ltm init\`。`);
     return;
@@ -134,7 +162,7 @@ async function handleContext(
   deps: ProjectCliDeps,
 ): Promise<void> {
   const dir = resolveDir(positional, options, deps);
-  const manifest = readManifest(dir);
+  const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
     console.log(`未找到 ${MANIFEST_FILENAME}，请先运行 \`ltm init\`。`);
     return;
@@ -170,7 +198,7 @@ async function handleContext(
 
 async function handleLookup(query: unknown, options: DirOptions, deps: ProjectCliDeps): Promise<void> {
   const dir = resolveDir(undefined, options, deps);
-  const manifest = readManifest(dir);
+  const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
     console.log(`未找到 ${MANIFEST_FILENAME}，请先运行 \`ltm init\`。`);
     return;

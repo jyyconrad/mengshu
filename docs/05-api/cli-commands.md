@@ -15,6 +15,8 @@
 | `ltm scan <directory>` | 扫描 Markdown 目录并进入 ingestion pipeline |
 | `ltm cleanup` | 按数据类型、时间或分类清理数据 |
 | `ltm kb:list` | 列出 `knowledge*` 知识库表 |
+| `ltm init` | 初始化项目指针和全局 manifest（v0.1.2+） |
+| `ltm migrate-home` | 迁移 `~/.openclaw/` 到 `~/.memory-autodb/`（v0.1.2+） |
 | `ltm serve` | 启动本机 REST server 和 `/console` |
 | `ltm mcp` | 启动 stdio MCP server，供 Claude Desktop / Cursor 等客户端接入 |
 | `ltm status` | 输出中间件状态 |
@@ -141,6 +143,66 @@ ltm kb:list
 ```
 
 列出所有表名以 `knowledge` 开头的知识库表。该命令依赖 provider 的 `getTableStats()`。
+
+## `ltm init`
+
+```bash
+ltm init [directory]
+ltm init --force
+```
+
+**用途**：初始化项目记忆工作区（v0.1.2+）。
+
+**行为**：
+1. 生成或复用 `projectId/workspaceId`
+2. 写入项目指针 `.memory-autodb.json`（version: "0.2"）
+3. 创建全局项目目录 `~/.memory-autodb/projects/<projectId>/`
+4. 写入完整 `manifest.json`
+5. 自动注册到 `~/.memory-autodb/registry.json`
+
+**选项**：
+- `[directory]`：目标项目目录（默认当前目录）
+- `--force`：强制覆盖已存在的指针文件
+
+**幂等性**：重复 `init` 会更新 registry 的 `lastOpenedAt`，不会修改已存在的 `projectId`。
+
+## `ltm migrate-home`
+
+**用途**：将 `~/.openclaw/` 迁移到 `~/.memory-autodb/`（v0.1.2+）。
+
+**用法**：
+```bash
+ltm migrate-home [options]
+```
+
+**选项**：
+- `--execute`：执行迁移（默认 dry-run）
+- `--backup`：迁移前备份旧目录
+- `--force`：覆盖已存在的目标文件
+
+**迁移清单**：
+1. `~/.openclaw/.env` → `~/.memory-autodb/.env`
+2. `~/.openclaw/memory-autodb-mcp.json` → `~/.memory-autodb/config.json`
+3. `~/.openclaw/memory/` → `~/.memory-autodb/memory/`（递归复制）
+4. `~/.openclaw/conf/plugins.json` 中的内联配置 → 提示手工迁移
+
+**示例**：
+```bash
+# 预览迁移计划（不执行）
+ltm migrate-home
+
+# 执行迁移并备份
+ltm migrate-home --execute --backup
+
+# 执行迁移并强制覆盖冲突文件
+ltm migrate-home --execute --force
+```
+
+**注意**：
+- 默认为 dry-run 模式，需显式 `--execute` 才会修改文件。
+- 迁移后旧 `~/.openclaw/` 仍会保留，可手动删除。
+- 如果检测到项目指针 `.memory-autodb.json`，会提示重新运行 `ltm init` 更新 registry。
+- 迁移后请更新客户端配置（Codex/Claude Desktop/OpenClaw）指向新路径。
 
 ## `ltm serve`
 

@@ -8,29 +8,44 @@
  * 4. manifestToScope 映射正确（appId/tenantId 固定，visibility/workspace/project 来自 manifest）。
  * 5. 目录移动 identity 不变（manifest 内记录的 id 随指针文件保留，readManifest 不重算）。
  *
+ * v0.1.2 新增：
+ * 6. createPointer 由 manifest 派生轻量指针，manifestPath 正确。
+ * 7. writeProjectIdentity 同时写项目指针和全局 manifest，内容一致。
+ * 8. readPointerOrLegacyManifest 区分 0.1（legacy）和 0.2（pointer）格式。
+ * 9. readProjectManifest 在 pointer 场景读全局 manifest，legacy 场景直接返回。
+ * 10. pointer 指向不存在的全局 manifest 时抛错。
+ *
  * 使用 os.tmpdir 下的临时目录，测试后清理，保持纯单元风格。
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   MANIFEST_FILENAME,
+  MANIFEST_POINTER_VERSION,
   createManifest,
+  createPointer,
   readManifest,
   writeManifest,
   manifestToScope,
+  readPointerOrLegacyManifest,
+  writeProjectIdentity,
+  readProjectManifest,
 } from "./manifest.js";
 
 let workDir: string;
+let testHome: string;
 
 beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "memory-autodb-manifest-"));
+  testHome = mkdtempSync(join(tmpdir(), "memory-autodb-home-"));
 });
 
 afterEach(() => {
   rmSync(workDir, { recursive: true, force: true });
+  rmSync(testHome, { recursive: true, force: true });
 });
 
 describe("createManifest", () => {
@@ -154,5 +169,130 @@ describe("目录移动 identity 不变", () => {
     } finally {
       rmSync(movedDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("createPointer（v0.1.2）", () => {
+  test("由 manifest 派生轻量指针，manifestPath 正确", () => {
+    const manifest = createManifest({ dir: workDir, projectId: "proj-test" });
+    const pointer = createPointer(manifest, { homeDir: testHome });
+
+    expect(pointer.version).toBe(MANIFEST_POINTER_VERSION);
+    expect(pointer.workspaceId).toBe(manifest.workspaceId);
+    expect(pointer.projectId).toBe(manifest.projectId);
+    expect(pointer.createdAt).toBe(manifest.createdAt);
+    expect(pointer.manifestPath).toContain("proj-test");
+    expect(pointer.manifestPath).toContain("manifest.json");
+  });
+});
+
+describe("writeProjectIdentity（v0.1.2）", () => {
+  test("同时写项目指针和全局 manifest，内容一致", () => {
+    const manifest = createManifest({ dir: workDir, projectId: "proj-xyz", userId: "user-1" });
+    writeProjectIdentity(workDir, manifest, { homeDir: testHome });
+
+    // 检查项目指针
+    const pointerPath = join(workDir, MANIFEST_FILENAME);
+    expect(existsSync(pointerPath)).toBe(true);
+    const pointerContent = JSON.parse(readFileSync(pointerPath, "utf8"));
+    expect(pointerContent.version).toBe(MANIFEST_POINTER_VERSION);
+    expect(pointerContent.projectId).toBe("proj-xyz");
+
+    // 检查全局 manifest
+    const globalPath = join(testHome, "projects", "proj-xyz", "manifest.json");
+    expect(existsSync(globalPath)).toBe(true);
+    const globalContent = JSON.parse(readFileSync(globalPath, "utf8"));
+    expect(globalContent.version).toBe("0.1");
+    expect(globalContent.projectId).toBe("proj-xyz");
+    expect(globalContent.userId).toBe("user-1");
+    expect(globalContent.slotReusePolicy).toBeDefined();
+  });
+
+  test("全局目录不存在时自动创建", () => {
+    const manifest = createManifest({ dir: workDir, projectId: "proj-auto" });
+    const nonExistentHome = join(testHome, "nested", "path");
+
+    writeProjectIdentity(workDir, manifest, { homeDir: nonExistentHome });
+
+    const globalPath = join(nonExistentHome, "projects", "proj-auto", "manifest.json");
+    expect(existsSync(globalPath)).toBe(true);
+  });
+});
+
+describe("readPointerOrLegacyManifest（v0.1.2）", () => {
+  test("识别 0.2 指针格式", () => {
+    const pointer = {
+      version: "0.2",
+      workspaceId: "ws-test",
+      projectId: "proj-test",
+      manifestPath: "/fake/path/manifest.json",
+      createdAt: Date.now(),
+    };
+    writeFileSync(join(workDir, MANIFEST_FILENAME), JSON.stringify(pointer, null, 2), "utf8");
+
+    const result = readPointerOrLegacyManifest(workDir);
+    expect(result).not.toBeNull();
+    expect(result?.kind).toBe("pointer");
+    if (result?.kind === "pointer") {
+      expect(result.pointer.projectId).toBe("proj-test");
+    }
+  });
+
+  test("识别 0.1 legacy 完整 manifest", () => {
+    const manifest = createManifest({ dir: workDir, projectId: "proj-legacy" });
+    writeManifest(workDir, manifest);
+
+    const result = readPointerOrLegacyManifest(workDir);
+    expect(result).not.toBeNull();
+    expect(result?.kind).toBe("legacy");
+    if (result?.kind === "legacy") {
+      expect(result.manifest.projectId).toBe("proj-legacy");
+      expect(result.manifest.slotReusePolicy).toBeDefined();
+    }
+  });
+
+  test("文件不存在返回 null", () => {
+    expect(readPointerOrLegacyManifest(workDir)).toBeNull();
+  });
+});
+
+describe("readProjectManifest（v0.1.2）", () => {
+  test("pointer 场景：读取全局 manifest", () => {
+    const manifest = createManifest({ dir: workDir, projectId: "proj-ptr", userId: "user-x" });
+    writeProjectIdentity(workDir, manifest, { homeDir: testHome });
+
+    const loaded = readProjectManifest(workDir, { homeDir: testHome });
+    expect(loaded).not.toBeNull();
+    expect(loaded?.projectId).toBe("proj-ptr");
+    expect(loaded?.userId).toBe("user-x");
+    expect(loaded?.slotReusePolicy).toBeDefined();
+  });
+
+  test("legacy 场景：直接返回项目目录的完整 manifest", () => {
+    const manifest = createManifest({ dir: workDir, projectId: "proj-old" });
+    writeManifest(workDir, manifest);
+
+    const loaded = readProjectManifest(workDir, { homeDir: testHome });
+    expect(loaded).not.toBeNull();
+    expect(loaded?.projectId).toBe("proj-old");
+    expect(loaded?.slotReusePolicy).toBeDefined();
+  });
+
+  test("pointer 指向不存在的全局 manifest 时抛错", () => {
+    const pointer = {
+      version: "0.2",
+      workspaceId: "ws-broken",
+      projectId: "proj-broken",
+      manifestPath: join(testHome, "projects", "proj-broken", "manifest.json"),
+      createdAt: Date.now(),
+    };
+    writeFileSync(join(workDir, MANIFEST_FILENAME), JSON.stringify(pointer, null, 2), "utf8");
+
+    expect(() => readProjectManifest(workDir, { homeDir: testHome })).toThrow(/不存在/);
+    expect(() => readProjectManifest(workDir, { homeDir: testHome })).toThrow(/proj-broken/);
+  });
+
+  test("文件不存在返回 null", () => {
+    expect(readProjectManifest(workDir, { homeDir: testHome })).toBeNull();
   });
 });
