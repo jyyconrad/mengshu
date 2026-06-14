@@ -68,6 +68,8 @@ let originalLog: typeof console.log;
 beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "mengshu-cli-"));
   testHome = mkdtempSync(join(tmpdir(), "mengshu-home-"));
+  // 写入最小 config.json 避免触发交互式向导
+  writeFileSync(join(testHome, "config.json"), JSON.stringify({ embedding: { apiKey: "test", baseURL: "http://localhost" } }));
   logs = [];
   originalLog = console.log;
   console.log = (message?: unknown) => {

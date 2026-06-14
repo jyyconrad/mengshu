@@ -34,6 +34,7 @@ import {
 } from "./manifest.js";
 import { readRegistry, writeRegistry, upsertProject, touchProjectOpenedAt } from "../../core/registry.js";
 import { resolveProjectManifestPath, type HomePathOptions } from "../../core/paths.js";
+import { isGlobalConfigReady, runInteractiveSetup } from "./cli-setup.js";
 
 /** project 命令依赖注入。service/getRecordCount 缺省时相关命令降级。 */
 export interface ProjectCliDeps {
@@ -88,7 +89,14 @@ function printReusePolicy(manifest: MemoryAutodbManifest): void {
   }
 }
 
-function handleInit(positional: unknown, options: InitOptions, deps: ProjectCliDeps): void {
+async function handleInit(positional: unknown, options: InitOptions, deps: ProjectCliDeps): Promise<void> {
+  // 首次使用时引导全局配置
+  if (!isGlobalConfigReady(deps.homePathOptions)) {
+    console.log("首次使用梦枢，需要先完成全局配置。\n");
+    await runInteractiveSetup();
+    console.log("");
+  }
+
   const dir = resolveDir(positional, options, deps);
   const existing = readProjectManifest(dir, deps.homePathOptions);
   if (existing && !options.force) {
@@ -238,9 +246,16 @@ export function registerProjectCliCommands(memory: CommanderLike, deps: ProjectC
     .option("--user-id <id>", "User id for scope")
     .option("--visibility <level>", "Default visibility: private | workspace | team | public")
     .option("--force", "Overwrite existing manifest", false)
-    .action((...args: unknown[]) => {
+    .action(async (...args: unknown[]) => {
       const [dir, opts] = args;
-      handleInit(dir, normalizeInitOptions(asRecord(opts)), deps);
+      await handleInit(dir, normalizeInitOptions(asRecord(opts)), deps);
+    });
+
+  memory
+    .command("setup")
+    .description("Interactive setup wizard for global mengshu configuration")
+    .action(async () => {
+      await runInteractiveSetup();
     });
 
   const project = memory.command("project").description("Project memory workspace commands");
