@@ -1,33 +1,75 @@
 /**
  * mengshu 交互式初始化向导。
  *
- * 本文件做什么：提供 `ms init` 的交互式引导流程，逐步收集用户配置并写入
- * `~/.mengshu/config.json` 和项目 `.mengshu.json`。
+ * 本文件做什么：提供 `ms init` / `ms setup` 的交互式引导流程，逐步收集用户配置
+ * 并写入 `~/.mengshu/config.json` 和 `~/.mengshu/.env`。
  *
  * 核心流程：
- * 1. 检测全局配置是否已存在（~/.mengshu/config.json）
- * 2. 若不存在，引导用户完成 embedding 配置（API provider / key / model）
- * 3. 可选配置 LLM、存储类型
- * 4. 写入全局配置
- * 5. 初始化项目工作空间（.mengshu.json）
+ * 1. 检测全局配置是否已存在
+ * 2. 引导用户完成 Embedding 配置（服务商 / key / model）
+ * 3. 引导用户完成 LLM 配置（必选，记忆树构建依赖 LLM 生成实体和关系三元组）
+ * 4. 配置存储类型
+ * 5. 写入配置文件
  *
  * 关键边界：
  * - 使用 Node.js 内置 readline，不引入额外依赖
- * - 敏感信息（API key）建议写入 .env 而非 config.json 明文
- * - 已有配置时默认跳过全局设置，只做项目初始化
+ * - 敏感信息（API key）写入 .env 而非 config.json 明文
+ * - 已有配置时默认跳过，可通过 ms setup 重新配置
  */
 
 import fs from "node:fs";
-import path from "node:path";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
-import { resolveHomeDir, resolveConfigPath, resolveEnvPath, expandHome } from "../../core/paths.js";
+import { resolveHomeDir, resolveConfigPath, resolveEnvPath } from "../../core/paths.js";
 
-// Embedding provider 预设
-const EMBEDDING_PROVIDERS: ReadonlyArray<{ name: string; baseURL: string; models: string[]; envKey: string }> = [
-  { name: "OpenAI", baseURL: "https://api.openai.com/v1", models: ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"], envKey: "OPENAI_API_KEY" },
-  { name: "Azure OpenAI", baseURL: "https://{resource}.openai.azure.com/openai/deployments/{deployment}", models: ["text-embedding-3-small", "text-embedding-3-large"], envKey: "AZURE_OPENAI_API_KEY" },
-  { name: "Ollama (本地)", baseURL: "http://localhost:11434/v1", models: ["nomic-embed-text", "mxbai-embed-large", "all-minilm"], envKey: "" },
-  { name: "自定义 (OpenAI-compatible)", baseURL: "", models: [], envKey: "" },
+// ─── Provider 预设 ──────────────────────────────────────────────────────────
+
+interface ProviderPreset {
+  name: string;
+  baseURL: string;
+  models: string[];
+  envKey: string;
+  needsKey: boolean;
+}
+
+const EMBEDDING_PROVIDERS: ReadonlyArray<ProviderPreset> = [
+  // 国际
+  { name: "OpenAI", baseURL: "https://api.openai.com/v1", models: ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"], envKey: "OPENAI_API_KEY", needsKey: true },
+  { name: "Azure OpenAI", baseURL: "https://{resource}.openai.azure.com/openai/deployments/{deployment}", models: ["text-embedding-3-small", "text-embedding-3-large"], envKey: "AZURE_OPENAI_API_KEY", needsKey: true },
+  // 国产
+  { name: "智谱 AI (Zhipu)", baseURL: "https://open.bigmodel.cn/api/paas/v4", models: ["embedding-3", "embedding-2"], envKey: "ZHIPU_API_KEY", needsKey: true },
+  { name: "通义千问 (DashScope)", baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["text-embedding-v3", "text-embedding-v2", "text-embedding-v1"], envKey: "DASHSCOPE_API_KEY", needsKey: true },
+  { name: "百川 AI (Baichuan)", baseURL: "https://api.baichuan-ai.com/v1", models: ["Baichuan-Text-Embedding"], envKey: "BAICHUAN_API_KEY", needsKey: true },
+  { name: "月之暗面 (Moonshot)", baseURL: "https://api.moonshot.cn/v1", models: ["moonshot-v1-embedding"], envKey: "MOONSHOT_API_KEY", needsKey: true },
+  { name: "深度求索 (DeepSeek)", baseURL: "https://api.deepseek.com/v1", models: ["deepseek-embedding"], envKey: "DEEPSEEK_API_KEY", needsKey: true },
+  { name: "零一万物 (Yi)", baseURL: "https://api.lingyiwanwu.com/v1", models: ["yi-embedding"], envKey: "YI_API_KEY", needsKey: true },
+  { name: "硅基流动 (SiliconFlow)", baseURL: "https://api.siliconflow.cn/v1", models: ["BAAI/bge-m3", "BAAI/bge-large-zh-v1.5", "Pro/BAAI/bge-m3"], envKey: "SILICONFLOW_API_KEY", needsKey: true },
+  { name: "火山引擎 (Volcengine/豆包)", baseURL: "https://ark.cn-beijing.volces.com/api/v3", models: ["doubao-embedding", "doubao-embedding-large"], envKey: "VOLCENGINE_API_KEY", needsKey: true },
+  // 本地
+  { name: "Ollama (本地)", baseURL: "http://localhost:11434/v1", models: ["nomic-embed-text", "mxbai-embed-large", "bge-m3", "all-minilm"], envKey: "", needsKey: false },
+  // 自定义
+  { name: "自定义 (OpenAI-compatible)", baseURL: "", models: [], envKey: "", needsKey: true },
+];
+
+const LLM_PROVIDERS: ReadonlyArray<ProviderPreset> = [
+  // 国际
+  { name: "OpenAI", baseURL: "https://api.openai.com/v1", models: ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"], envKey: "OPENAI_API_KEY", needsKey: true },
+  { name: "Anthropic (Claude)", baseURL: "https://api.anthropic.com/v1", models: ["claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-8"], envKey: "ANTHROPIC_API_KEY", needsKey: true },
+  { name: "Azure OpenAI", baseURL: "https://{resource}.openai.azure.com/openai/deployments/{deployment}", models: ["gpt-4o-mini", "gpt-4o"], envKey: "AZURE_OPENAI_API_KEY", needsKey: true },
+  // 国产
+  { name: "智谱 AI (Zhipu)", baseURL: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-4-flash", "glm-4", "glm-4-plus", "glm-4-long"], envKey: "ZHIPU_API_KEY", needsKey: true },
+  { name: "通义千问 (DashScope)", baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-turbo", "qwen-plus", "qwen-max", "qwen-long"], envKey: "DASHSCOPE_API_KEY", needsKey: true },
+  { name: "百川 AI (Baichuan)", baseURL: "https://api.baichuan-ai.com/v1", models: ["Baichuan4", "Baichuan3-Turbo", "Baichuan3-Turbo-128k"], envKey: "BAICHUAN_API_KEY", needsKey: true },
+  { name: "月之暗面 (Moonshot)", baseURL: "https://api.moonshot.cn/v1", models: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"], envKey: "MOONSHOT_API_KEY", needsKey: true },
+  { name: "深度求索 (DeepSeek)", baseURL: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"], envKey: "DEEPSEEK_API_KEY", needsKey: true },
+  { name: "零一万物 (Yi)", baseURL: "https://api.lingyiwanwu.com/v1", models: ["yi-lightning", "yi-large", "yi-large-turbo"], envKey: "YI_API_KEY", needsKey: true },
+  { name: "硅基流动 (SiliconFlow)", baseURL: "https://api.siliconflow.cn/v1", models: ["deepseek-ai/DeepSeek-V3", "Qwen/Qwen2.5-72B-Instruct", "Pro/deepseek-ai/DeepSeek-V3"], envKey: "SILICONFLOW_API_KEY", needsKey: true },
+  { name: "火山引擎 (Volcengine/豆包)", baseURL: "https://ark.cn-beijing.volces.com/api/v3", models: ["doubao-pro-32k", "doubao-pro-128k", "doubao-lite-32k"], envKey: "VOLCENGINE_API_KEY", needsKey: true },
+  { name: "讯飞星火 (SparkDesk)", baseURL: "https://spark-api-open.xf-yun.com/v1", models: ["generalv3.5", "4.0Ultra", "generalv3"], envKey: "SPARK_API_KEY", needsKey: true },
+  { name: "MiniMax", baseURL: "https://api.minimax.chat/v1", models: ["abab6.5s-chat", "abab6.5-chat", "abab5.5-chat"], envKey: "MINIMAX_API_KEY", needsKey: true },
+  // 本地
+  { name: "Ollama (本地)", baseURL: "http://localhost:11434/v1", models: ["qwen2.5:7b", "llama3.1:8b", "deepseek-r1:8b", "gemma2:9b"], envKey: "", needsKey: false },
+  // 自定义
+  { name: "自定义 (OpenAI-compatible)", baseURL: "", models: [], envKey: "", needsKey: true },
 ];
 
 const DB_TYPES = [
@@ -35,6 +77,8 @@ const DB_TYPES = [
   { name: "PostgreSQL (pgvector)", value: "postgres" },
   { name: "Supabase (云端)", value: "supabase" },
 ] as const;
+
+// ─── 交互工具函数 ────────────────────────────────────────────────────────────
 
 interface SetupResult {
   configWritten: boolean;
@@ -73,7 +117,6 @@ async function askChoice(rl: ReadlineInterface, question: string, options: Reado
   if (index >= 0 && index < options.length) {
     return index;
   }
-  // 默认选第一个
   return 0;
 }
 
@@ -90,53 +133,64 @@ function ensureDir(dirPath: string): void {
   }
 }
 
-async function setupEmbedding(rl: ReadlineInterface): Promise<{ apiKey: string; baseURL: string; model: string; envKey: string }> {
-  console.log("\n── Embedding 配置 ──────────────────────────────────");
-  console.log("梦枢需要一个 embedding 服务来进行记忆的向量化存储和检索。\n");
+async function selectModel(rl: ReadlineInterface, models: string[]): Promise<string> {
+  if (models.length === 0) {
+    return await ask(rl, "请输入模型名: ");
+  }
+  console.log("\n可用模型：");
+  for (let i = 0; i < models.length; i++) {
+    console.log(`  ${i + 1}. ${models[i]}${i === 0 ? " (推荐)" : ""}`);
+  }
+  const answer = await ask(rl, `选择模型 [1-${models.length}] 或输入自定义模型名: `);
+  const index = parseInt(answer, 10) - 1;
+  if (index >= 0 && index < models.length) {
+    return models[index]!;
+  }
+  return answer || models[0]!;
+}
 
-  const providerIndex = await askChoice(rl, "选择 Embedding 服务商：", EMBEDDING_PROVIDERS);
-  const provider = EMBEDDING_PROVIDERS[providerIndex];
+// ─── 各阶段配置 ─────────────────────────────────────────────────────────────
+
+interface ProviderSetupResult {
+  apiKey: string;
+  baseURL: string;
+  model: string;
+  envKey: string;
+}
+
+async function setupProvider(
+  rl: ReadlineInterface,
+  title: string,
+  description: string,
+  providers: ReadonlyArray<ProviderPreset>,
+  defaultEnvKey: string,
+): Promise<ProviderSetupResult> {
+  console.log(`\n── ${title} ──────────────────────────────────────────`);
+  console.log(`${description}\n`);
+
+  const providerIndex = await askChoice(rl, `选择${title}服务商：`, providers);
+  const provider = providers[providerIndex]!;
 
   let baseURL = provider.baseURL;
-  if (providerIndex === 3 || !baseURL) {
-    // 自定义 provider
+  const isCustom = providerIndex === providers.length - 1;
+
+  if (isCustom || !baseURL) {
     baseURL = await ask(rl, "请输入 API Base URL: ");
     if (!baseURL) {
       throw new Error("Base URL 不能为空");
     }
   } else if (baseURL.includes("{resource}")) {
-    // Azure 需要填写资源名
     const resource = await ask(rl, "Azure 资源名 (resource name): ");
     const deployment = await ask(rl, "Azure 部署名 (deployment name): ");
     baseURL = baseURL.replace("{resource}", resource).replace("{deployment}", deployment);
   }
 
-  // 选择 model
-  let model: string;
-  if (provider.models.length > 0) {
-    console.log("\n可用模型：");
-    for (let i = 0; i < provider.models.length; i++) {
-      console.log(`  ${i + 1}. ${provider.models[i]}${i === 0 ? " (推荐)" : ""}`);
-    }
-    const modelAnswer = await ask(rl, `选择模型 [1-${provider.models.length}] 或输入自定义模型名: `);
-    const modelIndex = parseInt(modelAnswer, 10) - 1;
-    if (modelIndex >= 0 && modelIndex < provider.models.length) {
-      model = provider.models[modelIndex]!;
-    } else if (modelAnswer) {
-      model = modelAnswer;
-    } else {
-      model = provider.models[0]!;
-    }
-  } else {
-    model = await askWithDefault(rl, "Embedding 模型名", "text-embedding-3-small");
-  }
+  const model = await selectModel(rl, provider.models);
 
-  // API Key
   let apiKey = "";
-  if (providerIndex === 2) {
-    // Ollama 不需要 key
-    apiKey = "ollama";
-    console.log("\nOllama 本地模式，无需 API Key。");
+  if (!provider.needsKey) {
+    apiKey = "local";
+    console.log("\n本地模式，无需 API Key。");
   } else {
     console.log("\nAPI Key 将存储在 ~/.mengshu/.env 文件中（不明文写入 config.json）。");
     apiKey = await ask(rl, "请输入 API Key: ");
@@ -145,15 +199,14 @@ async function setupEmbedding(rl: ReadlineInterface): Promise<{ apiKey: string; 
     }
   }
 
-  const envKey = provider.envKey || "MENGSHU_EMBEDDING_API_KEY";
-
+  const envKey = provider.envKey || defaultEnvKey;
   return { apiKey, baseURL, model, envKey };
 }
 
 async function setupDatabase(rl: ReadlineInterface): Promise<{ dbType: string; dbPath?: string }> {
   console.log("\n── 存储配置 ────────────────────────────────────────");
 
-  const dbIndex = await askChoice(rl, "选择存储方式：", DB_TYPES);
+  const dbIndex = await askChoice(rl, "选择向量存储方式：", DB_TYPES);
   const dbType = DB_TYPES[dbIndex].value;
 
   if (dbType === "lancedb") {
@@ -164,24 +217,7 @@ async function setupDatabase(rl: ReadlineInterface): Promise<{ dbType: string; d
   return { dbType };
 }
 
-async function setupLLM(rl: ReadlineInterface): Promise<{ apiKey: string; model: string; baseURL?: string; envKey: string } | null> {
-  console.log("\n── LLM 配置（可选）────────────────────────────────");
-  console.log("LLM 用于记忆分类、自动摘要等高级功能。不配置也能正常使用基础功能。\n");
-
-  const wantLLM = await askYesNo(rl, "是否配置 LLM？", false);
-  if (!wantLLM) return null;
-
-  const baseURL = await askWithDefault(rl, "LLM API Base URL", "https://api.openai.com/v1");
-  const model = await askWithDefault(rl, "LLM 模型名", "gpt-4o-mini");
-  const apiKey = await ask(rl, "LLM API Key (留空则复用 embedding key): ");
-
-  return {
-    apiKey: apiKey || "",
-    model,
-    baseURL,
-    envKey: "MENGSHU_LLM_API_KEY",
-  };
-}
+// ─── 主流程 ─────────────────────────────────────────────────────────────────
 
 export async function runInteractiveSetup(): Promise<SetupResult> {
   const homeDir = resolveHomeDir();
@@ -194,7 +230,6 @@ export async function runInteractiveSetup(): Promise<SetupResult> {
   console.log("╚══════════════════════════════════════════════════════╝");
   console.log(`\n配置目录: ${homeDir}`);
 
-  // 检查是否已有配置
   if (fs.existsSync(configPath)) {
     console.log(`\n检测到已有配置: ${configPath}`);
     const rl = createReadline();
@@ -210,25 +245,45 @@ export async function runInteractiveSetup(): Promise<SetupResult> {
   const rl = createReadline();
 
   try {
-    // 1. Embedding 配置
-    const embedding = await setupEmbedding(rl);
+    // 1. Embedding
+    const embedding = await setupProvider(
+      rl,
+      "Embedding 配置",
+      "梦枢需要一个 embedding 服务来进行记忆的向量化存储和检索。",
+      EMBEDDING_PROVIDERS,
+      "MENGSHU_EMBEDDING_API_KEY",
+    );
 
-    // 2. 存储配置
+    // 2. LLM（必选）
+    console.log("\n提示：LLM 是必需的，梦枢使用 LLM 来构建记忆树（生成实体、关系三元组）。");
+    const llmSameAsEmbedding = embedding.envKey && embedding.baseURL.includes("openai")
+      ? await askYesNo(rl, "LLM 是否使用与 Embedding 相同的服务商？", false)
+      : false;
+
+    let llm: ProviderSetupResult;
+    if (llmSameAsEmbedding) {
+      const model = await selectModel(rl, ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"]);
+      llm = { apiKey: embedding.apiKey, baseURL: embedding.baseURL, model, envKey: embedding.envKey };
+    } else {
+      llm = await setupProvider(
+        rl,
+        "LLM 配置",
+        "LLM 用于记忆树构建（实体抽取、关系推理、三元组生成）和记忆分类。",
+        LLM_PROVIDERS,
+        "MENGSHU_LLM_API_KEY",
+      );
+    }
+
+    // 3. 存储
     const database = await setupDatabase(rl);
 
-    // 3. LLM 配置（可选）
-    const llm = await setupLLM(rl);
-
-    // 4. 确认
+    // 4. 预览确认
     console.log("\n── 配置预览 ────────────────────────────────────────");
-    console.log(`  Embedding: ${embedding.baseURL}`);
-    console.log(`  Model:     ${embedding.model}`);
-    console.log(`  Storage:   ${database.dbType}${database.dbPath ? ` (${database.dbPath})` : ""}`);
-    if (llm) {
-      console.log(`  LLM:       ${llm.model} @ ${llm.baseURL}`);
-    }
-    console.log(`  Config:    ${configPath}`);
-    console.log(`  Env:       ${envPath}`);
+    console.log(`  Embedding:  ${embedding.model} @ ${embedding.baseURL}`);
+    console.log(`  LLM:        ${llm.model} @ ${llm.baseURL}`);
+    console.log(`  Storage:    ${database.dbType}${database.dbPath ? ` (${database.dbPath})` : ""}`);
+    console.log(`  Config:     ${configPath}`);
+    console.log(`  Env:        ${envPath}`);
 
     const confirm = await askYesNo(rl, "\n确认写入？", true);
     if (!confirm) {
@@ -236,38 +291,41 @@ export async function runInteractiveSetup(): Promise<SetupResult> {
       return { configWritten: false, envWritten: false, configPath, envPath };
     }
 
-    // 5. 写入配置
+    // 5. 写入
     ensureDir(homeDir);
 
-    // 构建 config.json（API key 用环境变量引用）
+    // config.json（key 用环境变量引用）
     const config: Record<string, unknown> = {
       embedding: {
         apiKey: `\${${embedding.envKey}}`,
         baseURL: embedding.baseURL,
         model: embedding.model,
       },
+      llm: {
+        apiKey: llm.envKey === embedding.envKey ? `\${${embedding.envKey}}` : `\${${llm.envKey}}`,
+        baseURL: llm.baseURL,
+        model: llm.model,
+      },
       dbType: database.dbType,
     };
     if (database.dbPath) {
       config.dbPath = database.dbPath;
     }
-    if (llm) {
-      config.llm = {
-        apiKey: llm.apiKey ? `\${${llm.envKey}}` : `\${${embedding.envKey}}`,
-        model: llm.model,
-        baseURL: llm.baseURL,
-      };
-    }
 
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
 
-    // 构建 .env
-    const envLines: string[] = [
-      "# Mengshu environment variables",
-      `${embedding.envKey}=${embedding.apiKey}`,
-    ];
-    if (llm?.apiKey) {
-      envLines.push(`${llm.envKey}=${llm.apiKey}`);
+    // .env
+    const envEntries = new Map<string, string>();
+    if (embedding.apiKey && embedding.apiKey !== "local") {
+      envEntries.set(embedding.envKey, embedding.apiKey);
+    }
+    if (llm.apiKey && llm.apiKey !== "local" && llm.envKey !== embedding.envKey) {
+      envEntries.set(llm.envKey, llm.apiKey);
+    }
+
+    const envLines: string[] = ["# Mengshu environment variables"];
+    for (const [key, value] of envEntries) {
+      envLines.push(`${key}=${value}`);
     }
     fs.writeFileSync(envPath, envLines.join("\n") + "\n", "utf8");
 
@@ -276,7 +334,7 @@ export async function runInteractiveSetup(): Promise<SetupResult> {
     console.log(`  ${envPath}`);
     console.log("\n下一步：");
     console.log("  1. 在项目目录运行 `ms init` 初始化项目工作空间");
-    console.log("  2. 运行 `ms doctor` 验证配置是否正确");
+    console.log("  2. 运行 `ms doctor` 验证连接是否正常");
     console.log("  3. 运行 `ms search \"test\"` 测试搜索功能");
 
     return { configWritten: true, envWritten: true, configPath, envPath };
@@ -286,8 +344,8 @@ export async function runInteractiveSetup(): Promise<SetupResult> {
 }
 
 /**
- * 检查全局配置是否就绪，未就绪时引导用户完成设置。
- * 返回 true 表示配置已就绪（已存在或刚完成设置）。
+ * 检查全局配置是否就绪。
+ * 返回 true 表示配置文件已存在。
  */
 export function isGlobalConfigReady(options?: import("../../core/paths.js").HomePathOptions): boolean {
   const configPath = resolveConfigPath(options);
