@@ -7,6 +7,8 @@
 | 文档 | 状态 | 说明 |
 |------|------|------|
 | [product-positioning.md](./product-positioning.md) | 当前产品方向真源 | 多产品 Agent Runtime 记忆方案，主要服务 OpenClaw 类型产品之间的工作记忆连续性 |
+| [product-roadmap.md](./product-roadmap.md) | 当前版本规划真源 | v0.1.x 之后的版本节奏、发布门槛、能力边界和依赖关系 |
+| [global-config-directory-upgrade.md](./global-config-directory-upgrade.md) | 全局目录升级方案 | 从 `~/.openclaw/` 迁移到独立 `~/.memory-autodb/` 的配置、密钥、项目 registry 和兼容策略 |
 | [memory-middleware-architecture.md](./memory-middleware-architecture.md) | 当前架构方案 | MemoryService、adapter、REST/MCP/SDK、ingestion、retrieval、graph/tree、console 的中间件化架构 |
 | [memory-autodb-deep-optimization-architecture.md](./memory-autodb-deep-optimization-architecture.md) | 长期优化方案 | 5 问题、5 type、SlotSnapshot、候选治理、图谱和记忆树路线 |
 | [architecture-review-v2.md](./architecture-review-v2.md) | 架构评审 | 对深层优化方案的可行性和阶段边界评审 |
@@ -28,5 +30,7 @@
 
 - 当前实现变化优先更新 `memory-middleware-architecture.md`。
 - 产品边界、目标用户和方向调整优先更新 `product-positioning.md`，再同步其它文档。
+- 版本节奏、release gate 和路线图优先更新 `product-roadmap.md`。
+- 全局目录、配置、密钥和本机项目 registry 的路径约定优先更新 `global-config-directory-upgrade.md`。
 - 未来路线或评审结论优先更新 `memory-autodb-deep-optimization-architecture.md` 和对应评审文档。
 - `copy-from-mate/` 下内容默认保持参考材料身份，除非明确把其中结论吸收到当前方案。

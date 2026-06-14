@@ -28,6 +28,8 @@
 |------|----------|
 | 项目简介和快速上手 | [../README.md](../README.md) |
 | 当前中间件架构 | [03-architecture/memory-middleware-architecture.md](./03-architecture/memory-middleware-architecture.md) |
+| 当前产品路线图 | [03-architecture/product-roadmap.md](./03-architecture/product-roadmap.md) |
+| 全局配置目录升级 | [03-architecture/global-config-directory-upgrade.md](./03-architecture/global-config-directory-upgrade.md) |
 | 深层优化方案 | [03-architecture/memory-autodb-deep-optimization-architecture.md](./03-architecture/memory-autodb-deep-optimization-architecture.md) |
 | REST、OpenClaw 工具和 MCP facade | [05-api/memory-api.md](./05-api/memory-api.md) |
 | CLI | [05-api/cli-commands.md](./05-api/cli-commands.md) |
