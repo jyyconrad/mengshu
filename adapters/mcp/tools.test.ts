@@ -104,13 +104,19 @@ describe("MCP memory tools", () => {
     await expect(namespaces?.execute({})).resolves.toEqual({ namespaces: ["memories", "knowledge"] });
   });
 
-  test("keeps ingest as an explicit unimplemented placeholder until M4", async () => {
+  test("keeps ingest as an explicit unimplemented placeholder with actionable hint", async () => {
     const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
     const ingest = tools.find((tool) => tool.name === "memory_ingest");
 
-    await expect(ingest?.execute({ source: "file-system" })).resolves.toEqual({
-      error: "memory_ingest is not implemented until ingestion pipeline is available",
-    });
+    const result = (await ingest?.execute({ source: "file-system" })) as {
+      status?: string;
+      error?: string;
+      hint?: string;
+    };
+    expect(result.status).toBe("not_implemented");
+    expect(result.error).toMatch(/暂未开放|roadmap/i);
+    // 必须给出可操作替代方案，避免调用方误判为配置错误。
+    expect(result.hint).toMatch(/memory_observe|memory_save|ms scan/);
   });
 
   test("every tool exposes a JSON Schema inputSchema object", () => {

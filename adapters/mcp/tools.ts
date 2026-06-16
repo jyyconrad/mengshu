@@ -126,7 +126,8 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     },
     {
       name: "memory_ingest",
-      description: "Ingest an external source into memory.",
+      description:
+        "Ingest an external source into memory. [Roadmap] Not yet available — use memory_observe/memory_save for single records, or the ms scan CLI for documents.",
       inputSchema: {
         type: "object",
         properties: {
@@ -134,8 +135,15 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
         },
         additionalProperties: true,
       },
+      // memory_ingest 是 roadmap 功能：完整接入需把 IngestionPipeline 串入 MCP
+      // 注入链路并决定持久化后端（当前 pipeline 用非持久化 InMemoryStore）。
+      // 在落地前返回明确的状态说明 + 可操作替代方案，避免调用方误判为配置错误。
       execute: async () => ({
-        error: "memory_ingest is not implemented until ingestion pipeline is available",
+        status: "not_implemented",
+        error:
+          "memory_ingest 暂未开放（roadmap 功能，尚未接入持久化的 ingestion pipeline）。",
+        hint:
+          "替代方案：单条记忆用 memory_observe / memory_save；批量文档用 CLI 'ms scan <dir> --target-table knowledge'。",
       }),
     },
     {
