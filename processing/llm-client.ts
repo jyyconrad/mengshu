@@ -45,6 +45,12 @@ export interface LlmClient {
   complete(messages: LlmCompletionMessage[], options?: LlmCompletionOptions): Promise<string>;
   /** 将正文按指令摘要，内部拼成 system+user prompt。 */
   summarize(text: string, instruction: string): Promise<string>;
+  /** 结构化抽取：强制 JSON 输出并解析为 T，失败重试最多 3 次。 */
+  extractStructured<T>(
+    messages: LlmCompletionMessage[],
+    schema: Record<string, unknown>,
+    options?: LlmCompletionOptions,
+  ): Promise<T>;
   /** 是否真正可用（已配置 LLM）。调用方应先检查再使用。 */
   readonly available: boolean;
 }
@@ -61,6 +67,7 @@ export interface ChatCompletionClient {
         messages: LlmCompletionMessage[];
         max_tokens?: number;
         temperature?: number;
+        response_format?: { type: "json_object" };
       }): Promise<{ choices: Array<{ message: { content: string | null } }> }>;
     };
   };
@@ -158,6 +165,42 @@ export class OpenAiLlmClient implements LlmClient {
       { role: "user", content: text },
     ]);
   }
+
+  async extractStructured<T>(
+    messages: LlmCompletionMessage[],
+    schema: Record<string, unknown>,
+    options: LlmCompletionOptions = {},
+  ): Promise<T> {
+    const schemaHint = `Respond with valid JSON matching this schema:\n${JSON.stringify(schema, null, 2)}`;
+    const augmented: LlmCompletionMessage[] = [
+      { role: "system", content: schemaHint },
+      ...messages,
+    ];
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const maxTokens = options.maxTokens ?? this.maxTokens;
+        const temperature = options.temperature ?? this.temperature;
+        const response = await this.limit(() =>
+          this.client.chat.completions.create({
+            model: this.model,
+            messages: augmented,
+            ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+            ...(temperature !== undefined ? { temperature } : {}),
+            response_format: { type: "json_object" },
+          }),
+        );
+        const content = response.choices?.[0]?.message?.content;
+        if (typeof content !== "string" || content.length === 0) {
+          throw new Error("LLM returned empty content");
+        }
+        return JSON.parse(content) as T;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError;
+  }
 }
 
 /**
@@ -173,6 +216,14 @@ export class NullLlmClient implements LlmClient {
 
   async summarize(_text: string, _instruction: string): Promise<string> {
     throw new Error("LLM is not configured: set the `llm` config block to enable summaries");
+  }
+
+  async extractStructured<T>(
+    _messages: LlmCompletionMessage[],
+    _schema: Record<string, unknown>,
+    _options?: LlmCompletionOptions,
+  ): Promise<T> {
+    throw new Error("LLM is not configured: set the `llm` config block to enable structured extraction");
   }
 }
 

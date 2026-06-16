@@ -32,6 +32,10 @@ class FakeLlmClient implements LlmClient {
   async summarize(text: string, instruction: string): Promise<string> {
     return this.summarizeText;
   }
+
+  async extractStructured<T>(): Promise<T> {
+    throw new Error("not implemented in fake");
+  }
 }
 
 // Fake LlmClient（不可用）
@@ -43,6 +47,10 @@ class UnavailableLlmClient implements LlmClient {
   }
 
   async summarize(): Promise<string> {
+    throw new Error("LLM not configured");
+  }
+
+  async extractStructured<T>(): Promise<T> {
     throw new Error("LLM not configured");
   }
 }
