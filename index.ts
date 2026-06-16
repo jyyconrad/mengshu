@@ -71,6 +71,42 @@ export {
 // Security and Helper Functions
 // ============================================================================
 
+/**
+ * 验证 embedding 配置完整性
+ * 在初始化 Embeddings 实例前进行早期验证，提供友好的错误提示
+ */
+function validateEmbeddingConfig(config: { apiKey: string; baseURL?: string; model?: string }): void {
+  if (!config.apiKey || config.apiKey.trim().length === 0) {
+    throw new Error(
+      `[Mengshu 配置错误] embedding.apiKey 未设置\n\n` +
+      `请在 openclaw.plugin.json 中配置 Embedding API Key：\n` +
+      `{\n` +
+      `  "embedding": {\n` +
+      `    "apiKey": "\${OPENAI_API_KEY}",  // 推荐：使用环境变量\n` +
+      `    "baseURL": "https://api.openai.com/v1",\n` +
+      `    "model": "text-embedding-3-small"\n` +
+      `  }\n` +
+      `}\n\n` +
+      `如需帮助，运行：ms doctor\n` +
+      `详细文档：docs/troubleshooting/env-setup.md`
+    );
+  }
+
+  if (config.apiKey.includes("${") || config.apiKey.includes("}")) {
+    throw new Error(
+      `[Mengshu 配置错误] 环境变量未正确解析\n\n` +
+      `当前配置：embedding.apiKey = "${config.apiKey}"\n\n` +
+      `这通常是因为环境变量未设置。请按以下步骤检查：\n` +
+      `1. 检查 Shell 配置文件（~/.zshrc 或 ~/.bashrc）中是否已设置环境变量\n` +
+      `2. 运行 'source ~/.zshrc' 重新加载配置（或重启终端）\n` +
+      `3. 运行 'echo $OPENAI_API_KEY' 验证环境变量是否已生效\n` +
+      `4. 或者直接在配置文件中填写实际 API Key（不推荐用于敏感信息）\n\n` +
+      `如需帮助，运行：ms doctor\n` +
+      `详细文档：docs/troubleshooting/env-setup.md`
+    );
+  }
+}
+
 const MEMORY_TRIGGERS = [
   /zapamatuj si|pamatuj|remember/i,
   /preferuji|radši|nechci|prefer/i,
@@ -141,15 +177,20 @@ const memoryPlugin = {
   configSchema: memoryConfigSchema,
 
   register(api: OpenClawPluginApi) {
-    const cfg = memoryConfigSchema.parse(api.pluginConfig);
-    const resolvedDbPath = api.resolvePath(cfg.dbPath!);
-    const db = DatabaseFactory.createProvider(cfg, resolvedDbPath);
-    const embeddings = new Embeddings(cfg.embedding, cfg.batchProcessing);
-    const memoryRepository = new LegacyDatabaseAdapter(db, { appId: "openclaw" });
-    const memoryService = new DefaultMemoryService({
-      repository: memoryRepository,
-      embeddings,
-    });
+    try {
+      const cfg = memoryConfigSchema.parse(api.pluginConfig);
+
+      // 早期验证：在初始化 Embeddings 前检查配置完整性
+      validateEmbeddingConfig(cfg.embedding);
+
+      const resolvedDbPath = api.resolvePath(cfg.dbPath!);
+      const db = DatabaseFactory.createProvider(cfg, resolvedDbPath);
+      const embeddings = new Embeddings(cfg.embedding, cfg.batchProcessing);
+      const memoryRepository = new LegacyDatabaseAdapter(db, { appId: "openclaw" });
+      const memoryService = new DefaultMemoryService({
+        repository: memoryRepository,
+        embeddings,
+      });
     const ingestionStore = new InMemoryMemoryStore();
     const ingestionPipeline = new IngestionPipeline({
       documents: ingestionStore.documents,
@@ -905,6 +946,76 @@ const memoryPlugin = {
         api.logger.info("mengshu: stopped");
       },
     });
+    } catch (error) {
+      // 捕获并转换技术性错误为用户友好的提示
+      if (error instanceof Error) {
+        // 如果错误已经包含友好提示（以 [Mengshu 配置错误] 开头），直接抛出
+        if (error.message.includes("[Mengshu 配置错误]") || error.message.includes("环境变量")) {
+          throw error;
+        }
+
+        // 余额不足：403 + balance/insufficient/余额/code 30001。
+        // 优先于通用 401/403 判断，避免把"余额不足"误导成"Key 无效"。
+        if (
+          (error.message.includes("403") || error.message.includes("余额") ||
+            /balance|insufficient|arrears/i.test(error.message)) &&
+          (/balance|insufficient|余额|欠费|arrears/i.test(error.message) ||
+            error.message.includes("30001"))
+        ) {
+          throw new Error(
+            `[Mengshu 配置错误] Embedding 服务账户余额不足（${error.message}）\n\n` +
+            `API Key 本身有效，但对应账户额度不足以调用 Embedding。\n\n` +
+            `请处理：\n` +
+            `- 前往服务商控制台充值（如 SiliconFlow / DeepSeek）\n` +
+            `- 或更换一个有额度的 Embedding API Key\n` +
+            `- 充值后运行 'ms doctor' 复验\n\n` +
+            `原始错误：${error.message}`
+          );
+        }
+
+        // 转换常见的 API 错误
+        if (error.message.includes("403") || error.message.includes("401")) {
+          throw new Error(
+            `[Mengshu 配置错误] API 认证失败（${error.message}）\n\n` +
+            `这通常是因为：\n` +
+            `1. API Key 无效或已过期\n` +
+            `2. API Key 没有访问 Embedding API 的权限\n` +
+            `3. 环境变量未正确设置\n\n` +
+            `请检查配置：\n` +
+            `- 确认 API Key 是否有效（可在提供商控制台验证）\n` +
+            `- 确认 baseURL 是否正确（如 https://api.openai.com/v1）\n` +
+            `- 运行 'ms doctor' 诊断配置问题\n\n` +
+            `详细文档：docs/troubleshooting/env-setup.md\n\n` +
+            `原始错误：${error.message}`
+          );
+        }
+
+        if (error.message.includes("ECONNREFUSED") || error.message.includes("ENOTFOUND")) {
+          throw new Error(
+            `[Mengshu 配置错误] 无法连接到 Embedding API（${error.message}）\n\n` +
+            `这通常是因为：\n` +
+            `1. baseURL 配置错误（请检查拼写和协议 http/https）\n` +
+            `2. 网络连接问题（防火墙、代理设置）\n` +
+            `3. API 服务不可用\n\n` +
+            `请检查配置：\n` +
+            `- 确认 baseURL 是否正确（如 https://api.openai.com/v1）\n` +
+            `- 如使用本地服务（如 Ollama），确认服务是否已启动\n` +
+            `- 运行 'ms doctor' 诊断连接问题\n\n` +
+            `详细文档：docs/troubleshooting/env-setup.md\n\n` +
+            `原始错误：${error.message}`
+          );
+        }
+      }
+
+      // 未识别的错误，附加通用帮助信息
+      throw new Error(
+        `[Mengshu 初始化失败] ${error instanceof Error ? error.message : String(error)}\n\n` +
+        `如需帮助：\n` +
+        `- 运行 'ms doctor' 诊断问题\n` +
+        `- 查看配置文档：docs/troubleshooting/env-setup.md\n` +
+        `- 查看故障排查：docs/troubleshooting/README.md`
+      );
+    }
   },
 };
 

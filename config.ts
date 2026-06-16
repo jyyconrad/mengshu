@@ -239,14 +239,45 @@ export function vectorDimsForModel(model: string): number {
   return dims;
 }
 
-function resolveEnvVars(value: string): string {
+/**
+ * 解析配置中的环境变量占位符
+ * @param value 配置值，如 "${OPENAI_API_KEY}"
+ * @param fieldName 字段名，用于生成友好的错误信息
+ * @returns 解析后的实际值
+ * @throws 当环境变量未设置时抛出友好的配置错误
+ */
+function resolveEnvVars(value: string, fieldName?: string): string {
   return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
     const envValue = process.env[envVar];
     if (!envValue) {
-      throw new Error(`Environment variable ${envVar} is not set`);
+      const field = fieldName ? ` (${fieldName})` : "";
+      const shellConfig = getShellConfigFile();
+      throw new Error(
+        `环境变量 ${envVar} 未设置${field}\n\n` +
+        `请按以下步骤配置：\n` +
+        `1. 编辑 Shell 配置文件：${shellConfig}\n` +
+        `2. 添加环境变量：export ${envVar}="your-actual-value"\n` +
+        `3. 重新加载配置：source ${shellConfig}\n` +
+        `4. 或者在配置文件中直接填写实际值（不推荐用于敏感信息）\n\n` +
+        `详细文档：docs/troubleshooting/env-setup.md`
+      );
     }
     return envValue;
   });
+}
+
+/**
+ * 获取当前 Shell 的配置文件路径
+ */
+function getShellConfigFile(): string {
+  const shell = process.env.SHELL || "";
+  if (shell.includes("zsh")) {
+    return "~/.zshrc";
+  }
+  if (shell.includes("bash")) {
+    return "~/.bashrc 或 ~/.bash_profile";
+  }
+  return "~/.profile";
 }
 
 function resolveEmbeddingModel(embedding: Record<string, unknown>): string {
@@ -502,14 +533,14 @@ export const memoryConfigSchema = {
       embedding: {
         provider: "openai",
         model,
-        apiKey: resolveEnvVars(String(embedding.apiKey)),
-        baseURL: resolveEnvVars(String(embedding.baseURL)),
+        apiKey: resolveEnvVars(String(embedding.apiKey), "embedding.apiKey"),
+        baseURL: resolveEnvVars(String(embedding.baseURL), "embedding.baseURL"),
       },
       llm: llm ? {
         provider: "openai",
         model: String(llm.model),
-        apiKey: resolveEnvVars(String(llm.apiKey)),
-        baseURL: typeof llm.baseURL === "string" ? resolveEnvVars(llm.baseURL) : undefined,
+        apiKey: resolveEnvVars(String(llm.apiKey), "llm.apiKey"),
+        baseURL: typeof llm.baseURL === "string" ? resolveEnvVars(llm.baseURL, "llm.baseURL") : undefined,
         maxTokens: typeof llm.maxTokens === "number" ? llm.maxTokens : undefined,
         temperature: typeof llm.temperature === "number" ? llm.temperature : undefined,
       } : undefined,
@@ -518,7 +549,7 @@ export const memoryConfigSchema = {
         enabled: server?.enabled === true,
         host: typeof server?.host === "string" ? server.host : DEFAULT_SERVER_HOST,
         port: typeof server?.port === "number" ? server.port : DEFAULT_SERVER_PORT,
-        secret: typeof server?.secret === "string" ? resolveEnvVars(server.secret) : undefined,
+        secret: typeof server?.secret === "string" ? resolveEnvVars(server.secret, "server.secret") : undefined,
         requireHttps: server?.requireHttps === true,
       },
       features: {
@@ -530,15 +561,15 @@ export const memoryConfigSchema = {
       dbType: (cfg.dbType === "supabase" ? "supabase" : cfg.dbType === "postgres" ? "postgres" : "lancedb"),
       dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : resolveDefaultDbPath(),
       supabase: supabase ? {
-        url: resolveEnvVars(String(supabase.url)),
-        serviceKey: resolveEnvVars(String(supabase.serviceKey)),
+        url: resolveEnvVars(String(supabase.url), "supabase.url"),
+        serviceKey: resolveEnvVars(String(supabase.serviceKey), "supabase.serviceKey"),
       } : undefined,
       postgres: postgres ? {
-        host: resolveEnvVars(String(postgres.host)),
+        host: resolveEnvVars(String(postgres.host), "postgres.host"),
         port: postgres.port as number,
-        database: resolveEnvVars(String(postgres.database)),
-        user: resolveEnvVars(String(postgres.user)),
-        password: resolveEnvVars(String(postgres.password)),
+        database: resolveEnvVars(String(postgres.database), "postgres.database"),
+        user: resolveEnvVars(String(postgres.user), "postgres.user"),
+        password: resolveEnvVars(String(postgres.password), "postgres.password"),
         ssl: postgres.ssl as boolean | undefined,
       } : undefined,
       scanner: scanner ? {
