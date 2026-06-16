@@ -45,6 +45,7 @@ export interface AutoCaptureContext {
   idFactory?: () => string;
   now?: () => number;
   logger?: HookLogger;
+  enqueueGraphExtraction?: (chunkId: string, text: string, scope: import("../../core/types.js").MemoryScope) => Promise<void>;
 }
 
 function defaultShouldCapture(text: string): boolean {
@@ -221,6 +222,11 @@ export async function handleAgentEndCapture(
         updatedAt: now(),
       };
       await context.service.storeMemory({ record });
+      if (context.enqueueGraphExtraction) {
+        await context.enqueueGraphExtraction(record.id, entry.text, record.scope).catch(() => {
+          // 图谱提取入队失败不影响记忆写入
+        });
+      }
     }
 
     context.logger?.info?.(`mengshu: auto-captured ${newEntries.length} new memories`);
