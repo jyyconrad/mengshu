@@ -15,6 +15,12 @@ import { createExtractCandidateHandler } from "./extract-candidate-handler.js";
 import { InMemoryCandidateRepository } from "./candidate-repository.js";
 import { HeuristicTypeExtractor } from "./type-extractor.js";
 import type { JobRecord } from "../storage/repositories/types.js";
+import type {
+  LlmClient,
+  LlmCompletionMessage,
+  LlmCompletionOptions,
+  SimpleJsonSchema,
+} from "../processing/llm-client.js";
 
 const scope = {
   tenantId: "local",
@@ -119,5 +125,177 @@ describe("createExtractCandidateHandler", () => {
 
     await handler(job({ scope, text: "禁止在未确认前删除生产数据。", intent: "auto" }));
     expect(audited).toContain("candidate.extract");
+  });
+});
+
+/**
+ * Fake LlmClient 基类：默认 available，complete/summarize 不被本测试用到。
+ * 子类只需覆写 extractStructured 模拟不同返回 / 抛错场景。
+ */
+class FakeLlmClient implements LlmClient {
+  readonly available: boolean;
+
+  constructor(available = true) {
+    this.available = available;
+  }
+
+  async complete(_m: LlmCompletionMessage[], _o?: LlmCompletionOptions): Promise<string> {
+    throw new Error("not used in test");
+  }
+
+  async summarize(_t: string, _i: string): Promise<string> {
+    throw new Error("not used in test");
+  }
+
+  async extractStructured<T>(
+    _messages: LlmCompletionMessage[],
+    _schema: SimpleJsonSchema,
+    _options?: LlmCompletionOptions,
+  ): Promise<T> {
+    throw new Error("not implemented");
+  }
+}
+
+/** 返回固定候选结果的 fake（候选 quote 取自源文本，eventIds 对齐 traceId）。 */
+class StubLlmClient extends FakeLlmClient {
+  constructor(private readonly payload: unknown) {
+    super(true);
+  }
+
+  async extractStructured<T>(): Promise<T> {
+    return this.payload as T;
+  }
+}
+
+/** extractStructured 抛错的 fake（模拟超时 / schema 失败 / 网络不可用）。 */
+class ThrowingLlmClient extends FakeLlmClient {
+  async extractStructured<T>(): Promise<T> {
+    throw new Error("simulated LLM failure");
+  }
+}
+
+describe("createExtractCandidateHandler - LLM 异步路径（§0.8 / §2.3 / §10.4）", () => {
+  const traceId = "trace-1";
+
+  test("llmClient.available 时走 LLM 路径，候选过 validator 后入库", async () => {
+    const candidates = new InMemoryCandidateRepository();
+    // quote 必须是源文本子串（validator 闸门 2）；eventIds 对齐 handler 传入的 eventId(=traceId)。
+    const text = "禁止在未确认前删除生产数据，必须先经过审批流程确认。";
+    const llmClient = new StubLlmClient({
+      candidates: [
+        {
+          text,
+          semanticType: "rules",
+          kind: "constraint",
+          targetScope: "project",
+          evidence: { eventIds: [traceId], quote: "禁止在未确认前删除生产数据" },
+          salience: 0.9,
+          temporality: "durable",
+          crossContextual: true,
+          reason: "硬约束",
+        },
+      ],
+    });
+
+    const handler = createExtractCandidateHandler({
+      extractor: new HeuristicTypeExtractor(),
+      candidates,
+      llmClient,
+    });
+
+    const result = (await handler(job({ scope, text, traceId, intent: "auto" }))) as { created: number };
+    expect(result.created).toBe(1);
+
+    const pending = await candidates.list({ scope, status: "pending" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0].semanticType).toBe("rules");
+    expect(pending[0].extractor).toBe("llm");
+    expect(pending[0].metadata.admission).toBe("llm_validated");
+  });
+
+  test("LLM 抛错时 fallback 到 heuristic 路径（链路不断）", async () => {
+    const candidates = new InMemoryCandidateRepository();
+    const handler = createExtractCandidateHandler({
+      extractor: new HeuristicTypeExtractor(),
+      candidates,
+      llmClient: new ThrowingLlmClient(),
+    });
+
+    const text = "禁止在未确认前删除生产数据。";
+    const result = (await handler(job({ scope, text, traceId, intent: "auto" }))) as { created: number };
+
+    // fallback heuristic 命中 rules，正常入库。
+    expect(result.created).toBeGreaterThanOrEqual(1);
+    const pending = await candidates.list({ scope, status: "pending" });
+    expect(pending.length).toBeGreaterThanOrEqual(1);
+    expect(pending[0].extractor).toBe("heuristic");
+  });
+
+  test("validator 拒绝的 LLM 候选不入库（quote 不在源文本 + 低 salience）", async () => {
+    const candidates = new InMemoryCandidateRepository();
+    const text = "禁止在未确认前删除生产数据。";
+    const llmClient = new StubLlmClient({
+      candidates: [
+        {
+          // quote 不在源文本 → 闸门 2 拒绝。
+          text: "用户偏好使用 TypeScript 严格模式开发项目。",
+          semanticType: "profile",
+          profileDimension: "language",
+          targetScope: "project",
+          evidence: { eventIds: [traceId], quote: "完全不存在于源文本的引用内容" },
+          salience: 0.8,
+          temporality: "durable",
+        },
+        {
+          // salience 低于 MIN_SALIENCE(0.3) → 闸门 4 拒绝。
+          text: text + " 这是补充说明信息内容。",
+          semanticType: "rules",
+          targetScope: "project",
+          evidence: { eventIds: [traceId], quote: "禁止在未确认前删除生产数据" },
+          salience: 0.1,
+          temporality: "durable",
+        },
+      ],
+    });
+
+    const handler = createExtractCandidateHandler({
+      extractor: new HeuristicTypeExtractor(),
+      candidates,
+      llmClient,
+    });
+
+    const result = (await handler(job({ scope, text, traceId, intent: "auto" }))) as { created: number };
+    expect(result.created).toBe(0);
+    expect(await candidates.count({ scope })).toBe(0);
+  });
+
+  test("LLM 成功但零候选时不 fallback heuristic（视为无可记内容）", async () => {
+    const candidates = new InMemoryCandidateRepository();
+    const llmClient = new StubLlmClient({ candidates: [] });
+
+    const handler = createExtractCandidateHandler({
+      extractor: new HeuristicTypeExtractor(),
+      candidates,
+      llmClient,
+    });
+
+    // 该文本 heuristic 会命中 rules；若错误 fallback 则会产生候选。
+    const result = (await handler(job({ scope, text: "禁止在未确认前删除生产数据。", traceId, intent: "auto" }))) as { created: number };
+    expect(result.created).toBe(0);
+    expect(await candidates.count({ scope })).toBe(0);
+  });
+
+  test("llmClient 不可用（available=false）时走纯 heuristic（向后兼容）", async () => {
+    const candidates = new InMemoryCandidateRepository();
+    const handler = createExtractCandidateHandler({
+      extractor: new HeuristicTypeExtractor(),
+      candidates,
+      llmClient: new FakeLlmClient(false),
+    });
+
+    const result = (await handler(job({ scope, text: "禁止在未确认前删除生产数据。", intent: "auto" }))) as { created: number };
+    expect(result.created).toBeGreaterThanOrEqual(1);
+    const pending = await candidates.list({ scope, status: "pending" });
+    expect(pending[0].extractor).toBe("heuristic");
   });
 });
