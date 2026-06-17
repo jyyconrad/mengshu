@@ -10,6 +10,29 @@ import type { MemoryScope } from "../core/types.js";
 export type MemoryTreeType = "source" | "topic" | "global";
 export type SummaryNodeStatus = "open" | "sealed" | "stale" | "archived";
 
+/**
+ * Summary faithfulness 模式（D-07）。
+ * - off: 仅 deterministic check（P0/P1 默认）
+ * - sampled: 按 sampleRate 抽样 LLM judge
+ * - high_risk: 仅对 high_risk 摘要触发 LLM judge（P2 起启用）
+ * - always: 全量 LLM judge
+ */
+export type SummaryFaithfulnessMode = "off" | "sampled" | "high_risk" | "always";
+
+/**
+ * Summary faithfulness 配置（§7.7）。
+ */
+export interface SummaryFaithfulnessConfig {
+  /** 校验模式（D-07：P0/P1 默认 off，P2 起 high_risk） */
+  mode: SummaryFaithfulnessMode;
+  /** 抽样比例（sampled 模式下生效） */
+  sampleRate?: number;
+  /** Judge 模型（可选，缺省使用 llm.reasoningModel） */
+  judgeModel?: string;
+  /** 校验失败时的处理动作 */
+  failAction: "fallback_extractive" | "mark_untrusted" | "retry";
+}
+
 export interface TreeLeaf {
   id: string;
   scope: MemoryScope;

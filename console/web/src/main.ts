@@ -5,7 +5,17 @@
  * 面向本机中间件运维和知识速查，不引入前端框架依赖。
  */
 
-import { defaultScope, fetchGraph, fetchJobs, fetchOverview, lookup, type Scope } from "./api";
+import {
+  defaultScope,
+  fetchCandidates,
+  fetchGraph,
+  fetchJobs,
+  fetchOverview,
+  lookup,
+  reviewCandidates,
+  type CandidateReviewAction,
+  type Scope,
+} from "./api";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) {
@@ -29,7 +39,7 @@ function renderShell() {
   const layout = h("div", "layout");
   const sidebar = h("aside", "sidebar");
   sidebar.append(h("div", "brand", "Memory Console"));
-  for (const tab of ["overview", "lookup", "graph", "jobs"]) {
+  for (const tab of ["overview", "lookup", "graph", "candidates", "jobs"]) {
     const button = h("button", `nav ${activeTab === tab ? "active" : ""}`, tab);
     button.addEventListener("click", () => {
       activeTab = tab;
@@ -138,6 +148,78 @@ async function renderGraph(view: HTMLElement) {
   });
 }
 
+async function renderCandidates(view: HTMLElement) {
+  // 候选区审核视图：只展示 pending 候选，approve 才会经 promoteCandidate 进入主库。
+  // pending 候选不进入 5 槽位（由 context_fast 侧保证），这里仅做治理入口。
+  const data = await fetchCandidates(scope, { status: "pending", limit: 50 });
+
+  const summary = h("div", "metrics");
+  summary.append(metricCard("pending", data.total));
+  view.append(summary);
+
+  if (data.candidates.length === 0) {
+    view.append(h("div", "panel", "没有待审核候选"));
+    return;
+  }
+
+  const list = h("div", "panel");
+  const selected = new Set<string>();
+
+  async function applyAction(action: CandidateReviewAction) {
+    await reviewCandidates(action);
+    await render();
+  }
+
+  const toolbar = h("div", "toolbar");
+  const approveAll = h("button", "primary", "批量通过所选");
+  approveAll.addEventListener("click", () => {
+    if (selected.size === 0) return;
+    void applyAction({ action: "approve", ids: [...selected] });
+  });
+  const rejectAll = h("button", "", "批量拒绝所选");
+  rejectAll.addEventListener("click", () => {
+    if (selected.size === 0) return;
+    void applyAction({ action: "reject", ids: [...selected] });
+  });
+  toolbar.append(approveAll, rejectAll);
+  view.append(toolbar);
+
+  for (const candidate of data.candidates) {
+    const row = h("div", "row candidate");
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.addEventListener("change", () => {
+      if (check.checked) selected.add(candidate.id);
+      else selected.delete(candidate.id);
+    });
+    row.append(check);
+    row.append(
+      h(
+        "span",
+        "",
+        `${candidate.semanticType ?? candidate.kind}  ${candidate.confidence.toFixed(2)}`
+      )
+    );
+    row.append(h("p", "", candidate.preview));
+
+    const approve = h("button", "primary", "通过");
+    approve.addEventListener("click", () =>
+      applyAction({ action: "approve", ids: [candidate.id] })
+    );
+    const reject = h("button", "", "拒绝");
+    reject.addEventListener("click", () =>
+      applyAction({ action: "reject", ids: [candidate.id] })
+    );
+    const archive = h("button", "", "归档");
+    archive.addEventListener("click", () =>
+      applyAction({ action: "archive", ids: [candidate.id] })
+    );
+    row.append(approve, reject, archive);
+    list.append(row);
+  }
+  view.append(list);
+}
+
 async function renderJobs(view: HTMLElement) {
   const data = await fetchJobs();
   const metrics = h("div", "metrics");
@@ -158,6 +240,7 @@ async function render() {
     if (activeTab === "overview") await renderOverview(view);
     if (activeTab === "lookup") await renderLookup(view);
     if (activeTab === "graph") await renderGraph(view);
+    if (activeTab === "candidates") await renderCandidates(view);
     if (activeTab === "jobs") await renderJobs(view);
   } catch (error) {
     view.append(h("div", "error", error instanceof Error ? error.message : String(error)));

@@ -6,6 +6,30 @@ import { vectorDimsForModel } from "../../config";
 const DEFAULT_TABLES: TableName[] = ["memories", "knowledge"];
 
 /**
+ * 允许在 DDL 中拼接的表名白名单（含前缀模式）。
+ *
+ * 安全约束：`ensureTableExists` 会把表名直接拼进 CREATE TABLE / CREATE INDEX
+ * 语句，TS 类型层面虽然有 TableName 限制，但运行时若调用方传入未净化的字符串
+ * （例如带分号、空格或 SQL 关键字），仍可能造成 SQL 注入。这里在运行时通过严格
+ * 正则白名单进行二次校验：
+ *   - 固定表名：memories / knowledge / documents
+ *   - 动态知识库表：以 knowledge_ 为前缀，后缀只允许 [a-z][a-z0-9_]{0,63}
+ * 任何不匹配的表名都会立即抛错并阻止 DDL 执行。
+ */
+export const ALLOWED_TABLE_NAME_RE = /^(memories|knowledge|documents|knowledge_[a-z][a-z0-9_]{0,63})$/;
+
+/**
+ * 校验表名是否符合白名单。校验失败时抛错（不静默通过），调用方负责捕获。
+ *
+ * @internal 仅供 SupabaseProvider 内部及单元测试使用。
+ */
+export function assertSafeTableName(tableName: string): void {
+  if (typeof tableName !== "string" || !ALLOWED_TABLE_NAME_RE.test(tableName)) {
+    throw new Error(`Invalid table name: ${tableName}`);
+  }
+}
+
+/**
  * 扩展的知识库表（由配置文件动态指定）
  */
 let EXTENDED_KNOWLEDGE_TABLES: string[] = [];
@@ -98,6 +122,8 @@ export class SupabaseProvider implements DatabaseProvider {
   }
 
   private async ensureTableExists(tableName: TableName): Promise<void> {
+    // 安全校验：阻止任何不在白名单内的表名进入 DDL，防止 SQL 注入。
+    assertSafeTableName(tableName);
     try {
       const { error } = await this.client!.rpc('exec_sql', {
         sql: `

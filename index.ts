@@ -43,6 +43,27 @@ import {
   handleBeforeAgentStartRecall,
 } from "./adapters/openclaw/hooks.js";
 import { registerMemoryServerCliCommands } from "./adapters/openclaw/cli.js";
+import { registerProjectCliCommands } from "./adapters/openclaw/cli-project.js";
+import { registerDoctorCliCommands } from "./adapters/openclaw/cli-doctor.js";
+import { registerMcpCliCommands } from "./adapters/openclaw/cli-mcp.js";
+import { registerMigrateHomeCommand } from "./adapters/openclaw/cli-migrate-home.js";
+import { registerMaintainCommands } from "./adapters/openclaw/cli-maintain.js";
+import { createConsoleApi } from "./console/api.js";
+import { InMemoryCandidateRepository } from "./lifecycle/candidate-repository.js";
+import { CandidateReviewService } from "./lifecycle/candidate-review.js";
+import { candidateToMemoryRecord } from "./lifecycle/candidate-promotion.js";
+import { createExtractCandidateHandler } from "./lifecycle/extract-candidate-handler.js";
+import { defaultTypeExtractor } from "./lifecycle/type-extractor.js";
+import { AgentFastPathService } from "./api/agent-fast-path.js";
+import { enqueueUniqueJob } from "./ingest/jobs.js";
+import { extractRecords } from "./adapters/openclaw/agent-service-helper.js";
+import { InMemoryTreeRepository } from "./tree/buffer.js";
+import { createBuildTreeHandler } from "./tree/build-tree-handler.js";
+import { createLlmClient } from "./processing/llm-client.js";
+import { InMemoryGraphRepository } from "./graph/repository.js";
+import { createExtractGraphHandler } from "./graph/extract-graph-handler.js";
+import { QueryHitsTracker } from "./graph/query-hits-tracker.js";
+import { CentralityCalculator } from "./graph/centrality-calculator.js";
 
 export {
   escapeMemoryForPrompt,
@@ -54,6 +75,42 @@ export {
 // ============================================================================
 // Security and Helper Functions
 // ============================================================================
+
+/**
+ * 验证 embedding 配置完整性
+ * 在初始化 Embeddings 实例前进行早期验证，提供友好的错误提示
+ */
+function validateEmbeddingConfig(config: { apiKey: string; baseURL?: string; model?: string }): void {
+  if (!config.apiKey || config.apiKey.trim().length === 0) {
+    throw new Error(
+      `[Mengshu 配置错误] embedding.apiKey 未设置\n\n` +
+      `请在 openclaw.plugin.json 中配置 Embedding API Key：\n` +
+      `{\n` +
+      `  "embedding": {\n` +
+      `    "apiKey": "\${OPENAI_API_KEY}",  // 推荐：使用环境变量\n` +
+      `    "baseURL": "https://api.openai.com/v1",\n` +
+      `    "model": "text-embedding-3-small"\n` +
+      `  }\n` +
+      `}\n\n` +
+      `如需帮助，运行：ms doctor\n` +
+      `详细文档：docs/troubleshooting/env-setup.md`
+    );
+  }
+
+  if (config.apiKey.includes("${") || config.apiKey.includes("}")) {
+    throw new Error(
+      `[Mengshu 配置错误] 环境变量未正确解析\n\n` +
+      `当前配置：embedding.apiKey = "${config.apiKey}"\n\n` +
+      `这通常是因为环境变量未设置。请按以下步骤检查：\n` +
+      `1. 检查 Shell 配置文件（~/.zshrc 或 ~/.bashrc）中是否已设置环境变量\n` +
+      `2. 运行 'source ~/.zshrc' 重新加载配置（或重启终端）\n` +
+      `3. 运行 'echo $OPENAI_API_KEY' 验证环境变量是否已生效\n` +
+      `4. 或者直接在配置文件中填写实际 API Key（不推荐用于敏感信息）\n\n` +
+      `如需帮助，运行：ms doctor\n` +
+      `详细文档：docs/troubleshooting/env-setup.md`
+    );
+  }
+}
 
 const MEMORY_TRIGGERS = [
   /zapamatuj si|pamatuj|remember/i,
@@ -118,22 +175,38 @@ export function detectCategory(text: string): MemoryCategory {
 // ============================================================================
 
 const memoryPlugin = {
-  id: "memory-autodb",
+  id: "mengshu",
   name: "Memory (AutoDB)",
   description: "Long-term memory with vector search, supporting local LanceDB and cloud Supabase storage, with auto-recall/capture and directory scanning capabilities.",
   kind: "memory" as const,
   configSchema: memoryConfigSchema,
 
   register(api: OpenClawPluginApi) {
-    const cfg = memoryConfigSchema.parse(api.pluginConfig);
-    const resolvedDbPath = api.resolvePath(cfg.dbPath!);
-    const db = DatabaseFactory.createProvider(cfg, resolvedDbPath);
-    const embeddings = new Embeddings(cfg.embedding, cfg.batchProcessing);
-    const memoryRepository = new LegacyDatabaseAdapter(db, { appId: "openclaw" });
-    const memoryService = new DefaultMemoryService({
-      repository: memoryRepository,
-      embeddings,
-    });
+    try {
+      const cfg = memoryConfigSchema.parse(api.pluginConfig);
+
+      // 早期验证：在初始化 Embeddings 前检查配置完整性
+      validateEmbeddingConfig(cfg.embedding);
+
+      const resolvedDbPath = api.resolvePath(cfg.dbPath!);
+      const db = DatabaseFactory.createProvider(cfg, resolvedDbPath);
+      const embeddings = new Embeddings(cfg.embedding, cfg.batchProcessing);
+
+      // P1-Q2：LLM 驱动的知识图谱仓库（in-memory，v0.x 不持久化）。
+      const graphRepository = new InMemoryGraphRepository();
+
+      // P2：QueryHits 追踪器，在 recall 时递增 entity.queryHits30d
+      const queryHitsTracker = new QueryHitsTracker({ graphRepo: graphRepository });
+
+      // P2：Centrality 计算器，按 degree 归一化计算 graphCentrality
+      const centralityCalculator = new CentralityCalculator({ graphRepo: graphRepository });
+
+      const memoryRepository = new LegacyDatabaseAdapter(db, { appId: "openclaw" });
+      const memoryService = new DefaultMemoryService({
+        repository: memoryRepository,
+        embeddings,
+        queryHitsTracker,
+      });
     const ingestionStore = new InMemoryMemoryStore();
     const ingestionPipeline = new IngestionPipeline({
       documents: ingestionStore.documents,
@@ -142,12 +215,96 @@ const memoryPlugin = {
       audit: ingestionStore.audit,
     });
 
+    // 候选区：共享单例，供 observe 自动抽取链路与 Console 审核闭环共用同一实例。
+    // approve 通过 promoteCandidate 把候选转换为 active MemoryRecord 写入主库。
+    const candidateRepository = new InMemoryCandidateRepository();
+    const candidateReview = new CandidateReviewService({
+      repository: candidateRepository,
+      promoteCandidate: async ({ candidate }) => {
+        const record = candidateToMemoryRecord(candidate);
+        await memoryService.storeMemory({ record });
+        return { memoryId: record.id };
+      },
+      audit: async ({ scope, action, targetId, metadata }) => {
+        await ingestionStore.audit.append({ scope, action, targetId, metadata });
+      },
+    });
+
+    // Console 聚合 API：把候选区注入，使 serve 启动的 daemon 能提供 Candidates 治理闭环。
+    const consoleApi = createConsoleApi({
+      service: memoryService,
+      candidates: candidateRepository,
+      candidateReview,
+    });
+
+    // F2/F3：LLM 客户端（未配置 llm 时返回 NullLlmClient，树摘要降级 extractive）
+    // 与 in-memory 记忆树仓库（source/topic/global，v0.x 不持久化）。
+    const llmClient = createLlmClient(cfg.llm);
+    const treeRepository = new InMemoryTreeRepository();
+
+    // observe 自动抽取链路：
+    // 1. AgentFastPathService.observeLight 入队 extract_candidate + build_tree job（jobs = ingestionStore.jobs）。
+    // 2. extract_candidate handler 经 extractor 抽取并写入候选区（pending，不污染主库）。
+    // 3. build_tree handler 把 observation 追加到 source 树 buffer，满阈值 seal 成 SummaryNode。
+    // 4. daemon worker loop 轮询 jobs 执行 handler（serve 时启动，见下方 registerMemoryServerCliCommands）。
+    const agentFastPath = new AgentFastPathService({
+      loadRecordsForScope: async (resolvedScope) => {
+        const result = await memoryService.recall({
+          query: "",
+          scope: resolvedScope,
+          limit: 50,
+          minScore: 0,
+        });
+        return extractRecords(result.hits);
+      },
+      recall: async (resolvedScope, query, opts) =>
+        memoryService.recall({
+          query,
+          scope: resolvedScope,
+          limit: opts?.limit ?? 10,
+          minScore: opts?.minScore ?? 0.1,
+        }),
+      enqueueJob: async ({ type, payload }) => {
+        const targetId =
+          typeof payload.traceId === "string" ? payload.traceId : computeContentHash(JSON.stringify(payload));
+        const job = await enqueueUniqueJob(ingestionStore.jobs, { type, targetId, payload });
+        return job.id;
+      },
+      // F3-3：lookup_deep 融合记忆树摘要。
+      loadTreeSummaries: async (resolvedScope) => treeRepository.listSummaries({ scope: resolvedScope }),
+    });
+
+    // extract_candidate job handler：observe → extractor → 候选区（pending）。
+    const extractCandidateHandler = createExtractCandidateHandler({
+      extractor: defaultTypeExtractor,
+      candidates: candidateRepository,
+      audit: async ({ scope, action, targetId, metadata }) => {
+        await ingestionStore.audit.append({ scope, action, targetId, metadata });
+      },
+    });
+
+    // F3：build_tree job handler：observe/ingest → 树 buffer → seal（LLM 可用则 abstractive 摘要）。
+    const buildTreeHandler = createBuildTreeHandler({
+      repository: treeRepository,
+      llmClient,
+    });
+
+    // P1-Q2：extract_graph job handler：LLM 驱动的知识图谱提取，失败时 fallback 到规则提取。
+    // LLM 异常通过 audit 钩子记录 llm_extraction_failed 事件到 ingestionStore.audit。
+    const extractGraphHandler = createExtractGraphHandler({
+      llmClient,
+      graphRepository,
+      audit: async ({ scope, action, targetId, metadata }) => {
+        await ingestionStore.audit.append({ scope, action, targetId, metadata });
+      },
+    });
+
     // 初始化路由引擎（如果启用了多知识库功能）
     const routingEngine = cfg.knowledgeBases?.enabled
       ? createRoutingEngine(cfg.routingRules)
       : null;
 
-    api.logger.info(`memory-autodb: plugin registered (dbType: ${cfg.dbType}, lazy init)`);
+    api.logger.info(`mengshu: plugin registered (dbType: ${cfg.dbType}, lazy init)`);
 
     // ========================================================================
     // Tools
@@ -321,11 +478,59 @@ const memoryPlugin = {
 
     api.registerCli(
       ({ program }) => {
-        const memory = program.command("ltm").description("Memory plugin commands");
+        const memory = program.command("ms").description("Memory plugin commands");
         registerMemoryServerCliCommands(memory, {
           config: cfg,
           service: memoryService,
+          console: consoleApi,
+          agentFastPath,
+          worker: {
+            jobs: ingestionStore.jobs,
+            leaseMs: 30_000,
+            intervalMs: 1_000,
+            handlers: {
+              extract_candidate: extractCandidateHandler,
+              build_tree: buildTreeHandler,
+              extract_graph: extractGraphHandler,
+            },
+          },
           getTableStats: db.getTableStats ? () => db.getTableStats!() : undefined,
+        });
+
+        // A2-lite: ms init + project 子命令（project scope identity 与 manifest）
+        registerProjectCliCommands(memory, {
+          service: memoryService,
+          getRecordCount: () => db.count(),
+        });
+
+        // v0.1.2: ms migrate-home（全局配置目录迁移）
+        registerMigrateHomeCommand(memory);
+
+        // Milestone B: ms doctor / demo / connect（本机接入体验）
+        registerDoctorCliCommands(memory, {
+          config: cfg,
+          service: memoryService,
+          embeddings,
+        });
+
+        // F1-2: ms mcp（stdio MCP server，供 Claude Desktop / Cursor 接入）
+        registerMcpCliCommands(memory, {
+          service: memoryService,
+          agentFastPath,
+          namespaces: ["memories", "knowledge"],
+        });
+
+        // P2: ms maintain（数据维护工具：calculate-centrality 等）
+        registerMaintainCommands(memory, {
+          centralityCalculator,
+          getDefaultScope: () => ({
+            tenantId: "default",
+            appId: "openclaw",
+            userId: "default",
+            projectId: "default",
+            agentId: "default",
+            namespace: "default",
+          }),
         });
 
         memory
@@ -730,7 +935,7 @@ const memoryPlugin = {
             }
           });
       },
-      { commands: ["ltm"] },
+      { commands: ["ms"] },
     );
 
     // ========================================================================
@@ -769,18 +974,88 @@ const memoryPlugin = {
     // ========================================================================
 
     api.registerService({
-      id: "memory-autodb",
+      id: "mengshu",
       start: async () => {
         await db.initialize();
         api.logger.info(
-          `memory-autodb: initialized (dbType: ${cfg.dbType}, model: ${cfg.embedding.model})`,
+          `mengshu: initialized (dbType: ${cfg.dbType}, model: ${cfg.embedding.model})`,
         );
       },
       stop: async () => {
         await db.close();
-        api.logger.info("memory-autodb: stopped");
+        api.logger.info("mengshu: stopped");
       },
     });
+    } catch (error) {
+      // 捕获并转换技术性错误为用户友好的提示
+      if (error instanceof Error) {
+        // 如果错误已经包含友好提示（以 [Mengshu 配置错误] 开头），直接抛出
+        if (error.message.includes("[Mengshu 配置错误]") || error.message.includes("环境变量")) {
+          throw error;
+        }
+
+        // 余额不足：403 + balance/insufficient/余额/code 30001。
+        // 优先于通用 401/403 判断，避免把"余额不足"误导成"Key 无效"。
+        if (
+          (error.message.includes("403") || error.message.includes("余额") ||
+            /balance|insufficient|arrears/i.test(error.message)) &&
+          (/balance|insufficient|余额|欠费|arrears/i.test(error.message) ||
+            error.message.includes("30001"))
+        ) {
+          throw new Error(
+            `[Mengshu 配置错误] Embedding 服务账户余额不足（${error.message}）\n\n` +
+            `API Key 本身有效，但对应账户额度不足以调用 Embedding。\n\n` +
+            `请处理：\n` +
+            `- 前往服务商控制台充值（如 SiliconFlow / DeepSeek）\n` +
+            `- 或更换一个有额度的 Embedding API Key\n` +
+            `- 充值后运行 'ms doctor' 复验\n\n` +
+            `原始错误：${error.message}`
+          );
+        }
+
+        // 转换常见的 API 错误
+        if (error.message.includes("403") || error.message.includes("401")) {
+          throw new Error(
+            `[Mengshu 配置错误] API 认证失败（${error.message}）\n\n` +
+            `这通常是因为：\n` +
+            `1. API Key 无效或已过期\n` +
+            `2. API Key 没有访问 Embedding API 的权限\n` +
+            `3. 环境变量未正确设置\n\n` +
+            `请检查配置：\n` +
+            `- 确认 API Key 是否有效（可在提供商控制台验证）\n` +
+            `- 确认 baseURL 是否正确（如 https://api.openai.com/v1）\n` +
+            `- 运行 'ms doctor' 诊断配置问题\n\n` +
+            `详细文档：docs/troubleshooting/env-setup.md\n\n` +
+            `原始错误：${error.message}`
+          );
+        }
+
+        if (error.message.includes("ECONNREFUSED") || error.message.includes("ENOTFOUND")) {
+          throw new Error(
+            `[Mengshu 配置错误] 无法连接到 Embedding API（${error.message}）\n\n` +
+            `这通常是因为：\n` +
+            `1. baseURL 配置错误（请检查拼写和协议 http/https）\n` +
+            `2. 网络连接问题（防火墙、代理设置）\n` +
+            `3. API 服务不可用\n\n` +
+            `请检查配置：\n` +
+            `- 确认 baseURL 是否正确（如 https://api.openai.com/v1）\n` +
+            `- 如使用本地服务（如 Ollama），确认服务是否已启动\n` +
+            `- 运行 'ms doctor' 诊断连接问题\n\n` +
+            `详细文档：docs/troubleshooting/env-setup.md\n\n` +
+            `原始错误：${error.message}`
+          );
+        }
+      }
+
+      // 未识别的错误，附加通用帮助信息
+      throw new Error(
+        `[Mengshu 初始化失败] ${error instanceof Error ? error.message : String(error)}\n\n` +
+        `如需帮助：\n` +
+        `- 运行 'ms doctor' 诊断问题\n` +
+        `- 查看配置文档：docs/troubleshooting/env-setup.md\n` +
+        `- 查看故障排查：docs/troubleshooting/README.md`
+      );
+    }
   },
 };
 

@@ -1,5 +1,5 @@
 /**
- * memory-autodb JavaScript client SDK.
+ * mengshu JavaScript client SDK.
  *
  * SDK 通过 M2 REST API 访问 MemoryService，提供 bearer 注入、请求超时和稳定
  * 错误类型；它不依赖 OpenClaw，也不直接访问本地数据库。

@@ -16,15 +16,15 @@ describe("extractGraph", () => {
       scope,
       chunkId: "chunk-1",
       sourceId: "/repo/docs/guide.md",
-      text: "memory-autodb project uses Postgres and LanceDB. See src/index.ts.",
+      text: "mengshu project uses Postgres and LanceDB. See src/index.ts.",
       createdAt: 1710000000000,
-      metadata: { source: "scan", projectPath: "/repo/memory-autodb" },
+      metadata: { source: "scan", projectPath: "/repo/mengshu" },
     });
 
     expect(result.entities.map((entity) => [entity.type, entity.canonicalName])).toEqual(
       expect.arrayContaining([
         ["chunk", "chunk-1"],
-        ["project", "memory-autodb"],
+        ["project", "mengshu"],
         ["tool", "postgresql"],
         ["tool", "lancedb"],
         ["file", "src/index.ts"],

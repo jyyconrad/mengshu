@@ -104,12 +104,73 @@ describe("MCP memory tools", () => {
     await expect(namespaces?.execute({})).resolves.toEqual({ namespaces: ["memories", "knowledge"] });
   });
 
-  test("keeps ingest as an explicit unimplemented placeholder until M4", async () => {
+  test("keeps ingest as an explicit unimplemented placeholder with actionable hint", async () => {
     const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
     const ingest = tools.find((tool) => tool.name === "memory_ingest");
 
-    await expect(ingest?.execute({ source: "file-system" })).resolves.toEqual({
-      error: "memory_ingest is not implemented until ingestion pipeline is available",
+    const result = (await ingest?.execute({ source: "file-system" })) as {
+      status?: string;
+      error?: string;
+      hint?: string;
+    };
+    expect(result.status).toBe("not_implemented");
+    expect(result.error).toMatch(/暂未开放|roadmap/i);
+    // 必须给出可操作替代方案，避免调用方误判为配置错误。
+    expect(result.hint).toMatch(/memory_observe|memory_save|ms scan/);
+  });
+
+  test("every tool exposes a JSON Schema inputSchema object", () => {
+    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+
+    for (const tool of tools) {
+      expect(tool.inputSchema).toBeTypeOf("object");
+      expect(tool.inputSchema.type).toBe("object");
+      expect(tool.inputSchema).toHaveProperty("properties");
+    }
+  });
+
+  test("keeps 8 base tools when no agentFastPath is injected", () => {
+    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+    expect(tools).toHaveLength(8);
+    expect(tools.map((tool) => tool.name)).not.toContain("memory_context_fast");
+  });
+
+  test("adds 3 fast-path tools when agentFastPath is injected", async () => {
+    const calls: string[] = [];
+    const fastPath = {
+      async context() {
+        calls.push("context");
+        return { scope, slots: {}, content: "ctx" };
+      },
+      async observeLight() {
+        calls.push("observeLight");
+        return { ack: true as const, traceId: "t-1", queuedJobs: [] };
+      },
+      async lookup() {
+        calls.push("lookup");
+        return { hits: [], telemetry: { latencyMs: 1, mode: "fast" as const } };
+      },
+    };
+
+    const tools = createMcpMemoryTools({
+      service: new FakeMemoryService(),
+      // 只用到 3 个方法，用最小桩替身注入
+      agentFastPath: fastPath as unknown as Parameters<
+        typeof createMcpMemoryTools
+      >[0]["agentFastPath"],
     });
+
+    expect(tools).toHaveLength(11);
+    const names = tools.map((tool) => tool.name);
+    expect(names).toContain("memory_context_fast");
+    expect(names).toContain("memory_observe_light");
+    expect(names).toContain("memory_lookup");
+
+    const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
+    await byName.memory_context_fast.execute({ scope, task: "t" });
+    await byName.memory_observe_light.execute({ scope, eventType: "user_input", text: "x" });
+    await byName.memory_lookup.execute({ scope, query: "q" });
+
+    expect(calls).toEqual(["context", "observeLight", "lookup"]);
   });
 });

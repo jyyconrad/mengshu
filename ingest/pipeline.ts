@@ -18,6 +18,7 @@ import { canonicalize } from "./canonicalize.js";
 import { chunkMarkdown } from "./chunker.js";
 import { enqueueUniqueJob } from "./jobs.js";
 import type { IngestInput, IngestResult } from "./types.js";
+import { enqueueExtractGraphJob } from "../graph/extract-graph-handler.js";
 
 export interface IngestionPipelineOptions {
   documents: DocumentRepository;
@@ -25,6 +26,7 @@ export interface IngestionPipelineOptions {
   jobs: JobRepository;
   audit: AuditRepository;
   now?: () => number;
+  graphJobs?: JobRepository;
 }
 
 export class IngestionPipeline {
@@ -93,6 +95,16 @@ export class IngestionPipeline {
       if (!knownJobIds.has(job.id)) {
         knownJobIds.add(job.id);
         jobsQueued += 1;
+      }
+    }
+    if (this.options.graphJobs) {
+      for (const chunk of chunks) {
+        await enqueueExtractGraphJob(this.options.graphJobs, {
+          chunkId: chunk.id,
+          text: chunk.text,
+          scope: chunk.scope,
+          sourceId: canonical.sourceId,
+        }).catch(() => { /* 图谱入队失败不阻塞 ingest */ });
       }
     }
     await this.options.audit.append({

@@ -62,20 +62,6 @@ export interface CandidateRecord {
 }
 
 /**
- * 5 type 抽取阈值（参考 §9.3）
- */
-export const CANDIDATE_THRESHOLDS: Record<
-  MemorySemanticType,
-  { min: number; direct: number }
-> = {
-  profile: { min: 0.7, direct: 0.9 },
-  task_context: { min: 0.7, direct: 0.9 },
-  rules: { min: 0.8, direct: 0.9 },
-  experience: { min: 0.75, direct: 0.9 },
-  resource: { min: 0.7, direct: 0.95 },
-};
-
-/**
  * 候选区配置
  */
 export interface CandidateZoneConfig {
@@ -85,12 +71,19 @@ export interface CandidateZoneConfig {
   archiveDays?: number;
   /** 审核批次大小 */
   reviewBatchSize?: number;
+  /**
+   * 单会话候选区容量限制（D-02 / §17.1）
+   * 防止候选区无限膨胀，超限时最早入队的候选被自动归档。
+   * @default 50
+   */
+  maxCandidatesPerSession?: number;
 }
 
 export const DEFAULT_CANDIDATE_CONFIG: Required<CandidateZoneConfig> = {
   evictionDays: 30,
   archiveDays: 30,
   reviewBatchSize: 100,
+  maxCandidatesPerSession: 50,
 };
 
 /**
@@ -159,42 +152,4 @@ export interface CandidateReviewResult {
   affected: number;
   promoted: string[];
   errors: string[];
-}
-
-/**
- * 候选区配置：根据 semanticType 计算入库决策
- */
-export type CandidateAdmissionDecision =
-  | { route: "memory"; reason: string }
-  | { route: "candidate"; reason: string }
-  | { route: "drop"; reason: string };
-
-export function decideAdmission(
-  semanticType: MemorySemanticType | undefined,
-  confidence: number,
-  text: string,
-  meta: { hasWhy?: boolean; hasOutcome?: boolean } = {}
-): CandidateAdmissionDecision {
-  // 无 semanticType：进入候选（但不丢弃，保留 lookup）
-  if (!semanticType) {
-    return { route: "candidate", reason: "no_semantic_type" };
-  }
-
-  // experience 必须有 why
-  if (semanticType === "experience" && !meta.hasWhy) {
-    return { route: "drop", reason: "experience_missing_why" };
-  }
-
-  const threshold = CANDIDATE_THRESHOLDS[semanticType];
-  if (!threshold) {
-    return { route: "candidate", reason: "unknown_semantic_type" };
-  }
-
-  if (confidence >= threshold.direct) {
-    return { route: "memory", reason: "high_confidence" };
-  }
-  if (confidence >= threshold.min) {
-    return { route: "candidate", reason: "medium_confidence" };
-  }
-  return { route: "drop", reason: "low_confidence" };
 }

@@ -6,41 +6,11 @@
  */
 
 import type { MemoryScope } from "../core/types.js";
+import type { EntityType, RelationPredicate } from "./schema.js";
 
-export const ENTITY_TYPES = [
-  "person",
-  "organization",
-  "project",
-  "repo",
-  "file",
-  "topic",
-  "tool",
-  "task",
-  "concept",
-  "user",
-  "agent",
-  "chunk",
-  "document",
-  "other",
-] as const;
-
-export type EntityType = (typeof ENTITY_TYPES)[number];
-
-export const RELATION_PREDICATES = [
-  "mentions",
-  "works_on",
-  "uses",
-  "owns",
-  "depends_on",
-  "decided",
-  "prefers",
-  "blocked_by",
-  "fixed_by",
-  "supersedes",
-  "related_to",
-] as const;
-
-export type RelationPredicate = (typeof RELATION_PREDICATES)[number];
+// Re-export schema types for backward compatibility
+export type { EntityType, RelationPredicate };
+export { ENTITY_TYPES, RELATION_PREDICATES } from "./schema.js";
 
 export type EntityStatus = "active" | "archived" | "merged";
 export type RelationStatus = "active" | "weak" | "contradicted" | "archived";

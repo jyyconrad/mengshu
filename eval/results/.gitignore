@@ -1,0 +1,4 @@
+# 评测 runner 输出目录：每次跑都会落盘 timestamp 子目录，不进入版本控制。
+*
+!.gitignore
+!.gitkeep

@@ -1,5 +1,5 @@
 /**
- * OpenClaw tool handlers for memory-autodb.
+ * OpenClaw tool handlers for mengshu.
  *
  * 该模块把 OpenClaw 工具参数映射到中间件 `MemoryService` 和 ingestion pipeline，
  * 并保持旧工具的响应文案和 details 结构。
@@ -320,7 +320,7 @@ export async function handleMemoryStore(
     const routingResult = context.routingEngine.routeToKnowledgeBases(text, enrichedMetadata);
     targetTables = routingResult.targetTables;
     context.logger?.info?.(
-      `memory-autodb: routing to ${targetTables.join(", ")} (matched rules: ${routingResult.matchedRules.map((r) => r.name).join(", ")})`,
+      `mengshu: routing to ${targetTables.join(", ")} (matched rules: ${routingResult.matchedRules.map((r) => r.name).join(", ")})`,
     );
   }
 

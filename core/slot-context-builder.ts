@@ -11,14 +11,16 @@
  * 5. 缓存结果到 SlotSnapshot
  *
  * 参考文档：
- * - docs/03-architecture/memory-autodb-deep-optimization-architecture.md §5/§9
+ * - docs/03-architecture/mengshu-deep-optimization-architecture.md §5/§9
  */
 
 import type {
   ContextFastResponse,
+  FilteredEntry,
+  FilteredReason,
   SlotContextBlock,
 } from "./semantic-types.js";
-import { FIVE_QUESTIONS } from "./semantic-types.js";
+import { FIVE_QUESTIONS, lifecycleStatusToFilteredReason } from "./semantic-types.js";
 import type {
   MemoryLifecycleStatus,
   MemoryRecord,
@@ -32,6 +34,13 @@ import {
   RECOMMENDED_TTL,
 } from "./slot-snapshot.js";
 import { kindToSemanticType } from "./semantic-type-mapper.js";
+import {
+  DEFAULT_RECALL_WEIGHTS,
+  sortByNodeScore,
+  type RecallWeights,
+} from "./recall-scoring.js";
+import { packSlotsToPrompt } from "./slot-prompt-packer.js";
+import { mergeProfileByLayer, enrichProfileLayer } from "./profile-layer.js";
 
 export interface BuildSlotContextOptions {
   /** 每个槽位最大字符预算（默认按 type 推荐） */
@@ -46,6 +55,8 @@ export interface BuildSlotContextOptions {
   cache?: SlotSnapshotCache;
   /** 任务描述（用于上下文标题，可选） */
   task?: string;
+  /** 召回评分权重（默认 DEFAULT_RECALL_WEIGHTS） */
+  weights?: RecallWeights;
 }
 
 /**
@@ -58,50 +69,6 @@ const SLOT_BUDGET_DEFAULT: Record<MemorySemanticType, number> = {
   resource: 600,
   experience: 800,
 };
-
-/**
- * Prompt 注入模板。
- * 将 5 槽位拼接为可直接放入 Agent prompt 的文本。
- */
-function packSlotsToPrompt(
-  slots: ContextFastResponse["slots"],
-  task?: string
-): string {
-  const lines: string[] = ["<relevant-memories>"];
-
-  if (task) {
-    lines.push(`<task>${escapeForPrompt(task)}</task>`);
-  }
-
-  const order: MemorySemanticType[] = [
-    "rules", // 规则优先（合规底线）
-    "profile",
-    "task_context",
-    "experience",
-    "resource",
-  ];
-
-  for (const type of order) {
-    const block = slots[type];
-    if (!block || block.nodeCount === 0) continue;
-    lines.push(`<slot type="${type}" question="${escapeForPrompt(block.question)}">`);
-    lines.push(escapeForPrompt(block.content));
-    lines.push(`</slot>`);
-  }
-
-  lines.push("</relevant-memories>");
-  return lines.join("\n");
-}
-
-/**
- * 简单的 prompt-safe 转义：剔除可能注入的标签
- */
-function escapeForPrompt(text: string): string {
-  return text
-    .replace(/<\/?relevant-memories>/g, "")
-    .replace(/<\/?slot[^>]*>/g, "")
-    .replace(/<\/?system>/gi, "");
-}
 
 export class SlotContextBuilder {
   private cache: SlotSnapshotCache;
@@ -123,19 +90,24 @@ export class SlotContextBuilder {
       latencyBudgetMs = 80,
       useCache = true,
       task,
+      weights = DEFAULT_RECALL_WEIGHTS,
     } = options;
 
     const warnings: string[] = [];
+    // filtered：累积所有被过滤出必读层的记忆解释（生命周期/无类型/超预算）
+    const filtered: FilteredEntry[] = [];
     let cacheHit = false;
 
-    // 1. 过滤掉 revoked / superseded 记忆，应用 visibility 默认规则
-    const filtered = this.applyLifecycleFilter(allRecords);
+    // 1. 生命周期过滤：仅保留 active，其余按状态记入 filtered
+    const { kept, filtered: lifecycleFiltered } = this.applyLifecycleFilter(allRecords);
+    filtered.push(...lifecycleFiltered);
 
     // 2. 为没有 semanticType 的记忆自动映射
-    const enriched = this.enrichSemanticType(filtered);
+    const enriched = this.enrichSemanticType(kept);
 
-    // 3. 按 semanticType 分组
-    const grouped = this.groupBySemanticType(enriched);
+    // 3. 按 semanticType 分组，无法归类的记入 filtered(no_semantic_type)
+    const { grouped, filtered: ungrouped } = this.groupBySemanticType(enriched);
+    filtered.push(...ungrouped);
 
     // 4. 构建每个槽位
     const slots: ContextFastResponse["slots"] = {};
@@ -160,19 +132,27 @@ export class SlotContextBuilder {
         }
       }
 
-      // 4.2 构建新槽位
+      // 4.2 构建新槽位（selectTopNodes 同时返回超预算被裁掉的记录）
       const records = grouped[semanticType] ?? [];
       const budget = options.tokenBudgetPerSlot ?? SLOT_BUDGET_DEFAULT[semanticType];
-      const topNodes = this.selectTopNodes(records, budget);
+      const { selected, overflow } = this.selectTopNodes(records, budget, weights);
 
-      slots[semanticType] = this.recordsToBlock(topNodes, semanticType, budget);
+      slots[semanticType] = this.recordsToBlock(selected, semanticType, budget);
+
+      for (const record of overflow) {
+        filtered.push({
+          recordId: record.id,
+          reason: "budget_exceeded",
+          semanticType,
+        });
+      }
 
       // 4.3 缓存结果
       if (useCache) {
         this.cache.create(
           scope,
           semanticType,
-          topNodes,
+          selected,
           RECOMMENDED_TTL[semanticType]
         );
       }
@@ -202,6 +182,8 @@ export class SlotContextBuilder {
       slots,
       content,
       warnings: warnings.length > 0 ? warnings : undefined,
+      filtered,
+      filteredSummary: this.summarizeFiltered(filtered),
       freshness: {
         slotSnapshotAt: snapshotAtMin,
         staleSlots,
@@ -216,14 +198,27 @@ export class SlotContextBuilder {
   }
 
   /**
-   * 应用生命周期过滤：剔除 revoked / superseded
+   * 应用生命周期过滤：仅保留 active，其余按状态记入 filtered。
+   * 必读层只接受 active；archived/promoted 通过 lookup 检索。
    */
-  private applyLifecycleFilter(records: MemoryRecord[]): MemoryRecord[] {
-    return records.filter((record) => {
+  private applyLifecycleFilter(records: MemoryRecord[]): {
+    kept: MemoryRecord[];
+    filtered: FilteredEntry[];
+  } {
+    const kept: MemoryRecord[] = [];
+    const filtered: FilteredEntry[] = [];
+    for (const record of records) {
       const status: MemoryLifecycleStatus = record.lifecycleStatus ?? "active";
-      // 必读层只接受 active；archived/promoted 通过 lookup 检索
-      return status === "active";
-    });
+      if (status === "active") {
+        kept.push(record);
+        continue;
+      }
+      const reason = lifecycleStatusToFilteredReason(status);
+      if (reason) {
+        filtered.push({ recordId: record.id, reason, semanticType: record.semanticType });
+      }
+    }
+    return { kept, filtered };
   }
 
   /**
@@ -243,46 +238,109 @@ export class SlotContextBuilder {
   }
 
   /**
-   * 按 semanticType 分组（跳过无法归类的）
+   * 按 semanticType 分组；无法归类的记入 filtered(no_semantic_type)。
+   * 注意：no_semantic_type 是降级为 lookup-only，不是错误。
+   *
+   * D-13 profile 分层合并：
+   * - profile 类型按 profileLayer 合并（project > app > global）
+   * - 同 profileDimension 保留高层，低层记入 filtered(overridden_by_layer)
    */
-  private groupBySemanticType(
-    records: MemoryRecord[]
-  ): Partial<Record<MemorySemanticType, MemoryRecord[]>> {
+  private groupBySemanticType(records: MemoryRecord[]): {
+    grouped: Partial<Record<MemorySemanticType, MemoryRecord[]>>;
+    filtered: FilteredEntry[];
+  } {
     const grouped: Partial<Record<MemorySemanticType, MemoryRecord[]>> = {};
+    const filtered: FilteredEntry[] = [];
 
+    // 1. 先按 semanticType 初步分组
+    const byType: Partial<Record<MemorySemanticType, MemoryRecord[]>> = {};
     for (const record of records) {
-      if (!record.semanticType) continue;
-      if (!grouped[record.semanticType]) {
-        grouped[record.semanticType] = [];
+      if (!record.semanticType) {
+        filtered.push({ recordId: record.id, reason: "no_semantic_type" });
+        continue;
       }
-      grouped[record.semanticType]!.push(record);
+      if (!byType[record.semanticType]) {
+        byType[record.semanticType] = [];
+      }
+      byType[record.semanticType]!.push(record);
     }
 
-    return grouped;
+    // 2. 对 profile 类型应用分层合并（D-13）
+    if (byType.profile && byType.profile.length > 0) {
+      // 2.1 为缺失 profileLayer 的记忆自动补充
+      const enriched = byType.profile.map((r) => enrichProfileLayer(r));
+
+      // 2.2 按层级合并
+      const { active, overridden, unclassified } = mergeProfileByLayer(enriched);
+
+      // 2.3 active + unclassified 进入 grouped
+      grouped.profile = [...active, ...unclassified];
+
+      // 2.4 overridden 记入 filtered
+      for (const record of overridden) {
+        filtered.push({
+          recordId: record.id,
+          reason: "overridden_by_layer" as FilteredReason,
+          semanticType: "profile",
+          metadata: {
+            overriddenBy: record.overriddenBy,
+            profileDimension: record.profileDimension,
+          },
+        });
+      }
+    }
+
+    // 3. 其他类型直接复制
+    for (const type of Object.keys(byType) as MemorySemanticType[]) {
+      if (type !== "profile") {
+        grouped[type] = byType[type];
+      }
+    }
+
+    return { grouped, filtered };
   }
 
   /**
-   * 选择 top-N 节点（按 importance × hotness 排序，截断到字符预算）
+   * 选择 top-N 节点：按显式权重打分（recall-scoring）降序，截断到字符预算。
+   * 返回 selected（入选）与 overflow（超预算被裁掉，记为 budget_exceeded）。
    */
   private selectTopNodes(
     records: MemoryRecord[],
-    charBudget: number
-  ): MemoryRecord[] {
-    const sorted = [...records].sort((a, b) => {
-      const scoreA = (a.importance ?? 0.5) * 10 + (a.hotness ?? 0);
-      const scoreB = (b.importance ?? 0.5) * 10 + (b.hotness ?? 0);
-      return scoreB - scoreA;
-    });
+    charBudget: number,
+    weights: RecallWeights = DEFAULT_RECALL_WEIGHTS,
+  ): { selected: MemoryRecord[]; overflow: MemoryRecord[] } {
+    const sorted = sortByNodeScore(records, weights);
 
-    const result: MemoryRecord[] = [];
+    const selected: MemoryRecord[] = [];
+    const overflow: MemoryRecord[] = [];
     let used = 0;
     for (const record of sorted) {
       const cost = record.text.length + 4;
-      if (used + cost > charBudget) break;
-      result.push(record);
+      if (used + cost > charBudget) {
+        overflow.push(record);
+        continue;
+      }
+      selected.push(record);
       used += cost;
     }
-    return result;
+    return { selected, overflow };
+  }
+
+  /**
+   * 按 reason 聚合 filtered 计数，保持稳定的首次出现顺序。
+   */
+  private summarizeFiltered(
+    filtered: FilteredEntry[],
+  ): Array<{ reason: FilteredReason; count: number }> {
+    const order: FilteredReason[] = [];
+    const counts = new Map<FilteredReason, number>();
+    for (const entry of filtered) {
+      if (!counts.has(entry.reason)) {
+        order.push(entry.reason);
+      }
+      counts.set(entry.reason, (counts.get(entry.reason) ?? 0) + 1);
+    }
+    return order.map((reason) => ({ reason, count: counts.get(reason) ?? 0 }));
   }
 
   /**

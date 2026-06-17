@@ -9,6 +9,7 @@
  */
 
 import type { MemorySemanticType } from "../core/types.js";
+import { isSensitive } from "./sensitive-filter.js";
 
 /**
  * Extractor 输出
@@ -123,6 +124,10 @@ export class HeuristicTypeExtractor implements TypeExtractor {
   async extract(input: ExtractorInput): Promise<ExtractedCandidate[]> {
     const text = input.text.trim();
     if (text.length < 5) return [];
+
+    // 隐私安全底线（plan §5.1.3 + RISK-15）：命中敏感个人属性（人格/健康/政治/
+    // 宗教/性取向）直接返回空候选，确保敏感内容不进入候选区与 Durable Memory。
+    if (isSensitive(text)) return [];
 
     const results: ExtractedCandidate[] = [];
     const explicit = input.hints?.explicitSave;

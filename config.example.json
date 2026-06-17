@@ -1,5 +1,5 @@
 {
-  "id": "memory-autodb",
+  "id": "mengshu",
   "config": {
     "embedding": {
       "apiKey": "${OPENAI_API_KEY}",
@@ -7,11 +7,22 @@
       "model": "text-embedding-3-small"
     },
 
+    // LLM chat completion 配置 (可选)
+    // 提供后启用摘要 / 抽取等生成式能力；不提供则相关功能自动降级关闭
+    "llm": {
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "${OPENAI_API_KEY}",
+      "maxTokens": 512, // 可选，单次生成最大 token 数
+      "temperature": 0.3 // 可选，0-2 之间，越低越确定
+    },
+
     // 数据库类型选择: "lancedb" (本地) 或 "supabase" (云端)
     "dbType": "lancedb",
 
     // LanceDB 本地存储配置 (仅 dbType=lancedb 时需要)
-    "dbPath": "~/.openclaw/memory/autodb",
+    "dbPath": "~/.mengshu/lancedb",
 
     // Supabase 云端存储配置 (可选，提供则开启混合模式或纯云端模式)
     "supabase": {

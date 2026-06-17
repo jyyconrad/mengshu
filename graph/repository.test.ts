@@ -59,12 +59,12 @@ describe("InMemoryGraphRepository", () => {
   test("upserts entities and isolates by scope", async () => {
     const repository = new InMemoryGraphRepository();
     await repository.upsertEntities([
-      entity("entity-1", "memory-autodb"),
-      entity("entity-1", "memory-autodb"),
-      entity("entity-2", "memory-autodb", otherScope),
+      entity("entity-1", "mengshu"),
+      entity("entity-1", "mengshu"),
+      entity("entity-2", "mengshu", otherScope),
     ]);
 
-    const results = await repository.findEntities({ scope, query: "memory" });
+    const results = await repository.findEntities({ scope, query: "mengshu" });
 
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({

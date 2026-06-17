@@ -11,7 +11,7 @@ import type {
   StoreMemoryInput,
 } from "../../core/service-types.js";
 import type { GraphQueryInput } from "../../graph/query.js";
-import type { ConsoleLookupRequest } from "../../console/types.js";
+import type { ConsoleCandidatesRequest, ConsoleCandidateReviewRequest, ConsoleLookupRequest } from "../../console/types.js";
 import type { MemoryScope } from "../../core/types.js";
 import { authorizeRestRequest } from "./auth.js";
 import type { RestRequest, RestResponse, RestRouterOptions } from "./types.js";
@@ -188,6 +188,41 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         return {
           status: 200,
           body: await options.console.jobs(),
+        };
+      }
+
+      if (request.path === "/v1/console/candidates") {
+        if (!options.console) {
+          return notFound();
+        }
+        if (request.method !== "POST") {
+          return methodNotAllowed();
+        }
+        const body = requireObjectBody(request.body);
+        if (!body?.scope || typeof body.scope !== "object" || Array.isArray(body.scope)) {
+          return badRequest("scope is required");
+        }
+        return {
+          status: 200,
+          body: await options.console.candidates(body as unknown as ConsoleCandidatesRequest),
+        };
+      }
+
+      if (request.path === "/v1/console/candidates/review") {
+        if (!options.console) {
+          return notFound();
+        }
+        if (request.method !== "POST") {
+          return methodNotAllowed();
+        }
+        const body = requireObjectBody(request.body);
+        const action = body?.action;
+        if (!action || typeof action !== "object" || Array.isArray(action)) {
+          return badRequest("action is required");
+        }
+        return {
+          status: 200,
+          body: await options.console.reviewCandidates(body as unknown as ConsoleCandidateReviewRequest),
         };
       }
 

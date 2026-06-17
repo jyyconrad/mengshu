@@ -1,11 +1,12 @@
 {
-  "name": "@openclaw/memory-autodb",
+  "name": "@mengshu/core",
   "version": "2026.3.9",
   "private": true,
-  "description": "Local-first memory middleware for OpenClaw-type Agent Runtime products with auto-recall/capture",
+  "description": "Local-first memory middleware (mengshu) for OpenClaw-type Agent Runtime products with auto-recall/capture",
   "type": "module",
   "dependencies": {
     "@lancedb/lancedb": "^0.26.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@sinclair/typebox": "0.34.48",
     "@supabase/supabase-js": "^2.45.0",
     "front-matter": "^4.0.2",
@@ -21,14 +22,28 @@
   "devDependencies": {
     "@types/node": "^25.3.1",
     "@types/pg": "^8.15.4",
+    "@vitest/coverage-v8": "^4.1.8",
     "dotenv": "^17.3.1",
     "openclaw": "*",
+    "tsx": "^4.22.4",
     "vitest": "^4.0.18"
+  },
+  "optionalDependencies": {
+    "@rolldown/binding-darwin-arm64": "^1.1.1",
+    "@rolldown/binding-darwin-x64": "^1.1.1",
+    "@rolldown/binding-linux-arm64-gnu": "^1.1.1",
+    "@rolldown/binding-linux-x64-gnu": "^1.1.1",
+    "@rolldown/binding-win32-x64-msvc": "^1.1.1"
+  },
+  "bin": {
+    "ms": "./bin/ms.ts",
+    "mengshu": "./bin/ms.ts"
   },
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "eval:quick": "tsx eval/runners/quick-eval.ts"
   },
   "openclaw": {
     "extensions": [

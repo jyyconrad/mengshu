@@ -16,6 +16,8 @@ export interface OpenClawScopeInput extends Record<string, unknown> {
   agentName?: unknown;
   agentId?: unknown;
   tableName?: unknown;
+  sessionId?: unknown;
+  workspaceId?: unknown;
 }
 
 function stringValue(value: unknown): string | undefined {
@@ -30,6 +32,8 @@ export function buildOpenClawScope(input: OpenClawScopeInput = {}): MemoryScope 
     projectId: stringValue(input.projectPath) ?? stringValue(input.workspacePath),
     agentId: stringValue(input.agentName) ?? stringValue(input.agentId),
     namespace: stringValue(input.tableName) ?? "memories",
+    sessionId: stringValue(input.sessionId),
+    workspaceId: stringValue(input.workspaceId),
   });
 }
 

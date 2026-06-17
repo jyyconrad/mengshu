@@ -13,15 +13,22 @@ import { fileURLToPath } from "node:url";
 import type { MemoryService } from "../core/service-types.js";
 import { createRestRouter } from "../api/rest/router.js";
 import type { RestRequest, RestRouterOptions } from "../api/rest/types.js";
+import { startJobWorkerLoop, type JobWorkerLoopOptions } from "./workers.js";
+import type { JobRepository } from "../storage/repositories/types.js";
 
 export interface StartMemoryServerOptions {
   service: MemoryService;
   graph?: RestRouterOptions["graph"];
   console?: RestRouterOptions["console"];
+  agentFastPath?: RestRouterOptions["agentFastPath"];
   host?: string;
   port?: number;
   secret?: string;
   requireHttps?: boolean;
+  /** 后台 job worker：注入后 daemon 在 listen 期间轮询 drain 队列，stop 时清理。 */
+  worker?: {
+    jobs: JobRepository;
+  } & Omit<JobWorkerLoopOptions, "workerId"> & { workerId?: string };
 }
 
 export interface RunningMemoryServer {
@@ -104,6 +111,7 @@ export async function startMemoryServer(options: StartMemoryServerOptions): Prom
     service: options.service,
     graph: options.graph,
     console: options.console,
+    agentFastPath: options.agentFastPath,
     server: {
       enabled: true,
       host,
@@ -146,10 +154,23 @@ export async function startMemoryServer(options: StartMemoryServerOptions): Prom
 
   const address = server.address() as AddressInfo;
   const url = `http://${host}:${address.port}`;
+
+  // 启动后台 job worker（注入时）。daemon 拥有其生命周期：随 listen 启动、随 stop 清理。
+  const workerLoop = options.worker
+    ? startJobWorkerLoop(options.worker.jobs, {
+        workerId: options.worker.workerId ?? "memory-daemon-worker",
+        leaseMs: options.worker.leaseMs,
+        intervalMs: options.worker.intervalMs,
+        handlers: options.worker.handlers,
+        maxPerTick: options.worker.maxPerTick,
+      })
+    : undefined;
+
   return {
     url,
     server,
     stop: async () => {
+      await workerLoop?.stop();
       if (!server.listening) {
         return;
       }

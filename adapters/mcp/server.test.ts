@@ -14,7 +14,7 @@ describe("MCP memory server adapter", () => {
   test("provides a minimal tool registry without binding to a transport", async () => {
     const server = createMcpMemoryServer({ service });
 
-    expect(server.name).toBe("memory-autodb");
+    expect(server.name).toBe("mengshu");
     expect(server.listTools().map((tool) => tool.name)).toContain("memory_health");
     await expect(server.callTool("memory_health", {})).resolves.toEqual({ ok: true });
     await expect(server.callTool("missing", {})).rejects.toThrow("Unknown MCP tool: missing");

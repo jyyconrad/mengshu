@@ -1,6 +1,5 @@
 import fs from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { resolveDefaultLanceDbPath, resolveLegacyLanceDbPath } from "./core/paths.js";
 
 /**
  * 路由规则配置
@@ -38,6 +37,33 @@ export type MemoryConfig = {
     model?: string;
     baseURL?: string;
     apiKey: string;
+  };
+  /**
+   * LLM chat completion 配置（可选）。
+   * 提供后即可启用摘要 / 抽取等生成式能力；未提供时上层降级到 NullLlmClient。
+   *
+   * 模型分层配置：
+   * - extractionModel: 结构化抽取（候选记忆提取）
+   * - summarizationModel: 摘要生成（Memory Tree sealing）
+   * - reasoningModel: 推理判断（faithfulness 校验、晋升决策）
+   *
+   * temperature 可选配置（0~2），缺省由调用方决定（结构化任务通常用 0.0）。
+   */
+  llm?: {
+    provider: "openai";
+    /** 默认模型（兜底） */
+    model: string;
+    baseURL?: string;
+    apiKey: string;
+    maxTokens?: number;
+    /** 采样温度（0~2），可选 */
+    temperature?: number;
+    /** 结构化抽取模型（候选记忆提取） */
+    extractionModel?: string;
+    /** 摘要生成模型（Memory Tree sealing） */
+    summarizationModel?: string;
+    /** 推理判断模型（faithfulness 校验、晋升决策） */
+    reasoningModel?: string;
   };
   mode?: "embedded" | "server" | "remote" | "backend-proxy";
   server?: {
@@ -102,6 +128,38 @@ export type MemoryConfig = {
    * 根据内容自动路由到对应的知识库表
    */
   routingRules?: RoutingRule[];
+  /**
+   * Memory Tree 配置
+   */
+  tree?: {
+    summaryFaithfulness?: {
+      /** 校验模式（D-07：P2 起默认 high_risk） */
+      mode?: "off" | "sampled" | "high_risk" | "always";
+      /** 抽样比例（sampled 模式下生效） */
+      sampleRate?: number;
+      /** Judge 模型（可选，缺省使用 llm.reasoningModel） */
+      judgeModel?: string;
+      /** 校验失败时的处理动作 */
+      failAction?: "fallback_extractive" | "mark_untrusted" | "retry";
+    };
+  };
+  /**
+   * 候选自动晋升配置（§11.1 / §13）
+   */
+  promotion?: {
+    /** 是否启用自动晋升（默认 true） */
+    enabled?: boolean;
+    /** 最少证据数（默认 5） */
+    minEvidenceCount?: number;
+    /** 最少观察时间跨度（天，默认 3） */
+    minTimeSpanDays?: number;
+    /** 泛化阈值：达到此阈值才聚合（默认 5） */
+    generalizeThreshold?: number;
+    /** 语义相似度阈值（默认 0.78） */
+    minSimilarity?: number;
+    /** 是否启用冲突自动降级（默认 true） */
+    autoConflictDowngrade?: boolean;
+  };
 };
 
 /**
@@ -150,11 +208,11 @@ export const DEFAULT_CAPTURE_MAX_CHARS = 500;
 const DEFAULT_SERVER_HOST = "127.0.0.1";
 const DEFAULT_SERVER_PORT = 3847;
 const VALID_MODES = ["embedded", "server", "remote", "backend-proxy"] as const;
-const LEGACY_STATE_DIRS: string[] = [];
+
+let warnedLegacyDbPath = false;
 
 function resolveDefaultDbPath(): string {
-  const home = homedir();
-  const preferred = join(home, ".openclaw", "memory", "lancedb");
+  const preferred = resolveDefaultLanceDbPath();
   try {
     if (fs.existsSync(preferred)) {
       return preferred;
@@ -163,11 +221,20 @@ function resolveDefaultDbPath(): string {
     // best-effort
   }
 
-  for (const legacy of LEGACY_STATE_DIRS) {
-    const candidate = join(home, legacy, "memory", "lancedb");
+  // 兼容回退：仅当用户未显式覆盖 MENGSHU_HOME 时，才考虑旧路径。
+  // 显式覆盖代表用户已经选择新 home，不应被旧目录截胡。
+  const explicitHome = process.env.MENGSHU_HOME;
+  if (!explicitHome || explicitHome.trim().length === 0) {
     try {
-      if (fs.existsSync(candidate)) {
-        return candidate;
+      const legacy = resolveLegacyLanceDbPath();
+      if (fs.existsSync(legacy)) {
+        if (!warnedLegacyDbPath) {
+          warnedLegacyDbPath = true;
+          console.warn(
+            "[mengshu] 检测到旧路径 ~/.openclaw/memory/lancedb，建议运行 `ms migrate-home` 迁移到 ~/.mengshu/",
+          );
+        }
+        return legacy;
       }
     } catch {
       // best-effort
@@ -176,8 +243,6 @@ function resolveDefaultDbPath(): string {
 
   return preferred;
 }
-
-const DEFAULT_DB_PATH = resolveDefaultDbPath();
 
 const EMBEDDING_DIMENSIONS: Record<string, number> = {
   // OpenAI 模型
@@ -221,14 +286,61 @@ export function vectorDimsForModel(model: string): number {
   return dims;
 }
 
-function resolveEnvVars(value: string): string {
-  return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
+/**
+ * 解析配置中的环境变量占位符
+ * @param value 配置值，如 "${OPENAI_API_KEY}"
+ * @param fieldName 字段名，用于生成友好的错误信息
+ * @returns 解析后的实际值
+ * @throws 当环境变量未设置时抛出友好的配置错误
+ *
+ * 安全约束：占位符内的变量名必须匹配 `ENV_NAME_RE`（POSIX 习惯：大写字母 / 数字 /
+ * 下划线，且首字符不能是数字）。不匹配时保留原 `${...}` 不替换并打印 warning，
+ * 避免把可疑字符串（如 `${'; DROP TABLE; --}` 或带空格的命令片段）当作 env key
+ * 透传到 process.env 查询。
+ */
+const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+function resolveEnvVars(value: string, fieldName?: string): string {
+  return value.replace(/\$\{([^}]+)\}/g, (placeholder, envVar) => {
+    if (typeof envVar !== "string" || !ENV_NAME_RE.test(envVar)) {
+      // 非法变量名：保留原样并告警，不破坏整体配置加载（保持向后兼容）。
+      const field = fieldName ? ` (${fieldName})` : "";
+      console.warn(
+        `[memory-autodb] Ignoring invalid env var placeholder${field}: ${placeholder}. ` +
+          `Allowed pattern: ${ENV_NAME_RE.source}`,
+      );
+      return placeholder;
+    }
     const envValue = process.env[envVar];
     if (!envValue) {
-      throw new Error(`Environment variable ${envVar} is not set`);
+      const field = fieldName ? ` (${fieldName})` : "";
+      const shellConfig = getShellConfigFile();
+      throw new Error(
+        `环境变量 ${envVar} 未设置${field}\n\n` +
+        `请按以下步骤配置：\n` +
+        `1. 编辑 Shell 配置文件：${shellConfig}\n` +
+        `2. 添加环境变量：export ${envVar}="your-actual-value"\n` +
+        `3. 重新加载配置：source ${shellConfig}\n` +
+        `4. 或者在配置文件中直接填写实际值（不推荐用于敏感信息）\n\n` +
+        `详细文档：docs/troubleshooting/env-setup.md`
+      );
     }
     return envValue;
   });
+}
+
+/**
+ * 获取当前 Shell 的配置文件路径
+ */
+function getShellConfigFile(): string {
+  const shell = process.env.SHELL || "";
+  if (shell.includes("zsh")) {
+    return "~/.zshrc";
+  }
+  if (shell.includes("bash")) {
+    return "~/.bashrc 或 ~/.bash_profile";
+  }
+  return "~/.profile";
 }
 
 function resolveEmbeddingModel(embedding: Record<string, unknown>): string {
@@ -245,7 +357,7 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "mode", "server", "features", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules"],
+      ["embedding", "llm", "mode", "server", "features", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
       "memory config",
     );
 
@@ -259,6 +371,46 @@ export const memoryConfigSchema = {
     assertAllowedKeys(embedding, ["apiKey", "baseURL", "model"], "embedding config");
 
     const model = resolveEmbeddingModel(embedding);
+
+    // Validate llm config if provided
+    const llm = cfg.llm as Record<string, unknown> | undefined;
+    if (llm) {
+      assertAllowedKeys(
+        llm,
+        ["provider", "model", "baseURL", "apiKey", "maxTokens", "temperature", "extractionModel", "summarizationModel", "reasoningModel"],
+        "llm config",
+      );
+      if (typeof llm.apiKey !== "string" || !llm.apiKey) {
+        throw new Error("llm.apiKey is required when llm config is provided");
+      }
+      if (typeof llm.model !== "string" || !llm.model) {
+        throw new Error("llm.model is required when llm config is provided");
+      }
+      if (llm.baseURL !== undefined && typeof llm.baseURL !== "string") {
+        throw new Error("llm.baseURL must be a string");
+      }
+      if (
+        llm.maxTokens !== undefined &&
+        (typeof llm.maxTokens !== "number" || !Number.isInteger(llm.maxTokens) || llm.maxTokens < 1)
+      ) {
+        throw new Error("llm.maxTokens must be a positive integer");
+      }
+      if (llm.extractionModel !== undefined && typeof llm.extractionModel !== "string") {
+        throw new Error("llm.extractionModel must be a string");
+      }
+      if (llm.summarizationModel !== undefined && typeof llm.summarizationModel !== "string") {
+        throw new Error("llm.summarizationModel must be a string");
+      }
+      if (llm.reasoningModel !== undefined && typeof llm.reasoningModel !== "string") {
+        throw new Error("llm.reasoningModel must be a string");
+      }
+      if (
+        llm.temperature !== undefined &&
+        (typeof llm.temperature !== "number" || llm.temperature < 0 || llm.temperature > 2)
+      ) {
+        throw new Error("llm.temperature must be between 0 and 2");
+      }
+    }
 
     const mode = typeof cfg.mode === "string" ? cfg.mode : "embedded";
     if (!VALID_MODES.includes(mode as (typeof VALID_MODES)[number])) {
@@ -440,6 +592,36 @@ export const memoryConfigSchema = {
       }
     }
 
+    // Validate tree config if provided
+    const tree = cfg.tree as Record<string, unknown> | undefined;
+    if (tree) {
+      assertAllowedKeys(tree, ["summaryFaithfulness"], "tree config");
+      const summaryFaithfulness = tree.summaryFaithfulness as Record<string, unknown> | undefined;
+      if (summaryFaithfulness) {
+        assertAllowedKeys(summaryFaithfulness, ["mode", "sampleRate", "judgeModel", "failAction"], "tree.summaryFaithfulness config");
+        if (summaryFaithfulness.mode !== undefined) {
+          const validModes = ["off", "sampled", "high_risk", "always"];
+          if (typeof summaryFaithfulness.mode !== "string" || !validModes.includes(summaryFaithfulness.mode)) {
+            throw new Error(`tree.summaryFaithfulness.mode must be one of: ${validModes.join(", ")}`);
+          }
+        }
+        if (summaryFaithfulness.sampleRate !== undefined) {
+          if (typeof summaryFaithfulness.sampleRate !== "number" || summaryFaithfulness.sampleRate < 0 || summaryFaithfulness.sampleRate > 1) {
+            throw new Error("tree.summaryFaithfulness.sampleRate must be between 0 and 1");
+          }
+        }
+        if (summaryFaithfulness.judgeModel !== undefined && typeof summaryFaithfulness.judgeModel !== "string") {
+          throw new Error("tree.summaryFaithfulness.judgeModel must be a string");
+        }
+        if (summaryFaithfulness.failAction !== undefined) {
+          const validActions = ["fallback_extractive", "mark_untrusted", "retry"];
+          if (typeof summaryFaithfulness.failAction !== "string" || !validActions.includes(summaryFaithfulness.failAction)) {
+            throw new Error(`tree.summaryFaithfulness.failAction must be one of: ${validActions.join(", ")}`);
+          }
+        }
+      }
+    }
+
     const captureMaxChars =
       typeof cfg.captureMaxChars === "number" ? Math.floor(cfg.captureMaxChars) : undefined;
     if (
@@ -453,15 +635,26 @@ export const memoryConfigSchema = {
       embedding: {
         provider: "openai",
         model,
-        apiKey: resolveEnvVars(String(embedding.apiKey)),
-        baseURL: resolveEnvVars(String(embedding.baseURL)),
+        apiKey: resolveEnvVars(String(embedding.apiKey), "embedding.apiKey"),
+        baseURL: resolveEnvVars(String(embedding.baseURL), "embedding.baseURL"),
       },
+      llm: llm ? {
+        provider: "openai",
+        model: String(llm.model),
+        apiKey: resolveEnvVars(String(llm.apiKey), "llm.apiKey"),
+        baseURL: typeof llm.baseURL === "string" ? resolveEnvVars(llm.baseURL, "llm.baseURL") : undefined,
+        maxTokens: typeof llm.maxTokens === "number" ? llm.maxTokens : undefined,
+        temperature: typeof llm.temperature === "number" ? llm.temperature : undefined,
+        extractionModel: typeof llm.extractionModel === "string" ? llm.extractionModel : undefined,
+        summarizationModel: typeof llm.summarizationModel === "string" ? llm.summarizationModel : undefined,
+        reasoningModel: typeof llm.reasoningModel === "string" ? llm.reasoningModel : undefined,
+      } : undefined,
       mode: mode as MemoryConfig["mode"],
       server: {
         enabled: server?.enabled === true,
         host: typeof server?.host === "string" ? server.host : DEFAULT_SERVER_HOST,
         port: typeof server?.port === "number" ? server.port : DEFAULT_SERVER_PORT,
-        secret: typeof server?.secret === "string" ? resolveEnvVars(server.secret) : undefined,
+        secret: typeof server?.secret === "string" ? resolveEnvVars(server.secret, "server.secret") : undefined,
         requireHttps: server?.requireHttps === true,
       },
       features: {
@@ -471,17 +664,17 @@ export const memoryConfigSchema = {
         webConsole: features?.webConsole === true,
       },
       dbType: (cfg.dbType === "supabase" ? "supabase" : cfg.dbType === "postgres" ? "postgres" : "lancedb"),
-      dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : DEFAULT_DB_PATH,
+      dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : resolveDefaultDbPath(),
       supabase: supabase ? {
-        url: resolveEnvVars(String(supabase.url)),
-        serviceKey: resolveEnvVars(String(supabase.serviceKey)),
+        url: resolveEnvVars(String(supabase.url), "supabase.url"),
+        serviceKey: resolveEnvVars(String(supabase.serviceKey), "supabase.serviceKey"),
       } : undefined,
       postgres: postgres ? {
-        host: resolveEnvVars(String(postgres.host)),
+        host: resolveEnvVars(String(postgres.host), "postgres.host"),
         port: postgres.port as number,
-        database: resolveEnvVars(String(postgres.database)),
-        user: resolveEnvVars(String(postgres.user)),
-        password: resolveEnvVars(String(postgres.password)),
+        database: resolveEnvVars(String(postgres.database), "postgres.database"),
+        user: resolveEnvVars(String(postgres.user), "postgres.user"),
+        password: resolveEnvVars(String(postgres.password), "postgres.password"),
         ssl: postgres.ssl as boolean | undefined,
       } : undefined,
       scanner: scanner ? {
@@ -517,6 +710,18 @@ export const memoryConfigSchema = {
         customCategories: (knowledgeBases.customCategories as string[] | undefined),
       } : undefined,
       routingRules: routingRules ? routingRules as RoutingRule[] : DEFAULT_ROUTING_RULES,
+      tree: tree ? {
+        summaryFaithfulness: tree.summaryFaithfulness ? {
+          mode: (tree.summaryFaithfulness as Record<string, unknown>).mode as "off" | "sampled" | "high_risk" | "always" | undefined ?? "high_risk",
+          sampleRate: (tree.summaryFaithfulness as Record<string, unknown>).sampleRate as number | undefined ?? 0.05,
+          judgeModel: (tree.summaryFaithfulness as Record<string, unknown>).judgeModel as string | undefined,
+          failAction: (tree.summaryFaithfulness as Record<string, unknown>).failAction as "fallback_extractive" | "mark_untrusted" | "retry" | undefined ?? "fallback_extractive",
+        } : {
+          mode: "high_risk",
+          sampleRate: 0.05,
+          failAction: "fallback_extractive",
+        },
+      } : undefined,
     };
   },
   uiHints: {
@@ -545,7 +750,7 @@ export const memoryConfigSchema = {
     },
     dbPath: {
       label: "LanceDB Path",
-      placeholder: "~/.openclaw/memory/lancedb",
+      placeholder: "~/.mengshu/memory/lancedb",
       advanced: true,
       help: "Path to local LanceDB database (only for lancedb type)",
     },

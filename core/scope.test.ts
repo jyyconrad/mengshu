@@ -1,5 +1,18 @@
 import { describe, expect, test } from "vitest";
-import { normalizeScope, scopeToKey } from "./scope.js";
+import type { MemoryScope } from "./types.js";
+import { normalizeScope, scopeToKey, validateScopeForWrite } from "./scope.js";
+
+function makeScope(overrides: Partial<MemoryScope> = {}): MemoryScope {
+  return {
+    tenantId: "acme",
+    appId: "openclaw",
+    userId: "user-1",
+    projectId: "project-a",
+    agentId: "agent-main",
+    namespace: "memories",
+    ...overrides,
+  };
+}
 
 describe("memory scope", () => {
   test("builds a stable scope key with defaults", () => {
@@ -59,5 +72,29 @@ describe("memory scope", () => {
     });
 
     expect(key).toBe("local:open%3Aclaw:user%2F1:project%20a:agent%3Amain:knowledge%3Adocs");
+  });
+});
+
+describe("validateScopeForWrite", () => {
+  test("passes when tenantId/appId/userId match", () => {
+    expect(() => validateScopeForWrite(makeScope(), makeScope())).not.toThrow();
+  });
+
+  test("throws when tenantId mismatches", () => {
+    expect(() =>
+      validateScopeForWrite(makeScope({ tenantId: "other" }), makeScope()),
+    ).toThrow(/tenantId/);
+  });
+
+  test("throws when appId mismatches", () => {
+    expect(() =>
+      validateScopeForWrite(makeScope({ appId: "other-app" }), makeScope()),
+    ).toThrow(/appId/);
+  });
+
+  test("throws when userId mismatches", () => {
+    expect(() =>
+      validateScopeForWrite(makeScope({ userId: "user-2" }), makeScope()),
+    ).toThrow(/userId/);
   });
 });

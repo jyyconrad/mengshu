@@ -32,6 +32,16 @@ export type MemorySemanticType =
   | "resource";
 
 /**
+ * ProfileLayer: profile 记忆的 3 层分层（D-13，§3.3）
+ *
+ * 避免项目偏好污染全局画像，召回优先级 project > app > global：
+ * - project: 绑定明确 projectId/repo/任务域，或用户说"这个项目里"
+ * - app: 绑定 appId/agent/工具，但不绑定具体项目
+ * - global: 跨项目长期偏好，或来自全局规则文件
+ */
+export type ProfileLayer = "project" | "app" | "global";
+
+/**
  * MemoryContainer: 记忆容器（语义归属）
  *
  * 与 MemoryScope（隔离边界）正交：
@@ -57,6 +67,41 @@ export type MemoryLifecycleStatus =
   | "revoked"
   | "superseded"
   | "promoted";
+
+/**
+ * AdmissionRoute: 准入路由结果（D-02 / D-19，§0.3.1 / §6.2）
+ *
+ * 表示一条新记忆经过 admission 打分后被路由到的去向，是"准入阶段"的瞬时结果，
+ * 与候选区状态机 `CandidateStatus`、主库生命周期 `MemoryLifecycleStatus` 分开定义，
+ * 严禁共用同一枚举（D-19）。取值严格对应 §0.3.1 表：
+ * - drop: 低于阈值带，不入库（不可见）
+ * - candidate_low_priority: 0.40–0.55，低优先候选（TTL=30d）
+ * - candidate: 0.55–0.88，普通候选
+ * - active: >=0.88，直接进入主库 active
+ * - lookup_only / evidence_only: economy 模式不丢弃，仅保留可搜索/证据（D-20）
+ */
+export type AdmissionRoute =
+  | "drop"
+  | "candidate_low_priority"
+  | "candidate"
+  | "active"
+  | "lookup_only"
+  | "evidence_only";
+
+/**
+ * UserVisibleStatus: 用户可见聚合视图（§0.3.1，D-19）
+ *
+ * 仅服务于 CLI/UI 聚合呈现层（`ms list` / `ms why`）：
+ * - 不持久化、不落库
+ * - 不参与任何算法判定（算法只认 AdmissionRoute / CandidateStatus / MemoryLifecycleStatus 三套内部状态）
+ * 由 `mapToUserVisibleStatus` 从内部状态单向聚合得到。
+ */
+export type UserVisibleStatus =
+  | "active"
+  | "pending"
+  | "low_priority"
+  | "archived"
+  | "forgotten";
 
 /**
  * MemoryVisibility: 可见性
@@ -143,6 +188,10 @@ export interface MemoryRecord {
   promotedToSkillId?: string;
   /** v3.0 新增（可选）：版本号 */
   version?: number;
+  /** D-13 新增（可选）：profile 分层标识，仅 semanticType=profile 时有效 */
+  profileLayer?: ProfileLayer;
+  /** §3.3 新增（可选）：profile 维度，仅 semanticType=profile 时有效 */
+  profileDimension?: string;
   createdAt: number;
   updatedAt?: number;
   vector?: number[];

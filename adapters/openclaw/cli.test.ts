@@ -31,29 +31,29 @@ class FakeCommand {
 
 describe("OpenClaw server CLI commands", () => {
   test("registers serve, status, and health commands", () => {
-    const ltm = new FakeCommand("ltm");
+    const ms = new FakeCommand("ms");
 
-    registerMemoryServerCliCommands(ltm as never, {
+    registerMemoryServerCliCommands(ms as never, {
       config: { dbType: "lancedb", dbPath: "/tmp/db", server: { host: "127.0.0.1", port: 3847 } },
       service: { health: async () => ({ ok: true }) } as never,
     });
 
-    expect(ltm.subcommands.map((command) => command.name)).toEqual(["serve", "status", "health", "migrate"]);
+    expect(ms.subcommands.map((command) => command.name)).toEqual(["serve", "status", "health", "migrate"]);
   });
 
   test("status prints server URL, db type, and table stats", async () => {
-    const ltm = new FakeCommand("ltm");
+    const ms = new FakeCommand("ms");
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (message?: unknown) => logs.push(String(message));
     try {
-      registerMemoryServerCliCommands(ltm as never, {
+      registerMemoryServerCliCommands(ms as never, {
         config: { dbType: "lancedb", dbPath: "/tmp/db", server: { host: "127.0.0.1", port: 3847 } },
         service: { health: async () => ({ ok: true, records: 3 }) } as never,
         getTableStats: async () => [{ name: "memories", count: 3, dataType: "memory" }],
       });
 
-      await ltm.subcommands.find((command) => command.name === "status")?.actionHandler?.({});
+      await ms.subcommands.find((command) => command.name === "status")?.actionHandler?.({});
 
       expect(logs.join("\n")).toContain("Server URL: http://127.0.0.1:3847");
       expect(logs.join("\n")).toContain("Database type: lancedb");
@@ -64,15 +64,15 @@ describe("OpenClaw server CLI commands", () => {
   });
 
   test("health prints service health JSON", async () => {
-    const ltm = new FakeCommand("ltm");
+    const ms = new FakeCommand("ms");
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
-      registerMemoryServerCliCommands(ltm as never, {
+      registerMemoryServerCliCommands(ms as never, {
         config: { dbType: "lancedb", server: { host: "127.0.0.1", port: 3847 } },
         service: { health: async () => ({ ok: true, records: 1 }) } as never,
       });
 
-      await ltm.subcommands.find((command) => command.name === "health")?.actionHandler?.({});
+      await ms.subcommands.find((command) => command.name === "health")?.actionHandler?.({});
 
       expect(log).toHaveBeenCalledWith(JSON.stringify({ ok: true, records: 1 }, null, 2));
     } finally {
@@ -81,7 +81,7 @@ describe("OpenClaw server CLI commands", () => {
   });
 
   test("serve starts server with configured host and port", async () => {
-    const ltm = new FakeCommand("ltm");
+    const ms = new FakeCommand("ms");
     const startServer = vi.fn(async () => ({
       url: "http://127.0.0.1:3847",
       server: {} as never,
@@ -89,14 +89,14 @@ describe("OpenClaw server CLI commands", () => {
     }));
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
-      registerMemoryServerCliCommands(ltm as never, {
+      registerMemoryServerCliCommands(ms as never, {
         config: { dbType: "lancedb", server: { host: "127.0.0.1", port: 3847, secret: "secret" } },
         service: { health: async () => ({ ok: true }) } as never,
         startServer,
         keepAlive: false,
       });
 
-      await ltm.subcommands.find((command) => command.name === "serve")?.actionHandler?.({});
+      await ms.subcommands.find((command) => command.name === "serve")?.actionHandler?.({});
 
       expect(startServer).toHaveBeenCalledWith({
         service: expect.anything(),
@@ -112,15 +112,15 @@ describe("OpenClaw server CLI commands", () => {
   });
 
   test("migrate prints v4 dry-run plan", async () => {
-    const ltm = new FakeCommand("ltm");
+    const ms = new FakeCommand("ms");
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
-      registerMemoryServerCliCommands(ltm as never, {
+      registerMemoryServerCliCommands(ms as never, {
         config: { dbType: "lancedb", server: { host: "127.0.0.1", port: 3847 } },
         service: { health: async () => ({ ok: true, records: 2 }) } as never,
       });
 
-      await ltm.subcommands.find((command) => command.name === "migrate")?.actionHandler?.({ toSchema: "v4", dryRun: true });
+      await ms.subcommands.find((command) => command.name === "migrate")?.actionHandler?.({ toSchema: "v4", dryRun: true });
 
       expect(log).toHaveBeenCalledWith(JSON.stringify({
         sourceRecords: 2,

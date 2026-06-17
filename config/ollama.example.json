@@ -13,7 +13,7 @@
  * - snowflake-arctic-embed (多种尺寸)
  */
 {
-  "id": "memory-autodb",
+  "id": "mengshu",
   "config": {
     "embedding": {
       "apiKey": "ollama",
@@ -22,7 +22,7 @@
     },
 
     "dbType": "lancedb",
-    "dbPath": "~/.openclaw/memory/autodb",
+    "dbPath": "~/.mengshu/lancedb",
 
     "autoCapture": true,
     "autoRecall": true,

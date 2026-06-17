@@ -39,7 +39,7 @@
 ## 相关文档
 
 - [v3.0.0 Changelog](./docs/09-changelog/v3.0.0.md)
-- [架构方案](./docs/03-architecture/memory-autodb-deep-optimization-architecture.md)
+- [架构方案](./docs/03-architecture/mengshu-deep-optimization-architecture.md)
 - [架构评审](./docs/03-architecture/architecture-review-v2.md)
 - [Memory API](./docs/05-api/memory-api.md)
 

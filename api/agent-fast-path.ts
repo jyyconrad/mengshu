@@ -28,6 +28,7 @@ import type {
   RecallHit,
   RecallResult,
 } from "../core/types.js";
+import type { TreeSummaryNode } from "../tree/types.js";
 
 export type { AgentTaskContextRequest };
 
@@ -105,6 +106,8 @@ export interface AgentFastPathDeps {
   }): Promise<{ id: string }>;
   /** job 入队（observe / session_commit 异步处理） */
   enqueueJob?(input: { type: string; payload: Record<string, unknown> }): Promise<string>;
+  /** lookup_deep 时加载记忆树摘要（source/topic/global），未注入则 deep 退化为 fast。 */
+  loadTreeSummaries?(scope: MemoryScope, query: string): Promise<TreeSummaryNode[]>;
   /** 自定义 SlotContextBuilder（默认全局） */
   builder?: SlotContextBuilder;
   /** 默认 scope（兜底） */
@@ -188,6 +191,30 @@ export class AgentFastPathService {
       } catch (err) {
         warnings.push(`enqueue_failed: ${(err as Error).message}`);
       }
+
+      // F3-2：observation 同时进入 source 树构建链路（按 session 分组）。
+      // 树构建失败不影响 observation ack；树是 in-memory 增强，非主链路。
+      try {
+        const treeKey = scope.sessionId ?? "default";
+        const treeJobId = await this.deps.enqueueJob({
+          type: "build_tree",
+          payload: {
+            scope,
+            treeType: "source",
+            treeKey,
+            leaf: {
+              id: traceId,
+              chunkId: traceId,
+              sourceId: scope.sessionId ?? scope.appId,
+              text: request.text,
+              eventAt: Date.now(),
+            },
+          },
+        });
+        jobs.push(treeJobId);
+      } catch (err) {
+        warnings.push(`tree_enqueue_failed: ${(err as Error).message}`);
+      }
     }
 
     return {
@@ -222,8 +249,23 @@ export class AgentFastPathService {
       .filter((hit): hit is RecallHit => Boolean(hit))
       .map((hit) => this.shapeHit(hit));
 
+    // F3-3：deep 模式融合记忆树摘要（source/topic/global），提供宏观追溯。
+    // loadTreeSummaries 未注入时 deep 退化为 fast（只返回向量召回）。
+    const warnings: string[] = [];
+    if (mode === "deep" && this.deps.loadTreeSummaries) {
+      try {
+        const summaries = await this.deps.loadTreeSummaries(scope, request.query);
+        for (const node of summaries) {
+          hits.push(this.shapeTreeSummary(node));
+        }
+      } catch (err) {
+        warnings.push(`tree_lookup_failed: ${(err as Error).message}`);
+      }
+    }
+
     return {
       hits,
+      warnings: warnings.length > 0 ? warnings : undefined,
       telemetry: { latencyMs: Date.now() - startedAt, mode },
     };
   }
@@ -336,6 +378,18 @@ export class AgentFastPathService {
       semanticType: "semanticType" in record ? record.semanticType : undefined,
       evidence: [],
       actions: ["copy_reference", "drill_down"],
+    };
+  }
+
+  /** 把记忆树摘要节点转为 lookup hit（deep 模式融合用）。 */
+  private shapeTreeSummary(node: TreeSummaryNode): AgentLookupResponse["hits"][number] {
+    return {
+      id: node.id,
+      preview: node.summary.slice(0, 240),
+      score: 0,
+      source: `tree:${node.treeType}`,
+      evidence: node.evidenceChunkIds.slice(0, 5).map((id) => ({ id, preview: "" })),
+      actions: ["drill_down", "show_graph"],
     };
   }
 }

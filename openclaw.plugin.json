@@ -1,5 +1,5 @@
 {
-  "id": "memory-autodb",
+  "id": "mengshu",
   "kind": "memory",
   "uiHints": {
     "embedding.apiKey": {
@@ -27,7 +27,7 @@
     },
     "dbPath": {
       "label": "LanceDB Path",
-      "placeholder": "~/.openclaw/memory/autodb",
+      "placeholder": "~/.mengshu/lancedb",
       "advanced": true,
       "help": "Path to local LanceDB database (only for lancedb type)"
     },

@@ -55,7 +55,7 @@ describe("GraphQueryService", () => {
   test("looks up entity and traverses relations with evidence chunks", async () => {
     const repository = new InMemoryGraphRepository();
     await repository.upsertEntities([
-      entity("project", "memory-autodb", 10),
+      entity("project", "mengshu", 10),
       entity("tool", "postgresql", 5),
       entity("file", "src/index.ts", 3),
     ]);
@@ -67,7 +67,7 @@ describe("GraphQueryService", () => {
 
     const result = await service.query({
       scope,
-      query: "memory",
+      query: "mengshu",
       depth: 2,
     });
 

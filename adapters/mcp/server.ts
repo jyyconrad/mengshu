@@ -20,7 +20,7 @@ export function createMcpMemoryServer(options: {
 }): McpMemoryServer {
   const tools = createMcpMemoryTools(options);
   return {
-    name: "memory-autodb",
+    name: "mengshu",
     listTools: () => tools,
     callTool: async (name, input) => {
       const tool = tools.find((candidate) => candidate.name === name);

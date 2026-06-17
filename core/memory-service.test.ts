@@ -1,5 +1,11 @@
 import { describe, expect, test } from "vitest";
 import type { MemoryRecord } from "./types.js";
+import type {
+  AppendAuditInput,
+  AuditRecord,
+  AuditRepository,
+  ScopeFilter,
+} from "../storage/repositories/types.js";
 import {
   DefaultMemoryService,
   type EmbeddingPort,
@@ -74,6 +80,27 @@ class FakeEmbeddings implements EmbeddingPort {
   }
 }
 
+class FakeAudit implements AuditRepository {
+  records: AuditRecord[] = [];
+
+  async append(input: AppendAuditInput): Promise<AuditRecord> {
+    const record: AuditRecord = {
+      id: `audit-${this.records.length + 1}`,
+      scope: input.scope,
+      action: input.action,
+      targetId: input.targetId,
+      metadata: input.metadata ?? {},
+      createdAt: now,
+    };
+    this.records = [...this.records, record];
+    return record;
+  }
+
+  async list(_filter?: ScopeFilter): Promise<AuditRecord[]> {
+    return this.records;
+  }
+}
+
 describe("DefaultMemoryService", () => {
   test("stores a memory record through the repository", async () => {
     const repository = new FakeRepository();
@@ -84,6 +111,51 @@ describe("DefaultMemoryService", () => {
 
     expect(result).toEqual({ id: "mem-1", stored: true });
     expect(repository.stored).toEqual([record]);
+  });
+
+  test("writes a memory.store audit when audit repository is injected", async () => {
+    const repository = new FakeRepository();
+    const audit = new FakeAudit();
+    const service = new DefaultMemoryService({
+      repository,
+      embeddings: new FakeEmbeddings(),
+      audit,
+    });
+    const record = makeRecord();
+
+    await service.storeMemory({ record });
+
+    expect(audit.records).toHaveLength(1);
+    expect(audit.records[0]).toMatchObject({
+      action: "memory.store",
+      targetId: "mem-1",
+      scope: record.scope,
+    });
+  });
+
+  test("rejects store with invalid scope and writes scope.reject audit", async () => {
+    const repository = new FakeRepository();
+    const audit = new FakeAudit();
+    const service = new DefaultMemoryService({
+      repository,
+      embeddings: new FakeEmbeddings(),
+      audit,
+    });
+    const record = makeRecord({
+      scope: {
+        tenantId: "",
+        appId: "openclaw",
+        userId: "user-1",
+        projectId: "project-1",
+        agentId: "agent-1",
+        namespace: "memories",
+      },
+    });
+
+    await expect(service.storeMemory({ record })).rejects.toThrow();
+    expect(repository.stored).toHaveLength(0);
+    expect(audit.records).toHaveLength(1);
+    expect(audit.records[0].action).toBe("scope.reject");
   });
 
   test("recalls memories with embedding, scope and score breakdown", async () => {

@@ -52,4 +52,45 @@ describe("OpenClaw scope adapter", () => {
       namespace: "knowledge_work",
     });
   });
+
+  test("preserves sessionId and workspaceId when provided", () => {
+    expect(
+      buildOpenClawScope({
+        userId: "user-1",
+        projectPath: "/workspace/app",
+        agentName: "main-agent",
+        sessionId: "session-123",
+        workspaceId: "workspace-456",
+      }),
+    ).toEqual({
+      tenantId: "local",
+      appId: "openclaw",
+      userId: "user-1",
+      projectId: "/workspace/app",
+      agentId: "main-agent",
+      namespace: "memories",
+      sessionId: "session-123",
+      workspaceId: "workspace-456",
+    });
+  });
+
+  test("handles missing sessionId and workspaceId gracefully", () => {
+    const scope = buildOpenClawScope({
+      userId: "user-1",
+      projectPath: "/workspace/app",
+    });
+    expect(scope.sessionId).toBeUndefined();
+    expect(scope.workspaceId).toBeUndefined();
+  });
+
+  test("ignores empty string sessionId and workspaceId", () => {
+    const scope = buildOpenClawScope({
+      userId: "user-1",
+      projectPath: "/workspace/app",
+      sessionId: "  ",
+      workspaceId: "",
+    });
+    expect(scope.sessionId).toBeUndefined();
+    expect(scope.workspaceId).toBeUndefined();
+  });
 });

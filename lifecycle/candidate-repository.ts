@@ -52,6 +52,17 @@ export class InMemoryCandidateRepository implements CandidateRepository {
     CandidateRecord,
     "id" | "status" | "hitCount" | "createdAt"
   > & { id?: string; status?: CandidateStatus }): Promise<CandidateRecord> {
+    const status: CandidateStatus = input.status ?? "pending";
+
+    // D-02 / §17.1：候选区单会话容量约束。
+    // 仅对新写入 status=pending 的候选生效——超限时把同会话最早入队的 pending
+    // 标记为 archived（含 audit 原因 archived_due_to_session_capacity），保证候选区
+    // 不会无限膨胀。会话身份按 scope.sessionId 识别；缺省时退回 full scope 比较，
+    // 让限制即便在无 sessionId 的旧调用方也生效。
+    if (status === "pending") {
+      this.evictOldestPendingIfFull(input.scope);
+    }
+
     const record: CandidateRecord = {
       id: input.id ?? this.idFactory(),
       scope: input.scope,
@@ -62,7 +73,7 @@ export class InMemoryCandidateRepository implements CandidateRepository {
       reason: input.reason,
       evidenceIds: input.evidenceIds,
       extractor: input.extractor,
-      status: input.status ?? "pending",
+      status,
       hitCount: 0,
       metadata: input.metadata,
       createdAt: this.now(),
@@ -72,6 +83,46 @@ export class InMemoryCandidateRepository implements CandidateRepository {
     };
     this.records.set(record.id, record);
     return record;
+  }
+
+  /**
+   * D-02：超限时归档最早入队的 pending 候选。
+   *
+   * 同会话（按 scope.sessionId 优先；缺省退回 sameScope 全字段匹配）的 pending
+   * 数 >= maxCandidatesPerSession 时，按 createdAt 升序找最旧条目并将 status
+   * 改为 archived，metadata.statusReason 写入 archived_due_to_session_capacity
+   * 以便后续 audit 追溯。该归档行为是内部副作用，不改 enqueue 外部签名。
+   */
+  private evictOldestPendingIfFull(scope: MemoryScope): void {
+    const limit = this.config.maxCandidatesPerSession;
+    if (!Number.isFinite(limit) || limit <= 0) return;
+
+    const sessionId = scope.sessionId;
+    const sameSession = (a: MemoryScope): boolean =>
+      sessionId !== undefined
+        ? a.sessionId === sessionId
+        : sameScope(a, scope);
+
+    const pendingInSession: CandidateRecord[] = [];
+    for (const r of this.records.values()) {
+      if (r.status === "pending" && sameSession(r.scope)) {
+        pendingInSession.push(r);
+      }
+    }
+    if (pendingInSession.length < limit) return;
+
+    pendingInSession.sort((a, b) => a.createdAt - b.createdAt);
+    // 可能存在多余条目（理论上应只多 1 条；为稳妥按需驱逐多余的）。
+    const overflow = pendingInSession.length - limit + 1;
+    for (let i = 0; i < overflow; i++) {
+      const oldest = pendingInSession[i];
+      oldest.status = "archived";
+      oldest.updatedAt = this.now();
+      oldest.metadata = {
+        ...oldest.metadata,
+        statusReason: "archived_due_to_session_capacity",
+      };
+    }
   }
 
   async get(id: string): Promise<CandidateRecord | undefined> {

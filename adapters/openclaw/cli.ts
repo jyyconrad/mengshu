@@ -1,5 +1,5 @@
 /**
- * OpenClaw `ltm` server CLI commands.
+ * OpenClaw `ms` server CLI commands.
  *
  * 这里只注册 serve/status/health 三个中间件入口；既有 stats/search/scan 等命令
  * 仍保留在 index.ts，避免一次性迁移全部 CLI。
@@ -8,7 +8,7 @@
 import type { MemoryConfig } from "../../config.js";
 import type { MemoryService } from "../../core/service-types.js";
 import type { TableStats } from "../../db/types.js";
-import { startMemoryServer } from "../../server/daemon.js";
+import { startMemoryServer, type StartMemoryServerOptions } from "../../server/daemon.js";
 import { planV4Migration } from "../../migration/v4.js";
 
 export interface CommanderLike {
@@ -24,6 +24,12 @@ export interface RegisterMemoryServerCliOptions {
   getTableStats?: () => Promise<TableStats[]>;
   startServer?: typeof startMemoryServer;
   keepAlive?: boolean;
+  /** Console 聚合 API，注入后 serve 启动的 daemon 暴露 /v1/console/* 与 Candidates 闭环。 */
+  console?: StartMemoryServerOptions["console"];
+  /** Agent 快路径服务，注入后 daemon 暴露 /v1/agent/*（context/observe/lookup/session）。 */
+  agentFastPath?: StartMemoryServerOptions["agentFastPath"];
+  /** 后台 job worker，注入后 daemon 在 listen 期间 drain extract_candidate 等 job。 */
+  worker?: StartMemoryServerOptions["worker"];
 }
 
 function serverHost(config: RegisterMemoryServerCliOptions["config"]): string {
@@ -53,6 +59,9 @@ export function registerMemoryServerCliCommands(
       const port = values.port ? Number.parseInt(values.port, 10) : serverPort(options.config);
       const running = await (options.startServer ?? startMemoryServer)({
         service: options.service,
+        console: options.console,
+        agentFastPath: options.agentFastPath,
+        worker: options.worker,
         host,
         port,
         secret: options.config.server?.secret,

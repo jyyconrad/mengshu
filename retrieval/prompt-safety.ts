@@ -7,14 +7,34 @@
  */
 
 import type { MemoryCategory } from "../config.js";
+import { PROMPT_INJECTION_PATTERNS as BASE_INJECTION_PATTERNS } from "../processing/extraction-rules.js";
 
-const PROMPT_INJECTION_PATTERNS = [
-  /ignore (all|any|previous|above|prior) instructions/i,
+/**
+ * 检索/捕获侧专用的注入模式补充。
+ *
+ * 基础中英文控制话术（"忽略之前指令"/"you are now"/"system:" 等）统一从
+ * processing/extraction-rules.ts 的 PROMPT_INJECTION_PATTERNS 复用，避免双轨漂移
+ * （此前捕获过滤只有英文模式，中文注入全部漏过——安全缺口）。
+ *
+ * 这里只补充检索侧独有的结构化注入面：
+ *   - HTML/XML 角色标签伪造（<system>/<tool>/<relevant-memories> 等）
+ *   - 显式工具/命令调用诱导
+ *   - system prompt / developer message 字面引用
+ */
+const RETRIEVAL_INJECTION_PATTERNS: readonly RegExp[] = [
   /do not follow (the )?(system|developer)/i,
   /system prompt/i,
   /developer message/i,
   /<\s*(system|assistant|developer|tool|function|relevant-memories)\b/i,
   /\b(run|execute|call|invoke)\b.{0,40}\b(tool|command)\b/i,
+];
+
+/**
+ * 捕获/检索阶段的完整注入模式集 = 基础词表（单一事实来源）+ 检索侧补充。
+ */
+const PROMPT_INJECTION_PATTERNS: readonly RegExp[] = [
+  ...BASE_INJECTION_PATTERNS,
+  ...RETRIEVAL_INJECTION_PATTERNS,
 ];
 
 const PROMPT_ESCAPE_MAP: Record<string, string> = {

@@ -82,3 +82,36 @@ export function fetchJobs() {
     counts: Record<string, number>;
   }>("/v1/console/jobs");
 }
+
+export interface Candidate {
+  id: string;
+  preview: string;
+  semanticType?: string;
+  kind: string;
+  confidence: number;
+  status: string;
+  evidenceIds: string[];
+  createdAt: number;
+}
+
+export type CandidateReviewAction =
+  | { action: "approve"; ids: string[] }
+  | { action: "reject"; ids: string[]; reason?: string }
+  | { action: "archive"; ids: string[] };
+
+export function fetchCandidates(scope: Scope, filter: { status?: string; limit?: number } = { status: "pending" }) {
+  return request<{ candidates: Candidate[]; total: number }>("/v1/console/candidates", {
+    method: "POST",
+    body: JSON.stringify({ scope, filter }),
+  });
+}
+
+export function reviewCandidates(action: CandidateReviewAction) {
+  return request<{ affected: number; promoted: string[]; errors: string[] }>(
+    "/v1/console/candidates/review",
+    {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    }
+  );
+}

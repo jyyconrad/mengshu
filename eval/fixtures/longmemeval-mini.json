@@ -1,0 +1,40 @@
+[
+  {
+    "question_id": "lme-sample-001",
+    "question": "用户上次提到他们偏好的编程语言是什么？",
+    "answer": "用户偏好 TypeScript 严格模式",
+    "question_type": "single-session-user",
+    "sessions": [
+      {
+        "session_id": "s1",
+        "date": "2026-04-01",
+        "messages": [
+          { "role": "user", "content": "我项目里都用 TypeScript，喜欢开严格模式。" },
+          { "role": "assistant", "content": "好的，记下了 TypeScript + strict。" }
+        ]
+      },
+      {
+        "session_id": "s2",
+        "date": "2026-05-12",
+        "messages": [
+          { "role": "user", "content": "今天我们继续做后端项目。" }
+        ]
+      }
+    ]
+  },
+  {
+    "question_id": "lme-sample-002",
+    "question": "用户上次提到的工作偏好是什么？",
+    "answer": "用户偏好简洁回答",
+    "question_type": "preference-recall",
+    "sessions": [
+      {
+        "session_id": "s1",
+        "date": "2026-04-15",
+        "messages": [
+          { "role": "user", "content": "我喜欢简洁的回答，先给短结论再给计划。" }
+        ]
+      }
+    ]
+  }
+]

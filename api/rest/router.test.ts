@@ -4,6 +4,8 @@ import type { ContextBlock, MemoryRecord, RecallResult } from "../../core/types.
 import { InMemoryGraphRepository } from "../../graph/repository.js";
 import { GraphQueryService } from "../../graph/query.js";
 import { createConsoleApi } from "../../console/api.js";
+import { InMemoryCandidateRepository } from "../../lifecycle/candidate-repository.js";
+import { CandidateReviewService } from "../../lifecycle/candidate-review.js";
 import { createRestRouter } from "./router.js";
 
 const scope = {
@@ -136,10 +138,10 @@ describe("REST router", () => {
       {
         id: "entity-1",
         scope,
-        canonicalName: "memory-autodb",
-        displayName: "memory-autodb",
+        canonicalName: "mengshu",
+        displayName: "mengshu",
         type: "project",
-        aliases: ["memory-autodb"],
+        aliases: ["mengshu"],
         mentionCount: 1,
         mentionCount30d: 1,
         distinctSourceCount: 1,
@@ -161,7 +163,7 @@ describe("REST router", () => {
       method: "POST",
       path: "/v1/graph/query",
       headers: {},
-      body: { scope, query: "memory" },
+      body: { scope, query: "mengshu" },
     });
 
     expect(result.status).toBe(200);
@@ -202,6 +204,57 @@ describe("REST router", () => {
     expect(lookup.body).toMatchObject({ results: [expect.objectContaining({ id: "mem-1" })] });
     expect(jobs.status).toBe(200);
     expect(jobs.body).toEqual({ jobs: [], counts: {} });
+  });
+
+  test("routes console candidates list and review", async () => {
+    const service = new FakeMemoryService();
+    const repository = new InMemoryCandidateRepository();
+    const candidate = await repository.enqueue({
+      scope,
+      text: "candidate via REST",
+      semanticType: "profile",
+      kind: "preference",
+      confidence: 0.8,
+      evidenceIds: ["ev-1"],
+      metadata: {},
+    });
+    const review = new CandidateReviewService({
+      repository,
+      promoteCandidate: async ({ candidate: c }) => ({ memoryId: `mem-${c.id}` }),
+    });
+    const router = createRestRouter({
+      service,
+      console: createConsoleApi({ service, candidates: repository, candidateReview: review }),
+    });
+
+    const list = await router.handle({
+      method: "POST",
+      path: "/v1/console/candidates",
+      headers: {},
+      body: { scope, filter: { status: "pending" } },
+    });
+    expect(list.status).toBe(200);
+    expect(list.body).toMatchObject({
+      total: 1,
+      candidates: [expect.objectContaining({ id: candidate.id, preview: "candidate via REST" })],
+    });
+
+    const reviewResult = await router.handle({
+      method: "POST",
+      path: "/v1/console/candidates/review",
+      headers: {},
+      body: { action: { action: "approve", ids: [candidate.id] } },
+    });
+    expect(reviewResult.status).toBe(200);
+    expect(reviewResult.body).toMatchObject({ affected: 1, promoted: [`mem-${candidate.id}`] });
+
+    const missingAction = await router.handle({
+      method: "POST",
+      path: "/v1/console/candidates/review",
+      headers: {},
+      body: { scope },
+    });
+    expect(missingAction.status).toBe(400);
   });
 
   test("returns 404 and 405 for unsupported routes", async () => {

@@ -32,3 +32,8 @@ test-pg-connection.js
 
 # Process files (orchestrator)
 .claude/.DS_Store
+
+# Internal documentation (not for open source release)
+.memory-docs/
+CLAUDE.local.md
+AGENTS.local.md

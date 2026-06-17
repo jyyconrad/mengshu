@@ -17,7 +17,7 @@ const baseScope: MemoryScope = {
   tenantId: "local",
   appId: "openclaw",
   userId: "user-1",
-  projectId: "memory-autodb",
+  projectId: "mengshu",
   agentId: "agent-1",
   namespace: "memories",
 };
@@ -52,7 +52,7 @@ describe("AgentFastPathService", () => {
         id: "goal-1",
         kind: "goal",
         semanticType: "task_context",
-        text: "完成 memory-autodb 架构升级",
+        text: "完成 mengshu 架构升级",
         importance: 0.95,
       }),
       makeRecord({
@@ -143,7 +143,7 @@ describe("AgentFastPathService", () => {
     it("返回任务 hints（rules + experience）", async () => {
       const response = await service.context({
         scope: baseScope,
-        task: "完成 memory-autodb 架构升级",
+        task: "完成 mengshu 架构升级",
       });
 
       expect(response.taskHints).toBeDefined();
@@ -161,6 +161,25 @@ describe("AgentFastPathService", () => {
       const response = await service.context({ scope: baseScope, task: "test" });
 
       expect(response.content).not.toContain("无 semanticType 的记忆不进入");
+    });
+
+    it("透传 filtered：revoked 记忆带 lifecycle_revoked，fact 带 no_semantic_type", async () => {
+      const response = await service.context({ scope: baseScope, task: "test" });
+
+      expect(response.filtered).toBeDefined();
+      const revoked = response.filtered!.find((f) => f.recordId === "revoked-1");
+      expect(revoked?.reason).toBe("lifecycle_revoked");
+      const fact = response.filtered!.find((f) => f.recordId === "fact-1");
+      expect(fact?.reason).toBe("no_semantic_type");
+    });
+
+    it("透传 filteredSummary：按 reason 聚合", async () => {
+      const response = await service.context({ scope: baseScope, task: "test" });
+
+      expect(response.filteredSummary).toBeDefined();
+      const reasons = response.filteredSummary!.map((s) => s.reason);
+      expect(reasons).toContain("lifecycle_revoked");
+      expect(reasons).toContain("no_semantic_type");
     });
   });
 
@@ -194,6 +213,30 @@ describe("AgentFastPathService", () => {
 
       expect(response.warnings?.[0]).toContain("observation_store_failed");
     });
+
+    it("F3-2：observe 同时入队 extract_candidate 与 build_tree", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("job-x");
+      const treeService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        enqueueJob,
+      });
+
+      await treeService.observeLight({
+        scope: { ...baseScope, sessionId: "s-1" },
+        eventType: "user_input",
+        text: "禁止删除生产库",
+      });
+
+      const types = enqueueJob.mock.calls.map((c) => (c[0] as { type: string }).type);
+      expect(types).toContain("extract_candidate");
+      expect(types).toContain("build_tree");
+      const treeCall = enqueueJob.mock.calls.find((c) => (c[0] as { type: string }).type === "build_tree");
+      const payload = (treeCall![0] as { payload: Record<string, unknown> }).payload;
+      expect(payload.treeType).toBe("source");
+      expect(payload.treeKey).toBe("s-1");
+    });
   });
 
   describe("lookup()", () => {
@@ -221,6 +264,59 @@ describe("AgentFastPathService", () => {
 
       expect(response.warnings?.[0]).toContain("recall_failed");
       expect(response.hits).toEqual([]);
+    });
+
+    it("F3-3：deep 模式融合记忆树摘要", async () => {
+      const treeNode = {
+        id: "sum_1",
+        scope: baseScope,
+        treeType: "source" as const,
+        treeKey: "s-1",
+        level: 1,
+        title: "source:s-1",
+        summary: "本会话讨论了 LanceDB 索引升级",
+        childNodeIds: [],
+        leafIds: ["l1"],
+        evidenceChunkIds: ["c1", "c2"],
+        entityIds: [],
+        relationIds: [],
+        tokenCount: 100,
+        timeRange: { startAt: 1, endAt: 2 },
+        status: "sealed" as const,
+        createdAt: 1,
+        sealedAt: 2,
+        metadata: { summaryMode: "extractive" },
+      };
+      const deepService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "LanceDB", hits: [] }),
+        loadTreeSummaries: vi.fn().mockResolvedValue([treeNode]),
+      });
+
+      const response = await deepService.lookup({
+        scope: baseScope,
+        query: "LanceDB",
+        mode: "deep",
+      });
+
+      const treeHit = response.hits.find((h) => h.source === "tree:source");
+      expect(treeHit).toBeDefined();
+      expect(treeHit?.preview).toContain("LanceDB");
+      expect(treeHit?.evidence.length).toBe(2);
+    });
+
+    it("F3-3：fast 模式不查树", async () => {
+      const loadTreeSummaries = vi.fn().mockResolvedValue([]);
+      const fastService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "x", hits: [] }),
+        loadTreeSummaries,
+      });
+
+      await fastService.lookup({ scope: baseScope, query: "x", mode: "fast" });
+      expect(loadTreeSummaries).not.toHaveBeenCalled();
     });
   });
 

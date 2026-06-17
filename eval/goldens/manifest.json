@@ -1,0 +1,163 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-06-10",
+  "version": "v0.2-P0c",
+  "updatedAt": "2026-06-16",
+  "suites": {
+    "mengshu-v0.1": {
+      "file": "mengshu-v0.1.jsonl",
+      "size": 30,
+      "sha256": "92c8d45a50b33c08e2b258800a6b88bbebefe748d2265cf9648203309641c3ff",
+      "coverage": {
+        "profile_workspace_reuse": 6,
+        "rules_workspace_reuse": 6,
+        "task_context_project_isolation": 6,
+        "experience_reuse": 4,
+        "resource_isolation": 4,
+        "lookup_only_no_semantic_type": 4
+      },
+      "metrics": ["slot_recall", "wrong_injection", "latency"]
+    },
+    "mengshu-safety": {
+      "file": "mengshu-safety.jsonl",
+      "size": 40,
+      "sha256": "ed6da2125b0d622642918bf4f6f6e07c333de218bfed8fa385c776489bebade6",
+      "coverage": {
+        "visibility_private": 6,
+        "lifecycle_revoked": 6,
+        "lifecycle_archived": 4,
+        "sensitive_personality": 3,
+        "sensitive_health": 3,
+        "sensitive_political": 3,
+        "sensitive_religious": 3,
+        "sensitive_sexual_orientation": 3,
+        "prompt_injection": 4,
+        "forbidden_ids": 5
+      },
+      "metrics": ["wrong_injection", "sensitive_blocked", "must_escape", "latency"]
+    },
+    "mengshu-extraction": {
+      "file": "mengshu-extraction.jsonl",
+      "size": 45566,
+      "sha256": "d6aef5a467e831cdb01eaac41f8e083235084b1087349d679dea3aaa79d0fc12",
+      "coverage": {
+        "profile_extraction": 20,
+        "rules_extraction": 20,
+        "experience_extraction": 20,
+        "task_context_extraction": 20,
+        "resource_extraction": 20,
+        "rejection_gates": 16,
+        "boundary_cases": 14
+      },
+      "metrics": ["type_precision", "extraction_precision", "over_capture"],
+      "description": "候选抽取 + 5 type 分类。覆盖 11 闸门、5 type、边界样例（应抽不抽/不应抽却抽）",
+      "phase": "P0-c",
+      "gate": {
+        "type_precision": 0.85,
+        "extraction_precision": 0.80,
+        "over_capture": 0.10
+      }
+    },
+    "mengshu-dedup": {
+      "file": "mengshu-dedup.jsonl",
+      "size": 22191,
+      "sha256": "36797aebf46bc0fc6e6cb6da29616c375eb8d10f60c3908a2ebcc88791a2412e",
+      "coverage": {
+        "duplicate": 30,
+        "update": 10,
+        "conflict": 20,
+        "related": 15,
+        "distinct": 5
+      },
+      "metrics": ["duplicate_precision", "false_merge"],
+      "description": "去重关系判定。P0-c 仅验 lexical/hash/规则冲突（不含 P2 semantic/entity dedup）",
+      "phase": "P0-c",
+      "gate": {
+        "duplicate_precision": 0.90,
+        "false_merge": 0.03
+      },
+      "notes": "验证 D-06 中文短文本 0.88 / 英文 0.85 阈值"
+    },
+    "mengshu-recall-explain": {
+      "file": "mengshu-recall-explain.jsonl",
+      "size": 25042,
+      "sha256": "0e4bfd2f9f3fe6760fcfb02a30c7a02db5218735ffbf198d00a2d5fb02bbcf6b",
+      "coverage": {
+        "profile_intent": 10,
+        "rules_intent": 10,
+        "experience_intent": 10,
+        "task_context_intent": 10,
+        "resource_intent": 10,
+        "filtered_reasons": 10
+      },
+      "metrics": ["breakdown_output_rate"],
+      "description": "召回 score breakdown + filtered reason。验证 importance 4 项明细可追溯",
+      "phase": "P1",
+      "gate": {
+        "breakdown_output_rate": 1.0
+      }
+    },
+    "mengshu-conflict": {
+      "file": "mengshu-conflict.jsonl",
+      "size": 3436,
+      "sha256": "50c1e70bfc0b8a5dfe750d1cf6df01b4ce6eaa13ddc78ed6ea15d27d98d5fd26",
+      "coverage": {
+        "rules_conflict": 8,
+        "profile_conflict": 1,
+        "resource_conflict": 1
+      },
+      "metrics": ["conflict_recall", "rules_false_merge"],
+      "description": "冲突检出。重点 rules 类强冲突（false merge=0）",
+      "phase": "P1-P3",
+      "gate": {
+        "conflict_recall": 0.80,
+        "rules_false_merge": 0
+      },
+      "notes": "P1/P3 待扩充至 50 条"
+    },
+    "mengshu-tree-summary": {
+      "file": "mengshu-tree-summary.jsonl",
+      "size": 3551,
+      "sha256": "176cdb31cdc0291cdf5be31eb2dcfe876ae4da65e87c6606151e1dbf4456ade3",
+      "coverage": {
+        "source_tree": 3,
+        "topic_tree": 2,
+        "global_tree": 2,
+        "faithfulness_check": 1
+      },
+      "metrics": ["faithfulness", "key_fact_evidence_rate"],
+      "description": "摘要 faithfulness + evidence 引用。source/topic/global 各 treeType",
+      "phase": "P3",
+      "gate": {
+        "faithfulness": 0.95,
+        "key_fact_evidence_rate": 1.0
+      },
+      "notes": "P3 待扩充至 50 条"
+    },
+    "mengshu-skill-candidate": {
+      "file": "mengshu-skill-candidate.jsonl",
+      "size": 3335,
+      "sha256": "91caec9e581dff8c8190bc7d3f0a4b90724d5373002c8a458cdd19441f21cd6d",
+      "coverage": {
+        "aggregation_threshold": 3,
+        "independent_schema": 2,
+        "llm_suggest_only": 2,
+        "conflict_downgrade": 1
+      },
+      "metrics": ["skill_candidate_only", "no_executable_skill"],
+      "description": "experience 聚合升格为 skill_candidate。断言只生成候选不生成可执行 skill（D-05）",
+      "phase": "P4",
+      "gate": {
+        "skill_candidate_only": 1.0,
+        "no_executable_skill": 1.0
+      },
+      "notes": "P4 待扩充至 30 条"
+    }
+  },
+  "notes": [
+    "本 manifest 在每次黄金集变更时同步更新 sha256 与 size。",
+    "release gate：safety wrong_injection_rate=0；v0.1 pass rate>=80%。",
+    "P0-c 新增 6 个 suite：extraction(100)、dedup(80)、recall-explain(60) 充分样例；conflict(10)、tree-summary(8)、skill-candidate(8) 骨架占位。",
+    "P0-c gate：extraction type precision>=0.85、extraction precision>=0.80、over-capture<=0.10；dedup duplicate precision>=0.90、false merge<=0.03；recall-explain breakdown 输出率=1.0。"
+  ]
+}

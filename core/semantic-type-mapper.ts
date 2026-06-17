@@ -10,7 +10,7 @@
  * 4. 无法归类的保留 kind，通过 memory_lookup 检索
  *
  * 映射规则详见：
- * ~/.claude/tasks/20260608-1430-memory-autodb-architecture-upgrade/kind-semantic-type-mapping-rules.json
+ * ~/.claude/tasks/20260608-1430-mengshu-architecture-upgrade/kind-semantic-type-mapping-rules.json
  */
 
 import type { MemoryKind, MemoryRecord, MemorySemanticType } from "./types.js";

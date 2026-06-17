@@ -45,6 +45,7 @@ export interface AutoCaptureContext {
   idFactory?: () => string;
   now?: () => number;
   logger?: HookLogger;
+  enqueueGraphExtraction?: (chunkId: string, text: string, scope: import("../../core/types.js").MemoryScope) => Promise<void>;
 }
 
 function defaultShouldCapture(text: string): boolean {
@@ -120,7 +121,7 @@ export async function handleBeforeAgentStartRecall(
       return undefined;
     }
 
-    context.logger?.info?.(`memory-autodb: injecting ${memoryHits.length} memories into context`);
+    context.logger?.info?.(`mengshu: injecting ${memoryHits.length} memories into context`);
     return {
       prependContext: formatRelevantMemoriesContext(
         memoryHits.map((hit) => {
@@ -135,7 +136,7 @@ export async function handleBeforeAgentStartRecall(
       ),
     };
   } catch (err) {
-    context.logger?.warn(`memory-autodb: recall failed: ${String(err)}`);
+    context.logger?.warn(`mengshu: recall failed: ${String(err)}`);
     return undefined;
   }
 }
@@ -221,10 +222,15 @@ export async function handleAgentEndCapture(
         updatedAt: now(),
       };
       await context.service.storeMemory({ record });
+      if (context.enqueueGraphExtraction) {
+        await context.enqueueGraphExtraction(record.id, entry.text, record.scope).catch(() => {
+          // 图谱提取入队失败不影响记忆写入
+        });
+      }
     }
 
-    context.logger?.info?.(`memory-autodb: auto-captured ${newEntries.length} new memories`);
+    context.logger?.info?.(`mengshu: auto-captured ${newEntries.length} new memories`);
   } catch (err) {
-    context.logger?.warn(`memory-autodb: capture failed: ${String(err)}`);
+    context.logger?.warn(`mengshu: capture failed: ${String(err)}`);
   }
 }

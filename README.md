@@ -1,23 +1,140 @@
-# memory-autodb
+# mengshu（梦枢）
 
-memory-autodb 是面向多产品 Agent Runtime 的本地优先记忆中间件，主要服务 OpenClaw 类型产品之间的工作记忆连续性。它让同一用户在不同 Claw 产品之间切换时，工作记忆、协作偏好、长期约束、历史经验和可用资源仍然持续存在。
+> 面向多产品 Agent Runtime 的本地优先记忆中间件
 
-它从 OpenClaw 长期记忆插件演进而来，用 LanceDB、Supabase 或 Postgres 保存对话记忆和文档知识，提供自动捕获、自动召回、目录扫描、CLI、REST、MCP facade、JS SDK 和 Web Console 基线能力。当前产品方向暂不进入 coding-agent 细分领域。
-
-当前代码同时保留两条边界：
-
-- **OpenClaw 插件兼容层**：`memory_store`、`memory_recall`、`memory_scan_directory`、`memory_cleanup`、自动捕获和自动召回继续可用。
-- **多产品 Agent Runtime 记忆层**：`MemoryService`、REST `/v1/*`、MCP tool adapter、JS SDK、ingestion pipeline、BM25/RRF/context packer、graph/tree/console 的 in-memory baseline 已落地，并面向多个 OpenClaw 类产品共享。
+mengshu（梦枢）是一个智能记忆管理系统，主要服务于 OpenClaw 类型产品之间的工作记忆连续性。它让同一用户在不同 Agent 产品之间切换时，工作记忆、协作偏好、长期约束、历史经验和可用资源仍然持续存在。
 
 ## 快速开始
 
-### 安装依赖
+### 安装
 
 ```bash
-npm install
+npm install -g mengshu
 ```
 
-### 配置嵌入模型
+### 初始化配置
+
+运行交互式配置向导：
+
+```bash
+ms init
+```
+
+这将引导你完成 LLM、Embedding 和数据库的配置。
+
+### 基本使用
+
+```bash
+# 存储记忆
+ms store "用户偏好使用 TypeScript"
+
+# 召回记忆
+ms recall "编程语言偏好"
+
+# 查看记忆评分
+ms why <记忆ID>
+
+# 管理记忆
+ms forget <记忆ID>
+```
+
+完整指南见 [快速开始](docs/guides/getting-started.md)。
+
+## 核心特性
+
+- **智能记忆捕获**：LLM 结构化提取 + 11 闸门验证，自动分类为 profile/task_context/rules/experience/resource
+- **多模召回**：向量检索 + BM25 + RRF 融合，支持 6 档作用域（message/turn/session/project/app/global）
+- **上下文构建**：5 槽位任务上下文，自动组织为可注入的 prompt
+- **召回解释**：4 套评分体系（valueScore/importance/confidence/hotness）明细追溯
+- **记忆管理**：撤回/归档/纠错/回滚四种操作，审计可回溯
+- **语义去重**：entity 三级匹配（精确/别名/语义）+ embedding 相似度去重
+- **知识图谱**：entity/relation 自动抽取，图中心性计算
+- **记忆树**：L0-L3 折叠层（evidence → source → topic → global）
+- **技能聚合**：experience → skill_candidate 自动升格
+- **反馈闭环**：采纳率/停留/二次召回隐式信号反馈
+
+## CLI 命令
+
+```bash
+# 记忆管理
+ms store "记忆内容"              # 存储记忆
+ms recall "查询"                # 召回记忆
+ms search "关键词"              # 搜索记忆
+ms why <记忆ID>                 # 查看评分明细
+ms forget <记忆ID>              # 管理记忆（撤回/归档/纠错）
+
+# 统计与诊断
+ms stats                       # 查看统计信息
+ms doctor                      # 健康检查
+ms tables                      # 查看表结构
+
+# 数据管理
+ms scan ./docs                 # 扫描目录
+ms import history.jsonl        # 导入 agent history
+ms cleanup                     # 清理过期数据
+ms migrate-home               # 迁移旧配置
+
+# 服务
+ms serve                       # 启动 REST server + Web Console
+ms mcp                        # 启动 MCP Server
+```
+
+完整命令参考见 [CLI 命令文档](docs/api/cli-commands.md)。
+
+## 集成方式
+
+### OpenClaw 插件
+
+```bash
+openclaw plugin add memory-autodb
+```
+
+### MCP Server
+
+```bash
+ms mcp
+```
+
+支持 Claude Desktop、Cline、Zed 等 MCP 客户端。
+
+### REST API
+
+```bash
+ms serve --port 3847
+```
+
+API 文档见 [Memory API](docs/api/memory-api.md)。
+
+### 代码集成
+
+```typescript
+import { MemoryService } from 'mengshu';
+
+const memory = new MemoryService({
+  llm: {
+    apiKey: process.env.OPENAI_API_KEY,
+    extractionModel: 'gpt-4o-mini'
+  },
+  embedding: {
+    model: 'text-embedding-3-small'
+  },
+  dbType: 'lancedb'
+});
+
+await memory.initialize();
+await memory.store({ text: '用户偏好 TypeScript' });
+const result = await memory.recall({ query: '编程语言偏好' });
+```
+
+详见 [集成指南](docs/guides/integration.md)。
+
+## 配置
+
+mengshu 使用三层配置：
+
+1. 全局配置：`~/.mengshu/config.json`
+2. 项目配置：`$PROJECT/.mengshu/config.json`
+3. 环境变量覆盖
 
 最小配置示例：
 
@@ -25,123 +142,93 @@ npm install
 {
   "embedding": {
     "apiKey": "${OPENAI_API_KEY}",
-    "baseURL": "https://api.openai.com/v1",
     "model": "text-embedding-3-small"
   },
+  "llm": {
+    "apiKey": "${OPENAI_API_KEY}",
+    "extractionModel": "gpt-4o-mini"
+  },
   "dbType": "lancedb",
-  "dbPath": "~/.openclaw/memory/lancedb",
-  "autoCapture": true,
-  "autoRecall": true
+  "dbPath": "~/.mengshu/memory/lancedb"
 }
 ```
 
-支持 OpenAI-compatible embedding endpoint。模型维度由 [config.ts](./config.ts) 中的 `vectorDimsForModel()` 校验；更换模型前先确认数据库向量维度一致。
+完整配置说明见 [配置文档](docs/guides/configuration.md)。
 
-### 运行测试
+## 文档
 
-```bash
-npm test
-npx tsc --noEmit
-```
-
-`npm test` 包含若干本机 embedding 集成测试；如果本机没有启动对应服务，可能出现环境性的连接失败。更稳定的回归命令见 [测试文档](./docs/07-test/plugin-test.md)。
-
-## 主要能力
-
-| 能力 | 当前入口 | 说明 |
-|------|----------|------|
-| 保存记忆 | `memory_store`、`POST /v1/memories`、MCP `memory_save` | 保存用户偏好、事实、决策、任务和知识条目 |
-| 召回记忆 | `memory_recall`、`POST /v1/recall`、MCP `memory_recall` | 支持向量检索、过滤、跨分类搜索 |
-| 构建上下文 | `POST /v1/context`、MCP `memory_context` | 输出 prompt-safe context block |
-| Agent 快路径 | `memory_context_fast`、`POST /v1/agent/context` | 返回 5 槽位任务上下文 |
-| 扫描目录 | `memory_scan_directory`、`ltm scan` | 扫描 Markdown 文件并进入 ingestion pipeline |
-| 管理数据 | `ltm stats/tables/query/export/cleanup/migrate` | 统计、查询、导出、清理和迁移估算 |
-| 本机服务 | `ltm serve` | 启动 REST server 和 `/console` 静态页面 |
-
-## CLI 示例
-
-```bash
-# 查看统计
-ltm stats
-
-# 搜索核心记忆
-ltm search "用户偏好" --limit 5
-
-# 扫描 Markdown 目录到知识库
-ltm scan ./docs --category 知识库 --ignore node_modules dist
-
-# 启动本机 REST server，默认 127.0.0.1:3847
-ltm serve
-```
-
-完整命令说明见 [CLI 命令](./docs/05-api/cli-commands.md)。
-
-## REST 示例
-
-启动服务：
-
-```bash
-ltm serve --host 127.0.0.1 --port 3847
-```
-
-健康检查：
-
-```bash
-curl http://127.0.0.1:3847/v1/health
-```
-
-构建上下文：
-
-```bash
-curl -X POST http://127.0.0.1:3847/v1/context \
-  -H "Content-Type: application/json" \
-  -d '{"query":"当前项目的记忆架构是什么","limit":5}'
-```
-
-更多接口见 [Memory API](./docs/05-api/memory-api.md)。
-
-## 文档入口
-
-| 读者目标 | 文档 |
-|----------|------|
-| 快速了解文档结构 | [docs/README.md](./docs/README.md) |
-| 理解产品定位 | [product-positioning.md](./docs/03-architecture/product-positioning.md) |
-| 使用 CLI、REST、OpenClaw 工具 | [docs/05-api](./docs/05-api/README.md) |
-| 理解当前中间件架构 | [memory-middleware-architecture.md](./docs/03-architecture/memory-middleware-architecture.md) |
-| 理解长期深层优化方案 | [memory-autodb-deep-optimization-architecture.md](./docs/03-architecture/memory-autodb-deep-optimization-architecture.md) |
-| 查看数据模型和 schema | [docs/06-database/schema.md](./docs/06-database/schema.md) |
-| 查看测试和验证命令 | [docs/07-test/plugin-test.md](./docs/07-test/plugin-test.md) |
-| 查看版本变更 | [docs/09-changelog](./docs/09-changelog/README.md) |
-
-`docs/03-architecture/copy-from-mate/` 是外部 Banto/iFlyMate 记忆系统材料，用于架构参考，不是 memory-autodb 当前实现承诺。
+| 文档 | 说明 |
+|------|------|
+| [快速开始](docs/guides/getting-started.md) | 安装、配置、基本使用 |
+| [配置说明](docs/guides/configuration.md) | 配置文件详解 |
+| [集成指南](docs/guides/integration.md) | OpenClaw/MCP/REST/SDK 集成 |
+| [最佳实践](docs/guides/best-practices.md) | 使用建议和优化 |
+| [CLI 命令](docs/api/cli-commands.md) | 命令行工具完整参考 |
+| [Memory API](docs/api/memory-api.md) | REST API 接口文档 |
+| [系统架构](docs/architecture/system-architecture.md) | 架构设计 |
+| [核心设计](docs/design/memory-system-unified-design.md) | 算法层设计文档 |
 
 ## 项目结构
 
 ```text
 .
-├── index.ts                 # OpenClaw 插件注册入口
-├── config.ts                # 配置 schema、默认值、模型维度
-├── core/                    # MemoryService、scope、核心领域类型
-├── adapters/                # OpenClaw 与 MCP adapter
-├── api/rest/                # REST router、鉴权和契约类型
-├── server/                  # Node HTTP daemon
-├── ingest/                  # canonicalize、chunk、job pipeline
-├── retrieval/               # prompt safety、RRF、context packer
-├── graph/                   # in-memory graph baseline
-├── tree/                    # source/topic/global tree baseline
-├── console/                 # Console API 和静态页面
-├── storage/                 # legacy adapter、in-memory repo 和索引
-├── db/providers/            # LanceDB、Supabase、Postgres provider
-└── docs/                    # 长期维护文档
+├── core/                         # 领域类型、评分集成、profile 分层
+├── processing/                   # 评分公式、LLM 客户端
+├── lifecycle/                    # 候选区、validator、去重、遗忘管理
+├── graph/                        # 知识图谱、entity 匹配
+├── tree/                         # 记忆树、L0-L3 摘要
+├── retrieval/                    # 召回编排、融合排序
+├── ingest/                       # 摄入管线、agent-history 导入
+├── feedback/                     # 反馈闭环
+├── adapters/                     # OpenClaw / MCP 适配
+│   ├── openclaw/                 # OpenClaw 插件 + CLI
+│   └── mcp/                      # MCP Server
+├── api/                          # REST API
+├── console/                      # Web Console
+├── storage/                      # 存储抽象层
+└── docs/                         # 文档
 ```
 
-## 状态说明
+## 开发
 
-| 版本线 | 状态 |
-|--------|------|
-| v2.1 | OpenClaw 插件、多表存储、CLI、扫描、自动捕获/召回的兼容能力 |
-| v3.0 | 5 问题语义协议、Agent 快路径、候选区和 Slot Context Builder |
-| v4.0 | MemoryService、REST/MCP/SDK/ingestion/retrieval/graph/tree/console 的多产品 runtime 记忆基线 |
-| vNext | 深层优化方案，包含更完整的本地可回放、SlotSnapshot、治理、图谱和记忆树路线 |
+### 运行测试
 
-发布和变更记录以 [docs/09-changelog](./docs/09-changelog/README.md) 为准。
+```bash
+npm test                  # vitest run
+npx tsc --noEmit          # 类型检查
+npm run eval:quick        # golden set 评估
+```
+
+### 开发文档
+
+- [CLAUDE.md](CLAUDE.md) - 项目概述（面向 AI）
+- [AGENTS.md](AGENTS.md) - 代理指南（面向 AI）
+- [CLAUDE.local.md](CLAUDE.local.md) - 详细开发文档导航（团队内部）
+- [AGENTS.local.md](AGENTS.local.md) - 代理编排详解（团队内部）
+
+## 版本
+
+当前版本：**v1.0.2**
+
+- 4 套评分体系（valueScore/importance/confidence/hotness）
+- 11 闸门 validator
+- LLM 结构化提取
+- 语义去重
+- L0-L3 树摘要
+- skill_candidate 聚合
+- 反馈闭环
+- 用户可见面（ms why/explain/forget）
+
+详见 [Changelog](docs/09-changelog/)。
+
+## 许可
+
+MIT License
+
+## 贡献
+
+欢迎贡献！请查看 [贡献指南](CONTRIBUTING.md)。
+
+---
+
+**内部开发文档**见 `.memory-docs/original-docs/`（不包含在开源发布中）。

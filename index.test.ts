@@ -37,7 +37,7 @@ describe("memory plugin e2e", () => {
     // Dynamic import to avoid loading LanceDB when not testing
     const { default: memoryPlugin } = await import("./index.js");
 
-    expect(memoryPlugin.id).toBe("memory-autodb");
+    expect(memoryPlugin.id).toBe("mengshu");
     expect(memoryPlugin.name).toBe("Memory (AutoDB)");
     expect(memoryPlugin.kind).toBe("memory");
     expect(memoryPlugin.configSchema).toBeDefined();
@@ -382,7 +382,7 @@ describeLive("memory plugin live tests", () => {
     const logs: string[] = [];
 
     const mockApi = {
-      id: "memory-autodb",
+      id: "mengshu",
       name: "Memory (LanceDB)",
       source: "test",
       config: {},

@@ -1,61 +1,81 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance to Codex and AI coding assistants when working with code in this repository.
 
 ## 项目概述
 
-这是一个 OpenClaw 长期内存插件（v2.1），使用 LanceDB 向量数据库存储对话记忆，支持 Supabase 云端存储和混合模式，提供自动记忆捕获、自动召回和知识库扫描功能。
+mengshu（梦枢）是面向多产品 Agent Runtime 的本地优先记忆中间件。当前版本 v1.0.2，P0-P4 算法层已全量交付。
 
-### v2.1 核心升级
+核心能力：LLM 结构化提取 → 11 闸门 validator → 4 套评分 → 语义去重 → L0-L3 树摘要 → 6 因子召回 → 5 槽位注入。
 
-1. **多表存储架构**：`memories` 表（对话记忆）和 `knowledge` 表（文档知识）分离存储
-2. **增强型 CLI 命令**：新增 `ltm tables`、`ltm query`、`ltm export` 命令
-3. **元数据自动丰富**：自动捕获 OpenClaw 上下文（sessionId、conversationId 等）
-4. **配置扩展**：支持表级配置、扫描目标表配置
+多适配器接入：OpenClaw 插件 / MCP Server / REST API / Web Console / CLI（`ms` 命令组）。
+
+**算法层单一事实来源**：`docs/design/memory-system-unified-design.md`（D-01~D-23 决策）。
+
+**详细开发文档**：参见 `AGENTS.local.md`（包含代理编排、核心目录、评分体系等）。
 
 ## 常用命令
 
-### 开发
 ```bash
-# 运行测试
-npm test
-# 运行测试并观察变化
-npm test -- --watch
-# 类型检查
-npx tsc
-# 运行单个测试文件
-npx vitest run index.test.ts
+# 开发
+npm test                        # vitest run（100 文件 / 1101 测试）
+npx tsc --noEmit                # 类型检查
+npx vitest run core/            # 运行单目录测试
+npm run eval:quick              # 快速 golden set 评估
+
+# CLI 命令组（ms）
+ms init                         # 交互式初始化配置向导
+ms doctor                       # 配置/连接诊断
+ms why <记忆ID>                  # 评分明细追溯
+ms recall "查询" --explain       # 召回 + importance breakdown
+ms forget <记忆ID>               # 撤回/归档/纠错
+ms import <path>                # 导入 agent history
+ms project                      # 项目管理
+ms stats / ms search / ms scan / ms serve / ms mcp
 ```
 
-### CLI 命令
-```bash
-# 查看统计
-ltm stats
+## 核心架构
 
-# 列出所有表
-ltm tables
+### 铁律
 
-# 搜索记忆
-ltm search "查询内容" --limit 10
+1. **"LLM 可以建议，不可单独裁决"**：所有入库经 `lifecycle/candidate-validator.ts` 11 闸门
+2. **"四套评分分工明确"**：valueScore（准入）/ importance（召回排序）/ confidence（去重治理）/ hotness（树路由）
+3. **"单一事实来源"**：权重在 `processing/scoring-weights.ts`，实体类型在 `graph/schema.ts`
 
-# 高级查询
-ltm query --table memories --filter '{"category": "preference"}'
+### 核心目录
 
-# 导出数据
-ltm export --table knowledge --format json --output knowledge.json
+| 目录 | 职责 | 关键文件 |
+|------|------|---------|
+| `core/` | 领域类型、评分集成、profile 分层 | `recall-scoring.ts`、`profile-layer.ts`、`types.ts` |
+| `processing/` | 评分公式、LLM 客户端、词表 | `value-score.ts`、`importance-score.ts`、`confidence-score.ts`、`llm-client.ts` |
+| `lifecycle/` | 候选区、validator、去重、遗忘、skill 聚合 | `candidate-validator.ts`、`semantic-dedup.ts`、`forget-handler.ts`、`skill-candidate-aggregator.ts` |
+| `graph/` | 知识图谱、entity 三级匹配 | `llm-extractor.ts`、`entity-resolver.ts`、`centrality-calculator.ts`、`schema.ts` |
+| `tree/` | L0-L3 树摘要、leaf 路由 | `seal.ts`、`leaf-routing.ts`、`faithfulness.ts` |
+| `retrieval/` | 召回编排、上下文打包、prompt 安全 | `orchestrator.ts`、`context-packer.ts`、`prompt-safety.ts` |
+| `ingest/` | 入库管道、chunker、canonicalize | `pipeline.ts`、`chunker.ts`、`canonicalize.ts` |
+| `feedback/` | 反馈闭环 | `collector.ts`、`in-memory-store.ts` |
+| `adapters/openclaw/` | OpenClaw 插件 + CLI 命令 | `hooks.ts`、`tools.ts`、`cli-why.ts`、`cli-recall.ts`、`cli-forget.ts` |
+| `adapters/mcp/` | MCP Server 适配 | `server.ts`、`stdio-server.ts`、`tools.ts` |
 
-# 扫描目录
-ltm scan /path/to/docs --target-table knowledge
+### 4 套评分体系（SCORING_WEIGHTS_V1）
 
-# 清理数据
-ltm cleanup --older-than 30 --table knowledge
-```
+| 评分 | 用途 | 消费方 | 维度 |
+|------|------|--------|------|
+| **valueScore** | 准入决策（drop / low / pending / active） | `lifecycle/admission-decision.ts` | 8 维（explicitness/durability/actionability/specificity/evidence/scopeFit/novelty/riskPenalty=-0.15） |
+| **importance** | 召回排序 + score breakdown | `core/recall-scoring.ts` | 4 项（salience_llm 0.45 + sourceAuthority 0.20 + explicitnessBonus 0.20 + typePrior 0.15） |
+| **confidence** | 去重治理 + 证据晋升 | `processing/confidence-score.ts` | 多证据贝叶斯累积 |
+| **hotness** | topic tree 路由 + 归档 | `graph/query-hits-tracker.ts` | 5 项（mention + source + recency + centrality + queryHits） |
+
+### 决策阈值（D-01~D-03）
+
+- **D-01 riskPenalty**：-0.15（`processing/scoring-weights.ts:32`）
+- **D-02 Admission 阈值带**：drop<0.40 / low 0.40-0.55 / pending 0.55-0.88 / active≥0.88
+- **D-03 Leaf 分级路由**：0.55-0.70 仅进 source tree，≥0.70 进 topic/global
 
 ## 配置
 
-插件配置在 `openclaw.plugin.json` 中定义：
+三层加载：`~/.mengshu/config.json` → `$PROJECT/.mengshu/config.json` → 环境变量覆盖
 
-### 基础配置
 ```json
 {
   "embedding": {
@@ -63,105 +83,28 @@ ltm cleanup --older-than 30 --table knowledge
     "baseURL": "https://api.openai.com/v1",
     "model": "text-embedding-3-small"
   },
+  "llm": {
+    "apiKey": "${OPENAI_API_KEY}",
+    "baseURL": "https://api.openai.com/v1",
+    "extractionModel": "gpt-4o-mini",
+    "summarizationModel": "gpt-4o-mini",
+    "reasoningModel": "gpt-4o"
+  },
   "dbType": "lancedb",
-  "dbPath": "~/.openclaw/memory/autodb",
+  "dbPath": "~/.mengshu/memory/lancedb",
   "autoCapture": true,
   "autoRecall": true
 }
 ```
 
-### 混合模式配置
-```json
-{
-  "embedding": { /* ... */ },
-  "dbType": "lancedb",
-  "dbPath": "~/.openclaw/memory/autodb",
-  "supabase": {
-    "url": "${SUPABASE_URL}",
-    "serviceKey": "${SUPABASE_SERVICE_KEY}"
-  },
-  "scanner": {
-    "targetTable": "knowledge",
-    "autoEnrichMetadata": true
-  },
-  "tables": {
-    "memories": { "enabled": true },
-    "knowledge": { "enabled": true }
-  }
-}
-```
-
-## 代码架构
-
-### 核心文件
-
-- **`index.ts`**: 主入口文件
-  - 插件注册逻辑
-  - 核心工具：`memory_recall`、`memory_store`、`memory_scan_directory`、`memory_cleanup`
-  - 生命周期钩子：`before_agent_start`（自动召回）、`agent_end`（自动捕获）
-  - CLI 命令注册（`ltm` 命令组）
-  - 安全过滤：prompt 注入检测、内容转义
-  - 元数据自动丰富逻辑
-
-- **`config.ts`**: 配置管理
-  - 配置 schema 解析和验证
-  - 嵌入模型维度映射
-  - 环境变量解析
-  - 新增配置：`scanner.targetTable`、`scanner.autoEnrichMetadata`、`tables`
-
-- **`db/types.ts`**: 类型定义
-  - `MemoryEntry`、`MemoryMetadata` 接口
-  - `TableName` 类型：`"memories" | "knowledge" | "documents"`
-  - `DataType` 类型：`"memory" | "document" | "knowledge"`
-  - `DatabaseProvider` 接口
-
-- **`db/providers/`**: 数据库提供者实现
-  - `lancedb.ts`：LanceDB 本地向量数据库
-  - `supabase.ts`：Supabase PostgreSQL + pgvector
-  - `hybrid.ts`：混合模式（LanceDB + Supabase）
-
-- **`scanner/`**: 目录扫描模块
-  - `scanner-coordinator.ts`：扫描协调器
-  - `file-scanner.ts`：文件扫描器
-  - `markdown-processor.ts`：Markdown 处理器
-
-- **`processing/`**: 数据处理模块
-  - `embeddings.ts`：嵌入生成
-  - `text-splitter.ts`：文本切分器
-  - `hash-utils.ts`：哈希工具
-
-- **`index.test.ts`**: 测试文件
-  - 单元测试：配置解析、捕获规则、分类逻辑等
-  - 端到端测试：完整的存储/检索流程
-
-## 核心概念
-
-1. **多表存储**
-   - `memories` 表：对话记忆（用户偏好、决策、实体信息）
-   - `knowledge` 表：文档知识（扫描的 Markdown 文件）
-   - 支持表隔离查询和跨表搜索
-
-2. **元数据自动丰富**
-   - OpenClaw 上下文：`sessionId`、`conversationId`、`messageId`、`userId`
-   - 文档元数据：`filePath`、`fileModifiedAt`、`directoryPath`、`tokenCount`
-   - 技术元数据：`embeddingModel`、`pluginVersion`、`language`、`source`
-
-3. **混合存储模式**
-   - LanceDB：本地向量索引，快速搜索
-   - Supabase：云端持久化，完整元数据
-   - 查询时：LanceDB 搜索 → Supabase 获取完整数据
-
-4. **批量处理优化**
-   - 批量向量化：每批最多 20 个文本
-   - 并发控制：最多 3 个并发请求
-   - 自动重试：最多 3 次重试
-
 ## 开发注意事项
 
-- 所有代码使用 TypeScript，严格类型检查
-- 测试覆盖率目标：80%+
-- 新功能需要添加对应的单元测试
-- 涉及用户输入的地方需要进行安全校验
-- 记忆内容在注入上下文时会自动进行 HTML 转义
-- 多表操作时注意指定正确的 `tableName`
-- 元数据丰富时注意隐私保护（不上传第三方）
+- TypeScript 严格模式，`tsc --noEmit` 必须 exit 0
+- 测试覆盖率目标 80%+，新功能必须附带单元测试
+- 评分函数必须**纯函数**（同入同出，禁止内部发起 LLM 调用）
+- LLM 调用 temperature 一律 0.0（确定性提取）
+- LLM 默认超时 30s（`DEFAULT_LLM_TIMEOUT_MS`）
+- SQL 表名经运行时白名单校验（`db/providers/supabase.ts`）
+- 环境变量名经 `/^[A-Z_][A-Z0-9_]*$/` 白名单
+- 记忆内容注入上下文时自动 HTML 转义（`retrieval/prompt-safety.ts`）
+- 修改阈值/权重/prompt 后必须跑全量 golden set（6 套 eval suite）

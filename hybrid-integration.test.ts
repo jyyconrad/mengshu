@@ -142,7 +142,7 @@ describeLive("multi-knowledge base workflow with LanceDB", () => {
     const logs: string[] = [];
 
     const mockApi = {
-      id: "memory-autodb",
+      id: "mengshu",
       name: "Memory (LanceDB)",
       source: "test",
       config: {},
@@ -395,7 +395,7 @@ describeLive("end-to-end complete workflow", () => {
     const logs: string[] = [];
 
     const mockApi = {
-      id: "memory-autodb",
+      id: "mengshu",
       name: "Memory (LanceDB)",
       source: "test",
       config: {},
@@ -491,7 +491,7 @@ describeLive("end-to-end complete workflow", () => {
     const registeredTools: any[] = [];
 
     const mockApi = {
-      id: "memory-autodb",
+      id: "mengshu",
       name: "Memory (LanceDB)",
       source: "test",
       config: {},

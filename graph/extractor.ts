@@ -117,7 +117,7 @@ function extractProjectNames(text: string, metadata: Record<string, unknown>): s
   for (const match of text.matchAll(/\b([a-zA-Z][\w-]{2,})\s+(?:project|repo|repository)\b/gi)) {
     names.add(match[1]);
   }
-  for (const match of text.matchAll(/\b(memory-autodb|openclaw)\b/gi)) {
+  for (const match of text.matchAll(/\b(mengshu|openclaw)\b/gi)) {
     names.add(match[1]);
   }
   return Array.from(names);
