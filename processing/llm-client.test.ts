@@ -136,6 +136,96 @@ describe("OpenAiLlmClient", () => {
   });
 });
 
+describe("OpenAiLlmClient.extractStructured", () => {
+  const schema = {
+    type: "object" as const,
+    properties: { name: {}, age: {} },
+    required: ["name", "age"],
+  };
+
+  test("parses valid JSON and validates required fields", async () => {
+    const { client, calls } = makeFakeClient(JSON.stringify({ name: "Ada", age: 30 }));
+    const llm = new OpenAiLlmClient(llmConfig, { client, minTimeout: 1, maxTimeout: 5 });
+
+    const result = await llm.extractStructured<{ name: string; age: number }>(
+      [{ role: "user", content: "extract" }],
+      schema,
+    );
+
+    expect(result).toEqual({ name: "Ada", age: 30 });
+    // D-08: 强制 json_object response_format
+    expect(calls[0].response_format).toEqual({ type: "json_object" });
+  });
+
+  test("D-18: temperature is forced to 0.0 regardless of options/config", async () => {
+    const { client, calls } = makeFakeClient(JSON.stringify({ name: "Ada", age: 30 }));
+    const llm = new OpenAiLlmClient(
+      { ...llmConfig, temperature: 0.9 },
+      { client, minTimeout: 1, maxTimeout: 5 },
+    );
+
+    await llm.extractStructured(
+      [{ role: "user", content: "extract" }],
+      schema,
+      { temperature: 0.7 },
+    );
+
+    expect(calls[0].temperature).toBe(0.0);
+  });
+
+  test("retries then throws when JSON is malformed", async () => {
+    let attempts = 0;
+    const client: ChatCompletionClient = {
+      chat: {
+        completions: {
+          async create() {
+            attempts += 1;
+            return { choices: [{ message: { content: "not-json{" } }] };
+          },
+        },
+      },
+    };
+    const llm = new OpenAiLlmClient(llmConfig, {
+      client,
+      maxRetries: 2,
+      minTimeout: 1,
+      maxTimeout: 5,
+    });
+
+    await expect(
+      llm.extractStructured([{ role: "user", content: "x" }], schema),
+    ).rejects.toThrow();
+    // §10.4: 初次 + 2 次重试 = 3 次尝试
+    expect(attempts).toBe(3);
+  });
+
+  test("retries then throws when required field is missing (schema validation)", async () => {
+    let attempts = 0;
+    const client: ChatCompletionClient = {
+      chat: {
+        completions: {
+          async create() {
+            attempts += 1;
+            // 缺少 required 字段 age
+            return { choices: [{ message: { content: JSON.stringify({ name: "Ada" }) } }] };
+          },
+        },
+      },
+    };
+    const llm = new OpenAiLlmClient(llmConfig, {
+      client,
+      maxRetries: 1,
+      minTimeout: 1,
+      maxTimeout: 5,
+    });
+
+    await expect(
+      llm.extractStructured([{ role: "user", content: "x" }], schema),
+    ).rejects.toThrow(/Schema validation failed/);
+    expect(attempts).toBe(2);
+  });
+});
+
 describe("NullLlmClient", () => {
   test("available is false and calls throw", async () => {
     const llm = new NullLlmClient();

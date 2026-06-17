@@ -33,6 +33,22 @@ export interface LlmCompletionMessage {
   content: string;
 }
 
+/**
+ * 结构化抽取使用的简化 JSON Schema（§2.2 structured-output 约束）。
+ *
+ * 说明：本项目当前未引入 zod / ajv 等校验库，为避免新增依赖带来的
+ * 风险，extractStructured 仅依赖 schema 的 `required` 字段做运行时校验
+ * （检查这些字段在返回 JSON 中是否存在）。schema 的其余字段（properties
+ * 等）仍会序列化进 system message 作为结构提示。后续若需更严格的类型 /
+ * 取值校验，可在此基础上接入 zod schema 而无需改动调用方契约。
+ */
+export interface SimpleJsonSchema {
+  /** 标记必须存在的字段名，extractStructured 会逐一校验其存在性。 */
+  required?: string[];
+  /** schema 其余约束（properties / type 等），仅作 prompt 提示用途。 */
+  [key: string]: unknown;
+}
+
 /** complete 的可选调用参数（覆盖配置默认值）。 */
 export interface LlmCompletionOptions {
   maxTokens?: number;
@@ -45,10 +61,14 @@ export interface LlmClient {
   complete(messages: LlmCompletionMessage[], options?: LlmCompletionOptions): Promise<string>;
   /** 将正文按指令摘要，内部拼成 system+user prompt。 */
   summarize(text: string, instruction: string): Promise<string>;
-  /** 结构化抽取：强制 JSON 输出并解析为 T，失败重试最多 3 次。 */
+  /**
+   * 结构化抽取：强制 JSON 输出并解析为 T，失败重试最多 3 次。
+   * D-08 (§2.2): 使用 structured outputs + schema 运行时校验。
+   * D-18: temperature 一律为 0.0，不受 options/config 覆盖。
+   */
   extractStructured<T>(
     messages: LlmCompletionMessage[],
-    schema: Record<string, unknown>,
+    schema: SimpleJsonSchema,
     options?: LlmCompletionOptions,
   ): Promise<T>;
   /** 是否真正可用（已配置 LLM）。调用方应先检查再使用。 */
@@ -166,9 +186,15 @@ export class OpenAiLlmClient implements LlmClient {
     ]);
   }
 
+  /**
+   * 结构化抽取实现。
+   * D-08 (§2.2): 使用 structured outputs，运行时校验 schema required 字段。
+   * D-18: temperature 强制固定为 0.0，覆盖任何 options/config 设置。
+   * §10.4: 重试使用退避策略，最多 3 次，失败后抛错并应记 audit。
+   */
   async extractStructured<T>(
     messages: LlmCompletionMessage[],
-    schema: Record<string, unknown>,
+    schema: SimpleJsonSchema,
     options: LlmCompletionOptions = {},
   ): Promise<T> {
     const schemaHint = `Respond with valid JSON matching this schema:\n${JSON.stringify(schema, null, 2)}`;
@@ -176,30 +202,52 @@ export class OpenAiLlmClient implements LlmClient {
       { role: "system", content: schemaHint },
       ...messages,
     ];
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
+
+    return retry(
+      async () => {
         const maxTokens = options.maxTokens ?? this.maxTokens;
-        const temperature = options.temperature ?? this.temperature;
+        // D-18: temperature 一律 0.0，不受 options/config 覆盖
+        const temperature = 0.0;
+
         const response = await this.limit(() =>
           this.client.chat.completions.create({
             model: this.model,
             messages: augmented,
             ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
-            ...(temperature !== undefined ? { temperature } : {}),
+            temperature, // 显式传递 0.0
             response_format: { type: "json_object" },
           }),
         );
+
         const content = response.choices?.[0]?.message?.content;
         if (typeof content !== "string" || content.length === 0) {
           throw new Error("LLM returned empty content");
         }
-        return JSON.parse(content) as T;
-      } catch (err) {
-        lastError = err;
-      }
-    }
-    throw lastError;
+
+        const parsed = JSON.parse(content) as T;
+
+        // D-08 (§2.2): schema 运行时校验 - 检查 required 字段是否存在
+        if (schema.required && Array.isArray(schema.required)) {
+          const missing = schema.required.filter(
+            (field) => parsed && typeof parsed === "object" && !(field in parsed),
+          );
+          if (missing.length > 0) {
+            throw new Error(
+              `Schema validation failed: missing required fields: ${missing.join(", ")}`,
+            );
+          }
+        }
+
+        return parsed;
+      },
+      {
+        // §10.4: 最多 3 次重试，指数退避
+        retries: this.maxRetries,
+        minTimeout: this.minTimeout,
+        maxTimeout: this.maxTimeout,
+        factor: 2,
+      },
+    );
   }
 }
 
@@ -220,7 +268,7 @@ export class NullLlmClient implements LlmClient {
 
   async extractStructured<T>(
     _messages: LlmCompletionMessage[],
-    _schema: Record<string, unknown>,
+    _schema: SimpleJsonSchema,
     _options?: LlmCompletionOptions,
   ): Promise<T> {
     throw new Error("LLM is not configured: set the `llm` config block to enable structured extraction");
