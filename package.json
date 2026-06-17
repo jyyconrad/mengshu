@@ -1,6 +1,6 @@
 {
   "name": "@mengshu/core",
-  "version": "2026.3.9",
+  "version": "1.0.3",
   "private": true,
   "description": "Local-first memory middleware (mengshu) for OpenClaw-type Agent Runtime products with auto-recall/capture",
   "type": "module",
