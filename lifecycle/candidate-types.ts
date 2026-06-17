@@ -85,12 +85,19 @@ export interface CandidateZoneConfig {
   archiveDays?: number;
   /** 审核批次大小 */
   reviewBatchSize?: number;
+  /**
+   * 单会话候选区容量限制（D-02 / §17.1）
+   * 防止候选区无限膨胀，超限时最早入队的候选被自动归档。
+   * @default 50
+   */
+  maxCandidatesPerSession?: number;
 }
 
 export const DEFAULT_CANDIDATE_CONFIG: Required<CandidateZoneConfig> = {
   evictionDays: 30,
   archiveDays: 30,
   reviewBatchSize: 100,
+  maxCandidatesPerSession: 50,
 };
 
 /**
