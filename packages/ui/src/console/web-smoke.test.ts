@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "vitest";
-import type { MemoryService } from "../core/service-types.js";
-import type { ContextBlock, MemoryRecord, RecallResult } from "../core/types.js";
+import type { MemoryService } from "../../../../core/service-types.js";
+import type { ContextBlock, MemoryRecord, RecallResult } from "../../../../core/types.js";
 import { createConsoleApi } from "./api.js";
-import { startMemoryServer, type RunningMemoryServer } from "../server/daemon.js";
+import { startMemoryServer, type RunningMemoryServer } from "../../../../server/daemon.js";
 
 const scope = {
   tenantId: "local",

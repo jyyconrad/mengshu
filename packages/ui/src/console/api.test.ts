@@ -1,14 +1,14 @@
 import { describe, expect, test } from "vitest";
-import type { MemoryService, StoreMemoryInput, RecallInput, DeleteMemoryInput } from "../core/service-types.js";
-import type { ContextBlock, MemoryRecord, RecallResult } from "../core/types.js";
-import { InMemoryGraphRepository } from "../graph/repository.js";
-import { GraphQueryService } from "../graph/query.js";
-import { InMemoryMemoryStore } from "../storage/repositories/in-memory.js";
-import { InMemoryTreeRepository } from "../tree/buffer.js";
-import { buildDailyDigest } from "../tree/global.js";
-import { InMemoryCandidateRepository } from "../lifecycle/candidate-repository.js";
-import { CandidateReviewService } from "../lifecycle/candidate-review.js";
-import type { CandidateRecord } from "../lifecycle/candidate-types.js";
+import type { MemoryService, StoreMemoryInput, RecallInput, DeleteMemoryInput } from "../../../../core/service-types.js";
+import type { ContextBlock, MemoryRecord, RecallResult } from "../../../../core/types.js";
+import { InMemoryGraphRepository } from "../../../../graph/repository.js";
+import { GraphQueryService } from "../../../../graph/query.js";
+import { InMemoryMemoryStore } from "../../../../storage/repositories/in-memory.js";
+import { InMemoryTreeRepository } from "../../../../tree/buffer.js";
+import { buildDailyDigest } from "../../../../tree/global.js";
+import { InMemoryCandidateRepository } from "../../../../lifecycle/candidate-repository.js";
+import { CandidateReviewService } from "../../../../lifecycle/candidate-review.js";
+import type { CandidateRecord } from "../../../../lifecycle/candidate-types.js";
 import { createConsoleApi } from "./api.js";
 
 const scope = {

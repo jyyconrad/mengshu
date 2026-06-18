@@ -5,17 +5,17 @@
  * 显式 scope，private raw content 不返回。
  */
 
-import type { MemoryService } from "../core/service-types.js";
-import type { MemoryScope, RecallHit } from "../core/types.js";
-import type { GraphQueryService } from "../graph/query.js";
-import type { ChunkRepository, JobRepository } from "../storage/repositories/types.js";
-import type { TreeRepository } from "../tree/types.js";
+import type { MemoryService } from "../../../../core/service-types.js";
+import type { MemoryScope, RecallHit } from "../../../../core/types.js";
+import type { GraphQueryService } from "../../../../graph/query.js";
+import type { ChunkRepository, JobRepository } from "../../../../storage/repositories/types.js";
+import type { TreeRepository } from "../../../../tree/types.js";
 import type {
   CandidateRecord,
   CandidateRepository,
   CandidateStatus,
-} from "../lifecycle/candidate-types.js";
-import type { CandidateReviewService } from "../lifecycle/candidate-review.js";
+} from "../../../../lifecycle/candidate-types.js";
+import type { CandidateReviewService } from "../../../../lifecycle/candidate-review.js";
 import type {
   ConsoleApi,
   ConsoleCandidate,

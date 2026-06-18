@@ -11,13 +11,13 @@
  */
 
 import { afterEach, describe, expect, test } from "vitest";
-import type { MemoryService } from "../core/service-types.js";
-import type { ContextBlock, MemoryRecord, RecallResult } from "../core/types.js";
+import type { MemoryService } from "../../../../core/service-types.js";
+import type { ContextBlock, MemoryRecord, RecallResult } from "../../../../core/types.js";
 import { createConsoleApi } from "./api.js";
-import { startMemoryServer, type RunningMemoryServer } from "../server/daemon.js";
-import { InMemoryCandidateRepository } from "../lifecycle/candidate-repository.js";
-import { CandidateReviewService } from "../lifecycle/candidate-review.js";
-import { candidateToMemoryRecord } from "../lifecycle/candidate-promotion.js";
+import { startMemoryServer, type RunningMemoryServer } from "../../../../server/daemon.js";
+import { InMemoryCandidateRepository } from "../../../../lifecycle/candidate-repository.js";
+import { CandidateReviewService } from "../../../../lifecycle/candidate-review.js";
+import { candidateToMemoryRecord } from "../../../../lifecycle/candidate-promotion.js";
 
 const scope = {
   tenantId: "local",

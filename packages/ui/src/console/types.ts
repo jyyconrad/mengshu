@@ -5,14 +5,14 @@
  * 操作台视图返回数据，并保留 scope/provenance 以支持追溯。
  */
 
-import type { MemoryScope, MemorySemanticType, RecallHit } from "../core/types.js";
-import type { GraphQueryResult } from "../graph/query.js";
-import type { JobRecord } from "../storage/repositories/types.js";
+import type { MemoryScope, MemorySemanticType, RecallHit } from "../../../../core/types.js";
+import type { GraphQueryResult } from "../../../../graph/query.js";
+import type { JobRecord } from "../../../../storage/repositories/types.js";
 import type {
   CandidateReviewAction,
   CandidateReviewResult,
   CandidateStatus,
-} from "../lifecycle/candidate-types.js";
+} from "../../../../lifecycle/candidate-types.js";
 
 export interface ConsoleOverview {
   scope: MemoryScope;
