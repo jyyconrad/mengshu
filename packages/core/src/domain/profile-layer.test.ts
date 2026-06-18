@@ -9,7 +9,7 @@ import {
   enrichProfileLayer,
   isProfileMemory,
 } from "./profile-layer.js";
-import type { MemoryRecord, MemoryScope, ProfileLayer } from "./types.js";
+import type { MemoryRecord, MemoryScope, ProfileLayer } from "../../../../core/types.js";
 
 const mockScope = (partial?: Partial<MemoryScope>): MemoryScope => ({
   tenantId: "tenant-1",

@@ -6,7 +6,7 @@ import {
   recordToMemoryEntry,
   tableNameToNamespace,
 } from "./legacy-mapping.js";
-import { scopeToKey } from "./scope.js";
+import { scopeToKey } from "../../../../core/scope.js";
 
 const baseEntry: MemoryEntry = {
   id: "mem-1",

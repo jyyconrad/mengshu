@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, test } from "vitest";
-import type { MemoryRecord, MemoryScope } from "./types.js";
+import type { MemoryRecord, MemoryScope } from "../../../../core/types.js";
 import {
   filterRecallRecords,
   DEFAULT_SALIENCE_THRESHOLD,

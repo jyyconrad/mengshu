@@ -10,7 +10,7 @@ import {
   batchMapSemanticType,
   computeMappingCoverage,
 } from "./semantic-type-mapper.js";
-import type { MemoryRecord } from "./types.js";
+import type { MemoryRecord } from "../../../../core/types.js";
 
 describe("kindToSemanticType", () => {
   describe("v0.1 高置信度映射", () => {

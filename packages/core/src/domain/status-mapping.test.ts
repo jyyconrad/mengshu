@@ -10,9 +10,9 @@
 
 import { describe, it, expect } from "vitest";
 import { mapToUserVisibleStatus } from "./status-mapping.js";
-import type { AdmissionRoute, UserVisibleStatus } from "./types.js";
-import type { CandidateStatus } from "../lifecycle/candidate-types.js";
-import type { MemoryLifecycleStatus } from "./types.js";
+import type { AdmissionRoute, UserVisibleStatus } from "../../../../core/types.js";
+import type { CandidateStatus } from "../../../../lifecycle/candidate-types.js";
+import type { MemoryLifecycleStatus } from "../../../../core/types.js";
 
 describe("mapToUserVisibleStatus", () => {
   describe("AdmissionRoute 单向映射（§0.3.1）", () => {
