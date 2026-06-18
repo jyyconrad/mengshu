@@ -12,12 +12,12 @@
  */
 
 import type { ValueScoreSignals } from "./value-score.js";
-import type { MemorySemanticType } from "../core/types.js";
+import type { MemorySemanticType } from "../domain/types.js";
 import type {
   ValidatedCandidate,
   ScopeLevel,
   Temporality,
-} from "../lifecycle/candidate-validator.js";
+} from "../../../../lifecycle/candidate-validator.js";
 import { SCORING_WEIGHTS_V1 } from "./scoring-weights.js";
 import { detectExplicitSave } from "./importance-score.js";
 

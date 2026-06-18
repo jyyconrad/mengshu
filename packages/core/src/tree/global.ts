@@ -8,7 +8,7 @@
 import type { TreeLeaf, TreeRepository, TreeSummaryNode } from "./types.js";
 import { appendLeafToBuffer } from "./buffer.js";
 import { sealBuffer } from "./seal.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 export function dayKey(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(0, 10);

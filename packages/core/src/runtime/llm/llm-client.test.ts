@@ -14,7 +14,7 @@
  */
 
 import { describe, expect, test, vi, afterEach } from "vitest";
-import type { MemoryConfig } from "../config.js";
+import type { MemoryConfig } from "../../../../../config.js";
 import {
   DEFAULT_LLM_TIMEOUT_MS,
   NullLlmClient,

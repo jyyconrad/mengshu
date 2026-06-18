@@ -19,7 +19,7 @@ import {
   type EntityRepository,
   type EntityResolveResult,
 } from "./entity-resolver.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 import type { GraphEntityRecord } from "./types.js";
 import type { EntityType } from "./schema.js";
 

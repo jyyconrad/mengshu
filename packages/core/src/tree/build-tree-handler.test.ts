@@ -12,8 +12,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { createBuildTreeHandler } from "./build-tree-handler.js";
 import { InMemoryTreeRepository } from "./buffer.js";
-import type { LlmClient } from "../processing/llm-client.js";
-import type { MemoryScope } from "../core/types.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
+import type { MemoryScope } from "../domain/types.js";
 import type { JobRecord } from "../storage/repositories/types.js";
 
 // Fake LlmClient（可用，返回指定摘要）

@@ -23,7 +23,7 @@ import {
 } from "./confidence-score";
 import { SCORING_WEIGHTS_V1 } from "./scoring-weights";
 import { getSourceAuthority } from "./importance-score";
-import type { MemorySemanticType } from "../core/types";
+import type { MemorySemanticType } from "../domain/types";
 
 /** §4.3 参考实现（独立复现，用于交叉验证） */
 function referenceConfidence(

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
 import type { DatabaseProvider, MemoryEntry, MemoryQueryOptions, TableName, TableStats, KnowledgeBaseConfig } from "../types";
-import { vectorDimsForModel } from "../../config";
+import { vectorDimsForModel } from "../../../../../config.js";
 
 const { Pool } = pg;
 

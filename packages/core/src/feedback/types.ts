@@ -8,7 +8,7 @@
  * - 用户交互（显式反馈、编辑、删除等）
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../index.js";
 
 /**
  * 反馈信号类型

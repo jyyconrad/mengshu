@@ -7,10 +7,10 @@
  */
 
 import { packContext } from "../retrieval/context-packer.js";
-import { auditLifecycle } from "../lifecycle/audit.js";
-import { normalizeScope, validateScopeForWrite } from "./scope.js";
-import type { AuditRepository } from "../storage/repositories/types.js";
-import type { ContextBlock, RecallHit } from "./types.js";
+import { auditLifecycle } from "../../../../lifecycle/audit.js";
+import { normalizeScope, validateScopeForWrite } from "../domain/scope.js";
+import type { AuditRepository } from "../../../../storage/repositories/types.js";
+import type { ContextBlock, RecallHit } from "../domain/types.js";
 import type {
   BuildContextInput,
   DeleteMemoryInput,
@@ -23,8 +23,8 @@ import type {
   RecallResult,
   StoreMemoryInput,
   StoreMemoryResult,
-} from "./service-types.js";
-import type { QueryHitsTracker } from "../graph/query-hits-tracker.js";
+} from "../domain/service-types.js";
+import type { QueryHitsTracker } from "../../../../graph/query-hits-tracker.js";
 
 export type {
   BuildContextInput,
@@ -38,7 +38,7 @@ export type {
   RecallInput,
   StoreMemoryInput,
   StoreMemoryResult,
-} from "./service-types.js";
+} from "../domain/service-types.js";
 
 export interface DefaultMemoryServiceOptions {
   repository: MemoryRepository;

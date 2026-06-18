@@ -5,8 +5,8 @@
  * 会合并 mention/evidence 统计，查询严格按 scope 隔离。
  */
 
-import { scopeToKey } from "../core/scope.js";
-import type { MemoryScope } from "../core/types.js";
+import { scopeToKey } from "../domain/scope.js";
+import type { MemoryScope } from "../domain/types.js";
 import type { GraphEntityRecord, GraphRelationRecord, RelationPredicate } from "./types.js";
 
 export interface EntityFilter {

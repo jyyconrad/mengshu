@@ -15,12 +15,12 @@ import type {
 import {
   memoryEntryToRecord,
   recordToMemoryEntry,
-} from "../core/legacy-mapping.js";
+} from "../domain/legacy-mapping.js";
 import type {
   MemoryRepository,
   MemoryRepositoryQuery,
-} from "../core/service-types.js";
-import type { MemoryRecord, MemoryScopeInput } from "../core/types.js";
+} from "../domain/service-types.js";
+import type { MemoryRecord, MemoryScopeInput } from "../domain/types.js";
 
 export interface LegacyDatabaseStats {
   count: number;

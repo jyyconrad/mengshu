@@ -7,9 +7,9 @@
  */
 
 import { readFile, stat } from "node:fs/promises";
-import type { MemoryScope } from "../../core/types.js";
+import type { MemoryScope } from "../../domain/types.js";
 import type { TableName } from "../../db/types.js";
-import { FileScanner, type FileScannerOptions } from "../../scanner/file-scanner.js";
+import { FileScanner, type FileScannerOptions } from "../scanner/file-scanner.js";
 import type { IngestionPipeline } from "../pipeline.js";
 
 export interface IngestMarkdownFileInput {

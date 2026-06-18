@@ -1,6 +1,6 @@
 // 从 config 导入并重导出类型
-export type { RoutingRule, KnowledgeBaseConfig } from "../config";
-import type { MemoryCategory } from "../config";
+export type { RoutingRule, KnowledgeBaseConfig } from "../../../../config.js";
+import type { MemoryCategory } from "../../../../config.js";
 
 /**
  * 数据类型区分：

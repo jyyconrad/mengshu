@@ -8,8 +8,8 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { SkillCandidateAggregator } from "./skill-candidate-aggregator.js";
 import { InMemorySkillCandidateRepository } from "./skill-candidate-repository.js";
 import type { CandidateRepository, CandidateRecord } from "./candidate-types.js";
-import type { MemoryScope } from "../core/types.js";
-import type { LlmClient } from "../processing/llm-client.js";
+import type { MemoryScope } from "../domain/types.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
 
 /**
  * Mock CandidateRepository

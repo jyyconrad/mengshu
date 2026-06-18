@@ -12,7 +12,7 @@
  *   - 所有写操作均追加审计日志（前后值、操作者、原因、时间），软删可回滚。
  */
 
-import type { MemoryKind } from "../core/types.js";
+import type { MemoryKind } from "../domain/types.js";
 
 /** 撤回后可回滚的时间窗口：7 天（§13.3）。 */
 export const REVOKE_UNDO_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;

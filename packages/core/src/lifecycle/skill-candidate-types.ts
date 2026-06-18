@@ -10,7 +10,7 @@
  * - 高风险操作必须标记 highRisk=true
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 /**
  * SkillCandidate Schema（§8.2，独立于 MemoryKind）

@@ -14,10 +14,10 @@
  * - 不修改入参；contentHash 由文本派生，保证同文本幂等。
  */
 
-import { computeContentHash } from "../processing/hash-utils.js";
-import type { MemoryCategory } from "../config.js";
+import { computeContentHash } from "../scoring/hash-utils.js";
+import type { MemoryCategory } from "../../../../config.js";
 import type { CandidateRecord } from "./candidate-types.js";
-import type { MemoryKind, MemoryRecord } from "../core/types.js";
+import type { MemoryKind, MemoryRecord } from "../domain/types.js";
 
 /** 候选 kind 字符串收敛到 MemoryKind；未知值归为 other。 */
 function toMemoryKind(kind: string): MemoryKind {

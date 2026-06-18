@@ -8,8 +8,8 @@
  * 边界：纯函数，不修改入参；转义为保守白名单式标签剔除，非完整 HTML 转义。
  */
 
-import type { ContextFastResponse } from "./semantic-types.js";
-import type { MemorySemanticType } from "./types.js";
+import type { ContextFastResponse } from "../domain/semantic-types.js";
+import type { MemorySemanticType } from "../domain/types.js";
 
 /**
  * 简单的 prompt-safe 转义：剔除可能注入的标签。

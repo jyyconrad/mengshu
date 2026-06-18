@@ -13,7 +13,7 @@ import type {
   MemoryRecord,
   MemoryScope,
   MemorySemanticType,
-} from "../core/types.js";
+} from "../domain/types.js";
 
 /**
  * 候选状态机

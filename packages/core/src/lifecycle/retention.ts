@@ -4,8 +4,8 @@
  * 只生成可审计删除计划并通过 MemoryService 删除；调用方负责配置 TTL 和定时执行。
  */
 
-import type { MemoryService } from "../core/service-types.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryService } from "../domain/service-types.js";
+import type { MemoryScope } from "../domain/types.js";
 import type { AuditRepository } from "../storage/repositories/types.js";
 import { auditLifecycle } from "./audit.js";
 

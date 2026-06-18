@@ -11,7 +11,7 @@ import type { GraphEntityRecord } from "../graph/types.js";
 import type { TreeLeaf } from "./types.js";
 import { appendLeafToBuffer, type SealPolicy } from "./buffer.js";
 import type { TreeRepository } from "./types.js";
-import { SCORING_WEIGHTS_V1, type RecencyDecayBucket } from "../processing/scoring-weights.js";
+import { SCORING_WEIGHTS_V1, type RecencyDecayBucket } from "../scoring/scoring-weights.js";
 import { shouldRouteToTree, type LeafRoutingInput } from "./leaf-routing.js";
 
 export const TOPIC_CREATION_THRESHOLD = 6.0;

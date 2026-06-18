@@ -8,7 +8,7 @@ import type {
   MemoryScope,
   MemorySemanticType,
   MemoryRecord,
-} from "./types.js";
+} from "../domain/types.js";
 
 export interface SlotSnapshot {
   scope: MemoryScope;

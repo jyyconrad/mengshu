@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { CentralityCalculator } from "./centrality-calculator.js";
 import { InMemoryGraphRepository } from "./repository.js";
 import type { GraphEntityRecord, GraphRelationRecord } from "./types.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 describe("CentralityCalculator", () => {
   let graphRepo: InMemoryGraphRepository;

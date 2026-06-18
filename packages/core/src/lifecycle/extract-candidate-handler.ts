@@ -38,15 +38,15 @@ import {
   type Temporality,
   type ValidatedCandidate,
 } from "./candidate-validator.js";
-import type { MemoryScope, MemorySemanticType } from "../core/types.js";
-import { inferProfileLayer } from "../core/profile-layer.js";
+import type { MemoryScope, MemorySemanticType } from "../domain/types.js";
+import { inferProfileLayer } from "../domain/profile-layer.js";
 import type { JobRecord } from "../storage/repositories/types.js";
-import type { JobHandler } from "../server/workers.js";
+import type { JobHandler } from "../runtime/jobs.js";
 import type {
   LlmClient,
   LlmCompletionMessage,
   SimpleJsonSchema,
-} from "../processing/llm-client.js";
+} from "../runtime/llm/llm-client.js";
 import {
   decideAdmission as decideAdmissionV2,
   type AdmissionContext,

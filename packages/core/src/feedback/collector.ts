@@ -11,7 +11,7 @@
  */
 
 import { nanoid } from "nanoid";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../index.js";
 import type {
   FeedbackSignal,
   FeedbackSignalType,

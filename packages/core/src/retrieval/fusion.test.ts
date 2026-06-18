@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { MemoryRecord, RecallHit } from "../core/types.js";
+import type { MemoryRecord, RecallHit } from "../domain/types.js";
 import { fuseHits } from "./fusion.js";
 
 const scope = {

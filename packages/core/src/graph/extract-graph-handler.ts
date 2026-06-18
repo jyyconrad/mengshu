@@ -4,10 +4,10 @@
  */
 
 import type { JobRecord, JobRepository } from "../storage/repositories/types.js";
-import type { LlmClient } from "../processing/llm-client.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
 import type { InMemoryGraphRepository } from "./repository.js";
 import { extractGraphWithLlm } from "./llm-extractor.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 import { enqueueUniqueJob } from "../ingest/jobs.js";
 
 export interface ExtractGraphJobPayload {

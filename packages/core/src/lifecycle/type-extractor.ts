@@ -8,7 +8,7 @@
  * 单机配置的需求。LLM 抽取作为可选增强，通过 LLMTypeExtractor 实现。
  */
 
-import type { MemorySemanticType } from "../core/types.js";
+import type { MemorySemanticType } from "../domain/types.js";
 import { isSensitive } from "./sensitive-filter.js";
 
 /**

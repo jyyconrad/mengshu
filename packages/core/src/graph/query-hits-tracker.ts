@@ -7,8 +7,8 @@
  */
 
 import type { InMemoryGraphRepository } from "./repository.js";
-import type { MemoryScope } from "../core/types.js";
-import type { RecallHit } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
+import type { RecallHit } from "../domain/types.js";
 
 export interface QueryHitsTrackerOptions {
   graphRepo: InMemoryGraphRepository;

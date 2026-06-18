@@ -4,8 +4,8 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SlotSnapshotCache, RECOMMENDED_TTL } from "./slot-snapshot.js";
-import type { MemoryScope } from "./semantic-types.js";
-import type { MemoryRecord } from "./types.js";
+import type { MemoryScope } from "../domain/semantic-types.js";
+import type { MemoryRecord } from "../domain/types.js";
 
 const mockScope: MemoryScope = {
   tenantId: "test-tenant",

@@ -5,7 +5,7 @@
  * 和后续持久化 audit repository 统一展示。
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 import type { AuditRepository } from "../storage/repositories/types.js";
 
 export interface AuditLifecycleInput {

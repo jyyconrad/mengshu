@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type * as LanceDB from "@lancedb/lancedb";
 import type { DatabaseProvider, MemoryEntry, MemoryQueryOptions, TableName, TableStats, KnowledgeBaseConfig } from "../types";
-import { vectorDimsForModel } from "../../config";
+import { vectorDimsForModel } from "../../../../../config.js";
 
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null = null;
 const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {

@@ -16,7 +16,7 @@ import {
   type DedupCandidate,
   type SemanticDedupConfig,
 } from "./semantic-dedup.js";
-import { Embeddings } from "../processing/embeddings.js";
+import { Embeddings } from "../runtime/llm/embeddings.js";
 
 // Mock Embeddings 实现
 class MockEmbeddings extends Embeddings {

@@ -5,9 +5,9 @@
  * 热路径不依赖 embeddings 或 LLM。
  */
 
-import type { ChunkRecord, DocumentRecord } from "../core/types.js";
-import { scopeToKey } from "../core/scope.js";
-import { computeContentHash } from "../processing/hash-utils.js";
+import type { ChunkRecord, DocumentRecord } from "../domain/types.js";
+import { scopeToKey } from "../domain/scope.js";
+import { computeContentHash } from "../scoring/hash-utils.js";
 import type {
   AuditRepository,
   ChunkRepository,

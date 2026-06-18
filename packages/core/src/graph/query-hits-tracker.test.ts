@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { QueryHitsTracker } from "./query-hits-tracker.js";
 import { InMemoryGraphRepository } from "./repository.js";
 import type { GraphEntityRecord } from "./types.js";
-import type { RecallHit, MemoryScope } from "../core/types.js";
+import type { RecallHit, MemoryScope } from "../domain/types.js";
 
 describe("QueryHitsTracker", () => {
   let graphRepo: InMemoryGraphRepository;

@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { InMemoryFeedbackStore } from "./in-memory-store.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../index.js";
 import type { FeedbackSignal } from "./types.js";
 
 describe("InMemoryFeedbackStore", () => {

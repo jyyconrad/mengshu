@@ -5,8 +5,8 @@
  * 它是 `MemoryService` 后续替换单一路径检索的中间层。
  */
 
-import { normalizeScope } from "../core/scope.js";
-import type { MemoryScopeInput, RecallHit, RecallResult } from "../core/types.js";
+import { normalizeScope } from "../domain/scope.js";
+import type { MemoryScopeInput, RecallHit, RecallResult } from "../domain/types.js";
 import { fuseHits } from "./fusion.js";
 
 export interface RetrievalQuery {

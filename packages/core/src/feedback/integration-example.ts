@@ -5,7 +5,7 @@
  */
 
 import { FeedbackCollector, InMemoryFeedbackStore } from "./index.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../index.js";
 
 /**
  * 反馈集成示例类

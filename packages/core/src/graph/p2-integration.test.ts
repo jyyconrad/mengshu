@@ -3,14 +3,14 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { DefaultMemoryService } from "../core/memory-service.js";
+import { DefaultMemoryService } from "../service/memory-service.js";
 import { InMemoryMemoryStore } from "../storage/repositories/in-memory.js";
-import { InMemoryGraphRepository } from "../graph/repository.js";
-import { QueryHitsTracker } from "../graph/query-hits-tracker.js";
-import { CentralityCalculator } from "../graph/centrality-calculator.js";
+import { InMemoryGraphRepository } from "./repository.js";
+import { QueryHitsTracker } from "./query-hits-tracker.js";
+import { CentralityCalculator } from "./centrality-calculator.js";
 import { computeHotness } from "../tree/topic.js";
-import type { MemoryScope } from "../core/types.js";
-import type { GraphEntityRecord, GraphRelationRecord } from "../graph/types.js";
+import type { MemoryScope } from "../domain/types.js";
+import type { GraphEntityRecord, GraphRelationRecord } from "./types.js";
 
 describe("P2 Integration: queryHits30d + graphCentrality", () => {
   let memoryStore: InMemoryMemoryStore;

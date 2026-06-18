@@ -5,7 +5,7 @@
  * 或 embedding 服务。
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 export interface CanonicalizeInput {
   sourceId: string;

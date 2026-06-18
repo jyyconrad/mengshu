@@ -5,7 +5,7 @@
  * 供 REST、Console 和 retrieval orchestrator 统一消费。
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 import type { InMemoryGraphRepository } from "./repository.js";
 import type { GraphEntityRecord, GraphRelationRecord } from "./types.js";
 

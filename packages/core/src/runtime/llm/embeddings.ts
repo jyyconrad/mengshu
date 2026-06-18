@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import pLimit from "p-limit";
 import retry from "p-retry";
-import type { MemoryConfig } from "../config";
+import type { MemoryConfig } from "../../../../../config";
 
 export interface EmbeddingsOptions {
   /** 最大并发请求数 */

@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { FeedbackCollector } from "./collector.js";
 import { InMemoryFeedbackStore } from "./in-memory-store.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../index.js";
 
 describe("FeedbackCollector", () => {
   let collector: FeedbackCollector;

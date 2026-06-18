@@ -1,9 +1,9 @@
-import type { MemoryConfig } from "../config";
-import type { DatabaseProvider, MemoryEntry, TableName } from "../db/types";
-import { Embeddings } from "../processing/embeddings";
-import { computeContentHash } from "../processing/hash-utils";
-import { FileScanner, type FileScannerOptions } from "./file-scanner";
-import { MarkdownProcessor, type MarkdownProcessorOptions } from "./markdown-processor";
+import type { MemoryConfig } from "../../../../../config.js";
+import type { DatabaseProvider, MemoryEntry, TableName } from "../../db/types.js";
+import { Embeddings } from "../../runtime/llm/embeddings.js";
+import { computeContentHash } from "../../scoring/hash-utils.js";
+import { FileScanner, type FileScannerOptions } from "./file-scanner.js";
+import { MarkdownProcessor, type MarkdownProcessorOptions } from "./markdown-processor.js";
 
 export interface ScanResult {
   /** 扫描的目录路径 */

@@ -5,7 +5,7 @@ import {
   extractGraphWithLlm,
 } from "./llm-extractor.js";
 import { ENTITY_TYPES, RELATION_PREDICATES } from "./schema.js";
-import type { LlmClient, LlmCompletionMessage, SimpleJsonSchema } from "../processing/llm-client.js";
+import type { LlmClient, LlmCompletionMessage, SimpleJsonSchema } from "../runtime/llm/llm-client.js";
 
 const scope = {
   tenantId: "local",

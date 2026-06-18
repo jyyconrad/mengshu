@@ -9,7 +9,7 @@
  */
 
 import { SCORING_WEIGHTS_V1 } from "./scoring-weights.js";
-import type { MemorySemanticType } from "../core/types.js";
+import type { MemorySemanticType } from "../domain/types.js";
 
 /** sourceKind 映射到 sourceAuthority（6 档） */
 export type SourceKind =

@@ -6,8 +6,8 @@
  * provenance-aware `formatContextBlock`。
  */
 
-import type { MemoryCategory } from "../config.js";
-import { PROMPT_INJECTION_PATTERNS as BASE_INJECTION_PATTERNS } from "../processing/extraction-rules.js";
+import type { MemoryCategory } from "../../../../config.js";
+import { PROMPT_INJECTION_PATTERNS as BASE_INJECTION_PATTERNS } from "../runtime/llm/extraction-rules.js";
 
 /**
  * 检索/捕获侧专用的注入模式补充。

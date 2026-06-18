@@ -11,8 +11,8 @@ import type {
   DiscoverResult,
   SourceAdapterContext,
   SourceFileParseResult,
-} from "../../ingest/agent-history/types.js";
-import { redactSecrets } from "../../ingest/agent-history/redaction.js";
+} from "../agent-history/types.js";
+import { redactSecrets } from "../agent-history/redaction.js";
 
 export interface JsonlSourceOptions {
   provider: AgentHistoryProvider;

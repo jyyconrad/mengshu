@@ -5,7 +5,7 @@
  * 并在同一个 scope 内执行搜索和过滤。该实现不承担进程外持久化。
  */
 
-import type { MemoryScope, RecallHit } from "../../core/types.js";
+import type { MemoryScope, RecallHit } from "../../domain/types.js";
 import type { TextIndex, TextIndexDocument, TextSearchInput } from "./text-index.js";
 
 interface IndexedDocument extends TextIndexDocument {

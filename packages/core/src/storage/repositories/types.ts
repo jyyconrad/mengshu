@@ -5,10 +5,10 @@
  * in-memory 实现作为 contract test 基线，后续再映射到 Postgres/Supabase/LanceDB。
  */
 
-import type { MemoryRepository } from "../../core/service-types.js";
-import type { ChunkRecord, DocumentRecord, MemoryScope } from "../../core/types.js";
+import type { MemoryRepository } from "../../domain/service-types.js";
+import type { ChunkRecord, DocumentRecord, MemoryScope } from "../../domain/types.js";
 
-export type { MemoryRepository } from "../../core/service-types.js";
+export type { MemoryRepository } from "../../domain/service-types.js";
 
 export interface ScopeFilter {
   scope?: MemoryScope;

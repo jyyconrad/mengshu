@@ -4,8 +4,8 @@
  * 根据内容自动路由到对应的知识库表
  */
 
-import type { RoutingRule, TableName } from "../db/types";
-import { DEFAULT_ROUTING_RULES } from "../config";
+import type { RoutingRule, TableName } from "../db/types.js";
+import { DEFAULT_ROUTING_RULES } from "../../../../config.js";
 
 /**
  * 路由决策结果

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { MemoryRecord, MemoryScope, RecallHit } from "../../core/types.js";
+import type { MemoryRecord, MemoryScope, RecallHit } from "../../domain/types.js";
 import { InMemoryBm25Index, tokenizeForBm25 } from "./in-memory-bm25.js";
 
 const scope: MemoryScope = {

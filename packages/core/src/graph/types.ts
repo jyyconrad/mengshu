@@ -5,7 +5,7 @@
  * relation 必须绑定 evidence chunk，避免不可追溯的模型生成结论。
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 import type { EntityType, RelationPredicate } from "./schema.js";
 
 // Re-export schema types for backward compatibility

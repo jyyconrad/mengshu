@@ -5,8 +5,8 @@
  * 都只依赖 documentId、文本和顺序，便于重复导入和测试。
  */
 
-import type { ChunkRecord } from "../core/types.js";
-import { computeContentHash } from "../processing/hash-utils.js";
+import type { ChunkRecord } from "../domain/types.js";
+import { computeContentHash } from "../scoring/hash-utils.js";
 import type { ChunkMarkdownOptions } from "./types.js";
 
 function splitParagraph(paragraph: string, chunkSize: number): string[] {

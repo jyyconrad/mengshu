@@ -6,8 +6,8 @@
 
 import { describe, expect, test } from "vitest";
 import { InMemoryMemoryStore } from "../storage/repositories/in-memory.js";
-import type { MemoryRecord } from "../core/types.js";
-import { computeContentHash } from "../processing/hash-utils.js";
+import type { MemoryRecord } from "../domain/types.js";
+import { computeContentHash } from "../scoring/hash-utils.js";
 import { forgetCommand } from "./forget-handler.js";
 import {
   HIDDEN_FROM_RECALL,

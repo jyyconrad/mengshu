@@ -15,9 +15,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { scopeToKey } from "../core/scope.js";
+import { scopeToKey } from "../domain/scope.js";
 import type { TreeBuffer, TreeLeaf, TreeRepository, TreeSummaryNode, SummaryFaithfulnessConfig } from "./types.js";
-import type { LlmClient } from "../processing/llm-client.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
 import { validateFaithfulness } from "./faithfulness.js";
 
 export interface SealBufferInput {

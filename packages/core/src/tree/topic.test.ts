@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import type { GraphEntityRecord } from "../graph/types.js";
 import { InMemoryTreeRepository } from "./buffer.js";
 import { computeHotness, recencyDecay, routeLeafToTopicTree, shouldCreateTopicTree } from "./topic.js";
-import { SCORING_WEIGHTS_V1 } from "../processing/scoring-weights.js";
+import { SCORING_WEIGHTS_V1 } from "../scoring/scoring-weights.js";
 import type { TreeLeaf } from "./types.js";
 
 const scope = {

@@ -1,4 +1,4 @@
-import type { MemoryConfig } from "../config";
+import type { MemoryConfig } from "../../../../config.js";
 import type { DatabaseProvider } from "./types";
 import { LanceDBProvider } from "./providers/lancedb";
 import { SupabaseProvider } from "./providers/supabase";

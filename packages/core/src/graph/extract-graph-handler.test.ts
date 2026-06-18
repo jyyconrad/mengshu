@@ -9,10 +9,10 @@
 
 import { describe, test, expect, vi, beforeEach } from "vitest";
 import type { JobRecord } from "../storage/repositories/types.js";
-import type { LlmClient } from "../processing/llm-client.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
 import { InMemoryGraphRepository } from "./repository.js";
 import { createExtractGraphHandler, enqueueExtractGraphJob } from "./extract-graph-handler.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 import { InMemoryMemoryStore } from "../storage/repositories/in-memory.js";
 
 const scope: MemoryScope = {

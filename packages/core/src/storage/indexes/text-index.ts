@@ -5,7 +5,7 @@
  * `RecallHit`，不需要知道记录来自 memory、chunk 还是 summary tree。
  */
 
-import type { RecallHit, MemoryScope } from "../../core/types.js";
+import type { RecallHit, MemoryScope } from "../../domain/types.js";
 
 export interface TextIndexDocument {
   id: string;

@@ -25,7 +25,7 @@
 import OpenAI from "openai";
 import pLimit from "p-limit";
 import retry from "p-retry";
-import type { MemoryConfig } from "../config.js";
+import type { MemoryConfig } from "../../../../../config.js";
 
 /** 单条 chat 消息。 */
 export interface LlmCompletionMessage {

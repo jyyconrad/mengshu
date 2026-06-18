@@ -19,10 +19,10 @@
  * 替换对象：lifecycle/candidate-types.ts decideAdmission（旧 confidence 逻辑）
  */
 
-import type { AdmissionRoute } from "../core/types.js";
+import type { AdmissionRoute } from "../domain/types.js";
 import type { ValidatedCandidate } from "./candidate-validator.js";
-import { computeValueScore, computeValueScoreWithBreakdown } from "../processing/value-score.js";
-import { deriveValueScoreSignals } from "../processing/value-score-signals.js";
+import { computeValueScore, computeValueScoreWithBreakdown } from "../scoring/value-score.js";
+import { deriveValueScoreSignals } from "../scoring/value-score-signals.js";
 
 /**
  * 准入阈值带（§6.2 D-02 定稿，v1.0）

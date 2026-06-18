@@ -5,7 +5,7 @@
  * HTML 风格转义内容，并默认过滤标记为 private 的条目。
  */
 
-import type { ContextBlock, MemoryScope, RecallHit } from "../core/types.js";
+import type { ContextBlock, MemoryScope, RecallHit } from "../domain/types.js";
 import { escapeMemoryForPrompt } from "./prompt-safety.js";
 
 export interface PackContextInput {

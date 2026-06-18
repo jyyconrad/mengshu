@@ -19,28 +19,28 @@ import type {
   FilteredEntry,
   FilteredReason,
   SlotContextBlock,
-} from "./semantic-types.js";
-import { FIVE_QUESTIONS, lifecycleStatusToFilteredReason } from "./semantic-types.js";
+} from "../domain/semantic-types.js";
+import { FIVE_QUESTIONS, lifecycleStatusToFilteredReason } from "../domain/semantic-types.js";
 import type {
   MemoryLifecycleStatus,
   MemoryRecord,
   MemoryScope,
   MemorySemanticType,
   MemoryVisibility,
-} from "./types.js";
+} from "../domain/types.js";
 import {
   SlotSnapshotCache,
   globalSlotSnapshotCache,
   RECOMMENDED_TTL,
 } from "./slot-snapshot.js";
-import { kindToSemanticType } from "./semantic-type-mapper.js";
+import { kindToSemanticType } from "../domain/semantic-type-mapper.js";
 import {
   DEFAULT_RECALL_WEIGHTS,
   sortByNodeScore,
   type RecallWeights,
-} from "./recall-scoring.js";
+} from "../domain/recall-scoring.js";
 import { packSlotsToPrompt } from "./slot-prompt-packer.js";
-import { mergeProfileByLayer, enrichProfileLayer } from "./profile-layer.js";
+import { mergeProfileByLayer, enrichProfileLayer } from "../domain/profile-layer.js";
 
 export interface BuildSlotContextOptions {
   /** 每个槽位最大字符预算（默认按 type 推荐） */

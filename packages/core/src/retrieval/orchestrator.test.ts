@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { MemoryRecord, MemoryScope, RecallHit } from "../core/types.js";
+import type { MemoryRecord, MemoryScope, RecallHit } from "../domain/types.js";
 import { RetrievalOrchestrator, type RetrievalSource } from "./orchestrator.js";
 
 const scope: MemoryScope = {

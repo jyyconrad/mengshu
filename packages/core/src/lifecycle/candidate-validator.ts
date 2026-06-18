@@ -25,12 +25,12 @@
  * 设计唯一事实来源：docs/04-design/04.2-detail/memory-system-unified-design.md §3.1。
  */
 
-import type { MemorySemanticType } from "../core/types.js";
+import type { MemorySemanticType } from "../domain/types.js";
 import {
   PROFILE_WHITELIST_DIMENSIONS,
   PROMPT_INJECTION_PATTERNS,
   reconcileCrossContextual,
-} from "../processing/extraction-rules.js";
+} from "../runtime/llm/extraction-rules.js";
 // D-14 sensitive 单一事实来源：sensitive-filter.ts 是详细分类版（personality/health/
 // political/religious/sexual_orientation），口径严格（如 health 要求"患有/确诊/诊断"前缀），
 // 不会把"健康饮食"误标 sensitive。闸门 7 复用其判定，避免 extraction-rules 简化版的双轨漂移。

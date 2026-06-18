@@ -7,7 +7,7 @@
  */
 
 import type { TreeBuffer, TreeSummaryNode, SummaryFaithfulnessConfig } from "./types.js";
-import type { LlmClient } from "../processing/llm-client.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
 
 const PROMPT_INJECTION_KEYWORDS = [
   "ignore previous",

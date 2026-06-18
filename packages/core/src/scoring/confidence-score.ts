@@ -24,7 +24,7 @@
 
 import { SCORING_WEIGHTS_V1 } from "./scoring-weights.js";
 import { getSourceAuthority, type SourceKind } from "./importance-score.js";
-import type { MemorySemanticType } from "../core/types.js";
+import type { MemorySemanticType } from "../domain/types.js";
 
 /**
  * reliability 折扣系数：reliability_i = sourceAuthority * RELIABILITY_FACTOR。

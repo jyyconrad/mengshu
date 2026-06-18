@@ -5,7 +5,7 @@
  * 同一条记录按 record id 去重，并保留各来源 score breakdown，便于 explain。
  */
 
-import type { RecallHit } from "../core/types.js";
+import type { RecallHit } from "../domain/types.js";
 
 export interface RankedHits {
   source: RecallHit["source"];

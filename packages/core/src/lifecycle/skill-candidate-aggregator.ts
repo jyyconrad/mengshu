@@ -17,8 +17,8 @@ import type {
   SkillCandidateRepository,
 } from "./skill-candidate-types.js";
 import { DEFAULT_GENERALIZATION_TRIGGER } from "./skill-candidate-types.js";
-import type { MemoryScope } from "../core/types.js";
-import type { LlmClient } from "../processing/llm-client.js";
+import type { MemoryScope } from "../domain/types.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
 
 /**
  * SkillCandidate 聚合器

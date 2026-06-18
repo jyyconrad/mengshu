@@ -12,9 +12,9 @@
  *   4. 返回结果给 CLI / MCP
  */
 
-import { computeContentHash } from "../processing/hash-utils.js";
-import type { MemoryRepository } from "../core/service-types.js";
-import type { MemoryRecord, MemoryScope } from "../core/types.js";
+import { computeContentHash } from "../scoring/hash-utils.js";
+import type { MemoryRepository } from "../domain/service-types.js";
+import type { MemoryRecord, MemoryScope } from "../domain/types.js";
 import {
   HIDDEN_FROM_RECALL,
   HUMAN_CONFIRMED_CONFIDENCE,

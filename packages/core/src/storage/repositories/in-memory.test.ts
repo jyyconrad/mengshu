@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { ChunkRecord, DocumentRecord, MemoryRecord } from "../../core/types.js";
+import type { ChunkRecord, DocumentRecord, MemoryRecord } from "../../domain/types.js";
 import { InMemoryMemoryStore } from "./in-memory.js";
 
 const scope = {

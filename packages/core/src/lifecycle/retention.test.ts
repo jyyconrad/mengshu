@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { MemoryService } from "../core/service-types.js";
+import type { MemoryService } from "../domain/service-types.js";
 import { InMemoryMemoryStore } from "../storage/repositories/in-memory.js";
 import { retentionSweep } from "./retention.js";
 

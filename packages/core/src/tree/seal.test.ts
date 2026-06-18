@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { appendLeafToBuffer, InMemoryTreeRepository } from "./buffer.js";
 import { sealBuffer } from "./seal.js";
 import type { TreeLeaf, SummaryFaithfulnessConfig } from "./types.js";
-import type { LlmClient } from "../processing/llm-client.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
 
 const scope = {
   tenantId: "local",

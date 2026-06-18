@@ -5,7 +5,7 @@
  * buffer 保存 L0 待 seal 内容，SummaryNode 保留 leaf/evidence/provenance。
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 export type MemoryTreeType = "source" | "topic" | "global";
 export type SummaryNodeStatus = "open" | "sealed" | "stale" | "archived";

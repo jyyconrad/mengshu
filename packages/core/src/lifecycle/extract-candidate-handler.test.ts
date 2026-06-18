@@ -20,7 +20,7 @@ import type {
   LlmCompletionMessage,
   LlmCompletionOptions,
   SimpleJsonSchema,
-} from "../processing/llm-client.js";
+} from "../runtime/llm/llm-client.js";
 
 const scope = {
   tenantId: "local",

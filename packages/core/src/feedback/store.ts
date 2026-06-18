@@ -4,7 +4,7 @@
  * 负责持久化反馈信号和统计数据
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../index.js";
 import type {
   FeedbackSignal,
   FeedbackStats,

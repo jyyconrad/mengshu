@@ -11,7 +11,7 @@
  * - 所有进入 event.text 的内容必须已经过 secret redaction（见 redaction.ts）。
  */
 
-import type { MemoryScope } from "../../core/types.js";
+import type { MemoryScope } from "../../domain/types.js";
 
 /** 已知来源标识；保留 string 兼容未来来源。 */
 export type AgentHistoryProvider = "codex" | "claude-code" | "openclaw" | (string & {});

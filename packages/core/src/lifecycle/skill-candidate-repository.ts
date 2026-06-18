@@ -10,7 +10,7 @@ import type {
   SkillCandidateRepository,
   SkillCandidateStatus,
 } from "./skill-candidate-types.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 /**
  * 内存实现

@@ -19,7 +19,7 @@ import type {
   CandidateZoneConfig,
 } from "./candidate-types.js";
 import { DEFAULT_CANDIDATE_CONFIG } from "./candidate-types.js";
-import type { MemoryScope, MemorySemanticType } from "../core/types.js";
+import type { MemoryScope, MemorySemanticType } from "../domain/types.js";
 
 function sameScope(a: MemoryScope, b: MemoryScope): boolean {
   return (

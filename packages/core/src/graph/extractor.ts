@@ -6,8 +6,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { scopeToKey } from "../core/scope.js";
-import type { MemoryScope } from "../core/types.js";
+import { scopeToKey } from "../domain/scope.js";
+import type { MemoryScope } from "../domain/types.js";
 import type {
   EntityType,
   GraphEntityRecord,

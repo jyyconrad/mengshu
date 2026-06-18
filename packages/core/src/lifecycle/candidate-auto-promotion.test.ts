@@ -18,7 +18,7 @@ import {
 } from "./candidate-auto-promotion.js";
 import { InMemoryCandidateRepository } from "./candidate-repository.js";
 import type { CandidateRecord } from "./candidate-types.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 const scope: MemoryScope = {
   tenantId: "local",

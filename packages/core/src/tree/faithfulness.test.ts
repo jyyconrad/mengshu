@@ -10,7 +10,7 @@ import {
   validateFaithfulness,
 } from "./faithfulness.js";
 import type { TreeSummaryNode, TreeBuffer, SummaryFaithfulnessConfig } from "./types.js";
-import type { LlmClient } from "../processing/llm-client.js";
+import type { LlmClient } from "../runtime/llm/llm-client.js";
 
 const baseScope = {
   tenantId: "local",

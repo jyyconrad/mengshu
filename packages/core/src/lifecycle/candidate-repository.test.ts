@@ -14,7 +14,7 @@
 
 import { describe, expect, it } from "vitest";
 import { InMemoryCandidateRepository } from "./candidate-repository.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 const baseScope: MemoryScope = {
   tenantId: "local",

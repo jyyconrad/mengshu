@@ -8,6 +8,6 @@ export {
   createRoutingEngine,
   RoutingEngine,
   type RoutingResult,
-} from './rules.js';
+} from "./rules.js";
 
-export type { RoutingRule } from '../db/types.js';
+export type { RoutingRule } from "../db/types.js";

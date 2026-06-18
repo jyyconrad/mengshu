@@ -1,11 +1,11 @@
 import { describe, expect, test } from "vitest";
-import type { MemoryRecord } from "./types.js";
+import type { MemoryRecord } from "../domain/types.js";
 import type {
   AppendAuditInput,
   AuditRecord,
   AuditRepository,
   ScopeFilter,
-} from "../storage/repositories/types.js";
+} from "../../../../storage/repositories/types.js";
 import {
   DefaultMemoryService,
   type EmbeddingPort,

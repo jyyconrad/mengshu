@@ -6,8 +6,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { MemoryRepository, MemoryRepositoryQuery } from "../../core/service-types.js";
-import type { ChunkRecord, DocumentRecord, MemoryRecord, MemoryScope } from "../../core/types.js";
+import type { MemoryRepository, MemoryRepositoryQuery } from "../../domain/service-types.js";
+import type { ChunkRecord, DocumentRecord, MemoryRecord, MemoryScope } from "../../domain/types.js";
 import type {
   AppendAuditInput,
   AuditRecord,

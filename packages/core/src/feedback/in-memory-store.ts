@@ -4,7 +4,7 @@
  * 用于测试和简单场景，数据存储在内存中
  */
 
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../index.js";
 import type {
   FeedbackSignal,
   FeedbackStats,

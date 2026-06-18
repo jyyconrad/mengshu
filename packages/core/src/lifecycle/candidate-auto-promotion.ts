@@ -14,7 +14,7 @@
  */
 
 import type { CandidateRecord, CandidateRepository } from "./candidate-types.js";
-import type { MemoryScope } from "../core/types.js";
+import type { MemoryScope } from "../domain/types.js";
 
 /**
  * 自动晋升配置

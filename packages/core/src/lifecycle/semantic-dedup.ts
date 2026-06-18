@@ -14,7 +14,7 @@
  * 4. 去重决策基于 embedding 向量 + salience 分数双重过滤
  */
 
-import type { Embeddings } from "../processing/embeddings.js";
+import type { Embeddings } from "../runtime/llm/embeddings.js";
 
 /**
  * 去重配置

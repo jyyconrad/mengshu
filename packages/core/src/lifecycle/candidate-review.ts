@@ -15,7 +15,7 @@ import type {
   CandidateReviewAction,
   CandidateReviewResult,
 } from "./candidate-types.js";
-import type { MemoryRecord, MemoryScope } from "../core/types.js";
+import type { MemoryRecord, MemoryScope } from "../domain/types.js";
 
 export interface CandidateReviewServiceDeps {
   repository: CandidateRepository;
@@ -152,7 +152,7 @@ export class CandidateReviewService {
   }
 
   private async approveByFilter(filter: {
-    semanticType?: import("../core/types.js").MemorySemanticType;
+    semanticType?: import("../domain/types.js").MemorySemanticType;
     minConfidence?: number;
   }): Promise<CandidateReviewResult> {
     const candidates = await this.deps.repository.list({
@@ -164,7 +164,7 @@ export class CandidateReviewService {
   }
 
   private async rejectByFilter(filter: {
-    semanticType?: import("../core/types.js").MemorySemanticType;
+    semanticType?: import("../domain/types.js").MemorySemanticType;
     maxConfidence?: number;
   }): Promise<CandidateReviewResult> {
     const all = await this.deps.repository.list({ status: "pending" });
@@ -212,7 +212,7 @@ export function candidateToMemoryRecord(
   options: {
     contentHash: string;
     importance?: number;
-    category?: import("../config.js").MemoryCategory;
+    category?: import("../../../../config.js").MemoryCategory;
     dataType?: import("../db/types.js").DataType;
     idFactory?: () => string;
   }

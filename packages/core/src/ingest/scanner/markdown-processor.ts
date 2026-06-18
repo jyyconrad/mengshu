@@ -1,7 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import frontMatter from "front-matter";
-import type { MemoryMetadata } from "../db/types";
-import { TextSplitter, type TextSplitOptions } from "../processing/text-splitter";
+import type { MemoryMetadata } from "../../db/types.js";
+import { TextSplitter, type TextSplitOptions } from "../../scoring/text-splitter.js";
 
 export interface ProcessedDocument {
   /** 文件路径 */
