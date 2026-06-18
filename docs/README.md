@@ -12,14 +12,20 @@
 ### 架构设计
 - [系统架构](architecture/system-architecture.md) - 整体架构设计
 - [技术栈](architecture/technology-stack.md) - 技术选型说明
+- [项目目录层级与包结构重构方案](architecture/project-structure-refactor-plan.md) - core/plugins/mcp/api/ui/tests 分层与迁移路线
+- [多产品插件化实施方案](architecture/plugin-packaging-implementation-plan.md) - plugins/ 目录、OpenClaw/Codex 插件包与迁移路线
 
 ### 核心设计
 - [记忆系统统一设计](design/memory-system-unified-design.md) - 算法层单一事实来源
+- [记忆树批量推理方案](design/memory-tree-batch-inference-plan.md) - 记忆树摘要、faithfulness judge 和结论生成的异步 Batch LLM 方案
 - [数据库 Schema](design/schema.md) - 数据模型设计
 
 ### API 参考
 - [CLI 命令](api/cli-commands.md) - ms 命令组完整参考
 - [Memory API](api/memory-api.md) - REST API 接口规范
+
+### 测试与评测
+- [OpenClaw 历史数据评测集方案](07-test/openclaw-history-eval-plan.md) - 用真实 OpenClaw 历史验证提取、召回、上下文注入和记忆树能力
 
 ## 用户指南
 

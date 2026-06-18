@@ -22,7 +22,7 @@
 
 | 依赖 | 当前版本 | 用途 |
 |------|----------|------|
-| `@modelcontextprotocol/sdk` | `^1.29.0` | **MCP Server 适配**（`adapters/mcp/`），支持 stdio/SSE 双通道 |
+| `@modelcontextprotocol/sdk` | `^1.29.0` | **MCP Server 适配**（`packages/mcp/src/`），支持 stdio/SSE 双通道 |
 | `@sinclair/typebox` | `0.34.48` | **OpenClaw 插件 schema**（`openclaw.plugin.json`），config/tool 验证 |
 | `openclaw` | `*` (devDep) | OpenClaw Runtime 类型定义（仅编译时依赖） |
 
@@ -37,9 +37,9 @@
 
 | 依赖 | 当前版本 | 用途 |
 |------|----------|------|
-| `@lancedb/lancedb` | `^0.26.2` | **默认本地向量数据库**（`storage/providers/lancedb.ts`） |
+| `@lancedb/lancedb` | `^0.26.2` | **可选本地向量数据库**（`storage/providers/lancedb.ts`），仅 `dbType=lancedb` 时使用 |
 | `@supabase/supabase-js` | `^2.45.0` | **Supabase 云端存储**（`storage/providers/supabase.ts`），需 service key |
-| `pg` | `^8.16.0` | **Postgres provider**（`storage/providers/postgres.ts`），适合服务端部署 |
+| `pg` | `^8.16.0` | **Postgres provider**（`storage/providers/postgres.ts`），当前推荐的跨产品共享后端 |
 
 ### 工具库
 
@@ -70,9 +70,9 @@
 
 | 后端 | 实施状态 | 代码路径 | 说明 |
 |------|----------|----------|------|
-| **LanceDB** | ✅ 已完成 | `storage/providers/lancedb.ts` | 默认本地向量存储，零配置启动 |
+| **LanceDB** | ✅ 已完成 | `storage/providers/lancedb.ts` | 可选本地向量存储，显式 `dbType=lancedb` 时使用 |
 | **Supabase** | ✅ 已完成 | `storage/providers/supabase.ts` | PostgreSQL + pgvector，需 service key |
-| **Postgres** | ✅ 已完成 | `storage/providers/postgres.ts` | 自托管 PG，适合服务端部署 |
+| **Postgres** | ✅ 已完成 | `storage/providers/postgres.ts` | 当前推荐共享后端，适合 OpenClaw/Codex/Claude Code 共用 |
 | **Hybrid** | ✅ 已完成 | `storage/providers/hybrid.ts` | 本地向量索引 + 云端持久化路径 |
 | **In-memory** | ✅ 已完成 (测试用) | `storage/repositories/in-memory-*.ts` | 中间件 contract baseline 和单元测试 |
 

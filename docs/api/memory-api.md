@@ -7,7 +7,7 @@
 3. **MCP facade** — MCP 协议工具（stdio/HTTP transport）
 4. **JavaScript SDK** — 通过 REST API 的编程客户端
 
-参数以源码为准：[index.ts](../../index.ts)、[adapters/rest/router.ts](../../adapters/rest/router.ts)、[adapters/mcp/tools.ts](../../adapters/mcp/tools.ts)、[adapters/sdk/client.ts](../../adapters/sdk/client.ts)。
+参数以源码为准：[index.ts](../../index.ts)、[packages/api/src/rest/router.ts](../../packages/api/src/rest/router.ts)、[packages/mcp/src/tools.ts](../../packages/mcp/src/tools.ts)、[packages/api/src/sdk/client.ts](../../packages/api/src/sdk/client.ts)。旧路径 `adapters/rest/*`、`adapters/mcp/*`、`adapters/sdk/*` 仅保留兼容 re-export。
 
 ## 架构概述
 
@@ -312,7 +312,7 @@ private 内容不会返回 raw，只显示 `[private]` 预览。
 
 ## MCP facade
 
-[adapters/mcp/server.ts](../../adapters/mcp/server.ts) 当前是 transport-agnostic facade，不直接启动 stdio 或 HTTP MCP transport。工具注册表定义在 [adapters/mcp/tools.ts](../../adapters/mcp/tools.ts)。
+[packages/mcp/src/server.ts](../../packages/mcp/src/server.ts) 当前是 transport-agnostic facade，不直接启动 stdio 或 HTTP MCP transport。工具注册表定义在 [packages/mcp/src/tools.ts](../../packages/mcp/src/tools.ts)。
 
 ### 基础工具（8 个，始终可用）
 
@@ -337,7 +337,7 @@ private 内容不会返回 raw，只显示 `[private]` 预览。
 
 ## JavaScript SDK
 
-SDK 位于 `adapters/sdk/`，通过 REST API 访问 MemoryService。不依赖 OpenClaw，也不直接访问本地数据库。`sdk/js/` 保留为旧 deep import 的兼容 re-export。
+SDK 位于 `packages/api/src/sdk/`，通过 REST API 访问 MemoryService。不依赖 OpenClaw，也不直接访问本地数据库。`adapters/sdk/` 与 `sdk/js/` 保留为旧 deep import 的兼容 re-export。
 
 ### 初始化
 

@@ -2,12 +2,12 @@
 
 ## OpenClaw 插件集成
 
-mengshu 默认作为 OpenClaw 插件运行。
+mengshu / memory-autodb 现在以 OpenClaw memory slot 插件形态集成。插件包位于 `plugins/openclaw`，canonical id 为 `mengshu-openclaw`，旧 id `memory-autodb` 和 `mengshu` 通过 `legacyPluginIds` 兼容。
 
 ### 安装插件
 
 ```bash
-openclaw plugin add memory-autodb
+openclaw plugin add ./plugins/openclaw
 ```
 
 ### 配置
@@ -16,18 +16,45 @@ openclaw plugin add memory-autodb
 
 ```json
 {
-  "plugins": [
-    {
-      "name": "memory-autodb",
-      "enabled": true,
-      "config": {
-        "autoCapture": true,
-        "autoRecall": true
+  "plugins": {
+    "load": {
+      "paths": ["./plugins/openclaw"]
+    },
+    "slots": {
+      "memory": "mengshu-openclaw"
+    },
+    "entries": {
+      "mengshu-openclaw": {
+        "enabled": true,
+        "config": {
+          "dbType": "postgres",
+          "postgres": {
+            "host": "${PG_HOST}",
+            "port": 5432,
+            "database": "${PG_DATABASE}",
+            "user": "${PG_USER}",
+            "password": "${PG_PASSWORD}",
+            "ssl": false
+          },
+          "autoCapture": true,
+          "autoRecall": true
+        }
       }
     }
-  ]
+  }
 }
 ```
+
+OpenClaw、Codex、Claude Code、CLI 和 MCP 客户端通过 `~/.mengshu/config.json` 复用同一套 PostgreSQL 后端；不要再为不同产品创建独立的本地 LanceDB 目录。`dbPath` 仅在显式选择 `dbType=lancedb` 时使用。
+
+旧配置迁移：
+
+```bash
+ms migrate-openclaw-plugin-id          # 预览
+ms migrate-openclaw-plugin-id --execute
+```
+
+该命令会把 `plugins.slots.memory` 从 `memory-autodb` 或 `mengshu` 更新为 `mengshu-openclaw`，并把旧 entry 的配置复制到新 entry。
 
 ### 使用工具
 
@@ -35,8 +62,20 @@ openclaw plugin add memory-autodb
 
 - `memory_store` - 存储记忆
 - `memory_recall` - 召回记忆
-- `memory_search` - 搜索记忆
 - `memory_forget` - 删除记忆
+- `memory_scan_directory` - 扫描 Markdown 目录
+- `memory_context_fast` - 获取 Agent 启动 5 槽位上下文
+
+## Codex 插件集成
+
+Codex 插件包位于 `plugins/codex`，插件名为 `mengshu-memory`。仓库级 marketplace 位于 `.agents/plugins/marketplace.json`。
+
+```bash
+codex plugin marketplace add .agents/plugins
+codex plugin add mengshu-memory@mengshu-local
+```
+
+首期 Codex MCP 启动器会调用全局 `ms mcp`，因此需要先确保 `ms --help` 可执行、`ms doctor` 通过。插件默认同样使用 `~/.mengshu`。
 
 ## MCP Server 集成
 
@@ -44,23 +83,22 @@ openclaw plugin add memory-autodb
 
 ```bash
 ms mcp
-# 或指定端口
-ms mcp --port 3000
 ```
 
 ### 连接 MCP Client
 
-```typescript
-import { McpClient } from '@modelcontextprotocol/sdk';
-
-const client = new McpClient({
-  url: 'http://localhost:3000'
-});
-
-await client.callTool('memory_recall', {
-  query: '用户偏好',
-  limit: 5
-});
+```json
+{
+  "mcpServers": {
+    "mengshu": {
+      "command": "ms",
+      "args": ["mcp"],
+      "env": {
+        "MENGSHU_HOME": "~/.mengshu"
+      }
+    }
+  }
+}
 ```
 
 ## REST API 集成
@@ -103,8 +141,14 @@ const memory = new MemoryService({
     apiKey: process.env.OPENAI_API_KEY,
     model: 'text-embedding-3-small'
   },
-  dbType: 'lancedb',
-  dbPath: '~/.mengshu/memory/lancedb'
+  dbType: 'postgres',
+  postgres: {
+    host: process.env.PG_HOST,
+    port: 5432,
+    database: process.env.PG_DATABASE,
+    user: process.env.PG_USER,
+    password: process.env.PG_PASSWORD
+  }
 });
 
 await memory.initialize();

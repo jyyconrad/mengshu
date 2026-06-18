@@ -6,9 +6,9 @@
 
 | 后端 | 状态 | 说明 |
 |------|------|------|
-| LanceDB | 已支持 | 默认本地向量存储，路径由 `dbPath` 决定 |
+| LanceDB | 已支持 | 可选本地向量存储，路径由 `dbPath` 决定 |
 | Supabase | 已支持 | PostgreSQL + pgvector，需要 `SUPABASE_URL` 和 `SUPABASE_SERVICE_KEY` |
-| Postgres | 已支持 | provider 已存在，适合 server 部署 |
+| Postgres | 已支持 | 当前推荐共享后端，适合 OpenClaw/Codex/Claude Code 共用 |
 | In-memory | 已支持 | 中间件 contract baseline 和测试 |
 
 ## Legacy 表

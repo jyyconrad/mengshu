@@ -1,6 +1,6 @@
 # CLI 命令
 
-`ms` 是 mengshu 的管理命令组。命令由 OpenClaw 插件注册，当前代码入口在 [index.ts](../../index.ts) 和 [adapters/openclaw/cli.ts](../../adapters/openclaw/cli.ts)。
+`ms` 是 mengshu 的管理命令组。当前全局 CLI 入口是 [bin/ms.ts](../../bin/ms.ts)，主实现位于 [packages/api/src/cli/ms.ts](../../packages/api/src/cli/ms.ts)；OpenClaw 插件内的 CLI 注册实现位于 [plugins/openclaw/src/cli/](../../plugins/openclaw/src/cli)，旧 [adapters/openclaw/cli.ts](../../adapters/openclaw/cli.ts) 仅作为兼容转发。
 
 ## 命令总览
 
@@ -17,6 +17,7 @@
 | `ms kb:list` | 列出 `knowledge*` 知识库表 |
 | `ms init` | 初始化项目指针和全局 manifest（v0.1.2+） |
 | `ms migrate-home` | 迁移 `~/.openclaw/` 到 `~/.mengshu/`（v0.1.2+） |
+| `ms migrate-openclaw-plugin-id` | 迁移 OpenClaw memory 插件 id 到 `mengshu-openclaw` |
 | `ms serve` | 启动本机 REST server 和 `/console` |
 | `ms mcp` | 启动 stdio MCP server，供 Claude Desktop / Cursor 等客户端接入 |
 | `ms status` | 输出中间件状态 |
@@ -217,6 +218,22 @@ ms migrate-home --execute --force
 - 迁移后旧 `~/.openclaw/` 仍会保留，可手动删除。
 - 如果检测到项目指针 `.mengshu.json`，会提示重新运行 `ms init` 更新 registry。
 - 迁移后请更新客户端配置（Codex/Claude Desktop/OpenClaw）指向新路径。
+
+## `ms migrate-openclaw-plugin-id`
+
+**用途**：将 OpenClaw memory slot 插件 id 从旧的 `memory-autodb` / `mengshu` 迁移到 `mengshu-openclaw`。
+
+```bash
+ms migrate-openclaw-plugin-id
+ms migrate-openclaw-plugin-id --execute
+```
+
+选项：
+
+- `--execute`：执行迁移；默认只预览。
+- `--config <path>`：指定单个 OpenClaw 配置文件；默认同时处理 `~/.openclaw/openclaw.json` 与 `~/.openclaw/conf/plugins.json`。
+- `--no-backup`：执行时不备份配置文件。
+- `--keep-legacy-entry`：保留旧 entry 并置为 disabled；默认删除旧 entry，避免 OpenClaw stale config warning。
 
 ## `ms serve`
 
