@@ -47,6 +47,10 @@ export interface ProjectCliDeps {
   cwd?: () => string;
   /** 全局 home 路径选项，便于测试注入。 */
   homePathOptions?: HomePathOptions;
+  /** Embeddings 客户端（用于 ingest-history 真实验证）。 */
+  embeddings?: any;
+  /** LLM 客户端（用于 ingest-history 真实验证）。 */
+  llmClient?: any;
 }
 
 interface InitOptions {
@@ -290,6 +294,17 @@ export function registerProjectCliCommands(memory: CommanderLike, deps: ProjectC
 
   registerIngestHistoryCommand(project, {
     cwd: deps.cwd,
+    service: deps.service,
+    embeddings: deps.embeddings,
+    llmClient: deps.llmClient,
+    defaultScope: {
+      tenantId: "",
+      appId: "openclaw",
+      userId: "default",
+      projectId: "",
+      agentId: "",
+      namespace: "",
+    },
   });
 }
 

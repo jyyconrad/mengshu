@@ -94,21 +94,28 @@ describe("ms project ingest-history", () => {
     ]);
   });
 
-  test("registers dry-run command and rejects apply", async () => {
+  test("registers command and rejects apply without injected deps", async () => {
     const project = new FakeCommand("project");
+    const errors: string[] = [];
     const logs: string[] = [];
     const originalLog = console.log;
+    const originalError = console.error;
     console.log = (message?: unknown) => {
       logs.push(String(message));
     };
+    console.error = (message?: unknown) => {
+      errors.push(String(message));
+    };
     try {
+      // 不注入 service / embeddings / llmClient，--apply 应安全拒绝
       registerIngestHistoryCommand(project as never, { adapters: [fakeAdapter()] });
       const command = project.find("ingest-history");
       expect(command).toBeDefined();
       await command?.actionHandler?.({ from: "codex", apply: true });
-      expect(logs.join("\n")).toContain("--apply 尚未支持");
+      expect(errors.join("\n")).toContain("--apply 模式需要 service / embeddings / llmClient 注入");
     } finally {
       console.log = originalLog;
+      console.error = originalError;
     }
   });
 

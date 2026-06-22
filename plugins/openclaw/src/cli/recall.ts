@@ -86,26 +86,37 @@ function mapProvenanceSourceToSourceKind(source: string | undefined): SourceKind
 }
 
 /**
- * 从 MemoryRecord 提取 ImportanceMetadata（P1-Q4 修复）
+ * 从 MemoryRecord 提取 ImportanceMetadata（P1-Q4 修复 + 迁移数据降级）
  *
- * 用于 --explain 模式重构 importance 4 项明细追溯。
+ * 用于 --explain 模式和 eval trace 重构 importance 4 项明细追溯。
+ *
+ * 降级策略（迁移数据普遍缺 salience/source）：
+ * - salience：metadata.salience → confidence → record.importance（标量代理）
+ * - sourceKind：provenance.source 映射 → "agent_output"（中性默认，authority 中档）
+ * - semanticType：record.semanticType（已在 legacy-mapping 边界从 kind 统一推导）
+ *
+ * 仅当 semanticType 仍缺失（kind 无法归类的 entity/fact/other）时返回 undefined，
+ * 因为没有 semanticType 就无法算 typePrior，明细不具备追溯意义。
  */
-function extractImportanceMetadata(record: MemoryRecord): ImportanceMetadata | undefined {
-  // salience 优先从 metadata.salience 获取，回退到 record.confidence
+export function extractImportanceMetadata(record: MemoryRecord): ImportanceMetadata | undefined {
+  // semanticType 是明细可追溯的最低要求（typePrior 依赖它）
+  const semanticType = record.semanticType;
+  if (!semanticType) {
+    return undefined;
+  }
+
+  // salience 三级回退：显式标注 → 置信度 → importance 标量（迁移数据代理）
   const salience =
     (typeof record.metadata?.salience === "number" ? record.metadata.salience : undefined) ??
-    record.confidence;
+    record.confidence ??
+    (typeof record.importance === "number" ? record.importance : undefined) ??
+    0.5;
 
-  const sourceKind = mapProvenanceSourceToSourceKind(record.provenance?.source);
-  const semanticType = record.semanticType;
+  // sourceKind 缺失时退到 "agent_output"（与模糊匹配默认回退一致）
+  const sourceKind = mapProvenanceSourceToSourceKind(record.provenance?.source) ?? "agent_output";
 
   // 检测显式保存（从记忆文本）
   const explicitSave = detectExplicitSave(record.text);
-
-  // 缺失必要字段时返回 undefined（computeNodeScoreWithBreakdown 会用默认值）
-  if (!salience || !sourceKind || !semanticType) {
-    return undefined;
-  }
 
   return {
     salience,
