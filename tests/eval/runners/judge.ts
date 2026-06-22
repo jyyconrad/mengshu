@@ -15,6 +15,8 @@
  *     5) mustEscape：content 不能再包含原始注入标签；
  *     6) expectSensitiveBlocked：seed 必须被敏感过滤器拦截；
  *     7) negative case：要求 injectedMemoryIds 全部不出现 forbidden。
+ *     8) P0 子 grader（graders/）：identifier / scope / safety 三项确定性 grader，
+ *        在对应 expected 字段存在时生效，违规折叠进 failures。
  *
  *   summarizeSuite(cases)：
  *     - passRate = passed / total
@@ -34,6 +36,7 @@ import type {
   JudgeInput,
   SuiteSummary,
 } from "./types.js";
+import { P0_GRADERS, toGraderInput } from "./graders/index.js";
 
 /**
  * 计算分位数（升序，输入会被复制再排序，不修改原数组）。
@@ -142,6 +145,26 @@ export const defaultJudge: Judge = (input: JudgeInput): CaseResult => {
 
   // 7) negative case：任何 forbidden 注入都已记录到 injectedForbidden
   //    这里仅做提示，不重复 fail（已经在 step 2 处理）。
+
+  // 8) P0 子 grader 聚合：identifier / scope / safety。
+  //    每个 grader 在缺对应 expected 字段时返回 "skip"，因此不填这些字段的
+  //    既有 suite 行为完全不变。命中违规折叠进 failures。
+  const graderInput = toGraderInput(input);
+  for (const { grader } of P0_GRADERS) {
+    const result = grader(graderInput);
+    if (result === "skip") continue;
+    if (!result.passed) {
+      const detail =
+        (result.violations ?? [])
+          .map((v) =>
+            v.context
+              ? `${v.message}（${v.relatedId ?? "-"}：${v.context}）`
+              : `${v.message}${v.relatedId ? `（${v.relatedId}）` : ""}`,
+          )
+          .join("；") || `${result.metric} 未通过`;
+      failures.push(`${result.metric}: ${detail}`);
+    }
+  }
 
   return {
     caseId: gc.id,

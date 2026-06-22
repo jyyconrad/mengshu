@@ -9,8 +9,8 @@ function readJson(path: string): Record<string, unknown> {
 }
 
 describe("OpenClaw plugin manifests", () => {
-  test("root manifest uses mengshu-openclaw id with legacy aliases", () => {
-    const manifest = readJson(join(rootDir, "openclaw.plugin.json"));
+  test("plugin package manifest uses mengshu-openclaw id with legacy aliases", () => {
+    const manifest = readJson(join(rootDir, "plugins/openclaw/openclaw.plugin.json"));
 
     expect(manifest.id).toBe("mengshu-openclaw");
     expect(manifest.kind).toBe("memory");

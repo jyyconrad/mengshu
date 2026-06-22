@@ -73,10 +73,11 @@ describe("source adapters", () => {
 
     const parsed = await openClawSourceAdapter.parseFile(file, {});
     expect(parsed.events).toHaveLength(1);
+    // 评估计划 §脱敏规则：email 必须被脱敏为 <EMAIL_REDACTED>。
     expect(parsed.events[0]).toMatchObject({
       provider: "openclaw",
       sessionId: "session-1",
-      text: "My email is user@example.com",
+      text: "My email is <EMAIL_REDACTED>",
     });
   });
 
