@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"=== tsc exit: $? ===\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(git stash *)",
+      "Bash(echo \"=== 修改文件列表 ===\" && git status --short | grep -E \"\\(trace-writer|validator-integration|ingest-history\\)\" || echo \"未提交的修改\" *)",
+      "Read(//Users/jiangyayun/.mengshu/eval-corpus/openclaw/validation-runs/2026-06-20T14-54-07/phase-2-ingest/**)",
+      "Bash(echo \"tsc exit: $?\")",
+      "Bash(echo \"---exit code: $?---\")",
+      "Bash(echo \"exit=$?\")",
+      "Read(//tmp/**)",
+      "Bash(echo \"tsc exit=$?\")",
+      "Bash(git commit -m 'chore: remove temporary files and legacy configurations *)",
+      "Bash(git commit -m 'docs: update documentation structure and content *)",
+      "Bash(git commit -m 'chore: update project configuration *)",
+      "Bash(git commit -m 'refactor\\(core\\): improve domain layer mapping and type conversion *)",
+      "Bash(git commit -m 'feat\\(ingest\\): enhance agent history ingestion and validation *)"
+    ]
+  }
+}
