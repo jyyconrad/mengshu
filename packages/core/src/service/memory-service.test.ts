@@ -195,10 +195,233 @@ describe("DefaultMemoryService", () => {
     expect(result.hits).toHaveLength(1);
     expect(result.hits[0]).toMatchObject({
       record: hit,
-      score: 0.92,
       source: "vector",
-      scoreBreakdown: { vector: 0.92 },
     });
+    // 综合分由向量相似度 + scopeFit 加权得到，向量分仍可追溯
+    expect(result.hits[0].scoreBreakdown?.vector).toBe(0.92);
+    expect(result.hits[0].scoreBreakdown?.scopeFit).toBeGreaterThan(0);
+    expect(result.hits[0].score).toBeGreaterThan(0);
+    expect(result.hits[0].score).toBeLessThanOrEqual(1);
+  });
+
+  test("recalls memories across all scopes and ranks same-scope first via scopeFit", async () => {
+    // scopeA = query scope；scopeB 同 app 不同 project；scopeC 完全不同 tenant
+    const scopeA = {
+      tenantId: "local",
+      appId: "openclaw",
+      userId: "user-1",
+      projectId: "project-1",
+      agentId: "agent-1",
+      namespace: "memories",
+    };
+    const recA = makeRecord({ id: "mem-A", scope: scopeA });
+    const recB = makeRecord({
+      id: "mem-B",
+      scope: { ...scopeA, projectId: "project-2", agentId: "agent-2" },
+    });
+    const recC = makeRecord({
+      id: "mem-C",
+      scope: {
+        tenantId: "other-tenant",
+        appId: "other-app",
+        userId: "user-9",
+        projectId: "project-9",
+        agentId: "agent-9",
+        namespace: "memories",
+      },
+    });
+
+    // 三条向量相似度相同，唯一区别是 scopeFit → 排序完全由 scopeFit 决定
+    const repository = new FakeRepository([
+      { ...recC, score: 0.8 },
+      { ...recB, score: 0.8 },
+      { ...recA, score: 0.8 },
+    ]);
+    const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+    const result = await service.recall({
+      query: "concise replies",
+      scope: { appId: "openclaw", userId: "user-1", projectId: "project-1", agentId: "agent-1" },
+    });
+
+    // 跨域：三条全部召回，不被 scope 拦截
+    expect(result.hits).toHaveLength(3);
+    // 同 scope 的 A 排最前，跨域的 C 排最后
+    expect(result.hits.map((hit) => hit.record.id)).toEqual(["mem-A", "mem-B", "mem-C"]);
+    // scoreBreakdown 暴露 scopeFit（便于 ms why 追溯）
+    expect(result.hits[0].scoreBreakdown?.scopeFit).toBeGreaterThan(
+      result.hits[2].scoreBreakdown?.scopeFit ?? 1,
+    );
+    expect(result.hits[0].scoreBreakdown?.vector).toBe(0.8);
+  });
+
+  test("does not pass scope into repository filter (scope is not a hard WHERE)", async () => {
+    const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+    const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+    await service.recall({
+      query: "x",
+      scope: { appId: "openclaw", userId: "user-1", projectId: "project-1" },
+      filter: { tableName: "memories" },
+    });
+
+    // 调用方显式 filter 仍透传，但 scope 不进 filter（拦截改为排序信号）
+    const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+    expect(call.filter).toEqual({ tableName: "memories" });
+  });
+
+  // D-25：scope 维度硬过滤注入（filterProject/filterProduct + scopeFilterMode: "hard"）
+  describe("D-25: scope 维度硬过滤", () => {
+    test("scopeFilterMode='soft' 不注入硬过滤 filter（保持跨项目软召回）", async () => {
+      const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+      const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+      await service.recall({
+        query: "x",
+        scope: { appId: "codex", projectId: "project-A" },
+        filterProject: "project-A",  // 即使传了 filterProject，soft 模式也不注入
+        scopeFilterMode: "soft",
+      });
+
+      const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+      expect(call.filter).toBeUndefined();  // 软过滤模式不创建 filter
+    });
+
+    test("scopeFilterMode='hard' + filterProject 注入 _projectName 内部 key", async () => {
+      const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+      const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+      await service.recall({
+        query: "x",
+        // scope 不传 appId（默认 default），只验证 filterProject 注入
+        filterProject: "memory-autodb",
+        scopeFilterMode: "hard",
+      });
+
+      const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+      expect(call.filter).toEqual({ _projectName: "memory-autodb" });
+    });
+
+    test("scopeFilterMode='hard' + filterProduct 注入 _appName 内部 key", async () => {
+      const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+      const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+      await service.recall({
+        query: "x",
+        filterProduct: "codex",
+        scopeFilterMode: "hard",
+      });
+
+      const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+      expect(call.filter).toEqual({ _appName: "codex" });
+    });
+
+    test("scopeFilterMode='hard' 同时传 project + product 都注入", async () => {
+      const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+      const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+      await service.recall({
+        query: "x",
+        filterProject: "memory-autodb",
+        filterProduct: "codex",
+        scopeFilterMode: "hard",
+      });
+
+      const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+      expect(call.filter).toEqual({
+        _projectName: "memory-autodb",
+        _appName: "codex",
+      });
+    });
+
+    test("scopeFilterMode='hard' 不传 filterProject 时回退 scope.projectId（非 default）", async () => {
+      const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+      const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+      await service.recall({
+        query: "x",
+        scope: { appId: "codex", projectId: "fallback-project" },
+        scopeFilterMode: "hard",
+      });
+
+      const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+      expect(call.filter).toEqual({
+        _projectName: "fallback-project",
+        _appName: "codex",
+      });
+    });
+
+    test("scopeFilterMode='hard' scope.projectId='default' 时不回退（避免默认值污染）", async () => {
+      const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+      const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+      await service.recall({
+        query: "x",
+        scope: { projectId: "default", appId: "default" },
+        scopeFilterMode: "hard",
+      });
+
+      const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+      // 既无 filterProject 也无非默认 scope，hard 模式但无过滤值，filter 保持 undefined
+      expect(call.filter).toBeUndefined();
+    });
+
+    test("scopeFilterMode='hard' + projectPattern 注入 _projectPattern", async () => {
+      const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+      const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+      await service.recall({
+        query: "x",
+        projectPattern: "openclaw%",
+        scopeFilterMode: "hard",
+      });
+
+      const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+      expect(call.filter).toEqual({ _projectPattern: "openclaw%" });
+    });
+
+    test("scopeFilterMode='hard' 与用户 filter 合并（不冲突）", async () => {
+      const repository = new FakeRepository([{ ...makeRecord(), score: 0.7 }]);
+      const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+      await service.recall({
+        query: "x",
+        filter: { category: "preference" },
+        filterProject: "project-A",
+        scopeFilterMode: "hard",
+      });
+
+      const call = repository.queryCalls[0] as { filter?: Record<string, unknown> };
+      expect(call.filter).toEqual({
+        category: "preference",
+        _projectName: "project-A",
+      });
+    });
+  });
+
+  test("ranks higher vector similarity first when scopeFit is equal", async () => {
+    const scope = {
+      tenantId: "local",
+      appId: "openclaw",
+      userId: "user-1",
+      projectId: "project-1",
+      agentId: "agent-1",
+      namespace: "memories",
+    };
+    const low = makeRecord({ id: "low", scope });
+    const high = makeRecord({ id: "high", scope });
+    const repository = new FakeRepository([
+      { ...low, score: 0.3 },
+      { ...high, score: 0.95 },
+    ]);
+    const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+    const result = await service.recall({
+      query: "q",
+      scope: { appId: "openclaw", userId: "user-1", projectId: "project-1", agentId: "agent-1" },
+    });
+
+    expect(result.hits.map((hit) => hit.record.id)).toEqual(["high", "low"]);
   });
 
   test("builds safe context from recalled memories", async () => {
@@ -268,5 +491,45 @@ describe("DefaultMemoryService", () => {
       ok: true,
       records: 1,
     });
+  });
+
+  test("computes embedding when storeMemory receives record without vector", async () => {
+    const repository = new FakeRepository();
+    const embeddings = new FakeEmbeddings();
+    const service = new DefaultMemoryService({ repository, embeddings });
+    const recordWithoutVector = makeRecord({ vector: undefined });
+
+    await service.storeMemory({ record: recordWithoutVector });
+
+    expect(embeddings.texts).toEqual(["User prefers concise replies"]);
+    expect(repository.stored).toHaveLength(1);
+    expect(repository.stored[0].vector).toEqual([0.3, 0.4]);
+    expect(repository.stored[0].text).toBe("User prefers concise replies");
+  });
+
+  test("computes embedding when storeMemory receives record with empty vector array", async () => {
+    const repository = new FakeRepository();
+    const embeddings = new FakeEmbeddings();
+    const service = new DefaultMemoryService({ repository, embeddings });
+    const recordWithEmptyVector = makeRecord({ vector: [] });
+
+    await service.storeMemory({ record: recordWithEmptyVector });
+
+    expect(embeddings.texts).toEqual(["User prefers concise replies"]);
+    expect(repository.stored).toHaveLength(1);
+    expect(repository.stored[0].vector).toEqual([0.3, 0.4]);
+  });
+
+  test("does not recompute embedding when storeMemory receives record with existing vector", async () => {
+    const repository = new FakeRepository();
+    const embeddings = new FakeEmbeddings();
+    const service = new DefaultMemoryService({ repository, embeddings });
+    const recordWithVector = makeRecord({ vector: [0.5, 0.6, 0.7] });
+
+    await service.storeMemory({ record: recordWithVector });
+
+    expect(embeddings.texts).toHaveLength(0);
+    expect(repository.stored).toHaveLength(1);
+    expect(repository.stored[0].vector).toEqual([0.5, 0.6, 0.7]);
   });
 });

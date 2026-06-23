@@ -54,6 +54,14 @@ export interface AgentLookupRequest {
   filters?: Record<string, unknown>;
   mode?: "fast" | "deep";
   limit?: number;
+  minScore?: number;
+  // D-25：项目/产品维度友好筛选（映射到 recall filterProject/filterProduct）
+  /** 按项目精确筛选（如 'memory-autodb'），映射到 RecallInput.filterProject */
+  project?: string;
+  /** 按产品精确筛选（如 'codex'），映射到 RecallInput.filterProduct */
+  product?: string;
+  /** soft=跨项目软召回（默认），hard=精确筛选 */
+  scopeFilterMode?: "soft" | "hard";
 }
 
 export interface AgentLookupResponse {
@@ -96,7 +104,7 @@ export interface AgentFastPathDeps {
   recall(
     scope: MemoryScope,
     query: string,
-    options?: { limit?: number; minScore?: number }
+    options?: { limit?: number; minScore?: number; filter?: Record<string, unknown> }
   ): Promise<RecallResult>;
   /** observation 写入 */
   storeObservation?(input: {
@@ -234,9 +242,37 @@ export class AgentFastPathService {
     const limit = request.limit ?? 5;
     const mode = request.mode ?? "fast";
 
+    // 安全校验：filters 白名单（防止 SQL 注入）
+    let sanitizedFilters = this.sanitizeFilters(request.filters);
+
+    // D-25：硬过滤模式时，把 project/product 注入 filters（内部 key）
+    if (request.scopeFilterMode === "hard") {
+      const project = request.project ?? (scope.projectId !== "default" ? scope.projectId : undefined);
+      const product = request.product ?? (scope.appId !== "default" ? scope.appId : undefined);
+
+      if (project || product) {
+        sanitizedFilters = sanitizedFilters ?? {};
+        if (project) {
+          sanitizedFilters._projectName = project;
+        }
+        if (product) {
+          sanitizedFilters._appName = product;
+        }
+      }
+    }
+
+    // 构建 recall options：只传有值的参数
+    const recallOptions: { limit: number; minScore?: number; filter?: Record<string, unknown> } = { limit };
+    if (request.minScore !== undefined) {
+      recallOptions.minScore = request.minScore;
+    }
+    if (sanitizedFilters) {
+      recallOptions.filter = sanitizedFilters;
+    }
+
     let result: RecallResult;
     try {
-      result = await this.deps.recall(scope, request.query, { limit });
+      result = await this.deps.recall(scope, request.query, recallOptions);
     } catch (err) {
       return {
         hits: [],
@@ -391,5 +427,53 @@ export class AgentFastPathService {
       evidence: node.evidenceChunkIds.slice(0, 5).map((id) => ({ id, preview: "" })),
       actions: ["drill_down", "show_graph"],
     };
+  }
+
+  /**
+   * 安全过滤：filters 白名单校验（防止 SQL 注入）
+   */
+  private sanitizeFilters(
+    filters: Record<string, unknown> | undefined
+  ): Record<string, unknown> | undefined {
+    if (!filters) return undefined;
+
+    // 白名单字段
+    // 注意：scope 维度的 _projectName/_appName/_projectPattern 是内部 key，
+    // 由 lookup() 在 sanitizeFilters 之后注入（值走 provider 参数化查询，不经此处），
+    // 不放进客户端白名单，避免客户端绕过 request.project 直接传内部 key。
+    const allowedKeys = [
+      "category",
+      "dataType",
+      "lifecycleStatus",
+      "kind",
+      "semanticType",
+    ];
+
+    // SQL 注入危险字符
+    const dangerousChars = /[;'"\\`\-\-/\*]/;
+
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(filters)) {
+      // 只保留白名单字段
+      if (!allowedKeys.includes(key)) continue;
+
+      // 只允许 string/number/boolean
+      if (
+        typeof value !== "string" &&
+        typeof value !== "number" &&
+        typeof value !== "boolean"
+      ) {
+        continue;
+      }
+
+      // 字符串 value 拒绝 SQL 注入字符
+      if (typeof value === "string" && dangerousChars.test(value)) {
+        continue;
+      }
+
+      sanitized[key] = value;
+    }
+
+    return Object.keys(sanitized).length > 0 ? sanitized : undefined;
   }
 }

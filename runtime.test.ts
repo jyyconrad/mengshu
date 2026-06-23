@@ -124,4 +124,59 @@ describe("createMengshuRuntime", () => {
     expect(toFriendlyMengshuError(new Error("401 unauthorized")).message).toContain("API 认证失败");
     expect(toFriendlyMengshuError(new Error("ECONNREFUSED")).message).toContain("无法连接到 Embedding API");
   });
+
+  test("observeLight stores record with scope metadata for non-default scope", async () => {
+    const db = new FakeDb();
+    const embeddings = {
+      embed: vi.fn(async () => Array.from({ length: 1536 }, () => 0.01)),
+      embedBatch: vi.fn(),
+    } as unknown as Embeddings;
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: "/tmp/mengshu-test",
+      appId: "test-app",
+      db,
+      embeddings,
+    });
+
+    await runtime.agentFastPath.observeLight({
+      scope: { userId: "alice", projectId: "proj1", agentId: "agent1" },
+      eventType: "user_input",
+      text: "Alice 的项目任务",
+      intent: "remember",
+    });
+
+    expect(db.store).toHaveBeenCalledTimes(1);
+    const stored = db.store.mock.calls[0]?.[0]?.[0];
+    expect(stored?.metadata?.userId).toBe("alice");
+    expect(stored?.metadata?.projectPath).toBe("proj1");
+    expect(stored?.metadata?.agentName).toBe("agent1");
+  });
+
+  test("observeLight stores record with default scope metadata for default scope", async () => {
+    const db = new FakeDb();
+    const embeddings = {
+      embed: vi.fn(async () => Array.from({ length: 1536 }, () => 0.01)),
+      embedBatch: vi.fn(),
+    } as unknown as Embeddings;
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: "/tmp/mengshu-test",
+      appId: "test-app",
+      db,
+      embeddings,
+    });
+
+    await runtime.agentFastPath.observeLight({
+      scope: { userId: "default" },
+      eventType: "system_event",
+      text: "全局观察",
+    });
+
+    expect(db.store).toHaveBeenCalledTimes(1);
+    const stored = db.store.mock.calls[0]?.[0]?.[0];
+    expect(stored?.metadata?.userId).toBe("default");
+    expect(stored?.metadata?.projectPath).toBe("default");
+    expect(stored?.metadata?.agentName).toBe("default");
+  });
 });

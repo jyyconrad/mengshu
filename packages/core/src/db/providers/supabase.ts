@@ -1,9 +1,46 @@
+/**
+ * Supabase 数据库提供者实现。
+ *
+ * D-25 scope 维度列支持（v1.0.3）：
+ * - 表新增独立列 project_name / app_name / user_id / agent_id / workspace_id，
+ *   把 scope 维度真正落库，使项目/产品特有记忆与通用记忆可区分。
+ * - store 写入时把 MemoryEntry 的 scope 维度映射到对应列。
+ * - query（向量搜索）通过 match_* RPC 的 filter_project_name / filter_app_name
+ *   参数下推硬过滤；读回路径把列值还原到 MemoryEntry。
+ * - 所有 scope 列默认 NULL（表示全局/通用记忆），建有 B-tree 索引。
+ *
+ * RPC 与建表 SQL 见 scripts/sql/migrate-scope-columns-supabase.sql，
+ * 需在 Supabase Dashboard 手动执行。
+ */
 import { randomUUID } from "node:crypto";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { DatabaseProvider, MemoryEntry, MemoryQueryOptions, TableName, TableStats, KnowledgeBaseConfig } from "../types";
 import { vectorDimsForModel } from "../../../../../config.js";
 
 const DEFAULT_TABLES: TableName[] = ["memories", "knowledge"];
+
+/**
+ * Supabase memories/knowledge 表行结构。
+ *
+ * 新增 scope 维度列（nullable，NULL 表示全局/通用记忆）。
+ */
+interface SupabaseMemoryRow {
+  id: string;
+  text: string;
+  content_hash: string;
+  vector: number[];
+  importance: number;
+  category: string;
+  data_type: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  // scope 维度列（D-25）
+  project_name?: string | null;
+  app_name?: string | null;
+  user_id?: string | null;
+  agent_id?: string | null;
+  workspace_id?: string | null;
+}
 
 /**
  * 允许在 DDL 中拼接的表名白名单（含前缀模式）。
@@ -136,7 +173,13 @@ export class SupabaseProvider implements DatabaseProvider {
             category TEXT NOT NULL DEFAULT 'other',
             data_type TEXT NOT NULL DEFAULT '${tableName === 'memories' ? 'memory' : 'knowledge'}',
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            -- scope 维度列（D-25）：NULL 表示全局/通用记忆
+            project_name TEXT,
+            app_name TEXT,
+            user_id TEXT,
+            agent_id TEXT,
+            workspace_id TEXT
           );
 
           -- 向量搜索索引
@@ -152,6 +195,10 @@ export class SupabaseProvider implements DatabaseProvider {
 
           -- created_at 索引
           CREATE INDEX IF NOT EXISTS ${tableName}_created_at_idx ON ${tableName} (created_at DESC);
+
+          -- scope 维度索引（加速按项目/产品过滤）
+          CREATE INDEX IF NOT EXISTS idx_${tableName}_project_name ON ${tableName} (project_name);
+          CREATE INDEX IF NOT EXISTS idx_${tableName}_app_name ON ${tableName} (app_name);
         `
       });
 
@@ -193,6 +240,12 @@ export class SupabaseProvider implements DatabaseProvider {
         data_type: entry.dataType,
         metadata: entry.metadata,
         created_at: new Date(entry.createdAt || Date.now()).toISOString(),
+        // scope 维度映射（D-25）：仅当值存在时写入，否则为 NULL
+        project_name: entry.projectName ?? null,
+        app_name: entry.appName ?? null,
+        user_id: entry.userId ?? null,
+        agent_id: entry.agentId ?? null,
+        workspace_id: entry.workspaceId ?? null,
       }));
 
       const { error } = await this.client!
@@ -263,6 +316,14 @@ export class SupabaseProvider implements DatabaseProvider {
       }
     }
 
+    // scope 维度硬过滤（D-25）：非向量查询也支持按项目/产品精确筛选
+    if (options.projectName) {
+      query = query.eq('project_name', options.projectName);
+    }
+    if (options.appName) {
+      query = query.eq('app_name', options.appName);
+    }
+
     // 限制结果数量
     if (options.limit) {
       query = query.limit(options.limit);
@@ -285,6 +346,12 @@ export class SupabaseProvider implements DatabaseProvider {
       metadata: row.metadata,
       createdAt: new Date(row.created_at).getTime(),
       score: 0, // 非向量查询没有相似度分数
+      // scope 维度读回（D-25）
+      projectName: row.project_name ?? undefined,
+      appName: row.app_name ?? undefined,
+      userId: row.user_id ?? undefined,
+      agentId: row.agent_id ?? undefined,
+      workspaceId: row.workspace_id ?? undefined,
     }));
   }
 
@@ -298,6 +365,9 @@ export class SupabaseProvider implements DatabaseProvider {
       match_count: options.limit ?? 5,
       min_similarity: options.minScore ?? 0.1,
       filter_data_type: options.dataTypes && options.dataTypes.length > 0 ? options.dataTypes : null,
+      // scope 维度过滤参数（D-25）：NULL 时不过滤，保持跨项目软召回
+      filter_project_name: options.projectName ?? null,
+      filter_app_name: options.appName ?? null,
     });
 
     if (error) {
@@ -317,6 +387,12 @@ export class SupabaseProvider implements DatabaseProvider {
       metadata: row.metadata,
       createdAt: new Date(row.created_at).getTime(),
       score: row.similarity,
+      // scope 维度读回（D-25）：RPC 返回列已包含
+      projectName: row.project_name ?? undefined,
+      appName: row.app_name ?? undefined,
+      userId: row.user_id ?? undefined,
+      agentId: row.agent_id ?? undefined,
+      workspaceId: row.workspace_id ?? undefined,
     }));
   }
 
@@ -335,26 +411,25 @@ export class SupabaseProvider implements DatabaseProvider {
 
     try {
       // 尝试直接使用向量比较操作符
-      const query = this.client!
+      let query = this.client!
         .from(tableName)
         .select(`*, 1 - (vector <=> '${vectorString}')::float as similarity`);
 
       // 数据类型过滤
       if (options.dataTypes && options.dataTypes.length > 0) {
-        const { data: filterData, error: filterError } = await query.in('data_type', options.dataTypes);
-        if (filterError) {
-          throw new Error(`Failed to query entries: ${filterError.message}`);
-        }
-        // @ts-ignore - Supabase TypeScript limitation for computed fields
-        var data = filterData;
-        var error = null;
-      } else {
-        const { data: d, error: e } = await query;
-        // @ts-ignore - Supabase TypeScript limitation for computed fields
-        var data = d;
-        // @ts-ignore
-        var error = e;
+        query = query.in('data_type', options.dataTypes);
       }
+
+      // scope 维度硬过滤（D-25）：RPC 回退路径也需保持过滤语义一致
+      if (options.projectName) {
+        query = query.eq('project_name', options.projectName);
+      }
+      if (options.appName) {
+        query = query.eq('app_name', options.appName);
+      }
+
+      // @ts-ignore - Supabase TypeScript limitation for computed fields
+      const { data, error } = await query;
 
       if (error) {
         throw new Error(`Failed to query entries: ${error.message}`);
@@ -371,6 +446,12 @@ export class SupabaseProvider implements DatabaseProvider {
         metadata: row.metadata,
         createdAt: new Date(row.created_at).getTime(),
         score: row.similarity ?? 0,
+        // scope 维度读回（D-25）
+        projectName: row.project_name ?? undefined,
+        appName: row.app_name ?? undefined,
+        userId: row.user_id ?? undefined,
+        agentId: row.agent_id ?? undefined,
+        workspaceId: row.workspace_id ?? undefined,
       }));
     } catch (err: any) {
       // 如果还是 URL 太长，尝试先获取候选 ID 再计算相似度
@@ -393,6 +474,14 @@ export class SupabaseProvider implements DatabaseProvider {
 
     if (options.dataTypes && options.dataTypes.length > 0) {
       baseQuery = baseQuery.in('data_type', options.dataTypes);
+    }
+
+    // scope 维度硬过滤（D-25）：备选路径也需保持过滤语义一致
+    if (options.projectName) {
+      baseQuery = baseQuery.eq('project_name', options.projectName);
+    }
+    if (options.appName) {
+      baseQuery = baseQuery.eq('app_name', options.appName);
     }
 
     const { data: candidates, error: candidatesError } = await baseQuery;
@@ -419,6 +508,12 @@ export class SupabaseProvider implements DatabaseProvider {
         metadata: row.metadata,
         createdAt: new Date(row.created_at).getTime(),
         score: similarity,
+        // scope 维度读回（D-25）
+        projectName: row.project_name ?? undefined,
+        appName: row.app_name ?? undefined,
+        userId: row.user_id ?? undefined,
+        agentId: row.agent_id ?? undefined,
+        workspaceId: row.workspace_id ?? undefined,
       };
     });
 

@@ -106,9 +106,17 @@ describe("legacy memory mapping", () => {
 
     // baseEntry.category=preference -> kind=preference -> semanticType=profile（边界统一推导），
     // 该推导值会回写进 metadata.semanticType，因此 round-trip 后多出该字段。
+    // D-25：scope 维度（projectId/appId/userId/agentId）会镜像到独立列，
+    // workspaceId 在 baseEntry 中未设置，故为 undefined。
     expect(entry).toEqual({
       ...baseEntry,
       metadata: { ...baseEntry.metadata, semanticType: "profile" },
+      // 独立列镜像
+      projectName: "/workspace/app",
+      appName: "openclaw",
+      userId: "user-1",
+      agentId: "openclaw-agent",
+      workspaceId: undefined,
     });
   });
 
@@ -234,5 +242,199 @@ describe("legacy memory mapping", () => {
     expect(entry.metadata).not.toHaveProperty("confidence");
     expect(entry.metadata).not.toHaveProperty("semanticType");
     expect(entry.metadata.custom).toBe("kept");
+  });
+
+  describe("D-25: scope 维度独立列支持", () => {
+    test("recordToMemoryEntry 写入时把非默认 scope 维度镜像到独立字段", () => {
+      const record = memoryEntryToRecord(baseEntry, {
+        tenantId: "tenant-a",
+        appId: "codex",
+      });
+
+      // 手动设置 scope 维度
+      record.scope.projectId = "project-alpha";
+      record.scope.appId = "codex";
+      record.scope.userId = "user-123";
+      record.scope.agentId = "agent-456";
+      record.scope.workspaceId = "workspace-789";
+
+      const entry = recordToMemoryEntry(record);
+
+      // 验证独立字段正确写入
+      expect(entry.projectName).toBe("project-alpha");
+      expect(entry.appName).toBe("codex");
+      expect(entry.userId).toBe("user-123");
+      expect(entry.agentId).toBe("agent-456");
+      expect(entry.workspaceId).toBe("workspace-789");
+    });
+
+    test("recordToMemoryEntry 不写入默认值（避免污染）", () => {
+      const record = memoryEntryToRecord(baseEntry, {
+        tenantId: "tenant-a",
+        appId: "default",
+      });
+
+      // scope 全是默认值
+      record.scope.projectId = "default";
+      record.scope.appId = "default";
+      record.scope.userId = "default";
+      record.scope.agentId = "default";
+      record.scope.workspaceId = undefined;
+
+      const entry = recordToMemoryEntry(record);
+
+      // 验证默认值不写入独立字段
+      expect(entry.projectName).toBeUndefined();
+      expect(entry.appName).toBeUndefined();
+      expect(entry.userId).toBeUndefined();
+      expect(entry.agentId).toBeUndefined();
+      expect(entry.workspaceId).toBeUndefined();
+    });
+
+    test("memoryEntryToRecord 读回时优先使用独立列（新数据）", () => {
+      const entry: MemoryEntry = {
+        ...baseEntry,
+        projectName: "project-beta",
+        appName: "claude-code",
+        userId: "user-999",
+        agentId: "agent-888",
+        workspaceId: "workspace-777",
+        metadata: {
+          // 旧字段仍存在，但应被独立列覆盖
+          projectPath: "/old/path",
+          agentName: "old-agent",
+          userId: "old-user",
+        },
+      };
+
+      const record = memoryEntryToRecord(entry, {
+        tenantId: "tenant-x",
+        appId: "fallback-app",
+        projectId: "fallback-project",
+      });
+
+      // 验证优先使用独立列（而非 metadata 或 defaults）
+      expect(record.scope.projectId).toBe("project-beta");
+      expect(record.scope.appId).toBe("claude-code");
+      expect(record.scope.userId).toBe("user-999");
+      expect(record.scope.agentId).toBe("agent-888");
+      expect(record.scope.workspaceId).toBe("workspace-777");
+      expect(record.scope.tenantId).toBe("tenant-x"); // tenantId 仍用 defaults
+    });
+
+    test("memoryEntryToRecord 独立列为 NULL 时回退 defaults（向后兼容旧数据）", () => {
+      const entry: MemoryEntry = {
+        ...baseEntry,
+        // 旧数据无独立列
+        projectName: undefined,
+        appName: undefined,
+        userId: undefined,
+        agentId: undefined,
+        workspaceId: undefined,
+        metadata: {
+          // 也无旧 metadata 映射字段
+        },
+      };
+
+      const record = memoryEntryToRecord(entry, {
+        tenantId: "tenant-compat",
+        appId: "openclaw",
+        projectId: "/compat/project",
+        userId: "compat-user",
+        agentId: "compat-agent",
+        workspaceId: "compat-workspace",
+      });
+
+      // 验证回退 defaults（向后兼容行为）
+      expect(record.scope.projectId).toBe("/compat/project");
+      expect(record.scope.appId).toBe("openclaw");
+      expect(record.scope.userId).toBe("compat-user");
+      expect(record.scope.agentId).toBe("compat-agent");
+      expect(record.scope.workspaceId).toBe("compat-workspace");
+    });
+
+    test("scope 维度无损回转（写入→读回→再写入）", () => {
+      // 第一步：从 entry（带旧 metadata）到 record
+      const originalEntry: MemoryEntry = {
+        ...baseEntry,
+        metadata: {
+          ...baseEntry.metadata,
+          projectPath: "/workspace/app",
+          agentName: "openclaw-agent",
+          userId: "user-1",
+        },
+      };
+
+      const record1 = memoryEntryToRecord(originalEntry, {
+        tenantId: "tenant-test",
+        appId: "codex",
+      });
+
+      // 手动修改 scope 维度（模拟更新）
+      record1.scope.projectId = "project-gamma";
+      record1.scope.appId = "claude-code";
+      record1.scope.userId = "user-new";
+      record1.scope.agentId = "agent-new";
+      record1.scope.workspaceId = "workspace-new";
+
+      // 第二步：写回 entry（独立列应镜像 scope）
+      const entry2 = recordToMemoryEntry(record1);
+
+      expect(entry2.projectName).toBe("project-gamma");
+      expect(entry2.appName).toBe("claude-code");
+      expect(entry2.userId).toBe("user-new");
+      expect(entry2.agentId).toBe("agent-new");
+      expect(entry2.workspaceId).toBe("workspace-new");
+
+      // 第三步：再次读回 record（应优先用独立列，无损恢复）
+      const record2 = memoryEntryToRecord(entry2, {
+        tenantId: "tenant-test",
+        appId: "fallback",
+        projectId: "fallback",
+      });
+
+      expect(record2.scope.projectId).toBe("project-gamma");
+      expect(record2.scope.appId).toBe("claude-code");
+      expect(record2.scope.userId).toBe("user-new");
+      expect(record2.scope.agentId).toBe("agent-new");
+      expect(record2.scope.workspaceId).toBe("workspace-new");
+    });
+
+    test("独立列优先级：独立列 > 旧 metadata > defaults（三层回退）", () => {
+      const entry: MemoryEntry = {
+        ...baseEntry,
+        // 独立列：projectName 有值，userId 无值
+        projectName: "explicit-project",
+        userId: undefined,
+        appName: undefined,
+        agentId: undefined,
+        workspaceId: undefined,
+        metadata: {
+          // 旧 metadata：userId 有值，agentName 无值
+          userId: "metadata-user",
+          projectPath: "/should/be/overridden",
+        },
+      };
+
+      const record = memoryEntryToRecord(entry, {
+        tenantId: "tenant-priority",
+        appId: "default-app",
+        projectId: "default-project",
+        userId: "default-user",
+        agentId: "default-agent",
+      });
+
+      // projectId：独立列优先（explicit-project）
+      expect(record.scope.projectId).toBe("explicit-project");
+
+      // userId：独立列 undefined → 回退旧 metadata（metadata-user）
+      expect(record.scope.userId).toBe("metadata-user");
+
+      // appId：独立列 undefined，旧 metadata 无映射 → 回退 defaults（default-app）
+      expect(record.scope.appId).toBe("default-app");
+
+      // agentId：独立列 undefined，旧 metadata 无 → 回退 defaults（default-agent）
+      expect(record.scope.agentId).toBe("default-agent");
+    });
   });
 });

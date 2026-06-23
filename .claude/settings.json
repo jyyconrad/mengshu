@@ -16,7 +16,16 @@
       "Bash(git commit -m 'docs: update documentation structure and content *)",
       "Bash(git commit -m 'chore: update project configuration *)",
       "Bash(git commit -m 'refactor\\(core\\): improve domain layer mapping and type conversion *)",
-      "Bash(git commit -m 'feat\\(ingest\\): enhance agent history ingestion and validation *)"
+      "Bash(git commit -m 'feat\\(ingest\\): enhance agent history ingestion and validation *)",
+      "Bash(ms --version)",
+      "Bash(git diff *)",
+      "Bash(git --no-pager diff package.json)",
+      "Bash(git --no-pager diff --stat HEAD)",
+      "Bash(rg -n \"AgentHistoryProvider|provider:\" packages/core/src/ingest/agent-history/types.ts plugins/*/sources/adapter.ts)",
+      "Bash(echo \"=== EXIT: $? ===\")",
+      "Bash(echo \"=== TSC EXIT: $? ===\")",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(echo \"=== tsc EXIT: $? ===\")"
     ]
   }
 }

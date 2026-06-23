@@ -28,6 +28,16 @@ export interface RecallInput {
   tableName?: TableName;
   dataTypes?: DataType[];
   searchAll?: boolean;
+
+  // D-25：项目/产品维度过滤（默认软过滤，按需硬过滤）
+  /** 按项目精确筛选（硬过滤，对应 project_name 列）。不传则跨项目软召回。 */
+  filterProject?: string;
+  /** 按产品精确筛选（硬过滤，对应 app_name 列）。 */
+  filterProduct?: string;
+  /** 筛选模式。"soft"=仅 scopeFit 排序（默认），"hard"=精确过滤。 */
+  scopeFilterMode?: "soft" | "hard";
+  /** 项目相似检索（LIKE pattern，如 "openclaw%"）。与 filterProject 互斥。 */
+  projectPattern?: string;
 }
 
 export interface BuildContextInput extends RecallInput {
@@ -67,6 +77,8 @@ export interface MemoryRepositoryQuery {
   tableName?: TableName;
   dataTypes?: DataType[];
   searchAll?: boolean;
+  // 注意：scope 维度硬过滤通过 filter 的内部 key 传递（_projectName/_appName/_projectPattern），
+  // adapter.toLegacyQueryOptions 提取后映射到 MemoryQueryOptions.projectName 等。
 }
 
 export interface MemoryRepository {

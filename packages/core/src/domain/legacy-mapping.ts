@@ -3,6 +3,10 @@
  *
  * 这里是 OpenClaw v2.x 存储格式进入 v4 middleware core 的兼容边界：
  * legacy 字段必须可无损回转，scope/provenance 则从 metadata 中派生。
+ *
+ * 新增 scope 维度列支持，修复项目/产品维度过滤功能（D-25）：
+ * - recordToMemoryEntry：写入时把 scope 维度镜像到独立字段（projectName/appName/userId/agentId/workspaceId）
+ * - memoryEntryToRecord：读回时优先用独立字段，为 NULL 时回退 defaults（向后兼容）
  */
 
 import type { MemoryCategory } from "../../../../config.js";
@@ -111,11 +115,13 @@ export function memoryEntryToRecord(entry: MemoryEntry, defaults: MemoryScopeInp
   const metadata = entry.metadata;
   const scope = normalizeScope({
     tenantId: defaults.tenantId,
-    appId: defaults.appId,
-    userId: typeof metadata.userId === "string" ? metadata.userId : defaults.userId,
-    projectId: typeof metadata.projectPath === "string" ? metadata.projectPath : defaults.projectId,
-    agentId: typeof metadata.agentName === "string" ? metadata.agentName : defaults.agentId,
+    // D-25：优先使用独立列（projectName/appName/userId/agentId/workspaceId），NULL 时回退 defaults
+    appId: entry.appName ?? defaults.appId,
+    userId: entry.userId ?? (typeof metadata.userId === "string" ? metadata.userId : defaults.userId),
+    projectId: entry.projectName ?? (typeof metadata.projectPath === "string" ? metadata.projectPath : defaults.projectId),
+    agentId: entry.agentId ?? (typeof metadata.agentName === "string" ? metadata.agentName : defaults.agentId),
     namespace: tableNameToNamespace(entry.tableName),
+    workspaceId: entry.workspaceId ?? defaults.workspaceId,
   });
 
   const recordKind = inferKind(entry);
@@ -154,6 +160,20 @@ export function recordToMemoryEntry(record: MemoryRecord, vector?: number[]): Me
     category: record.category,
     dataType: record.dataType,
     tableName: record.tableName,
+    // D-25：scope 维度镜像到独立列（只有 !== "default" 才写入，避免污染）
+    projectName: record.scope.projectId && record.scope.projectId !== "default"
+      ? record.scope.projectId
+      : undefined,
+    appName: record.scope.appId && record.scope.appId !== "default"
+      ? record.scope.appId
+      : undefined,
+    userId: record.scope.userId && record.scope.userId !== "default"
+      ? record.scope.userId
+      : undefined,
+    agentId: record.scope.agentId && record.scope.agentId !== "default"
+      ? record.scope.agentId
+      : undefined,
+    workspaceId: record.scope.workspaceId,
     metadata: {
       ...record.metadata,
       ...(record.hotness !== undefined && { hotness: record.hotness }),

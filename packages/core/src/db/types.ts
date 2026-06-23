@@ -90,6 +90,8 @@ export interface MemoryMetadata {
 
 /**
  * 记忆条目
+ *
+ * 新增 scope 维度列支持，修复项目/产品维度过滤功能（D-25）
  */
 export interface MemoryEntry {
   /** 唯一 ID */
@@ -112,6 +114,18 @@ export interface MemoryEntry {
   metadata: MemoryMetadata;
   /** 创建时间戳 */
   createdAt: number;
+
+  // Scope 维度字段（D-25：独立列存储，支持项目/产品过滤）
+  /** 项目名称/标识（对应 scope.projectId） */
+  projectName?: string;
+  /** 产品/应用名称（对应 scope.appId） */
+  appName?: string;
+  /** 用户标识（对应 scope.userId） */
+  userId?: string;
+  /** Agent 标识（对应 scope.agentId） */
+  agentId?: string;
+  /** 工作区标识（对应 scope.workspaceId） */
+  workspaceId?: string;
 }
 
 /**
@@ -134,6 +148,14 @@ export interface MemoryQueryOptions {
   tableName?: TableName;
   /** 是否跨所有表搜索 */
   searchAll?: boolean;
+
+  // Scope 维度列过滤（D-25 / T0：前置到 T0 以便 T1-T3 编译通过）
+  /** 项目名称精确过滤（对应 project_name 列） */
+  projectName?: string;
+  /** 产品/应用名称精确过滤（对应 app_name 列） */
+  appName?: string;
+  /** 项目相似检索 LIKE pattern（如 "openclaw%"） */
+  projectPattern?: string;
 }
 
 /**
@@ -219,4 +241,22 @@ export interface DatabaseProvider {
    * 获取表统计信息
    */
   getTableStats?(): Promise<TableStats[]>;
+
+  /**
+   * 按 id 更新记录的 metadata（jsonb merge，仅部分后端实现）。
+   *
+   * 与 `store` 不同：`store` 在 content_hash 冲突时 DO NOTHING，
+   * 无法更新已存在记录的 metadata。本方法用 `metadata || $patch::jsonb`
+   * 做增量合并（不覆盖整个 metadata，仅 patch 指定字段）。
+   *
+   * @param id 记录 id
+   * @param metadataPatch 要 merge 进 metadata 的字段
+   * @param tableName 表名（默认 memories）
+   * @returns 是否有记录被更新（affected rows > 0）
+   */
+  updateMetadata?(
+    id: string,
+    metadataPatch: Record<string, unknown>,
+    tableName?: TableName,
+  ): Promise<boolean>;
 }

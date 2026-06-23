@@ -134,6 +134,7 @@ function registerOpenClawTools(api: OpenClawPluginApi, runtime: MengshuRuntime):
       async execute(_toolCallId, params) {
         return handleMemoryRecall(params as Parameters<typeof handleMemoryRecall>[0], {
           service: memoryService,
+          metadata: runtime.defaultScope,
         });
       },
     },

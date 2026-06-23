@@ -6,6 +6,9 @@
  */
 
 import type { MemoryService } from "../../../core/service-types.js";
+import type { AgentFastPathService } from "../../api/src/agent-fast-path/index.js";
+import type { IngestionPipeline } from "../../core/src/ingest/pipeline.js";
+import type { LlmClient } from "../../core/src/runtime/llm/llm-client.js";
 import { createMcpMemoryTools, type McpMemoryTool } from "./tools.js";
 
 export interface McpMemoryServer {
@@ -14,10 +17,33 @@ export interface McpMemoryServer {
   callTool(name: string, input: Record<string, unknown>): Promise<unknown>;
 }
 
-export function createMcpMemoryServer(options: {
+export interface McpMemoryServerOptions {
   service: MemoryService;
   namespaces?: string[];
-}): McpMemoryServer {
+  agentFastPath?: AgentFastPathService;
+  pipeline?: IngestionPipeline;
+  llmClient?: LlmClient;
+  /**
+   * 默认 scope，当客户端调用时未传递 scope 时自动填充。
+   *
+   * 设计理念：一个 MCP server 实例通常对应一个特定的产品/项目，
+   * 因此 scope（尤其是 tenantId）应该是 MCP server 启动时确定的上下文，
+   * 而不是每次调用时由客户端传递（容易遗漏或不一致）。
+   *
+   * 如果不配置，将使用系统默认值：
+   * { tenantId: "local", appId: "default", userId: "default", ... }
+   */
+  defaultScope?: {
+    tenantId?: string;
+    appId?: string;
+    userId?: string;
+    projectId?: string;
+    agentId?: string;
+    namespace?: string;
+  };
+}
+
+export function createMcpMemoryServer(options: McpMemoryServerOptions): McpMemoryServer {
   const tools = createMcpMemoryTools(options);
   return {
     name: "mengshu",

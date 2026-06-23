@@ -170,6 +170,9 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
     service: runtime.memoryService,
     agentFastPath: runtime.agentFastPath,
     namespaces: ["memories", "knowledge"],
+    pipeline: runtime.ingestionPipeline,
+    llmClient: runtime.llmClient,
+    defaultScope,
   });
 
   registerMemoryServerCliCommands(program, {
@@ -191,6 +194,7 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
     getRecordCount: () => runtime.db.count(),
     embeddings: runtime.embeddings,
     llmClient: runtime.llmClient,
+    db: runtime.db,
   });
 
   registerWhyCliCommands(program, {

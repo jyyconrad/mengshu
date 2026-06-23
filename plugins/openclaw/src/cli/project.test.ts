@@ -96,6 +96,7 @@ describe("registerProjectCliCommands 注册", () => {
       "context",
       "lookup",
       "ingest-history",
+      "backfill-observation-metadata",
     ]);
   });
 });

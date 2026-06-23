@@ -3,6 +3,27 @@ import type * as LanceDB from "@lancedb/lancedb";
 import type { DatabaseProvider, MemoryEntry, MemoryQueryOptions, TableName, TableStats, KnowledgeBaseConfig } from "../types";
 import { vectorDimsForModel } from "../../../../../config.js";
 
+/**
+ * Scope 维度列（D-25 / T3）的 sentinel 值。
+ *
+ * LanceDB Node SDK 通过种子记录推断 Arrow schema，nullable Utf8 列使用空串
+ * 作为 sentinel（与 `metadata: ""` 一致）。写入时把 undefined/null 归一成 ""，
+ * 读回时再把 "" 还原成 undefined，保持 MemoryEntry 上层语义。
+ */
+const SCOPE_NULL_SENTINEL = "";
+
+const escapeSqlString = (value: string): string => value.replace(/'/g, "''");
+
+const normalizeScopeValue = (value: string | null | undefined): string => {
+  if (typeof value !== "string") return SCOPE_NULL_SENTINEL;
+  return value;
+};
+
+const denormalizeScopeValue = (value: unknown): string | undefined => {
+  if (typeof value !== "string" || value === SCOPE_NULL_SENTINEL) return undefined;
+  return value;
+};
+
 let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null = null;
 const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {
   if (!lancedbImportPromise) {
@@ -19,7 +40,15 @@ const loadLanceDB = async (): Promise<typeof import("@lancedb/lancedb")> => {
 const DEFAULT_TABLES: TableName[] = ["memories", "knowledge"];
 
 /**
- * LanceDB 数据库提供者实现
+ * LanceDB 数据库提供者实现。
+ *
+ * Scope 维度列（D-25 / T3）支持：
+ * - project_name / app_name / user_id / agent_id / workspace_id 以独立 Utf8
+ *   列存储，替代「全部塞 metadata.*」的旧路径，让项目/产品维度过滤走列查询。
+ * - 写入时把 MemoryEntry 上的 scope 字段映射为列；undefined/null 走
+ *   SCOPE_NULL_SENTINEL（空串）保持 schema 兼容。
+ * - 读回时通过 denormalizeScopeValue 把空串还原成 undefined。
+ * - query 方法支持 projectName/appName 精确过滤与 projectPattern LIKE 相似检索。
  */
 export class LanceDBProvider implements DatabaseProvider {
   private db: LanceDB.Connection | null = null;
@@ -39,6 +68,33 @@ export class LanceDBProvider implements DatabaseProvider {
         this.extendedTables.push(...knowledgeBases.customCategories.map((cat: string) => `knowledge_${cat}` as TableName));
       }
     }
+  }
+
+  /**
+   * 构造表的 schema 种子记录。
+   *
+   * LanceDB 通过首条记录推断 Arrow schema，所以这里同时声明所有 scope 维度列；
+   * 创建后立即 `delete('id = "__schema__"')` 把它清掉，正式数据从空表写入。
+   */
+  private buildSchemaSeed(vectorDim: number, dataType: "memory" | "knowledge"): Record<string, unknown> {
+    return {
+      id: "__schema__",
+      text: "",
+      contentHash: "",
+      vector: Array.from({ length: vectorDim }).fill(0),
+      importance: 0,
+      category: "other",
+      dataType,
+      // 使用空字符串而非空对象，让 LanceDB 推断为字符串类型
+      metadata: "",
+      createdAt: 0,
+      // Scope 维度列（D-25 / T3）：使用 sentinel 让 LanceDB 推断为 Utf8。
+      project_name: SCOPE_NULL_SENTINEL,
+      app_name: SCOPE_NULL_SENTINEL,
+      user_id: SCOPE_NULL_SENTINEL,
+      agent_id: SCOPE_NULL_SENTINEL,
+      workspace_id: SCOPE_NULL_SENTINEL,
+    };
   }
 
   async initialize(): Promise<void> {
@@ -66,19 +122,7 @@ export class LanceDBProvider implements DatabaseProvider {
         const table = await this.db.openTable(tableName);
         this.tables.set(tableName, table);
       } else {
-        const table = await this.db.createTable(tableName, [
-          {
-            id: "__schema__",
-            text: "",
-            contentHash: "",
-            vector: Array.from({ length: vectorDim }).fill(0),
-            importance: 0,
-            category: "other",
-            dataType: "memory",
-            metadata: "",  // 使用空字符串而非空对象，让 LanceDB 推断为字符串类型
-            createdAt: 0,
-          },
-        ]);
+        const table = await this.db.createTable(tableName, [this.buildSchemaSeed(vectorDim, "memory")]);
         await table.delete('id = "__schema__"');
         this.tables.set(tableName, table);
       }
@@ -91,19 +135,7 @@ export class LanceDBProvider implements DatabaseProvider {
           const table = await this.db.openTable(tableName);
           this.tables.set(tableName, table);
         } else {
-          const table = await this.db.createTable(tableName, [
-            {
-              id: "__schema__",
-              text: "",
-              contentHash: "",
-              vector: Array.from({ length: vectorDim }).fill(0),
-              importance: 0,
-              category: "other",
-              dataType: "knowledge",
-              metadata: "",  // 使用空字符串而非空对象
-              createdAt: 0,
-            },
-          ]);
+          const table = await this.db.createTable(tableName, [this.buildSchemaSeed(vectorDim, "knowledge")]);
           await table.delete('id = "__schema__"');
           this.tables.set(tableName, table);
         }
@@ -147,19 +179,7 @@ export class LanceDBProvider implements DatabaseProvider {
     // 表不存在，创建新表
     const lancedb = await loadLanceDB();
     const vectorDim = vectorDimsForModel(this.embeddingModel);
-    const table = await this.db!.createTable(targetTable, [
-      {
-        id: "__schema__",
-        text: "",
-        contentHash: "",
-        vector: Array.from({ length: vectorDim }).fill(0),
-        importance: 0,
-        category: "other",
-        dataType: "memory",
-        metadata: "",  // 使用空字符串而非空对象
-        createdAt: 0,
-      },
-    ]);
+    const table = await this.db!.createTable(targetTable, [this.buildSchemaSeed(vectorDim, "memory")]);
     await table.delete('id = "__schema__"');
     this.tables.set(targetTable, table);
     return table;
@@ -181,12 +201,28 @@ export class LanceDBProvider implements DatabaseProvider {
     const storePromises = Array.from(entriesByTable.entries()).map(async ([tableName, tableEntries]) => {
       const table = await this.getTable(tableName);
       const entriesWithId = tableEntries.map(entry => {
-        const { tableName: _tableName, ...entryData } = entry;  // 移除 tableName 字段
+        // 移除 tableName 字段（仅运行时路由用），并把 entry 上的 scope 字段
+        // 显式映射为列；这些字段不会进入 metadata JSON。
+        const {
+          tableName: _tableName,
+          projectName,
+          appName,
+          userId,
+          agentId,
+          workspaceId,
+          ...entryData
+        } = entry;
         return {
           ...entryData,
           id: entry.id || randomUUID(),
           createdAt: entry.createdAt || Date.now(),
           metadata: JSON.stringify(entry.metadata || {}),  // 将 metadata 序列化为 JSON 字符串
+          // Scope 维度列（D-25 / T3）
+          project_name: normalizeScopeValue(projectName),
+          app_name: normalizeScopeValue(appName),
+          user_id: normalizeScopeValue(userId),
+          agent_id: normalizeScopeValue(agentId),
+          workspace_id: normalizeScopeValue(workspaceId),
         };
       });
       await table.add(entriesWithId);
@@ -232,6 +268,20 @@ export class LanceDBProvider implements DatabaseProvider {
     const table = await this.getTable(tableName);
     let results: any[];
 
+    // 构造 scope 维度列过滤条件（D-25 / T3）。
+    // projectName/appName 走精确等值；projectPattern 走 LIKE 模糊匹配，
+    // 与 filterProject 互斥（由上层 service 决定，这里只透传）。
+    const scopeFilters: string[] = [];
+    if (typeof options.projectName === "string" && options.projectName) {
+      scopeFilters.push(`project_name = '${escapeSqlString(options.projectName)}'`);
+    }
+    if (typeof options.appName === "string" && options.appName) {
+      scopeFilters.push(`app_name = '${escapeSqlString(options.appName)}'`);
+    }
+    if (typeof options.projectPattern === "string" && options.projectPattern) {
+      scopeFilters.push(`project_name LIKE '${escapeSqlString(options.projectPattern)}'`);
+    }
+
     // 向量搜索
     if (options.vector) {
       let vectorQuery = table.vectorSearch(options.vector);
@@ -255,6 +305,9 @@ export class LanceDBProvider implements DatabaseProvider {
           }
         }
       }
+
+      // Scope 维度列过滤（独立列，不走 metadata.*）
+      filters.push(...scopeFilters);
 
       if (filters.length > 0) {
         vectorQuery = vectorQuery.filter(filters.join(" AND "));
@@ -289,6 +342,9 @@ export class LanceDBProvider implements DatabaseProvider {
           }
         }
       }
+
+      // Scope 维度列过滤（独立列，不走 metadata.*）
+      filters.push(...scopeFilters);
 
       if (filters.length > 0) {
         queryBuilder = queryBuilder.filter(filters.join(" AND "));
@@ -330,6 +386,12 @@ export class LanceDBProvider implements DatabaseProvider {
         dataType: row.dataType as MemoryEntry["dataType"],
         metadata,
         createdAt: row.createdAt as number,
+        // Scope 维度列还原（空串视作未设置）
+        projectName: denormalizeScopeValue(row.project_name),
+        appName: denormalizeScopeValue(row.app_name),
+        userId: denormalizeScopeValue(row.user_id),
+        agentId: denormalizeScopeValue(row.agent_id),
+        workspaceId: denormalizeScopeValue(row.workspace_id),
         score,
       };
     });
@@ -386,19 +448,7 @@ export class LanceDBProvider implements DatabaseProvider {
           const table = await this.db!.openTable(tableName);
           this.tables.set(tableName, table);
         } else {
-          const table = await this.db!.createTable(tableName, [
-            {
-              id: "__schema__",
-              text: "",
-              contentHash: "",
-              vector: Array.from({ length: vectorDim }).fill(0),
-              importance: 0,
-              category: "other",
-              dataType: "knowledge",
-              metadata: {},
-              createdAt: 0,
-            },
-          ]);
+          const table = await this.db!.createTable(tableName, [this.buildSchemaSeed(vectorDim, "knowledge")]);
           await table.delete('id = "__schema__"');
           this.tables.set(tableName, table);
         }

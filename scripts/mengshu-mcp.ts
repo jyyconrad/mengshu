@@ -336,6 +336,8 @@ async function main(): Promise<void> {
     service,
     agentFastPath: runtime.agentFastPath,
     namespaces: ["memories", "knowledge"],
+    pipeline: runtime.ingestionPipeline,
+    llmClient: runtime.llmClient,
   });
 
   await new Promise<void>(() => {

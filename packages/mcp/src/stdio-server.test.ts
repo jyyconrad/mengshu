@@ -165,4 +165,32 @@ describe("createMcpStdioServer", () => {
 
     await server.close();
   });
+
+  test("memory_ingest becomes callable when a pipeline is injected", async () => {
+    const inputs: Array<Record<string, unknown>> = [];
+    const pipeline = {
+      async ingest(input: Record<string, unknown>) {
+        inputs.push(input);
+        return { documentId: "doc:x", chunksAdmitted: 1, chunksDropped: 0, jobsQueued: 1 };
+      },
+    };
+
+    const { tools } = createMcpStdioServer({
+      service: new FakeMemoryService(),
+      pipeline: pipeline as unknown as Parameters<typeof createMcpStdioServer>[0]["pipeline"],
+    });
+    const call = buildCallToolHandler(tools);
+
+    const result = await call("memory_ingest", {
+      source: "ingest body content",
+      sourceType: "text",
+      scope,
+    });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      documentId: "doc:x",
+      chunksAdmitted: 1,
+    });
+    expect(inputs).toHaveLength(1);
+  });
 });

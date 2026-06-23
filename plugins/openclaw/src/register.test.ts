@@ -20,6 +20,11 @@ class FakeDb implements DatabaseProvider {
   count = vi.fn(async (_filter?: Record<string, unknown>) => 0);
 }
 
+interface ToolEntry {
+  tool: { name: string; execute(toolCallId: string, params: unknown): Promise<unknown> };
+  opts: { name: string };
+}
+
 const config: MemoryConfig = {
   embedding: {
     provider: "openai",
@@ -34,7 +39,7 @@ const config: MemoryConfig = {
 };
 
 function makeApi() {
-  const tools: Array<{ tool: { name: string }; opts: { name: string } }> = [];
+  const tools: ToolEntry[] = [];
   const clis: unknown[] = [];
   const services: Array<{ id: string; start(): Promise<void>; stop(): Promise<void> }> = [];
   const hooks: Array<{ name: string; handler: unknown }> = [];
@@ -45,7 +50,7 @@ function makeApi() {
     pluginConfig: config,
     logger: { info: vi.fn(), warn: vi.fn() },
     resolvePath: (input: string) => input,
-    registerTool: (tool: { name: string }, opts: { name: string }) => tools.push({ tool, opts }),
+    registerTool: (tool: ToolEntry["tool"], opts: { name: string }) => tools.push({ tool, opts }),
     registerCli: (registrar: unknown) => clis.push(registrar),
     registerService: (service: { id: string; start(): Promise<void>; stop(): Promise<void> }) => services.push(service),
     on: (name: string, handler: unknown) => hooks.push({ name, handler }),
@@ -111,5 +116,42 @@ describe("registerOpenClawAdapter", () => {
     await services[0].stop();
     expect(db.initialize).toHaveBeenCalledTimes(1);
     expect(db.close).toHaveBeenCalledTimes(1);
+  });
+
+  test("memory_recall tool passes runtime defaultScope to the memory service", async () => {
+    const db = new FakeDb();
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: config.dbPath!,
+      appId: "openclaw",
+      db,
+    });
+    const recallSpy = vi.spyOn(runtime.memoryService, "recall").mockResolvedValue({
+      scope: runtime.defaultScope,
+      query: "dark mode",
+      hits: [],
+    });
+    const { api, tools } = makeApi();
+
+    registerOpenClawAdapter(api, config, { runtime });
+
+    const recallTool = tools.find((entry) => entry.opts.name === "memory_recall");
+    expect(recallTool).toBeDefined();
+
+    await recallTool!.tool.execute("call-1", { query: "dark mode" });
+
+    expect(recallSpy).toHaveBeenCalledTimes(1);
+    // Scope must match runtime.defaultScope so recall and store share the same isolation boundary
+    expect(recallSpy.mock.calls[0][0]).toMatchObject({
+      query: "dark mode",
+      scope: {
+        appId: "openclaw",
+        tenantId: runtime.defaultScope.tenantId,
+        userId: runtime.defaultScope.userId,
+        projectId: runtime.defaultScope.projectId,
+        agentId: runtime.defaultScope.agentId,
+        namespace: runtime.defaultScope.namespace,
+      },
+    });
   });
 });

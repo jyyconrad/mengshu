@@ -10,7 +10,7 @@ import type { MemoryCategory } from "../../../config.js";
 import { MEMORY_CATEGORIES } from "../../../config.js";
 import type { DataType, TableName } from "../../../db/types.js";
 import type { MemoryService } from "../../../core/service-types.js";
-import type { MemoryRecord, RecallHit } from "../../../core/types.js";
+import type { MemoryRecord, RecallHit, MemoryScope } from "../../../core/types.js";
 import type { IngestionPipeline } from "../../../ingest/pipeline.js";
 import { ingestMarkdownDirectory } from "../../../ingest/adapters/file-system.js";
 import { computeContentHash } from "../../../processing/hash-utils.js";
@@ -127,6 +127,7 @@ export interface MemoryStoreContext {
 export interface MemoryServiceContext {
   service: MemoryService;
   now?: () => number;
+  metadata?: Record<string, unknown> | MemoryScope;
 }
 
 export interface MemoryScanDirectoryContext {
@@ -250,6 +251,21 @@ export async function handleMemoryRecall(
     filter,
   } = params;
   const routing = resolveRecallRouting(params);
+
+  // Build scope from metadata if provided
+  // If metadata is already a MemoryScope, use it directly
+  // If it's OpenClaw event metadata, convert through buildOpenClawScope
+  let scope: MemoryScope | undefined;
+  if (context.metadata) {
+    if ("tenantId" in context.metadata && "appId" in context.metadata) {
+      // Already a MemoryScope (e.g. runtime.defaultScope)
+      scope = context.metadata as MemoryScope;
+    } else {
+      // OpenClaw event metadata, convert through buildOpenClawScope
+      scope = buildOpenClawScope(context.metadata);
+    }
+  }
+
   const result = await context.service.recall({
     query,
     limit,
@@ -258,6 +274,7 @@ export async function handleMemoryRecall(
     filter,
     tableName: routing.tableName,
     searchAll: routing.searchAll,
+    scope,
   });
 
   if (result.hits.length === 0) {

@@ -10,6 +10,11 @@ const DEFAULT_TABLES: TableName[] = ["memories", "knowledge"];
 /**
  * PostgreSQL + pgvector 数据库提供者实现
  * 使用原生 pg 库（Pool）进行连接管理
+ *
+ * D-25 scope 维度独立列（projectName/appName/userId/agentId/workspaceId）：
+ * - 写入：store 把 MemoryEntry 上的 scope 字段映射到独立列（NULL = 未指定/全局通用）
+ * - 查询：query 支持 projectName/appName 精确过滤、projectPattern LIKE 模糊匹配
+ * - Schema：ensureTable 自动 CREATE TABLE 时加列；存量表通过文档手动 ALTER TABLE
  */
 export class PostgresProvider implements DatabaseProvider {
   private pool: pg.Pool | null = null;
@@ -215,6 +220,34 @@ export class PostgresProvider implements DatabaseProvider {
     return stats;
   }
 
+  /**
+   * 按 id 增量合并 metadata（jsonb `||` 操作符）。
+   *
+   * 用于回填历史记录的溯源字段：store 在 content_hash 冲突时 DO NOTHING，
+   * 已存在记录的 metadata 无法更新；本方法直接按主键 UPDATE。
+   *
+   * SQL: `UPDATE <table> SET metadata = metadata || $1::jsonb WHERE id = $2`
+   * - $1 为 patch 的 JSON 字符串（参数化，防注入）
+   * - tableName 经 escapeIdentifier 白名单校验（防注入）
+   *
+   * @returns affected rows > 0
+   */
+  async updateMetadata(
+    id: string,
+    metadataPatch: Record<string, unknown>,
+    tableName: TableName = "memories",
+  ): Promise<boolean> {
+    await this.initialize();
+
+    const escaped = this.escapeIdentifier(tableName);
+    const result = await this.pool!.query(
+      `UPDATE ${escaped} SET metadata = metadata || $1::jsonb WHERE id = $2`,
+      [JSON.stringify(metadataPatch), id],
+    );
+
+    return (result.rowCount ?? 0) > 0;
+  }
+
   // ============================================================================
   // 私有方法
   // ============================================================================
@@ -256,9 +289,30 @@ export class PostgresProvider implements DatabaseProvider {
         category TEXT NOT NULL DEFAULT 'other',
         data_type TEXT NOT NULL DEFAULT '${defaultDataType}',
         metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        project_name TEXT,
+        app_name TEXT,
+        user_id TEXT,
+        agent_id TEXT,
+        workspace_id TEXT
       )
     `);
+
+    // 存量表兼容：CREATE TABLE 已有但缺 scope 列时补齐（IF NOT EXISTS 防重复）
+    const alterQueries = [
+      `ALTER TABLE ${escaped} ADD COLUMN IF NOT EXISTS project_name TEXT`,
+      `ALTER TABLE ${escaped} ADD COLUMN IF NOT EXISTS app_name TEXT`,
+      `ALTER TABLE ${escaped} ADD COLUMN IF NOT EXISTS user_id TEXT`,
+      `ALTER TABLE ${escaped} ADD COLUMN IF NOT EXISTS agent_id TEXT`,
+      `ALTER TABLE ${escaped} ADD COLUMN IF NOT EXISTS workspace_id TEXT`,
+    ];
+    for (const sql of alterQueries) {
+      try {
+        await this.pool!.query(sql);
+      } catch (err: any) {
+        console.warn(`Column add warning for ${tableName}:`, err.message);
+      }
+    }
 
     // 创建索引（忽略已存在错误）
     const indexQueries = [
@@ -266,6 +320,9 @@ export class PostgresProvider implements DatabaseProvider {
       `CREATE UNIQUE INDEX IF NOT EXISTS ${tableName}_content_hash_idx ON ${escaped} (content_hash)`,
       `CREATE INDEX IF NOT EXISTS ${tableName}_data_type_idx ON ${escaped} (data_type)`,
       `CREATE INDEX IF NOT EXISTS ${tableName}_created_at_idx ON ${escaped} (created_at DESC)`,
+      // D-25：scope 维度索引（高频按项目/产品过滤时性能关键）
+      `CREATE INDEX IF NOT EXISTS idx_${tableName}_project_name ON ${escaped} (project_name)`,
+      `CREATE INDEX IF NOT EXISTS idx_${tableName}_app_name ON ${escaped} (app_name)`,
     ];
 
     for (const sql of indexQueries) {
@@ -288,9 +345,13 @@ export class PostgresProvider implements DatabaseProvider {
       const vectorStr = `[${entry.vector.join(",")}]`;
       const createdAt = new Date(entry.createdAt || Date.now()).toISOString();
 
+      // D-25：scope 维度独立列写入（NULL = 未指定/全局通用）
       await this.pool!.query(
-        `INSERT INTO ${escaped} (id, text, content_hash, vector, importance, category, data_type, metadata, created_at)
-         VALUES ($1, $2, $3, $4::vector, $5, $6, $7, $8::jsonb, $9)
+        `INSERT INTO ${escaped} (
+           id, text, content_hash, vector, importance, category, data_type, metadata, created_at,
+           project_name, app_name, user_id, agent_id, workspace_id
+         )
+         VALUES ($1, $2, $3, $4::vector, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14)
          ON CONFLICT (content_hash) DO NOTHING`,
         [
           id,
@@ -302,6 +363,11 @@ export class PostgresProvider implements DatabaseProvider {
           entry.dataType,
           JSON.stringify(entry.metadata),
           createdAt,
+          entry.projectName ?? null,
+          entry.appName ?? null,
+          entry.userId ?? null,
+          entry.agentId ?? null,
+          entry.workspaceId ?? null,
         ],
       );
     }
@@ -338,6 +404,9 @@ export class PostgresProvider implements DatabaseProvider {
         }
       }
     }
+
+    // D-25：scope 维度硬过滤（参数化防注入）
+    paramIdx = this.appendScopeConditions(conditions, params, options, paramIdx);
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const limitClause = options.limit ? `LIMIT $${paramIdx}` : "";
@@ -378,6 +447,9 @@ export class PostgresProvider implements DatabaseProvider {
       }
     }
 
+    // D-25：scope 维度硬过滤（参数化防注入）
+    paramIdx = this.appendScopeConditions(conditions, params, options, paramIdx);
+
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const limit = options.limit ?? 5;
     params.push(limit);
@@ -397,6 +469,41 @@ export class PostgresProvider implements DatabaseProvider {
       .filter((entry) => entry.score >= minScore);
   }
 
+  /**
+   * D-25：把 options 上的 scope 维度字段转成 WHERE 条件（参数化）
+   *
+   * - projectName/appName：精确等值（走 B-tree 索引）
+   * - projectPattern：LIKE 模糊匹配（如 `'%openclaw%'`）
+   *
+   * @returns 更新后的 paramIdx
+   */
+  private appendScopeConditions(
+    conditions: string[],
+    params: unknown[],
+    options: MemoryQueryOptions,
+    paramIdx: number,
+  ): number {
+    if (typeof options.projectName === "string" && options.projectName.length > 0) {
+      conditions.push(`project_name = $${paramIdx}`);
+      params.push(options.projectName);
+      paramIdx++;
+    }
+
+    if (typeof options.appName === "string" && options.appName.length > 0) {
+      conditions.push(`app_name = $${paramIdx}`);
+      params.push(options.appName);
+      paramIdx++;
+    }
+
+    if (typeof options.projectPattern === "string" && options.projectPattern.length > 0) {
+      conditions.push(`project_name LIKE $${paramIdx}`);
+      params.push(options.projectPattern);
+      paramIdx++;
+    }
+
+    return paramIdx;
+  }
+
   private rowToEntry(row: any, score: number): MemoryEntry & { score: number } {
     return {
       id: row.id,
@@ -408,6 +515,12 @@ export class PostgresProvider implements DatabaseProvider {
       dataType: row.data_type,
       metadata: row.metadata,
       createdAt: new Date(row.created_at).getTime(),
+      // D-25：scope 维度字段（NULL → undefined，由上层 legacy-mapping 决定回退默认值）
+      projectName: row.project_name ?? undefined,
+      appName: row.app_name ?? undefined,
+      userId: row.user_id ?? undefined,
+      agentId: row.agent_id ?? undefined,
+      workspaceId: row.workspace_id ?? undefined,
       score,
     };
   }

@@ -36,6 +36,8 @@ import { readRegistry, writeRegistry, upsertProject, touchProjectOpenedAt } from
 import { resolveProjectManifestPath, type HomePathOptions } from "../../../../core/paths.js";
 import { isGlobalConfigReady, runInteractiveSetup } from "./setup.js";
 import { registerIngestHistoryCommand } from "./ingest-history.js";
+import { registerBackfillObservationMetadataCommand } from "./backfill-observation-metadata.js";
+import type { DatabaseProvider } from "../../../../packages/core/src/db/types.js";
 
 /** project 命令依赖注入。service/getRecordCount 缺省时相关命令降级。 */
 export interface ProjectCliDeps {
@@ -51,6 +53,8 @@ export interface ProjectCliDeps {
   embeddings?: any;
   /** LLM 客户端（用于 ingest-history 真实验证）。 */
   llmClient?: any;
+  /** 数据库 provider（用于 backfill-observation-metadata）。 */
+  db?: DatabaseProvider;
 }
 
 interface InitOptions {
@@ -305,6 +309,11 @@ export function registerProjectCliCommands(memory: CommanderLike, deps: ProjectC
       agentId: "",
       namespace: "",
     },
+  });
+
+  registerBackfillObservationMetadataCommand(project, {
+    db: deps.db,
+    cwd: deps.cwd,
   });
 }
 

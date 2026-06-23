@@ -267,4 +267,235 @@ describe("OpenClaw memory tool handlers", () => {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  test("recalls memories using the same scope as store for OpenClaw", async () => {
+    // Use OpenClaw's runtime defaultScope (from runtime.ts defaultScope function)
+    const openClawRuntimeDefaultScope = {
+      tenantId: "default",  // openclaw uses "default"
+      appId: "openclaw",
+      userId: "default",
+      projectId: "default",
+      agentId: "default",
+      namespace: "default",  // openclaw uses "default"
+      visibility: "private" as const,
+    };
+
+    const service = new FakeMemoryService({
+      scope: openClawRuntimeDefaultScope,
+      query: "scope test",
+      hits: [
+        {
+          record: makeRecord({ text: "OpenClaw scope test", scope: openClawRuntimeDefaultScope }),
+          score: 0.85,
+          source: "vector",
+          scoreBreakdown: { vector: 0.85 },
+        },
+      ],
+    });
+
+    // Store with OpenClaw runtime default scope
+    await handleMemoryStore(
+      {
+        text: "OpenClaw scope test",
+        importance: 0.8,
+        category: "preference",
+      },
+      {
+        service,
+        embed: async () => [0.5, 0.6],
+        existsByContentHash: async () => [],
+        embeddingModel: "test-model",
+        idFactory: () => "mem-scope-test",
+        now: () => 1710000000000,
+      },
+    );
+
+    // Clear previous recalls
+    service.recalls = [];
+
+    // Recall with OpenClaw runtime.defaultScope (passed directly as MemoryScope)
+    await handleMemoryRecall(
+      {
+        query: "scope test",
+        limit: 5,
+        minScore: 0.1,
+      },
+      {
+        service,
+        metadata: openClawRuntimeDefaultScope,  // Pass runtime.defaultScope directly
+      },
+    );
+
+    // Verify recall was called with same scope structure as runtime.defaultScope
+    expect(service.recalls).toHaveLength(1);
+    expect(service.recalls[0]).toMatchObject({
+      query: "scope test",
+      scope: {
+        tenantId: "default",
+        appId: "openclaw",
+        userId: "default",
+        projectId: "default",
+        agentId: "default",
+        namespace: "default",
+      },
+    });
+  });
+
+  test("recalls without scope passes undefined when no metadata provided", async () => {
+    const service = new FakeMemoryService();
+
+    await handleMemoryRecall(
+      {
+        query: "test",
+        limit: 5,
+      },
+      { service },
+    );
+
+    // Verify recall was called but scope should be undefined (allowing service to use default)
+    expect(service.recalls).toHaveLength(1);
+    expect(service.recalls[0].scope).toBeUndefined();
+  });
+
+  test("recalls with plain event metadata converts through buildOpenClawScope", async () => {
+    const service = new FakeMemoryService();
+
+    // Plain metadata without tenantId/appId (e.g. OpenClaw hook event)
+    await handleMemoryRecall(
+      { query: "test" },
+      {
+        service,
+        metadata: { userId: "user-1", projectPath: "/home/project", agentName: "agent-1" },
+      },
+    );
+
+    expect(service.recalls).toHaveLength(1);
+    // buildOpenClawScope normalizes: tenantId="local" (default), appId="openclaw"
+    expect(service.recalls[0].scope).toMatchObject({
+      tenantId: "local",
+      appId: "openclaw",
+      userId: "user-1",
+      projectId: "/home/project",
+      agentId: "agent-1",
+    });
+  });
+
+  test("recalls returns empty message when no hits found", async () => {
+    const service = new FakeMemoryService({ scope, query: "", hits: [] });
+
+    const result = await handleMemoryRecall(
+      { query: "nothing matches" },
+      { service },
+    );
+
+    expect(result.content[0].text).toBe("No relevant memories found.");
+    expect(result.details).toEqual({ count: 0 });
+  });
+
+  test("forget returns empty message when query finds no matches", async () => {
+    const service = new FakeMemoryService({ scope, query: "nothing", hits: [] });
+
+    const result = await handleMemoryForget({ query: "nothing" }, { service });
+
+    expect(result.content[0].text).toBe("No matching memories found.");
+    expect(result.details).toEqual({ found: 0 });
+    expect(service.deletes).toHaveLength(0);
+  });
+
+  test("forget returns candidates list when multiple low-confidence matches found", async () => {
+    const service = new FakeMemoryService({
+      scope,
+      query: "dark",
+      hits: [
+        { record: makeRecord({ id: "mem-1", text: "user prefers dark mode" }), score: 0.75, source: "vector" },
+        { record: makeRecord({ id: "mem-2", text: "dark background" }), score: 0.72, source: "vector" },
+      ],
+    });
+
+    const result = await handleMemoryForget({ query: "dark" }, { service });
+
+    expect(result.details).toMatchObject({ action: "candidates" });
+    const details = result.details as { action: string; candidates: Array<{ id: string; score: number }> };
+    expect(details.candidates).toHaveLength(2);
+    expect(details.candidates[0].id).toBe("mem-1");
+    expect(details.candidates[1].id).toBe("mem-2");
+    expect(result.content[0].text).toContain("candidates");
+    // Should NOT delete anything (ambiguous, requires explicit memoryId)
+    expect(service.deletes).toHaveLength(0);
+  });
+
+  test("forget returns missing_param error when no query, memoryId, or filter provided", async () => {
+    const service = new FakeMemoryService();
+
+    const result = await handleMemoryForget({}, { service });
+
+    expect(result.details).toEqual({ error: "missing_param" });
+    expect(service.deletes).toHaveLength(0);
+  });
+
+  test("recall formats non-MemoryRecord hits (SummaryNode) correctly", async () => {
+    const summaryRecord = {
+      id: "summary-1",
+      scope,
+      treeType: "source" as const,
+      level: 1,
+      summary: "Summary of dark mode preferences",
+      childIds: [],
+      evidenceIds: [],
+      createdAt: 1710000000000,
+    };
+
+    const service = new FakeMemoryService({
+      scope,
+      query: "dark mode",
+      hits: [
+        {
+          record: summaryRecord,
+          score: 0.88,
+          source: "tree" as const,
+        },
+      ],
+    });
+
+    const result = await handleMemoryRecall({ query: "dark mode" }, { service });
+
+    expect(result.content[0].text).toContain("Found 1 memories");
+    // Non-MemoryRecord hit uses summary field for display
+    expect(result.content[0].text).toContain("Summary of dark mode preferences");
+    expect(result.details?.memories).toMatchObject([
+      { id: "summary-1", score: 0.88, source: "tree" },
+    ]);
+  });
+
+  test("store routes to knowledge base when routingEngine matches", async () => {
+    const service = new FakeMemoryService();
+
+    const result = await handleMemoryStore(
+      {
+        text: "Technical knowledge about TypeScript",
+        storageCategory: "知识库",
+      },
+      {
+        service,
+        embed: async () => [0.1, 0.2],
+        existsByContentHash: async () => [],
+        embeddingModel: "test-model",
+        idFactory: () => "knowledge-id",
+        now: () => 1710000000000,
+        routingEngine: {
+          routeToKnowledgeBases: () => ({
+            targetTables: ["knowledge_work"] as import("../../../db/types.js").TableName[],
+            matchedRules: [{ name: "work-knowledge-rule" }],
+          }),
+        },
+      },
+    );
+
+    expect(result.details).toMatchObject({
+      action: "created",
+      targetTables: ["knowledge_work"],
+      routingEnabled: true,
+    });
+    expect(service.stores[0].record.tableName).toBe("knowledge_work");
+  });
 });

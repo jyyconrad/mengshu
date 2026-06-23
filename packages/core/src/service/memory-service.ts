@@ -9,8 +9,10 @@
 import { packContext } from "../retrieval/context-packer.js";
 import { auditLifecycle } from "../../../../lifecycle/audit.js";
 import { normalizeScope, validateScopeForWrite } from "../domain/scope.js";
+import { computeScopeFit } from "../domain/scope-fit.js";
+import { computeNodeScoreWithBreakdown } from "../domain/recall-scoring.js";
 import type { AuditRepository } from "../../../../storage/repositories/types.js";
-import type { ContextBlock, RecallHit } from "../domain/types.js";
+import type { ContextBlock, MemoryRecord, MemoryScope, RecallHit } from "../domain/types.js";
 import type {
   BuildContextInput,
   DeleteMemoryInput,
@@ -69,13 +71,19 @@ export class DefaultMemoryService implements MemoryService {
   }
 
   async storeMemory(input: StoreMemoryInput): Promise<StoreMemoryResult> {
+    // DEFECT-001 防御：如果 scope 是 undefined，先归一化避免 validateScopeForWrite 崩溃。
+    // 注意：显式传递空字符串仍会被 validateScopeForWrite 拒绝（保持严格校验）。
+    const normalizedScope = input.record.scope
+      ? input.record.scope
+      : normalizeScope(undefined);
+
     // v0.1 单 appId：record.scope 与 request scope 自洽校验，防止隔离字段缺失或被改动。
     try {
-      validateScopeForWrite(input.record.scope, input.record.scope);
+      validateScopeForWrite(normalizedScope, normalizedScope);
     } catch (error) {
       if (this.audit) {
         await auditLifecycle(this.audit, {
-          scope: input.record.scope,
+          scope: normalizedScope,
           action: "scope.reject",
           targetId: input.record.id,
           reason: error instanceof Error ? error.message : String(error),
@@ -84,18 +92,28 @@ export class DefaultMemoryService implements MemoryService {
       throw error;
     }
 
-    await this.repository.store([input.record]);
+    // 缺陷修复：storeMemory 此前从不计算 embedding，导致 record.vector 为 undefined →
+    // 落到 LanceDB 固定维向量 schema 时触发 "vector must have at least 1 dimension"。
+    // 参照 runtime.ts storeObservation 的 embed 模式：vector 缺失或为空数组时补齐。
+    // 不可变更新：基于入参创建新 record，不修改 input.record。
+    const needsEmbedding =
+      !input.record.vector || input.record.vector.length === 0;
+    const record = needsEmbedding
+      ? { ...input.record, scope: normalizedScope, vector: await this.embeddings.embed(input.record.text) }
+      : { ...input.record, scope: normalizedScope };
+
+    await this.repository.store([record]);
 
     if (this.audit) {
       await auditLifecycle(this.audit, {
-        scope: input.record.scope,
+        scope: record.scope,
         action: "memory.store",
-        targetId: input.record.id,
+        targetId: record.id,
       });
     }
 
     return {
-      id: input.record.id,
+      id: record.id,
       stored: true,
     };
   }
@@ -103,25 +121,75 @@ export class DefaultMemoryService implements MemoryService {
   async recall(input: RecallInput): Promise<RecallResult> {
     const scope = normalizeScope(input.scope);
     const vector = await this.embeddings.embed(input.query);
+
+    // D-25：硬过滤模式时，把项目/产品维度注入 filter（通过内部 key 传递给 adapter）
+    let filter = input.filter;
+    if (input.scopeFilterMode === "hard") {
+      // 优先用显式传入的 filterProject/filterProduct，回退当前 scope（如果不是 default）
+      const project = input.filterProject ?? (scope.projectId !== "default" ? scope.projectId : undefined);
+      const product = input.filterProduct ?? (scope.appId !== "default" ? scope.appId : undefined);
+
+      if (project || product || input.projectPattern) {
+        filter = { ...input.filter };  // 仅在有硬过滤时才复制 filter
+        if (project) {
+          filter._projectName = project;  // 内部 key，adapter 会提取
+        }
+        if (product) {
+          filter._appName = product;
+        }
+        if (input.projectPattern) {
+          filter._projectPattern = input.projectPattern;
+        }
+      }
+    }
+
     const records = await this.repository.query({
       query: input.query,
       vector,
       limit: input.limit,
       minScore: input.minScore,
-      filter: input.filter,
+      filter,  // 含硬过滤内部 key（仅在 hard 模式且有值时不为 undefined）
       scope,
       tableName: input.tableName,
       dataTypes: input.dataTypes,
       searchAll: input.searchAll,
     });
 
-    const hits: RecallHit[] = records.map((record) => ({
-      record,
-      score: record.score,
-      source: "vector",
-      scoreBreakdown: { vector: record.score },
-      provenance: record.provenance,
-    }));
+    const hits: RecallHit[] = records
+      .map((record) => {
+        // scope 软排序：record 自身 scope 与 query scope 的契合度（[0,1]）。
+        // 跨 scope 的记忆不被拦截，只是 scopeFit 偏低导致排序靠后。
+        const recordScope = (record as MemoryRecord).scope ?? scope;
+        const scopeFit = computeScopeFit(scope, recordScope);
+
+        // 用召回评分体系重算综合分：relevance 注入向量相似度，scopeFit 注入契合度。
+        // 其余因子（importance/confidence/evidence/recency）由 record 字段近似。
+        const breakdown = computeNodeScoreWithBreakdown(record, undefined, {
+          relevance: record.score,
+          scopeFit,
+        });
+
+        const hit: RecallHit = {
+          record,
+          score: breakdown.score,
+          source: "vector",
+          scoreBreakdown: {
+            vector: record.score,
+            scopeFit,
+            composite: breakdown.score,
+          },
+          provenance: record.provenance,
+        };
+        return hit;
+      })
+      // 综合分降序：同 scope（高 scopeFit）排前，跨 scope 不拦截只靠后。
+      // 综合分相同时按向量相似度兜底（保持相关性优先的稳定排序）。
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        const av = a.scoreBreakdown?.vector ?? 0;
+        const bv = b.scoreBreakdown?.vector ?? 0;
+        return bv - av;
+      });
 
     // P2: 追踪 queryHits，递增被命中 entity 的 queryHits30d
     if (this.queryHitsTracker && hits.length > 0) {

@@ -318,6 +318,334 @@ describe("AgentFastPathService", () => {
       await fastService.lookup({ scope: baseScope, query: "x", mode: "fast" });
       expect(loadTreeSummaries).not.toHaveBeenCalled();
     });
+
+    it("透传 minScore 到底层 recall", async () => {
+      const recallMock = vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: "test",
+        hits: [],
+      });
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: recallMock,
+      });
+
+      await testService.lookup({
+        scope: baseScope,
+        query: "test",
+        minScore: 0.8,
+      });
+
+      expect(recallMock).toHaveBeenCalledWith(
+        baseScope,
+        "test",
+        expect.objectContaining({ minScore: 0.8 })
+      );
+    });
+
+    it("不传 minScore 时使用 runtime 兜底 0.1", async () => {
+      const recallMock = vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: "test",
+        hits: [],
+      });
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: recallMock,
+      });
+
+      await testService.lookup({
+        scope: baseScope,
+        query: "test",
+      });
+
+      // 不传 minScore 则不在 lookup 层覆盖，依赖 runtime 兜底
+      expect(recallMock).toHaveBeenCalledWith(
+        baseScope,
+        "test",
+        expect.objectContaining({ limit: 5 })
+      );
+      // minScore 不应被 lookup 设置为 undefined，而是不传，让 runtime 用兜底值
+      const callArgs = recallMock.mock.calls[0][2];
+      expect(callArgs).not.toHaveProperty("minScore");
+    });
+
+    it("透传 filters 到底层 recall", async () => {
+      const recallMock = vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: "test",
+        hits: [],
+      });
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: recallMock,
+      });
+
+      const filters = { category: "core", lifecycleStatus: "active" };
+      await testService.lookup({
+        scope: baseScope,
+        query: "test",
+        filters,
+      });
+
+      expect(recallMock).toHaveBeenCalledWith(
+        baseScope,
+        "test",
+        expect.objectContaining({ filter: filters })
+      );
+    });
+
+    it("安全校验：拒绝非白名单字段", async () => {
+      const recallMock = vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: "test",
+        hits: [],
+      });
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: recallMock,
+      });
+
+      // 传入恶意字段
+      await testService.lookup({
+        scope: baseScope,
+        query: "test",
+        filters: { category: "core", maliciousField: "DROP TABLE" },
+      });
+
+      // 只保留白名单字段
+      const callArgs = recallMock.mock.calls[0][2];
+      expect(callArgs?.filter).toEqual({ category: "core" });
+    });
+
+    it("安全校验：拒绝 SQL 注入字符", async () => {
+      const recallMock = vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: "test",
+        hits: [],
+      });
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: recallMock,
+      });
+
+      // 传入 SQL 注入字符
+      await testService.lookup({
+        scope: baseScope,
+        query: "test",
+        filters: { category: "core'; DROP TABLE memories--" },
+      });
+
+      // 拒绝危险字符
+      const callArgs = recallMock.mock.calls[0][2];
+      expect(callArgs?.filter).toBeUndefined();
+    });
+
+    it("安全校验：拒绝对象/数组类型 value", async () => {
+      const recallMock = vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: "test",
+        hits: [],
+      });
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: recallMock,
+      });
+
+      // 传入对象/数组
+      await testService.lookup({
+        scope: baseScope,
+        query: "test",
+        filters: { category: { $ne: null }, tags: ["tag1", "tag2"] } as unknown as Record<string, unknown>,
+      });
+
+      // 拒绝非基础类型
+      const callArgs = recallMock.mock.calls[0][2];
+      expect(callArgs?.filter).toBeUndefined();
+    });
+
+    it("安全校验：允许 number 和 boolean 类型 value", async () => {
+      const recallMock = vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: "test",
+        hits: [],
+      });
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: recallMock,
+      });
+
+      await testService.lookup({
+        scope: baseScope,
+        query: "test",
+        filters: { category: "core", dataType: 1, lifecycleStatus: true } as unknown as Record<string, unknown>,
+      });
+
+      const callArgs = recallMock.mock.calls[0][2];
+      expect(callArgs?.filter).toEqual({
+        category: "core",
+        dataType: 1,
+        lifecycleStatus: true,
+      });
+    });
+
+    // D-25：scope 维度硬过滤（project/product/scopeFilterMode）
+    describe("D-25: scope 维度硬过滤", () => {
+      it("scopeFilterMode='hard' + project 注入 _projectName 到 filter", async () => {
+        const recallMock = vi.fn().mockResolvedValue({
+          scope: baseScope,
+          query: "test",
+          hits: [],
+        });
+        const testService = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecordsForScope: async () => [],
+          recall: recallMock,
+        });
+
+        await testService.lookup({
+          scope: { ...baseScope, projectId: "default", appId: "default" },  // 避免回退
+          query: "test",
+          project: "memory-autodb",
+          scopeFilterMode: "hard",
+        });
+
+        const callArgs = recallMock.mock.calls[0][2];
+        expect(callArgs?.filter).toEqual({ _projectName: "memory-autodb" });
+      });
+
+      it("scopeFilterMode='hard' + product 注入 _appName 到 filter", async () => {
+        const recallMock = vi.fn().mockResolvedValue({
+          scope: baseScope,
+          query: "test",
+          hits: [],
+        });
+        const testService = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecordsForScope: async () => [],
+          recall: recallMock,
+        });
+
+        await testService.lookup({
+          scope: { ...baseScope, projectId: "default", appId: "default" },
+          query: "test",
+          product: "codex",
+          scopeFilterMode: "hard",
+        });
+
+        const callArgs = recallMock.mock.calls[0][2];
+        expect(callArgs?.filter).toEqual({ _appName: "codex" });
+      });
+
+      it("scopeFilterMode='hard' 同时注入 project + product", async () => {
+        const recallMock = vi.fn().mockResolvedValue({
+          scope: baseScope,
+          query: "test",
+          hits: [],
+        });
+        const testService = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecordsForScope: async () => [],
+          recall: recallMock,
+        });
+
+        await testService.lookup({
+          scope: { ...baseScope, projectId: "default", appId: "default" },
+          query: "test",
+          project: "memory-autodb",
+          product: "codex",
+          scopeFilterMode: "hard",
+        });
+
+        const callArgs = recallMock.mock.calls[0][2];
+        expect(callArgs?.filter).toEqual({
+          _projectName: "memory-autodb",
+          _appName: "codex",
+        });
+      });
+
+      it("scopeFilterMode='soft' 不注入硬过滤（保持跨项目召回）", async () => {
+        const recallMock = vi.fn().mockResolvedValue({
+          scope: baseScope,
+          query: "test",
+          hits: [],
+        });
+        const testService = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecordsForScope: async () => [],
+          recall: recallMock,
+        });
+
+        await testService.lookup({
+          scope: { ...baseScope, projectId: "default", appId: "default" },
+          query: "test",
+          project: "memory-autodb",
+          scopeFilterMode: "soft",
+        });
+
+        const callArgs = recallMock.mock.calls[0][2];
+        expect(callArgs?.filter).toBeUndefined();
+      });
+
+      it("scopeFilterMode='hard' 不传 project 时回退 scope.projectId（非 default）", async () => {
+        const recallMock = vi.fn().mockResolvedValue({
+          scope: baseScope,
+          query: "test",
+          hits: [],
+        });
+        const testService = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecordsForScope: async () => [],
+          recall: recallMock,
+        });
+
+        await testService.lookup({
+          scope: { ...baseScope, projectId: "fallback-project", appId: "codex" },
+          query: "test",
+          scopeFilterMode: "hard",
+        });
+
+        const callArgs = recallMock.mock.calls[0][2];
+        expect(callArgs?.filter).toEqual({
+          _projectName: "fallback-project",
+          _appName: "codex",
+        });
+      });
+
+      it("scopeFilterMode='hard' 与用户 filters 合并", async () => {
+        const recallMock = vi.fn().mockResolvedValue({
+          scope: baseScope,
+          query: "test",
+          hits: [],
+        });
+        const testService = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecordsForScope: async () => [],
+          recall: recallMock,
+        });
+
+        await testService.lookup({
+          scope: { ...baseScope, projectId: "default", appId: "default" },
+          query: "test",
+          filters: { category: "preference" },
+          project: "memory-autodb",
+          scopeFilterMode: "hard",
+        });
+
+        const callArgs = recallMock.mock.calls[0][2];
+        expect(callArgs?.filter).toEqual({
+          category: "preference",
+          _projectName: "memory-autodb",
+        });
+      });
+    });
   });
 
   describe("sessionCommit()", () => {

@@ -22,6 +22,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentFastPathService } from "../../api/src/agent-fast-path/index.js";
 import type { MemoryService } from "../../../core/service-types.js";
+import type { IngestionPipeline } from "../../core/src/ingest/pipeline.js";
+import type { LlmClient } from "../../core/src/runtime/llm/llm-client.js";
 import { createMcpMemoryTools, type McpMemoryTool } from "./tools.js";
 
 const SERVER_NAME = "mengshu";
@@ -31,6 +33,28 @@ export interface McpStdioServerOptions {
   service: MemoryService;
   agentFastPath?: AgentFastPathService;
   namespaces?: string[];
+  /** 注入后 memory_ingest 走真实持久化链路 */
+  pipeline?: IngestionPipeline;
+  /** 预留给 ingest 增强；当前热路径不调用 LLM */
+  llmClient?: LlmClient;
+  /**
+   * 默认 scope，当客户端调用时未传递 scope 时自动填充。
+   *
+   * 设计理念：一个 MCP server 实例通常对应一个特定的产品/项目，
+   * 因此 scope（尤其是 tenantId）应该是 MCP server 启动时确定的上下文，
+   * 而不是每次调用时由客户端传递（容易遗漏或不一致）。
+   *
+   * 如果不配置，将使用系统默认值：
+   * { tenantId: "local", appId: "default", userId: "default", ... }
+   */
+  defaultScope?: {
+    tenantId?: string;
+    appId?: string;
+    userId?: string;
+    projectId?: string;
+    agentId?: string;
+    namespace?: string;
+  };
 }
 
 /** MCP CallTool 响应的 content 形态 */
