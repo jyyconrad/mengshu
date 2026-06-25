@@ -224,10 +224,10 @@ plugins/codex/
   "author": {
     "name": "mengshu",
     "email": "support@example.com",
-    "url": "https://github.com/jyyconrad/memory-autodb"
+    "url": "https://github.com/jyyconrad/mengshu"
   },
-  "homepage": "https://github.com/jyyconrad/memory-autodb",
-  "repository": "https://github.com/jyyconrad/memory-autodb",
+  "homepage": "https://github.com/jyyconrad/mengshu",
+  "repository": "https://github.com/jyyconrad/mengshu",
   "license": "MIT",
   "keywords": ["memory", "mcp", "codex", "agent"],
   "skills": "./skills/",
