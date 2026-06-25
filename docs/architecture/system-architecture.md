@@ -1,7 +1,7 @@
 # 系统架构
 
 > **状态**: 架构演进记录（2026-05-30 v4 方案 + v1.0.2 实施状态）  
-> **当前版本**: v1.0.4（P0-P4 算法层已交付）
+> **当前版本**: v1.0.5（P0-P4 算法层已交付）
 > **单一事实来源**: 算法层设计见 [memory-system-unified-design.md](../04-design/04.2-detail/memory-system-unified-design.md) (v2.0)  
 > **架构方案**: 中间件化路线见 [memory-middleware-architecture.md](./memory-middleware-architecture.md) (v4)
 

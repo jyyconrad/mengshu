@@ -225,12 +225,10 @@ describe("MCP memory tools", () => {
     const save = tools.find((tool) => tool.name === "memory_save");
     const schema = save?.inputSchema as {
       description?: string;
+      required?: string[];
       properties?: {
         text?: { minLength?: number; description?: string };
-        record?: {
-          required?: string[];
-          properties?: { text?: { minLength?: number; description?: string } };
-        };
+        metadata?: { type?: string; additionalProperties?: boolean };
       };
       anyOf?: Array<{ required?: string[] }>;
     };
@@ -241,9 +239,9 @@ describe("MCP memory tools", () => {
     expect(schema.description).toContain("`content` is not an input field");
     expect(schema.properties?.text?.minLength).toBe(1);
     expect(schema.properties?.text?.description).toContain("Required memory body text");
-    expect(schema.properties?.record?.required).toEqual(["text"]);
-    expect(schema.properties?.record?.properties?.text?.minLength).toBe(1);
-    expect(schema.anyOf).toEqual([{ required: ["text"] }, { required: ["record"] }]);
+    expect(schema.required).toEqual(["text"]);
+    expect(schema.anyOf).toBeUndefined();
+    expect(schema.properties?.metadata?.additionalProperties).toBe(true);
   });
 
   test("memory_save fails fast with an actionable text-field hint", async () => {

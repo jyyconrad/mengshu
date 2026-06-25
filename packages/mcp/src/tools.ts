@@ -153,33 +153,23 @@ const recallInputSchema: JsonSchemaObject = {
 const storeInputSchema: JsonSchemaObject = {
   type: "object",
   description:
-    "Save one memory. Put the memory body in top-level `text` (recommended) or in `record.text`; `content` is not an input field.",
+    "Save one memory. Put the memory body in top-level `text`; `content` is not an input field.",
   properties: {
     text: {
       type: "string",
       minLength: 1,
-      description: "Required memory body text. Recommended: pass this top-level field for the content to remember.",
+      description: "Required memory body text.",
     },
     scope: scopeSchema,
-    record: {
+    category: { type: "string", description: "Optional memory category." },
+    tableName: { type: "string", description: "Optional target table name." },
+    metadata: {
       type: "object",
-      description: "Advanced full memory record payload. If used, `record.text` is required.",
-      properties: {
-        text: {
-          type: "string",
-          minLength: 1,
-          description: "Required memory body text when using the full record form.",
-        },
-        scope: scopeSchema,
-      },
-      required: ["text"],
+      description: "Optional metadata.",
       additionalProperties: true,
     },
   },
-  anyOf: [
-    { required: ["text"] },
-    { required: ["record"] },
-  ],
+  required: ["text"],
   additionalProperties: true,
 };
 

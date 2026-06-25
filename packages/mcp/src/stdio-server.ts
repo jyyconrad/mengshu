@@ -27,7 +27,7 @@ import type { LlmClient } from "../../core/src/runtime/llm/llm-client.js";
 import { createMcpMemoryTools, type McpMemoryTool } from "./tools.js";
 
 const SERVER_NAME = "mengshu";
-const SERVER_VERSION = "1.0.4";
+const SERVER_VERSION = "1.0.5";
 
 export interface McpStdioServerOptions {
   service: MemoryService;

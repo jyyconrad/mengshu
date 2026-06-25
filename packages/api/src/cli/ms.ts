@@ -11,6 +11,7 @@ import { Command } from "commander";
 import { memoryConfigSchema } from "../../../../config.js";
 import { expandHome, resolveConfigPath, resolveEnvPath, resolveLegacyHomeDir } from "../../../../core/paths.js";
 import { createMengshuRuntime } from "../../../../runtime.js";
+import { ingestMarkdownDirectory } from "../../../../ingest/adapters/file-system.js";
 import { registerMemoryServerCliCommands } from "../../../../adapters/openclaw/cli.js";
 import { registerDoctorCliCommands } from "../../../../adapters/openclaw/cli-doctor.js";
 import { registerForgetCliCommands } from "../../../../adapters/openclaw/cli-forget.js";
@@ -20,10 +21,11 @@ import { registerProjectCliCommands } from "../../../../adapters/openclaw/cli-pr
 import { registerRecallCliCommands } from "../../../../adapters/openclaw/cli-recall.js";
 import { runInteractiveSetup } from "../../../../adapters/openclaw/cli-setup.js";
 import { registerWhyCliCommands } from "../../../../adapters/openclaw/cli-why.js";
+import { resolveCategoryName, resolveTableName } from "../../../../adapters/openclaw/tools.js";
 import { registerEvalCliCommands } from "./eval.js";
 
 const LEGACY_ENV_PATH = path.join(resolveLegacyHomeDir(), ".env");
-const CLI_VERSION = "1.0.4";
+const CLI_VERSION = "1.0.5";
 
 function loadDotEnv(envPath: string): void {
   if (!fs.existsSync(envPath)) {
@@ -91,6 +93,7 @@ function printConfiglessHelp(argv: string[]): void {
   program.command("why <memoryId>").description("Explain a memory's provenance and scoring");
   program.command("stats").description("Show memory statistics");
   program.command("search <query>").description("Search memories");
+  program.command("scan <directory>").description("Scan a directory of Markdown files into memory");
   console.log(program.helpInformation());
 }
 
@@ -216,6 +219,78 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
   registerMigrateHomeCommand(program);
 
   registerEvalCliCommands(program);
+
+  program
+    .command("scan <directory>")
+    .description("Scan a directory of Markdown files into memory")
+    .option("--ignore <paths...>", "Paths to ignore")
+    .option("--ignore-rule <rules...>", "Additional gitignore-style ignore rules")
+    .option("--category <name>", "Storage category: 核心记忆 | 知识库 (default: 知识库)", "知识库")
+    .option("--chunk-size <n>", "Maximum characters per chunk")
+    .option("--include-hidden", "Include hidden files", false)
+    .action(async (
+      directory: string,
+      options: {
+        ignore?: string[];
+        ignoreRule?: string[];
+        category?: string;
+        chunkSize?: string;
+        includeHidden?: boolean;
+      } = {},
+    ) => {
+      const resolvedDir = resolveMaybeRelative(directory, process.cwd());
+      const tableName = resolveTableName(options.category ?? "知识库");
+      const chunkSize = options.chunkSize ? Number.parseInt(options.chunkSize, 10) : undefined;
+      if (chunkSize !== undefined && (!Number.isFinite(chunkSize) || chunkSize <= 0)) {
+        throw new Error("--chunk-size must be a positive integer");
+      }
+
+      console.log(`Scanning directory: ${resolvedDir}`);
+      console.log(`Storage category: ${resolveCategoryName(tableName)}`);
+
+      const result = await ingestMarkdownDirectory({
+        directory: resolvedDir,
+        scope: {
+          ...defaultScope,
+          namespace: tableName,
+        },
+        pipeline: runtime.ingestionPipeline,
+        scannerOptions: {
+          ignorePaths: [
+            ...(options.ignore ?? []),
+            ...(cfg.scanner?.defaultIgnorePaths ?? []),
+          ],
+          ignoreRules: [
+            ...(options.ignoreRule ?? []),
+            ...(cfg.scanner?.customIgnoreRules ?? []),
+          ],
+          includeHidden: options.includeHidden ?? false,
+        },
+        chunkSize,
+        targetTable: tableName,
+        autoEnrichMetadata: cfg.scanner?.autoEnrichMetadata,
+      });
+
+      console.log("\nScan completed:");
+      console.log(`- Total files: ${result.totalFiles}`);
+      console.log(`- Processed: ${result.processedFiles}`);
+      console.log(`- Failed: ${result.failedFiles}`);
+      console.log(`- Total chunks: ${result.totalChunks}`);
+      console.log(`- Stored: ${result.storedChunks}`);
+      console.log(`- Duplicates skipped: ${result.duplicateChunks}`);
+      console.log(`- Jobs queued: ${result.jobsQueued}`);
+      console.log(`- Chunks admitted: ${result.chunksAdmitted}`);
+      console.log(`- Chunks dropped: ${result.chunksDropped}`);
+      if (result.totalFiles === 0) {
+        console.log("\nNo Markdown files found. `ms scan` currently imports .md and .mdx files.");
+      }
+      if (result.errors.length > 0) {
+        console.log("\nErrors:");
+        for (const error of result.errors) {
+          console.log(`- ${error.filePath}: ${error.error}`);
+        }
+      }
+    });
 
   program
     .command("stats")

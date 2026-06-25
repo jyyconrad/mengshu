@@ -30,6 +30,6 @@
 
 ## 项目信息
 
-- 当前版本：v1.0.4
+- 当前版本：v1.0.5
 - 开源协议：MIT
 - 仓库地址：[GitHub](https://github.com/your-org/mengshu)
