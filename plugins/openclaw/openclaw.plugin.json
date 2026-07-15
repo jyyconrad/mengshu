@@ -4,7 +4,7 @@
   "kind": "memory",
   "name": "Mengshu OpenClaw",
   "description": "mengshu memory middleware for OpenClaw, sharing memory data through the configured PostgreSQL backend.",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "uiHints": {
     "embedding.apiKey": {
       "label": "OpenAI API Key",

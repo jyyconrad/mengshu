@@ -4,7 +4,7 @@
 > **代码规模**: 246 个 TypeScript 文件 (不含 node_modules)
 > **单一事实来源**: `package.json` + `config.ts`
 
-本文记录 mengshu v1.0.5 (P0-P4 已交付) 的真实依赖与运行时约束。
+本文记录 mengshu v1.0.6 (P0-P4 已交付) 的真实依赖与运行时约束。
 
 ## 运行时
 

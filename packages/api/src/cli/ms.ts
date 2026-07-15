@@ -50,7 +50,7 @@ import { createPostgresSchemaCutoverPort } from
   "../../../../plugins/openclaw/src/cli/migrate-v10.js";
 
 const LEGACY_ENV_PATH = path.join(resolveLegacyHomeDir(), ".env");
-const CLI_VERSION = "1.0.5";
+const CLI_VERSION = "1.0.6";
 
 function loadDotEnv(envPath: string): void {
   if (!fs.existsSync(envPath)) {

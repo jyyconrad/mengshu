@@ -38,7 +38,7 @@ import { parseMcpServerAuthorityConfig } from "./server.js";
 import { formatMcpToolError } from "./tool-error.js";
 
 const SERVER_NAME = "mengshu";
-const SERVER_VERSION = "1.0.5";
+const SERVER_VERSION = "1.0.6";
 
 export interface McpStdioServerOptions {
   service: MemoryService;
