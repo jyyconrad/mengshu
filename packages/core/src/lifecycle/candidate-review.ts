@@ -16,9 +16,16 @@ import type {
   CandidateReviewResult,
 } from "./candidate-types.js";
 import type { MemoryRecord, MemoryScope } from "../domain/types.js";
+import { durableUuid } from "../scoring/hash-utils.js";
+
+/** Minimum repository surface needed by review; enqueue/hit writes stay provider-owned. */
+export type CandidateReviewRepositoryPort = Pick<
+  CandidateRepository,
+  "get" | "list" | "setStatus"
+>;
 
 export interface CandidateReviewServiceDeps {
-  repository: CandidateRepository;
+  repository: CandidateReviewRepositoryPort;
   /** 接受候选时调用，将候选转换为 MemoryRecord 并写入主库 */
   promoteCandidate?(input: {
     candidate: CandidateRecord;
@@ -68,6 +75,17 @@ export class CandidateReviewService {
     const errors: string[] = [];
     let affected = 0;
 
+    // Approval is a state transition only after a durable memory promotion has
+    // succeeded. A missing capability must never silently mark a candidate as
+    // approved without a memory or promotion receipt.
+    if (!this.deps.promoteCandidate) {
+      return {
+        affected: 0,
+        promoted,
+        errors: ids.map((id) => `promotion_unavailable:${id}`),
+      };
+    }
+
     for (const id of ids) {
       const record = await this.deps.repository.get(id);
       if (!record) {
@@ -80,11 +98,9 @@ export class CandidateReviewService {
       }
       try {
         let memoryId: string | undefined;
-        if (this.deps.promoteCandidate) {
-          const result = await this.deps.promoteCandidate({ candidate: record });
-          memoryId = result.memoryId;
-          promoted.push(memoryId);
-        }
+        const result = await this.deps.promoteCandidate({ candidate: record });
+        memoryId = result.memoryId;
+        promoted.push(memoryId);
         await this.deps.repository.setStatus(id, "approved", {
           promotedToMemoryId: memoryId,
         });
@@ -217,7 +233,9 @@ export function candidateToMemoryRecord(
     idFactory?: () => string;
   }
 ): MemoryRecord {
-  const id = options.idFactory ? options.idFactory() : candidate.id + ":memory";
+  const id = options.idFactory
+    ? options.idFactory()
+    : durableUuid("candidate-memory", candidate.id);
   return {
     id,
     scope: candidate.scope,

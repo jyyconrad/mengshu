@@ -10,6 +10,8 @@ import type { MemoryService } from "../../../../core/service-types.js";
 import type { GraphQueryService } from "../../../../graph/query.js";
 import type { ConsoleApi } from "../../../../console/types.js";
 import type { AgentFastPathService } from "../agent-fast-path/index.js";
+import type { AuthorityScope } from "../../../core/src/domain/authority-scope.js";
+import type { AuthorityScopedForgetService } from "../../../core/src/domain/service-types.js";
 
 export type RestMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | string;
 
@@ -32,6 +34,11 @@ export type RestServerConfig = NonNullable<MemoryConfig["server"]>;
 
 export interface RestRouterOptions {
   service: MemoryService;
+  forgetService?: AuthorityScopedForgetService;
+  /** Server-owned authority. Required unless the explicit test-only legacy channel is used. */
+  authority?: AuthorityScope;
+  /** @deprecated Test-only compatibility channel; production callers must not use it. */
+  unsafeLegacyScope?: true;
   graph?: GraphQueryService;
   console?: ConsoleApi;
   agentFastPath?: AgentFastPathService;

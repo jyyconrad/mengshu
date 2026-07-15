@@ -9,10 +9,9 @@ import { ALLOWED_TABLE_NAME_RE, assertSafeTableName } from "./supabase";
 
 describe("Supabase 表名白名单", () => {
   describe("合法表名", () => {
-    it("允许内置固定表：memories / knowledge / documents", () => {
+    it("允许实际存在的固定表：memories / knowledge", () => {
       expect(() => assertSafeTableName("memories")).not.toThrow();
       expect(() => assertSafeTableName("knowledge")).not.toThrow();
-      expect(() => assertSafeTableName("documents")).not.toThrow();
     });
 
     it("允许 knowledge_<category> 形式的动态知识库表", () => {
@@ -32,6 +31,7 @@ describe("Supabase 表名白名单", () => {
       ["空字符串", ""],
       ["纯前缀", "knowledge_"],
       ["未授权前缀", "users"],
+      ["不存在的旧 documents 表", "documents"],
       ["关键字", "select"],
       ["反引号", "memories`"],
       ["路径符", "memories/admin"],

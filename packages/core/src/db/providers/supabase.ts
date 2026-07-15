@@ -2,22 +2,87 @@
  * Supabase 数据库提供者实现。
  *
  * D-25 scope 维度列支持（v1.0.3）：
- * - 表新增独立列 project_name / app_name / user_id / agent_id / workspace_id，
+ * - 表新增独立列 tenant_id / project_name / app_name / user_id / agent_id / workspace_id，
  *   把 scope 维度真正落库，使项目/产品特有记忆与通用记忆可区分。
  * - store 写入时把 MemoryEntry 的 scope 维度映射到对应列。
  * - query（向量搜索）通过 match_* RPC 的 filter_project_name / filter_app_name
  *   参数下推硬过滤；读回路径把列值还原到 MemoryEntry。
- * - 所有 scope 列默认 NULL（表示全局/通用记忆），建有 B-tree 索引。
+ * - legacy scope 列可为 NULL；tenant_id/user_id 为 NULL 的历史记录在 authority recall
+ *   中 fail-closed 不可见，不允许回填成当前调用方。
  *
  * RPC 与建表 SQL 见 scripts/sql/migrate-scope-columns-supabase.sql，
  * 需在 Supabase Dashboard 手动执行。
  */
 import { randomUUID } from "node:crypto";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import type { DatabaseProvider, MemoryEntry, MemoryQueryOptions, TableName, TableStats, KnowledgeBaseConfig } from "../types.js";
+import type {
+  DatabaseProvider,
+  DatabaseStoreRecordResult,
+  DatabaseStoreResult,
+  MemoryEntry,
+  MemoryQueryOptions,
+  TableName,
+  TableStats,
+  KnowledgeBaseConfig,
+} from "../types.js";
 import { vectorDimsForModel } from "../../../../../config.js";
+import { assertSafeLegacyDeleteFilter } from "./legacy-delete-filter-guard.js";
 
 const DEFAULT_TABLES: TableName[] = ["memories", "knowledge"];
+const SAFE_AUTHORITY_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
+
+class SupabaseStoreError extends Error {
+  constructor(
+    readonly code: "SUPABASE_STORE_FAILED" | "SCHEMA_CONTRACT_PENDING" | "STORE_OUTCOME_INVALID",
+    message: string,
+  ) {
+    super(message);
+    this.name = "SupabaseStoreError";
+  }
+}
+
+function requireStoreScope(entry: MemoryEntry): void {
+  for (const [field, value] of Object.entries({
+    tenantId: entry.tenantId,
+    userId: entry.userId,
+    canonicalProjectId: entry.canonicalProjectId,
+    productId: entry.productId,
+    producerId: entry.producerId,
+    namespace: entry.namespace,
+    visibility: entry.visibility,
+  })) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new SupabaseStoreError("STORE_OUTCOME_INVALID", `Supabase store scope field is invalid: ${field}`);
+    }
+  }
+}
+
+type RecallAuthority = Readonly<{ tenantId: string; userId: string }>;
+
+function recallAuthority(options: MemoryQueryOptions): RecallAuthority | undefined {
+  const hasTenant = options.tenantId !== undefined;
+  const hasUser = options.userId !== undefined;
+  if (hasTenant !== hasUser) {
+    throw new Error("Supabase recall tenant/user authority must be provided together");
+  }
+  if (!hasTenant) return undefined;
+  if (!SAFE_AUTHORITY_IDENTIFIER.test(options.tenantId!) ||
+      !SAFE_AUTHORITY_IDENTIFIER.test(options.userId!)) {
+    throw new Error("Supabase recall authority identifier is invalid");
+  }
+  return Object.freeze({ tenantId: options.tenantId!, userId: options.userId! });
+}
+
+function exactAuthorityRows<T extends MemoryEntry & { score: number }>(
+  rows: readonly T[],
+  authority: RecallAuthority | undefined,
+  limit?: number,
+): T[] {
+  const authorized = authority
+    ? rows.filter((row) => row.tenantId === authority.tenantId && row.userId === authority.userId)
+    : [...rows];
+  return limit === undefined ? authorized : authorized.slice(0, limit);
+}
 
 /**
  * Supabase memories/knowledge 表行结构。
@@ -40,6 +105,13 @@ interface SupabaseMemoryRow {
   user_id?: string | null;
   agent_id?: string | null;
   workspace_id?: string | null;
+  tenant_id?: string | null;
+  canonical_project_id?: string | null;
+  product_id?: string | null;
+  producer_id?: string | null;
+  namespace?: string | null;
+  visibility?: MemoryEntry["visibility"] | null;
+  lifecycle_status?: MemoryEntry["lifecycleStatus"] | null;
 }
 
 /**
@@ -49,11 +121,11 @@ interface SupabaseMemoryRow {
  * 语句，TS 类型层面虽然有 TableName 限制，但运行时若调用方传入未净化的字符串
  * （例如带分号、空格或 SQL 关键字），仍可能造成 SQL 注入。这里在运行时通过严格
  * 正则白名单进行二次校验：
- *   - 固定表名：memories / knowledge / documents
+ *   - 固定表名：memories / knowledge
  *   - 动态知识库表：以 knowledge_ 为前缀，后缀只允许 [a-z][a-z0-9_]{0,63}
  * 任何不匹配的表名都会立即抛错并阻止 DDL 执行。
  */
-export const ALLOWED_TABLE_NAME_RE = /^(memories|knowledge|documents|knowledge_[a-z][a-z0-9_]{0,63})$/;
+export const ALLOWED_TABLE_NAME_RE = /^(memories|knowledge|knowledge_[a-z][a-z0-9_]{0,63})$/;
 
 /**
  * 校验表名是否符合白名单。校验失败时抛错（不静默通过），调用方负责捕获。
@@ -179,7 +251,14 @@ export class SupabaseProvider implements DatabaseProvider {
             app_name TEXT,
             user_id TEXT,
             agent_id TEXT,
-            workspace_id TEXT
+            workspace_id TEXT,
+            tenant_id TEXT,
+            canonical_project_id TEXT,
+            product_id TEXT,
+            producer_id TEXT,
+            namespace TEXT,
+            visibility TEXT,
+            lifecycle_status TEXT
           );
 
           -- 向量搜索索引
@@ -199,6 +278,7 @@ export class SupabaseProvider implements DatabaseProvider {
           -- scope 维度索引（加速按项目/产品过滤）
           CREATE INDEX IF NOT EXISTS idx_${tableName}_project_name ON ${tableName} (project_name);
           CREATE INDEX IF NOT EXISTS idx_${tableName}_app_name ON ${tableName} (app_name);
+          CREATE INDEX IF NOT EXISTS idx_${tableName}_tenant_user ON ${tableName} (tenant_id, user_id);
         `
       });
 
@@ -216,7 +296,7 @@ export class SupabaseProvider implements DatabaseProvider {
     this.client = null;
   }
 
-  async store(entries: MemoryEntry[]): Promise<void> {
+  async store(entries: MemoryEntry[]): Promise<DatabaseStoreResult> {
     await this.initialize();
 
     // 按表名分组
@@ -228,40 +308,83 @@ export class SupabaseProvider implements DatabaseProvider {
       entriesByTable.set(tableName, existing);
     }
 
-    // 分别存储到各表
+    for (const entry of entries) requireStoreScope(entry);
+
+    const records: DatabaseStoreRecordResult[] = [];
+    // Supabase/PostgREST 旧 schema 仍以 global content_hash 仲裁。逐条写入是为了
+    // 对每个 ignore-duplicate 精确解析 persisted ID，不能把 void 当作成功。
     for (const [tableName, tableEntries] of entriesByTable.entries()) {
-      const entriesToInsert = tableEntries.map(entry => ({
-        id: entry.id || randomUUID(),
-        text: entry.text,
-        content_hash: entry.contentHash,
-        vector: entry.vector,
-        importance: entry.importance,
-        category: entry.category,
-        data_type: entry.dataType,
-        metadata: entry.metadata,
-        created_at: new Date(entry.createdAt || Date.now()).toISOString(),
-        // scope 维度映射（D-25）：仅当值存在时写入，否则为 NULL
-        project_name: entry.projectName ?? null,
-        app_name: entry.appName ?? null,
-        user_id: entry.userId ?? null,
-        agent_id: entry.agentId ?? null,
-        workspace_id: entry.workspaceId ?? null,
-      }));
+      for (const entry of tableEntries) {
+        const requestedId = entry.id || randomUUID();
+        const row = {
+          id: requestedId,
+          text: entry.text,
+          content_hash: entry.contentHash,
+          vector: entry.vector,
+          importance: entry.importance,
+          category: entry.category,
+          data_type: entry.dataType,
+          metadata: entry.metadata,
+          created_at: new Date(entry.createdAt || Date.now()).toISOString(),
+          project_name: entry.projectName ?? null,
+          app_name: entry.appName ?? null,
+          user_id: entry.userId,
+          agent_id: entry.agentId ?? null,
+          workspace_id: entry.workspaceId ?? null,
+          tenant_id: entry.tenantId,
+          canonical_project_id: entry.canonicalProjectId,
+          product_id: entry.productId,
+          producer_id: entry.producerId,
+          namespace: entry.namespace,
+          visibility: entry.visibility,
+          lifecycle_status: entry.lifecycleStatus ?? null,
+        };
+        const { data, error } = await this.client!
+          .from(tableName)
+          .upsert([row], { onConflict: "content_hash", ignoreDuplicates: true })
+          .select("id, content_hash");
+        if (error) {
+          throw new SupabaseStoreError("SUPABASE_STORE_FAILED", "Supabase durable store failed");
+        }
+        if (data?.length === 1 && typeof data[0]?.id === "string") {
+          records.push({ requestedId, persistedId: data[0].id, stored: true });
+          continue;
+        }
+        if (data && data.length > 0) {
+          throw new SupabaseStoreError("STORE_OUTCOME_INVALID", "Supabase insert returned an invalid outcome");
+        }
 
-      const { error } = await this.client!
-        .from(tableName)
-        .upsert(entriesToInsert, {
-          onConflict: 'content_hash',
-          ignoreDuplicates: true,
-        });
-
-      if (error) {
-        console.error(`Failed to store entries to ${tableName}:`, error.message);
+        const duplicate = await this.client!
+          .from(tableName)
+          .select("id, content_hash")
+          .eq("tenant_id", entry.tenantId!)
+          .eq("user_id", entry.userId!)
+          .eq("canonical_project_id", entry.canonicalProjectId!)
+          .eq("product_id", entry.productId!)
+          .eq("producer_id", entry.producerId!)
+          .eq("namespace", entry.namespace!)
+          .eq("visibility", entry.visibility!)
+          .eq("content_hash", entry.contentHash)
+          .limit(2);
+        if (duplicate.error) {
+          throw new SupabaseStoreError("SUPABASE_STORE_FAILED", "Supabase duplicate resolution failed");
+        }
+        if (duplicate.data?.length !== 1 || typeof duplicate.data[0]?.id !== "string") {
+          throw new SupabaseStoreError(
+            "SCHEMA_CONTRACT_PENDING",
+            "Supabase global content hash conflict is outside the requested authority",
+          );
+        }
+        records.push({ requestedId, persistedId: duplicate.data[0].id, stored: false });
       }
     }
+    const inserted = records.filter((record) => record.stored).length;
+    return { inserted, duplicates: records.length - inserted, records };
   }
 
   async query(options: MemoryQueryOptions): Promise<(MemoryEntry & { score: number })[]> {
+    // 纯合同验证必须在 initialize/network 之前完成。
+    recallAuthority(options);
     await this.initialize();
 
     // 跨所有表搜索
@@ -302,6 +425,12 @@ export class SupabaseProvider implements DatabaseProvider {
     // 非向量查询（仅过滤）
     let query = this.client!.from(tableName).select('*');
 
+    const authority = recallAuthority(options);
+    if (authority) {
+      query = query.eq('tenant_id', authority.tenantId);
+      query = query.eq('user_id', authority.userId);
+    }
+
     // 数据类型过滤
     if (options.dataTypes && options.dataTypes.length > 0) {
       query = query.in('data_type', options.dataTypes);
@@ -310,7 +439,9 @@ export class SupabaseProvider implements DatabaseProvider {
     // 元数据过滤
     if (options.filter) {
       for (const [key, value] of Object.entries(options.filter)) {
-        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+        if (key === 'id' && Array.isArray(value) && value.every((id) => typeof id === 'string')) {
+          query = query.in('id', value);
+        } else if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
           query = query.eq(`metadata->>${key}`, value);
         }
       }
@@ -335,7 +466,7 @@ export class SupabaseProvider implements DatabaseProvider {
       throw new Error(`Failed to query entries: ${error.message}`);
     }
 
-    return data.map(row => ({
+    const rows = data.map(row => ({
       id: row.id,
       text: row.text,
       contentHash: row.content_hash,
@@ -352,13 +483,22 @@ export class SupabaseProvider implements DatabaseProvider {
       userId: row.user_id ?? undefined,
       agentId: row.agent_id ?? undefined,
       workspaceId: row.workspace_id ?? undefined,
+      tenantId: row.tenant_id ?? undefined,
+      canonicalProjectId: row.canonical_project_id ?? undefined,
+      productId: row.product_id ?? undefined,
+      producerId: row.producer_id ?? undefined,
+      namespace: row.namespace ?? undefined,
+      visibility: row.visibility ?? undefined,
+      lifecycleStatus: row.lifecycle_status ?? undefined,
     }));
+    return exactAuthorityRows(rows, authority, options.limit);
   }
 
   /**
    * 使用向量进行搜索（通过 Supabase RPC）
    */
   private async queryWithVector(tableName: TableName, options: MemoryQueryOptions): Promise<(MemoryEntry & { score: number })[]> {
+    const authority = recallAuthority(options);
     // 使用 Supabase 的 rpc 方法进行向量搜索，避免 URL 过长
     const { data, error } = await this.client!.rpc(`match_${tableName}`, {
       query_embedding: options.vector,
@@ -368,6 +508,8 @@ export class SupabaseProvider implements DatabaseProvider {
       // scope 维度过滤参数（D-25）：NULL 时不过滤，保持跨项目软召回
       filter_project_name: options.projectName ?? null,
       filter_app_name: options.appName ?? null,
+      filter_tenant_id: authority?.tenantId ?? null,
+      filter_user_id: authority?.userId ?? null,
     });
 
     if (error) {
@@ -376,7 +518,7 @@ export class SupabaseProvider implements DatabaseProvider {
       return this.queryWithVectorFallback(tableName, options);
     }
 
-    return (data || []).map((row: any) => ({
+    const rows = (data || []).map((row: any) => ({
       id: row.id,
       text: row.text,
       contentHash: row.content_hash,
@@ -393,7 +535,15 @@ export class SupabaseProvider implements DatabaseProvider {
       userId: row.user_id ?? undefined,
       agentId: row.agent_id ?? undefined,
       workspaceId: row.workspace_id ?? undefined,
+      tenantId: row.tenant_id ?? undefined,
+      canonicalProjectId: row.canonical_project_id ?? undefined,
+      productId: row.product_id ?? undefined,
+      producerId: row.producer_id ?? undefined,
+      namespace: row.namespace ?? undefined,
+      visibility: row.visibility ?? undefined,
+      lifecycleStatus: row.lifecycle_status ?? undefined,
     }));
+    return exactAuthorityRows(rows, authority, options.limit);
   }
 
   /**
@@ -415,9 +565,25 @@ export class SupabaseProvider implements DatabaseProvider {
         .from(tableName)
         .select(`*, 1 - (vector <=> '${vectorString}')::float as similarity`);
 
+      const authority = recallAuthority(options);
+      if (authority) {
+        query = query.eq('tenant_id', authority.tenantId);
+        query = query.eq('user_id', authority.userId);
+      }
+
       // 数据类型过滤
       if (options.dataTypes && options.dataTypes.length > 0) {
         query = query.in('data_type', options.dataTypes);
+      }
+
+      if (options.filter) {
+        for (const [key, value] of Object.entries(options.filter)) {
+          if (key === 'id' && Array.isArray(value) && value.every((id) => typeof id === 'string')) {
+            query = query.in('id', value);
+          } else if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+            query = query.eq(`metadata->>${key}`, value);
+          }
+        }
       }
 
       // scope 维度硬过滤（D-25）：RPC 回退路径也需保持过滤语义一致
@@ -428,6 +594,8 @@ export class SupabaseProvider implements DatabaseProvider {
         query = query.eq('app_name', options.appName);
       }
 
+      query = query.limit(options.limit ?? 5);
+
       // @ts-ignore - Supabase TypeScript limitation for computed fields
       const { data, error } = await query;
 
@@ -435,7 +603,7 @@ export class SupabaseProvider implements DatabaseProvider {
         throw new Error(`Failed to query entries: ${error.message}`);
       }
 
-      return (data || []).map((row: any) => ({
+      const rows = (data || []).map((row: any) => ({
         id: row.id,
         text: row.text,
         contentHash: row.content_hash,
@@ -452,7 +620,15 @@ export class SupabaseProvider implements DatabaseProvider {
         userId: row.user_id ?? undefined,
         agentId: row.agent_id ?? undefined,
         workspaceId: row.workspace_id ?? undefined,
+        tenantId: row.tenant_id ?? undefined,
+        canonicalProjectId: row.canonical_project_id ?? undefined,
+        productId: row.product_id ?? undefined,
+        producerId: row.producer_id ?? undefined,
+        namespace: row.namespace ?? undefined,
+        visibility: row.visibility ?? undefined,
+        lifecycleStatus: row.lifecycle_status ?? undefined,
       }));
+      return exactAuthorityRows(rows, authority, options.limit);
     } catch (err: any) {
       // 如果还是 URL 太长，尝试先获取候选 ID 再计算相似度
       console.warn('Fallback query also failed URL too long, trying alternative approach:', err.message);
@@ -472,8 +648,24 @@ export class SupabaseProvider implements DatabaseProvider {
     // 第一步：先获取一批候选记录（不带相似度计算）
     let baseQuery = this.client!.from(tableName).select('*');
 
+    const authority = recallAuthority(options);
+    if (authority) {
+      baseQuery = baseQuery.eq('tenant_id', authority.tenantId);
+      baseQuery = baseQuery.eq('user_id', authority.userId);
+    }
+
     if (options.dataTypes && options.dataTypes.length > 0) {
       baseQuery = baseQuery.in('data_type', options.dataTypes);
+    }
+
+    if (options.filter) {
+      for (const [key, value] of Object.entries(options.filter)) {
+        if (key === 'id' && Array.isArray(value) && value.every((id) => typeof id === 'string')) {
+          baseQuery = baseQuery.in('id', value);
+        } else if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+          baseQuery = baseQuery.eq(`metadata->>${key}`, value);
+        }
+      }
     }
 
     // scope 维度硬过滤（D-25）：备选路径也需保持过滤语义一致
@@ -514,13 +706,20 @@ export class SupabaseProvider implements DatabaseProvider {
         userId: row.user_id ?? undefined,
         agentId: row.agent_id ?? undefined,
         workspaceId: row.workspace_id ?? undefined,
+        tenantId: row.tenant_id ?? undefined,
+        canonicalProjectId: row.canonical_project_id ?? undefined,
+        productId: row.product_id ?? undefined,
+        producerId: row.producer_id ?? undefined,
+        namespace: row.namespace ?? undefined,
+        visibility: row.visibility ?? undefined,
+        lifecycleStatus: row.lifecycle_status ?? undefined,
       };
     });
 
     // 按相似度排序并返回前 N 条
     resultsWithScore.sort((a, b) => b.score - a.score);
     const limit = options.limit ?? 5;
-    return resultsWithScore.slice(0, limit);
+    return exactAuthorityRows(resultsWithScore, authority, limit);
   }
 
   /**
@@ -559,6 +758,7 @@ export class SupabaseProvider implements DatabaseProvider {
   }
 
   async deleteByFilter(filter: Record<string, unknown>): Promise<number> {
+    assertSafeLegacyDeleteFilter(filter, { consumesDataType: true });
     await this.initialize();
 
     // 确定要操作的表

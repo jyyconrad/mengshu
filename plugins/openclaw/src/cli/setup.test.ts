@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -72,6 +72,8 @@ describe("runInteractiveSetup 数据库配置", () => {
     });
     expect(config).not.toHaveProperty("dbPath");
     expect(readFileSync(join(homeDir, ".env"), "utf8")).toContain("MENGSHU_PG_PASSWORD=pg-secret");
+    expect(statSync(join(homeDir, "config.json")).mode & 0o777).toBe(0o600);
+    expect(statSync(join(homeDir, ".env")).mode & 0o777).toBe(0o600);
     expect(logs.join("\n")).toContain("postgres (mengshu_user@pg.local:15432/mengshu_test)");
   });
 

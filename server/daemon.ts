@@ -15,12 +15,19 @@ import { createRestRouter } from "../adapters/rest/router.js";
 import type { RestRequest, RestRouterOptions } from "../adapters/rest/types.js";
 import { startJobWorkerLoop, type JobWorkerLoopOptions } from "./workers.js";
 import type { JobRepository } from "../storage/repositories/types.js";
+import type { MemoryScope } from "../packages/core/src/domain/types.js";
+import type { AuthorityScope } from "../packages/core/src/domain/authority-scope.js";
+import { createExactRestAuthority } from "../packages/api/src/rest/authority.js";
 
 export interface StartMemoryServerOptions {
   service: MemoryService;
   graph?: RestRouterOptions["graph"];
   console?: RestRouterOptions["console"];
   agentFastPath?: RestRouterOptions["agentFastPath"];
+  /** Runtime-owned default scope; used to derive an exact-only authority. */
+  defaultScope?: MemoryScope;
+  /** Optional wider explicit allowlists from authenticated server configuration. */
+  authority?: AuthorityScope;
   host?: string;
   port?: number;
   secret?: string;
@@ -29,12 +36,93 @@ export interface StartMemoryServerOptions {
   worker?: {
     jobs: JobRepository;
   } & Omit<JobWorkerLoopOptions, "workerId"> & { workerId?: string };
+  /** 新 RuntimeHost 的渐进迁移接点；未注入时保持原 daemon 行为。 */
+  runtimeHost?: MemoryServerLifecycleHost;
+  /** 仅用于 composition/test 注入；生产默认使用 node:http。 */
+  listenerFactory?: MemoryServerListenerFactory;
+  /** 仅注册回调，不允许 daemon 直接 process.exit。 */
+  registerShutdownSignal?: (handler: () => Promise<void>) => () => void;
+  /** Host stop 的 daemon 级最后一道硬边界。 */
+  runtimeHostStopTimeoutMs?: number;
+  /** daemon 内所有 lifecycle await 共用的单操作硬边界。 */
+  lifecycleOperationTimeoutMs?: number;
+  lifecycleScheduler?: MemoryServerLifecycleScheduler;
 }
 
 export interface RunningMemoryServer {
   url: string;
   server: http.Server;
   stop(): Promise<void>;
+  snapshot(): MemoryServerDaemonSnapshot;
+}
+
+export interface MemoryServerLifecycleHost {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  snapshot(): {
+    readonly state: string;
+    readonly ready: boolean;
+    readonly accepting?: boolean;
+    readonly generation: number;
+  };
+}
+
+export interface MemoryServerListener {
+  readonly listening: boolean;
+  /** true 表示 error 是 bind 终态，之后绝不会再触发该次 listen callback。 */
+  readonly listenErrorIsTerminal?: boolean;
+  once(event: "error", listener: (error: unknown) => void): this;
+  off(event: "error", listener: (error: unknown) => void): this;
+  listen(port: number, host: string, callback: () => void): this;
+  address(): AddressInfo | string | null;
+  close(callback?: (error?: Error) => void): this;
+}
+
+export type MemoryServerListenerFactory = (
+  handler: http.RequestListener,
+) => MemoryServerListener;
+
+export interface MemoryServerLifecycleScheduler {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+export type MemoryServerDaemonState =
+  | "created"
+  | "starting"
+  | "ready"
+  | "stopping"
+  | "stopped"
+  | "failed";
+
+export type MemoryServerDaemonErrorCode =
+  | "DAEMON_HOST_NOT_READY"
+  | "DAEMON_START_FAILED"
+  | "DAEMON_STOP_FAILED"
+  | "DAEMON_STOPPING";
+
+export class MemoryServerDaemonError extends Error {
+  readonly code: MemoryServerDaemonErrorCode;
+
+  constructor(code: MemoryServerDaemonErrorCode) {
+    super("Memory server daemon operation failed");
+    this.name = "MemoryServerDaemonError";
+    this.code = code;
+  }
+}
+
+export interface MemoryServerDaemonSnapshot {
+  readonly state: MemoryServerDaemonState;
+  readonly ready: boolean;
+  readonly accepting: boolean;
+  readonly mode: "legacy" | "runtime_host";
+  readonly failureCode?: Exclude<MemoryServerDaemonErrorCode, "DAEMON_STOPPING">;
+}
+
+export interface MemoryServerDaemon {
+  start(): Promise<RunningMemoryServer>;
+  stop(): Promise<void>;
+  snapshot(): MemoryServerDaemonSnapshot;
 }
 
 async function readBody(request: http.IncomingMessage): Promise<unknown> {
@@ -104,85 +192,704 @@ async function serveConsoleAsset(pathname: string, response: http.ServerResponse
   return true;
 }
 
-export async function startMemoryServer(options: StartMemoryServerOptions): Promise<RunningMemoryServer> {
-  const host = options.host ?? "127.0.0.1";
-  const port = options.port ?? 3847;
-  const router = createRestRouter({
-    service: options.service,
-    graph: options.graph,
-    console: options.console,
-    agentFastPath: options.agentFastPath,
-    server: {
-      enabled: true,
-      host,
-      port,
-      secret: options.secret,
-      requireHttps: options.requireHttps,
-    },
-  });
+const DEFAULT_LIFECYCLE_SCHEDULER: MemoryServerLifecycleScheduler = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
 
-  const server = http.createServer(async (request, response) => {
-    try {
-      const pathname = requestPath(request.url);
-      if (request.method === "GET" && await serveConsoleAsset(pathname, response)) {
-        return;
+const DEFAULT_RUNTIME_HOST_STOP_TIMEOUT_MS = 5_000;
+
+function isPositiveSafeInteger(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+interface HostSnapshotData {
+  readonly state: unknown;
+  readonly ready: unknown;
+  readonly accepting: unknown;
+  readonly generation: unknown;
+}
+
+/** Host snapshot 是跨组件控制面合同，只接受无 getter/Proxy 副作用的 plain data object。 */
+function readHostSnapshotData(host: MemoryServerLifecycleHost): HostSnapshotData | undefined {
+  try {
+    const snapshot = host.snapshot();
+    if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) return undefined;
+    const prototype = Object.getPrototypeOf(snapshot);
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    const expectedKeys = ["state", "ready", "accepting", "generation"] as const;
+    const ownKeys = Reflect.ownKeys(snapshot);
+    if (ownKeys.length !== expectedKeys.length ||
+        ownKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key as typeof expectedKeys[number]))) {
+      return undefined;
+    }
+    const values: Record<keyof HostSnapshotData, unknown> = {
+      state: undefined,
+      ready: undefined,
+      accepting: undefined,
+      generation: undefined,
+    };
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(snapshot, key);
+      if (!descriptor || descriptor.enumerable !== true || !("value" in descriptor) ||
+          descriptor.get !== undefined || descriptor.set !== undefined) {
+        return undefined;
       }
-      const body = request.method === "GET" ? undefined : await readBody(request);
-      const restRequest: RestRequest = {
-        method: request.method ?? "GET",
-        path: pathname,
-        headers: request.headers as Record<string, string | string[] | undefined>,
-        body,
-        remoteAddress: request.socket.remoteAddress,
-        protocol: "http",
-      };
-      const restResponse = await router.handle(restRequest);
-      writeJson(response, restResponse.status, restResponse.body);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      writeJson(response, message === "Invalid JSON body" ? 400 : 500, { error: message });
+      values[key] = descriptor.value;
+    }
+    return values;
+  } catch {
+    return undefined;
+  }
+}
+
+function settleWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+  scheduler: MemoryServerLifecycleScheduler,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timerCreated = false;
+    let timer: unknown;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timerCreated) {
+        try {
+          scheduler.clearTimeout(timer);
+        } catch {
+          // 决议后清理 timer 失败不转发 raw scheduler 错误。
+        }
+      }
+      resolve(ok);
+    };
+    promise.then(() => { finish(true); }, () => { finish(false); });
+    try {
+      timer = scheduler.setTimeout(() => { finish(false); }, timeoutMs);
+      timerCreated = true;
+    } catch {
+      finish(false);
     }
   });
+}
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, host, () => {
-      server.off("error", reject);
-      resolve();
-    });
+function settlesWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+  scheduler: MemoryServerLifecycleScheduler,
+): Promise<boolean> {
+  return settleWithin(
+    promise.then(() => undefined, () => undefined),
+    timeoutMs,
+    scheduler,
+  );
+}
+
+function listen(
+  listener: MemoryServerListener,
+  port: number,
+  host: string,
+  isCancelled: () => boolean,
+  onLateBind: () => Promise<boolean>,
+  onBound: () => void,
+  errorIsTerminal: boolean,
+): ListenerBindOperation {
+  let finishCompletion!: (closed: boolean) => void;
+  let completionSettled = false;
+  const completion = new Promise<boolean>((resolve) => {
+    finishCompletion = (closed) => {
+      if (completionSettled) return;
+      completionSettled = true;
+      resolve(closed);
+    };
   });
-
-  const address = server.address() as AddressInfo;
-  const url = `http://${host}:${address.port}`;
-
-  // 启动后台 job worker（注入时）。daemon 拥有其生命周期：随 listen 启动、随 stop 清理。
-  const workerLoop = options.worker
-    ? startJobWorkerLoop(options.worker.jobs, {
-        workerId: options.worker.workerId ?? "memory-daemon-worker",
-        leaseMs: options.worker.leaseMs,
-        intervalMs: options.worker.intervalMs,
-        handlers: options.worker.handlers,
-        maxPerTick: options.worker.maxPerTick,
-      })
-    : undefined;
-
-  return {
-    url,
-    server,
-    stop: async () => {
-      await workerLoop?.stop();
-      if (!server.listening) {
-        return;
-      }
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => {
-          if (error) {
-            reject(error);
-            return;
+  const result = new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const onError = (error: unknown, terminal = errorIsTerminal) => {
+      if (settled) return;
+      settled = true;
+      listener.off("error", onError);
+      if (terminal) finishCompletion(true);
+      reject(error);
+    };
+    listener.once("error", onError);
+    try {
+      listener.listen(port, host, () => {
+        if (settled) {
+          if (isCancelled()) {
+            try {
+              void onLateBind().then(finishCompletion, () => { finishCompletion(false); });
+            } catch {
+              finishCompletion(false);
+              // 已失败 bind 的迟到 callback 仍必须 fail-closed。
+            }
           }
-          resolve();
-        });
+          return;
+        }
+        settled = true;
+        listener.off("error", onError);
+        if (isCancelled()) {
+          try {
+            void onLateBind().then(finishCompletion, () => { finishCompletion(false); });
+          } catch {
+            finishCompletion(false);
+            // late bind cleanup 由 daemon 的固定 cleanup 状态承接，不转发 raw listener error。
+          }
+          reject(new Error("listener bind cancelled"));
+          return;
+        }
+        try {
+          onBound();
+        } catch {
+          finishCompletion(false);
+          reject(new Error("listener runtime error handler registration failed"));
+          return;
+        }
+        finishCompletion(true);
+        resolve();
       });
-    },
-  };
+    } catch (error) {
+      onError(error, true);
+    }
+  });
+  return { result, completion };
+}
+
+interface ListenerBindOperation {
+  readonly result: Promise<void>;
+  readonly completion: Promise<boolean>;
+}
+
+async function closeListener(listener: MemoryServerListener | undefined): Promise<boolean> {
+  if (!listener?.listening) return true;
+  return new Promise((resolve) => {
+    try {
+      listener.close((error) => { resolve(!error); });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+class MemoryServerDaemonController implements MemoryServerDaemon {
+  private state: MemoryServerDaemonState = "created";
+  private failureCode?: Exclude<MemoryServerDaemonErrorCode, "DAEMON_STOPPING">;
+  private listener?: MemoryServerListener;
+  private workerLoop?: ReturnType<typeof startJobWorkerLoop>;
+  private unregisterSignal?: () => void;
+  private startPromise?: Promise<RunningMemoryServer>;
+  private stopPromise?: Promise<void>;
+  private hostStopPromise?: Promise<boolean>;
+  private lateHostStopPromise?: Promise<boolean>;
+  private workerStopPromise?: Promise<boolean>;
+  private listenerClosePromise?: Promise<boolean>;
+  private lateListenerClosePromise?: Promise<boolean>;
+  private listenerBindOperation?: ListenerBindOperation;
+  private running?: RunningMemoryServer;
+  private hostStartAttempted = false;
+  private hostStartSettled = false;
+  private hostStartAbandoned = false;
+  private hostStartPromise?: Promise<void>;
+  private ownedHostGeneration?: number;
+  private hostOwnershipInvalidated = false;
+  private listenerBindCancelled = false;
+  private listenerRuntimeErrorHandler?: (error: unknown) => void;
+  private listenerRuntimeErrorRegistered = false;
+  private cleanupFailed = false;
+  private readonly lifecycleScheduler: MemoryServerLifecycleScheduler;
+  private readonly operationTimeoutMs: number;
+
+  constructor(private readonly options: StartMemoryServerOptions) {
+    this.lifecycleScheduler = options.lifecycleScheduler ?? DEFAULT_LIFECYCLE_SCHEDULER;
+    this.operationTimeoutMs = options.lifecycleOperationTimeoutMs ??
+      options.runtimeHostStopTimeoutMs ?? DEFAULT_RUNTIME_HOST_STOP_TIMEOUT_MS;
+  }
+
+  snapshot(): MemoryServerDaemonSnapshot {
+    return Object.freeze({
+      state: this.state,
+      ready: this.state === "ready",
+      accepting: this.state === "ready" && this.listener?.listening === true,
+      mode: this.options.runtimeHost ? "runtime_host" : "legacy",
+      ...(this.failureCode ? { failureCode: this.failureCode } : {}),
+    });
+  }
+
+  start(): Promise<RunningMemoryServer> {
+    if (this.state === "starting" || this.state === "ready") return this.startPromise!;
+    if (this.state === "stopping") {
+      return Promise.reject(new MemoryServerDaemonError("DAEMON_STOPPING"));
+    }
+    if (this.state === "failed") {
+      return Promise.reject(new MemoryServerDaemonError(this.failureCode ?? "DAEMON_START_FAILED"));
+    }
+    if (this.state === "stopped") {
+      return Promise.reject(new MemoryServerDaemonError("DAEMON_START_FAILED"));
+    }
+    this.state = "starting";
+    this.failureCode = undefined;
+    this.startPromise = this.runStart();
+    return this.startPromise;
+  }
+
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    if (this.state === "created" || this.state === "stopped") {
+      this.state = "stopped";
+      this.stopPromise = Promise.resolve();
+      return this.stopPromise;
+    }
+    this.listenerBindCancelled = true;
+    this.abandonPendingHostStart();
+    this.state = "stopping";
+    this.stopPromise = this.runStop();
+    return this.stopPromise;
+  }
+
+  private async runStart(): Promise<RunningMemoryServer> {
+    let startFailureCode: Exclude<MemoryServerDaemonErrorCode, "DAEMON_STOPPING" | "DAEMON_STOP_FAILED"> =
+      "DAEMON_START_FAILED";
+    try {
+      const host = this.options.host ?? "127.0.0.1";
+      const port = this.options.port ?? 3847;
+      if (this.options.runtimeHost && this.options.worker) {
+        throw new MemoryServerDaemonError("DAEMON_START_FAILED");
+      }
+      if (!this.options.authority && !this.options.defaultScope) {
+        // 保留旧 API 的显式配置诊断。
+        throw new Error("REST server authority or server-owned defaultScope is required");
+      }
+      if (!isPositiveSafeInteger(this.operationTimeoutMs) ||
+          typeof this.lifecycleScheduler.setTimeout !== "function" ||
+          typeof this.lifecycleScheduler.clearTimeout !== "function") {
+        throw new MemoryServerDaemonError("DAEMON_START_FAILED");
+      }
+      if (this.options.runtimeHost && !this.captureOwnedHostGeneration()) {
+        startFailureCode = "DAEMON_HOST_NOT_READY";
+        throw new MemoryServerDaemonError(startFailureCode);
+      }
+      const authority = this.options.authority ?? createExactRestAuthority(this.options.defaultScope!);
+      const router = createRestRouter({
+        service: this.options.service,
+        forgetService: typeof (this.options.service as unknown as { forget?: unknown }).forget === "function"
+          ? this.options.service as never
+          : undefined,
+        authority,
+        graph: this.options.graph,
+        console: this.options.console,
+        agentFastPath: this.options.agentFastPath,
+        server: {
+          enabled: true,
+          host,
+          port,
+          secret: this.options.secret,
+          requireHttps: this.options.requireHttps,
+        },
+      });
+      const requestListener: http.RequestListener = async (request, response) => {
+        try {
+          const pathname = requestPath(request.url);
+          if (request.method === "GET" && await serveConsoleAsset(pathname, response)) return;
+          const body = request.method === "GET" ? undefined : await readBody(request);
+          const restRequest: RestRequest = {
+            method: request.method ?? "GET",
+            path: pathname,
+            headers: request.headers as Record<string, string | string[] | undefined>,
+            body,
+            remoteAddress: request.socket.remoteAddress,
+            protocol: "http",
+          };
+          const restResponse = await router.handle(restRequest);
+          writeJson(response, restResponse.status, restResponse.body);
+        } catch (error) {
+          const invalidJson = error instanceof Error && error.message === "Invalid JSON body";
+          writeJson(response, invalidJson ? 400 : 500, {
+            error: invalidJson ? "Invalid JSON body" : "Internal server error",
+          });
+        }
+      };
+      if (this.options.runtimeHost) {
+        this.hostStartAttempted = true;
+        const hostStartPromise = Promise.resolve().then(() => this.options.runtimeHost!.start());
+        this.hostStartPromise = hostStartPromise;
+        void hostStartPromise.then(
+          () => { this.hostStartSettled = true; },
+          () => { this.hostStartSettled = true; },
+        );
+        const hostStarted = await settleWithin(
+          hostStartPromise,
+          this.operationTimeoutMs,
+          this.lifecycleScheduler,
+        );
+        if (!hostStarted) {
+          this.abandonPendingHostStart();
+          startFailureCode = "DAEMON_HOST_NOT_READY";
+          throw new MemoryServerDaemonError(startFailureCode);
+        }
+        if (this.state === "stopping") throw new MemoryServerDaemonError("DAEMON_STOPPING");
+        if (!this.ownedHostIsReady()) {
+          startFailureCode = "DAEMON_HOST_NOT_READY";
+          throw new MemoryServerDaemonError(startFailureCode);
+        }
+      }
+
+      const factory = this.options.listenerFactory ??
+        ((handler: http.RequestListener) => http.createServer(handler));
+      this.listener = factory(requestListener);
+
+      const listenerBindOperation = listen(
+        this.listener,
+        port,
+        host,
+        () => this.listenerBindCancelled,
+        () => this.closeLateBoundListener(),
+        () => { this.installListenerRuntimeErrorHandler(); },
+        !this.options.listenerFactory || this.listener.listenErrorIsTerminal === true,
+      );
+      this.listenerBindOperation = listenerBindOperation;
+      const listenerBound = await settleWithin(
+        listenerBindOperation.result,
+        this.operationTimeoutMs,
+        this.lifecycleScheduler,
+      );
+      if (!listenerBound) {
+        this.listenerBindCancelled = true;
+        throw new MemoryServerDaemonError("DAEMON_START_FAILED");
+      }
+      if (this.stoppingRequested()) throw new MemoryServerDaemonError("DAEMON_STOPPING");
+      if (this.options.runtimeHost && !this.ownedHostIsReady()) {
+        startFailureCode = "DAEMON_HOST_NOT_READY";
+        throw new MemoryServerDaemonError(startFailureCode);
+      }
+
+      const address = this.listener.address();
+      if (!address || typeof address === "string" || !isPositiveSafeInteger(address.port)) {
+        throw new MemoryServerDaemonError("DAEMON_START_FAILED");
+      }
+      this.workerLoop = this.options.worker
+        ? startJobWorkerLoop(this.options.worker.jobs, {
+            workerId: this.options.worker.workerId ?? "memory-daemon-worker",
+            leaseMs: this.options.worker.leaseMs,
+            intervalMs: this.options.worker.intervalMs,
+            handlers: this.options.worker.handlers,
+            maxPerTick: this.options.worker.maxPerTick,
+          })
+        : undefined;
+
+      this.running = Object.freeze({
+        url: `http://${host}:${address.port}`,
+        server: this.listener as http.Server,
+        stop: () => this.stop(),
+        snapshot: () => this.snapshot(),
+      });
+      if (this.options.registerShutdownSignal) {
+        this.unregisterSignal = this.options.registerShutdownSignal(() => this.stop());
+        if (typeof this.unregisterSignal !== "function") {
+          throw new MemoryServerDaemonError("DAEMON_START_FAILED");
+        }
+      }
+      if (this.stoppingRequested()) throw new MemoryServerDaemonError("DAEMON_STOPPING");
+      this.state = "ready";
+      return this.running;
+    } catch (error) {
+      if (error instanceof Error &&
+          error.message === "REST server authority or server-owned defaultScope is required") {
+        this.state = "failed";
+        this.failureCode = "DAEMON_START_FAILED";
+        throw error;
+      }
+      if (error instanceof MemoryServerDaemonError && error.code === "DAEMON_HOST_NOT_READY") {
+        startFailureCode = error.code;
+      }
+      this.listenerBindCancelled = true;
+      const signalUnregistered = this.unregisterSignalOnce();
+      const listenerClosed = await this.closeListenerWithinBoundary();
+      const listenerErrorHandlerRemoved = this.removeListenerRuntimeErrorHandlerOnce();
+      const workerStopped = await this.stopLegacyWorker();
+      const hostStopped = await this.stopHostOnce();
+      const lateHostStopped = this.lateHostStopPromise
+        ? await this.lateHostStopPromise
+        : true;
+      if (this.state === "stopping") throw new MemoryServerDaemonError("DAEMON_STOPPING");
+      if (!signalUnregistered || !listenerClosed || !listenerErrorHandlerRemoved ||
+          !workerStopped || !hostStopped || !lateHostStopped || this.cleanupFailed) {
+        this.state = "failed";
+        this.failureCode = "DAEMON_STOP_FAILED";
+        throw new MemoryServerDaemonError("DAEMON_STOP_FAILED");
+      }
+      this.state = "failed";
+      this.failureCode = startFailureCode;
+      throw new MemoryServerDaemonError(startFailureCode);
+    }
+  }
+
+  private async runStop(): Promise<void> {
+    const signalUnregistered = this.unregisterSignalOnce();
+    const listenerClosed = await this.closeListenerWithinBoundary();
+    const listenerErrorHandlerRemoved = this.removeListenerRuntimeErrorHandlerOnce();
+    const workerStopped = await this.stopLegacyWorker();
+    const hostStopped = await this.stopHostOnce();
+    const startSettled = !this.startPromise || await settlesWithin(
+      this.startPromise,
+      this.operationTimeoutMs,
+      this.lifecycleScheduler,
+    );
+    const signalUnregisteredAfterStart = this.unregisterSignalOnce();
+    const listenerClosedAfterStart = await this.closeListenerWithinBoundary();
+    const listenerErrorHandlerRemovedAfterStart = this.removeListenerRuntimeErrorHandlerOnce();
+    const workerStoppedAfterStart = await this.stopLegacyWorker();
+    const hostStoppedAfterStart = await this.stopHostOnce();
+    const ownershipDrained = await this.drainLateCleanupOwnership();
+
+    if (!signalUnregistered || !signalUnregisteredAfterStart ||
+        !listenerClosed || !listenerClosedAfterStart ||
+        !listenerErrorHandlerRemoved || !listenerErrorHandlerRemovedAfterStart ||
+        !workerStopped || !workerStoppedAfterStart ||
+        !hostStopped || !hostStoppedAfterStart || !ownershipDrained ||
+        !startSettled || this.cleanupFailed) {
+      this.state = "failed";
+      this.failureCode = "DAEMON_STOP_FAILED";
+      throw new MemoryServerDaemonError("DAEMON_STOP_FAILED");
+    }
+    this.state = "stopped";
+    this.failureCode = undefined;
+  }
+
+  private stopHostOnce(): Promise<boolean> {
+    if (!this.options.runtimeHost || !this.hostStartAttempted) return Promise.resolve(true);
+    if (this.hostOwnershipInvalidated) {
+      this.hostStopPromise ??= Promise.resolve(true);
+      return this.hostStopPromise;
+    }
+    if (!this.ownsCurrentHostGeneration()) {
+      this.cleanupFailed = true;
+      this.hostStopPromise ??= Promise.resolve(false);
+      return this.hostStopPromise;
+    }
+    this.hostStopPromise ??= settleWithin(
+      Promise.resolve().then(() => this.options.runtimeHost!.stop()),
+      this.operationTimeoutMs,
+      this.lifecycleScheduler,
+    ).then((stopped) => this.recordCleanupResult(stopped));
+    return this.hostStopPromise;
+  }
+
+  private abandonPendingHostStart(): void {
+    const hostStartPromise = this.hostStartPromise;
+    if (!hostStartPromise || this.hostStartSettled || this.hostStartAbandoned) return;
+    this.hostStartAbandoned = true;
+    void hostStartPromise.then(
+      () => { this.startLateHostStop(); },
+      () => { this.startLateHostStop(); },
+    );
+  }
+
+  private startLateHostStop(): Promise<boolean> {
+    if (this.lateHostStopPromise) return this.lateHostStopPromise;
+    if (!this.options.runtimeHost || !this.hostStartAttempted) return Promise.resolve(true);
+    const earlyStop = this.stopHostOnce();
+    this.lateHostStopPromise = earlyStop.then(() => {
+      if (!this.ownsCurrentHostGeneration()) return false;
+      return settleWithin(
+        Promise.resolve().then(() => this.options.runtimeHost!.stop()),
+        this.operationTimeoutMs,
+        this.lifecycleScheduler,
+      );
+    }).then((stopped) => {
+      this.recordCleanupResult(stopped);
+      if (!stopped) {
+        this.state = "failed";
+        this.failureCode = "DAEMON_STOP_FAILED";
+      }
+      return stopped;
+    });
+    return this.lateHostStopPromise;
+  }
+
+  private captureOwnedHostGeneration(): boolean {
+    if (!this.options.runtimeHost) return true;
+    if (this.ownedHostGeneration !== undefined) return true;
+    const snapshot = readHostSnapshotData(this.options.runtimeHost);
+    const generation = snapshot?.generation;
+    if (typeof generation === "number" && isPositiveSafeInteger(generation)) {
+      this.ownedHostGeneration = generation;
+      return true;
+    }
+    return false;
+  }
+
+  private ownedHostIsReady(): boolean {
+    if (!this.options.runtimeHost || this.ownedHostGeneration === undefined) return false;
+    const snapshot = readHostSnapshotData(this.options.runtimeHost);
+    if (!snapshot) {
+      this.invalidateHostOwnership();
+      return false;
+    }
+    const { state, ready, accepting, generation } = snapshot;
+    if (typeof generation !== "number" || !isPositiveSafeInteger(generation) ||
+        generation !== this.ownedHostGeneration) {
+      this.invalidateHostOwnership();
+      return false;
+    }
+    return state === "ready" && ready === true && accepting === true;
+  }
+
+  private ownsCurrentHostGeneration(): boolean {
+    if (this.hostOwnershipInvalidated) return false;
+    if (!this.options.runtimeHost || this.ownedHostGeneration === undefined) return true;
+    const snapshot = readHostSnapshotData(this.options.runtimeHost);
+    const generation = snapshot?.generation;
+    return typeof generation === "number" && isPositiveSafeInteger(generation) &&
+      generation === this.ownedHostGeneration;
+  }
+
+  private invalidateHostOwnership(): void {
+    this.hostOwnershipInvalidated = true;
+    this.cleanupFailed = true;
+  }
+
+  private async drainLateCleanupOwnership(): Promise<boolean> {
+    const hostStartSettled = !this.hostStartAbandoned || !this.hostStartPromise || await settlesWithin(
+      this.hostStartPromise,
+      this.operationTimeoutMs,
+      this.lifecycleScheduler,
+    );
+    const listenerBindClosed = !this.listenerBindOperation || await settleWithin(
+      this.listenerBindOperation.completion.then((closed) => {
+        if (!closed) throw new MemoryServerDaemonError("DAEMON_STOP_FAILED");
+      }),
+      this.operationTimeoutMs,
+      this.lifecycleScheduler,
+    );
+    const lateHostStopped = this.lateHostStopPromise
+      ? await this.lateHostStopPromise
+      : true;
+    const lateListenerClosed = this.lateListenerClosePromise
+      ? await this.lateListenerClosePromise
+      : true;
+    return this.recordCleanupResult(
+      hostStartSettled && listenerBindClosed && lateHostStopped && lateListenerClosed,
+    );
+  }
+
+  private stopLegacyWorker(): Promise<boolean> {
+    if (this.workerStopPromise) return this.workerStopPromise;
+    const worker = this.workerLoop;
+    if (!worker) return Promise.resolve(true);
+    this.workerLoop = undefined;
+    this.workerStopPromise = settleWithin(
+      Promise.resolve().then(() => worker.stop()),
+      this.operationTimeoutMs,
+      this.lifecycleScheduler,
+    ).then((stopped) => this.recordCleanupResult(stopped));
+    return this.workerStopPromise;
+  }
+
+  private closeListenerWithinBoundary(): Promise<boolean> {
+    if (this.listenerClosePromise) return this.listenerClosePromise;
+    if (!this.listener?.listening) return Promise.resolve(true);
+    const closing = settleWithin(
+      closeListener(this.listener).then((closed) => {
+        if (!closed) throw new MemoryServerDaemonError("DAEMON_STOP_FAILED");
+      }),
+      this.operationTimeoutMs,
+      this.lifecycleScheduler,
+    ).then((closed) => this.recordCleanupResult(closed));
+    this.listenerClosePromise = closing;
+    void closing.then(() => {
+      if (this.listenerClosePromise === closing) this.listenerClosePromise = undefined;
+    });
+    return closing;
+  }
+
+  private unregisterSignalOnce(): boolean {
+    const unregister = this.unregisterSignal;
+    this.unregisterSignal = undefined;
+    if (!unregister) return true;
+    try {
+      unregister();
+      return true;
+    } catch {
+      this.cleanupFailed = true;
+      return false;
+    }
+  }
+
+  private recordCleanupResult(succeeded: boolean): boolean {
+    if (!succeeded) this.cleanupFailed = true;
+    return succeeded;
+  }
+
+  private closeLateBoundListener(): Promise<boolean> {
+    if (this.lateListenerClosePromise) return this.lateListenerClosePromise;
+    const earlyClose = this.listenerClosePromise ?? Promise.resolve(true);
+    this.lateListenerClosePromise = earlyClose.then(() => this.closeListenerAttempt());
+    void this.lateListenerClosePromise.then((closed) => {
+      if (closed) return;
+      this.cleanupFailed = true;
+      this.state = "failed";
+      this.failureCode = "DAEMON_STOP_FAILED";
+    });
+    return this.lateListenerClosePromise;
+  }
+
+  private closeListenerAttempt(): Promise<boolean> {
+    if (!this.listener?.listening) return Promise.resolve(false);
+    return settleWithin(
+      closeListener(this.listener).then((closed) => {
+        if (!closed) throw new MemoryServerDaemonError("DAEMON_STOP_FAILED");
+      }),
+      this.operationTimeoutMs,
+      this.lifecycleScheduler,
+    ).then((closed) => this.recordCleanupResult(closed));
+  }
+
+  private installListenerRuntimeErrorHandler(): void {
+    if (this.listenerRuntimeErrorRegistered || !this.listener) return;
+    const handler = (_error: unknown) => {
+      this.listenerRuntimeErrorRegistered = false;
+      try {
+        // once listener 触发后立即续订，覆盖 close callback 决议前的重复 runtime error。
+        this.listener!.once("error", handler);
+        this.listenerRuntimeErrorHandler = handler;
+        this.listenerRuntimeErrorRegistered = true;
+      } catch {
+        this.listenerRuntimeErrorHandler = undefined;
+        this.cleanupFailed = true;
+      }
+      this.listenerBindCancelled = true;
+      void this.stop().catch(() => undefined);
+    };
+    this.listener.once("error", handler);
+    this.listenerRuntimeErrorHandler = handler;
+    this.listenerRuntimeErrorRegistered = true;
+  }
+
+  private removeListenerRuntimeErrorHandlerOnce(): boolean {
+    const handler = this.listenerRuntimeErrorHandler;
+    if (!handler || !this.listenerRuntimeErrorRegistered || !this.listener) return true;
+    this.listenerRuntimeErrorHandler = undefined;
+    this.listenerRuntimeErrorRegistered = false;
+    try {
+      this.listener.off("error", handler);
+      return true;
+    } catch {
+      this.cleanupFailed = true;
+      return false;
+    }
+  }
+
+  private stoppingRequested(): boolean {
+    return this.state === "stopping";
+  }
+}
+
+export function createMemoryServerDaemon(options: StartMemoryServerOptions): MemoryServerDaemon {
+  return new MemoryServerDaemonController(options);
+}
+
+/** 兼容既有一次性启动 API；新 composition 可使用 createMemoryServerDaemon 做并发生命周期管理。 */
+export function startMemoryServer(options: StartMemoryServerOptions): Promise<RunningMemoryServer> {
+  return createMemoryServerDaemon(options).start();
 }

@@ -34,7 +34,7 @@ describe("IngestionPipeline", () => {
     });
 
     expect(result).toMatchObject({
-      documentId: expect.any(String),
+      documentId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
       chunksAdmitted: 3,
       chunksDropped: 0,
       jobsQueued: 3,
@@ -43,6 +43,7 @@ describe("IngestionPipeline", () => {
       id: result.documentId,
       uri: "/docs/guide.md",
       scope,
+      metadata: { logicalId: expect.stringMatching(/^doc:/) },
     });
     await expect(store.chunks.listByDocument(result.documentId, { scope })).resolves.toHaveLength(3);
     await expect(store.jobs.list("queued")).resolves.toHaveLength(3);

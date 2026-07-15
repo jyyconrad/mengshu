@@ -4,8 +4,9 @@
  * 本文件做什么：
  *   用真实 node:http daemon + in-memory 接线，验证 observe_light 到候选区
  *   pending 候选产出的完整异步链路：
- *     observe_light -> enqueue extract_candidate job -> daemon worker loop drain
- *     -> createExtractCandidateHandler 经 HeuristicTypeExtractor 抽取
+ *     observe_light -> enqueue extract_candidate/build_tree/extract_graph jobs
+ *     -> daemon worker loop drain -> createExtractCandidateHandler 经
+ *     HeuristicTypeExtractor 抽取
  *     -> 写入候选区 pending（不污染主库）-> Console candidates API 可见。
  *
  * 接线全部在测试内组装，全用 in-memory 实现，不依赖外部数据库/网络。
@@ -32,6 +33,9 @@ import { createExtractCandidateHandler } from "../lifecycle/extract-candidate-ha
 import { defaultTypeExtractor } from "../lifecycle/type-extractor.js";
 import { InMemoryTreeRepository } from "../tree/buffer.js";
 import { createBuildTreeHandler } from "../tree/build-tree-handler.js";
+import { InMemoryGraphRepository } from "../graph/repository.js";
+import { createExtractGraphHandler } from "../graph/extract-graph-handler.js";
+import { NullLlmClient } from "../processing/llm-client.js";
 
 const scope = {
   tenantId: "local",
@@ -110,26 +114,40 @@ async function startPipeline(): Promise<{
   const store = new InMemoryMemoryStore();
   const candidates = new InMemoryCandidateRepository();
   const service = new FakeMemoryService();
+  let observationSequence = 0;
 
   const extractCandidateHandler = createExtractCandidateHandler({
     extractor: defaultTypeExtractor,
     candidates,
   });
 
-  // F3：observe 也入队 build_tree，worker 需注册该 handler 才能 drain。
+  // observe 会派生三类任务，worker 必须注册完整 handler set 才能 drain。
   const treeRepository = new InMemoryTreeRepository();
   const buildTreeHandler = createBuildTreeHandler({ repository: treeRepository });
+  const graphRepository = new InMemoryGraphRepository();
+  const extractGraphHandler = createExtractGraphHandler({
+    llmClient: new NullLlmClient(),
+    graphRepository,
+  });
 
   const agentFastPath = new AgentFastPathService({
     loadRecordsForScope: async (): Promise<MemoryRecord[]> => [],
     recall: async (recallScope, query) => ({ scope: recallScope, query, hits: [] }),
+    // observation 自身必须先获得真实持久化身份，后续 job 才能安全引用。
+    // 本 e2e 使用独立 observation stub，不写主 MemoryService。
+    storeObservation: async () => ({
+      id: `observation-${++observationSequence}`,
+      stored: true,
+    }),
     // observe_light 内部调用 enqueueJob，这里落到 in-memory jobs 队列。
     enqueueJob: async ({ type, payload }) => {
-      const traceId = (payload as { traceId?: string }).traceId ?? String(Math.random());
+      const identity = (payload as { traceId?: string; chunkId?: string }).traceId
+        ?? (payload as { chunkId?: string }).chunkId
+        ?? String(Math.random());
       const job = await store.jobs.enqueue({
         type,
         payload,
-        dedupeKey: `${type}:${traceId}`,
+        dedupeKey: `${type}:${identity}`,
       });
       return job.id;
     },
@@ -139,6 +157,7 @@ async function startPipeline(): Promise<{
 
   const running = await startMemoryServer({
     service,
+    defaultScope: { ...scope, visibility: "private" },
     console: consoleApi,
     agentFastPath,
     host: "127.0.0.1",
@@ -148,7 +167,11 @@ async function startPipeline(): Promise<{
       leaseMs: 30000,
       // 小 intervalMs 让 worker 快速 drain 队列。
       intervalMs: 20,
-      handlers: { extract_candidate: extractCandidateHandler, build_tree: buildTreeHandler },
+      handlers: {
+        extract_candidate: extractCandidateHandler,
+        build_tree: buildTreeHandler,
+        extract_graph: extractGraphHandler,
+      },
     },
   });
 
@@ -185,7 +208,7 @@ describe("observe -> 候选区自动抽取链路 e2e", () => {
     expect(response.status).toBe(200);
     const ack = (await response.json()) as { ack: boolean; queuedJobs: string[] };
     expect(ack.ack).toBe(true);
-    expect(ack.queuedJobs.length).toBe(2);
+    expect(ack.queuedJobs.length).toBe(3);
 
     // 轮询等待 worker drain 队列并写入候选。
     const appeared = await waitFor(async () => {
@@ -229,12 +252,12 @@ describe("observe -> 候选区自动抽取链路 e2e", () => {
     expect(response.status).toBe(200);
     const ack = (await response.json()) as { queuedJobs: string[] };
     // job 仍会入队，但 handler 经 extractor 过滤后不产出候选。
-    expect(ack.queuedJobs.length).toBe(2);
+    expect(ack.queuedJobs.length).toBe(3);
 
     // 等待 job 被 worker 处理完（队列出现 completed），再断言候选为空。
     const processed = await waitFor(async () => {
       const completed = await pipeline.store.jobs.list("completed");
-      return completed.length >= 1;
+      return completed.length >= 3;
     });
     expect(processed).toBe(true);
 

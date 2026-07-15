@@ -14,12 +14,14 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { types as nodeUtilTypes } from "node:util";
 import { normalizeScope } from "../../../../core/scope.js";
 import { globalSlotContextBuilder, type SlotContextBuilder } from "../../../../core/slot-context-builder.js";
 import type {
   AgentTaskContextRequest,
   ContextFastResponse,
 } from "../../../core/src/domain/semantic-types.js";
+import { DATABASE_STORE_CLEANUP_WARNING } from "../../../core/src/db/types.js";
 import type { MemoryRepository } from "../../../../core/service-types.js";
 import type {
   MemoryRecord,
@@ -43,7 +45,15 @@ export interface AgentObserveLightRequest {
 
 export interface AgentObserveLightResponse {
   ack: true;
+  /** intent=ignore 时为 true，表示已确认忽略且没有产生持久化副作用。 */
+  ignored?: boolean;
   traceId: string;
+  /** Durable identity returned by the write kernel/provider. */
+  persistedId?: string;
+  /** Whether this request inserted a new durable observation. */
+  stored?: boolean;
+  /** Explicit duplicate acknowledgement; only native durable ensure may repair missing jobs. */
+  duplicate?: boolean;
   queuedJobs: string[];
   warnings?: string[];
 }
@@ -111,9 +121,15 @@ export interface AgentFastPathDeps {
     scope: MemoryScope;
     text: string;
     metadata: Record<string, unknown>;
-  }): Promise<{ id: string }>;
+  }): Promise<{
+    id: string;
+    stored: boolean;
+    warnings?: Array<typeof DATABASE_STORE_CLEANUP_WARNING>;
+  }>;
   /** job 入队（observe / session_commit 异步处理） */
   enqueueJob?(input: { type: string; payload: Record<string, unknown> }): Promise<string>;
+  /** Durable-idempotent ensure capability; duplicate observations may use it to repair missing jobs. */
+  ensureJob?(input: { type: string; payload: Record<string, unknown> }): Promise<string>;
   /** lookup_deep 时加载记忆树摘要（source/topic/global），未注入则 deep 退化为 fast。 */
   loadTreeSummaries?(scope: MemoryScope, query: string): Promise<TreeSummaryNode[]>;
   /** 自定义 SlotContextBuilder（默认全局） */
@@ -121,6 +137,73 @@ export interface AgentFastPathDeps {
   /** 默认 scope（兜底） */
   defaultScope?: MemoryScope;
   logger?: { info?(msg: string): void; warn?(msg: string): void };
+}
+
+interface ParsedStoreObservationOutcome {
+  readonly id: string;
+  readonly stored: boolean;
+  readonly warnings?: readonly (typeof DATABASE_STORE_CLEANUP_WARNING)[];
+}
+
+function parseStoreObservationOutcome(value: unknown): ParsedStoreObservationOutcome | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value) || nodeUtilTypes.isProxy(value)) {
+    return undefined;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return undefined;
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key !== "string") ||
+      keys.some((key) => key !== "id" && key !== "stored" && key !== "warnings") ||
+      !keys.includes("id") || !keys.includes("stored")) {
+    return undefined;
+  }
+  const snapshot: Record<string, unknown> = {};
+  for (const key of keys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || descriptor.enumerable !== true ||
+        !Object.prototype.hasOwnProperty.call(descriptor, "value") ||
+        descriptor.get !== undefined || descriptor.set !== undefined) {
+      return undefined;
+    }
+    snapshot[key] = descriptor.value;
+  }
+  const id = snapshot.id;
+  const stored = snapshot.stored;
+  if (typeof id !== "string" || id.length === 0 || id.length > 512 || id !== id.trim() ||
+      /[\u0000-\u001f\u007f]/.test(id) || typeof stored !== "boolean") {
+    return undefined;
+  }
+
+  let warnings: readonly (typeof DATABASE_STORE_CLEANUP_WARNING)[] | undefined;
+  if (Object.prototype.hasOwnProperty.call(snapshot, "warnings")) {
+    const rawWarnings = snapshot.warnings;
+    if (!Array.isArray(rawWarnings) || nodeUtilTypes.isProxy(rawWarnings)) return undefined;
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(rawWarnings, "length");
+    if (!lengthDescriptor || !Object.prototype.hasOwnProperty.call(lengthDescriptor, "value") ||
+        !Number.isSafeInteger(lengthDescriptor.value) || Number(lengthDescriptor.value) < 0 ||
+        lengthDescriptor.get !== undefined || lengthDescriptor.set !== undefined) {
+      return undefined;
+    }
+    const length = Number(lengthDescriptor.value);
+    const warningKeys = Reflect.ownKeys(rawWarnings);
+    const expected = length === 0 ? ["length"] : ["0", "length"];
+    if (length > 1 || warningKeys.length !== expected.length ||
+        warningKeys.some((key) => typeof key !== "string" || !expected.includes(key))) {
+      return undefined;
+    }
+    if (length === 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(rawWarnings, "0");
+      if (!descriptor || descriptor.enumerable !== true ||
+          !Object.prototype.hasOwnProperty.call(descriptor, "value") ||
+          descriptor.value !== DATABASE_STORE_CLEANUP_WARNING) {
+        return undefined;
+      }
+      warnings = Object.freeze([DATABASE_STORE_CLEANUP_WARNING]);
+    } else {
+      warnings = Object.freeze([]);
+    }
+  }
+  return Object.freeze({ id, stored, ...(warnings ? { warnings } : {}) });
 }
 
 /**
@@ -169,12 +252,27 @@ export class AgentFastPathService {
   ): Promise<AgentObserveLightResponse> {
     const scope = normalizeScope(request.scope, this.deps.defaultScope);
     const traceId = randomUUID();
+
+    if (request.intent === "ignore") {
+      return {
+        ack: true,
+        ignored: true,
+        traceId,
+        queuedJobs: [],
+      };
+    }
+
     const jobs: string[] = [];
     const warnings: string[] = [];
+    let storeOutcome: {
+      id: string;
+      stored: boolean;
+      warnings?: readonly (typeof DATABASE_STORE_CLEANUP_WARNING)[];
+    } | undefined;
 
     if (this.deps.storeObservation) {
       try {
-        await this.deps.storeObservation({
+        const outcome = await this.deps.storeObservation({
           scope,
           text: request.text,
           metadata: {
@@ -184,16 +282,42 @@ export class AgentFastPathService {
             traceId,
           },
         });
+        const parsedOutcome = parseStoreObservationOutcome(outcome);
+        if (!parsedOutcome) {
+          warnings.push("observation_store_outcome_invalid");
+        } else {
+          storeOutcome = parsedOutcome;
+          if (storeOutcome.warnings) warnings.push(...storeOutcome.warnings);
+        }
       } catch (err) {
         warnings.push(`observation_store_failed: ${(err as Error).message}`);
       }
+    } else {
+      warnings.push("observation_store_unavailable");
     }
 
-    if (this.deps.enqueueJob) {
+    // No durable identity means downstream jobs would point at a dangling trace.
+    if (!storeOutcome) {
+      return {
+        ack: true,
+        traceId,
+        persistedId: undefined,
+        stored: undefined,
+        duplicate: undefined,
+        queuedJobs: [],
+        warnings: warnings.length > 0 ? warnings : undefined,
+      };
+    }
+
+    // Generic enqueue is not assumed idempotent and is used only for a new
+    // durable observation. Duplicate repair is allowed solely through the
+    // separately injected native-v2 ensure capability.
+    const jobWriter = this.deps.ensureJob ?? (storeOutcome.stored ? this.deps.enqueueJob : undefined);
+    if (jobWriter) {
       try {
-        const jobId = await this.deps.enqueueJob({
+        const jobId = await jobWriter({
           type: "extract_candidate",
-          payload: { scope, text: request.text, traceId, intent: request.intent },
+          payload: { scope, text: request.text, traceId: storeOutcome.id, intent: request.intent },
         });
         jobs.push(jobId);
       } catch (err) {
@@ -204,15 +328,16 @@ export class AgentFastPathService {
       // 树构建失败不影响 observation ack；树是 in-memory 增强，非主链路。
       try {
         const treeKey = scope.sessionId ?? "default";
-        const treeJobId = await this.deps.enqueueJob({
+        const treeJobId = await jobWriter({
           type: "build_tree",
           payload: {
             scope,
+            traceId: storeOutcome.id,
             treeType: "source",
             treeKey,
             leaf: {
-              id: traceId,
-              chunkId: traceId,
+              id: storeOutcome.id,
+              chunkId: storeOutcome.id,
               sourceId: scope.sessionId ?? scope.appId,
               text: request.text,
               eventAt: Date.now(),
@@ -223,11 +348,36 @@ export class AgentFastPathService {
       } catch (err) {
         warnings.push(`tree_enqueue_failed: ${(err as Error).message}`);
       }
+
+      // 同一 durable observation 进入 graph 抽取；effect 在 worker 侧持久化到
+      // canonical PostgreSQL graph，失败不影响 observation ack。
+      try {
+        const graphJobId = await jobWriter({
+          type: "extract_graph",
+          payload: {
+            scope,
+            chunkId: storeOutcome.id,
+            text: request.text,
+            sourceId: scope.sessionId ?? scope.appId,
+            context: {
+              projectName: scope.projectId,
+              userName: scope.userId,
+              agentName: scope.agentId,
+            },
+          },
+        });
+        jobs.push(graphJobId);
+      } catch (err) {
+        warnings.push(`graph_enqueue_failed: ${(err as Error).message}`);
+      }
     }
 
     return {
       ack: true,
       traceId,
+      persistedId: storeOutcome.id,
+      stored: storeOutcome.stored,
+      duplicate: !storeOutcome.stored,
       queuedJobs: jobs,
       warnings: warnings.length > 0 ? warnings : undefined,
     };

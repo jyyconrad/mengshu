@@ -21,6 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
 import type { MemoryCategory } from "./config.js";
+import { isLiveTestEnabled } from "./tests/eval/runners/live-test-policy.js";
 
 // 环境变量配置
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
@@ -31,14 +32,16 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY ?? "";
 
 const HAS_OPENAI_KEY = Boolean(process.env.OPENAI_API_KEY);
 const HAS_SUPABASE = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY);
+const LIVE_TESTS_ENABLED = isLiveTestEnabled(process.env);
 
-// 强制启用实时测试（如果环境变量存在）
-const describeLive = HAS_OPENAI_KEY ? describe : describe.skip;
-const describeSupabase = HAS_SUPABASE ? describe : describe.skip;
+// 凭据只表示能力，不代表执行授权；live 必须由专用 flag 显式开启。
+const describeLive = LIVE_TESTS_ENABLED && HAS_OPENAI_KEY ? describe : describe.skip;
+const describeSupabase = LIVE_TESTS_ENABLED && HAS_SUPABASE ? describe : describe.skip;
 
 console.log('Environment check:', {
   hasOpenAIKey: HAS_OPENAI_KEY,
   hasSupabase: HAS_SUPABASE,
+  liveTestsEnabled: LIVE_TESTS_ENABLED,
   openAIBaseUrl: process.env.OPENAI_BASE_URL ? 'set' : 'missing',
   embeddingModel: process.env.EMBEDDING_MODEL || 'default',
 });

@@ -1,0 +1,1 @@
+{"id":"runtime-rest-001","suite":"mengshu-runtime-rest","input":{"jobId":"eval-runtime-build-tree-001","leafId":"eval-runtime-leaf-001","text":"production RuntimeHost must consume the durable build_tree job before release evidence is accepted"},"expected":{"healthOk":true,"records":0,"jobStatus":"completed","effectKey":"build_tree.persist.v1","treeLeafPersisted":true}}

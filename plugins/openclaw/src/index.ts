@@ -6,9 +6,8 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { memoryConfigSchema } from "../../../config.js";
-import {
-  registerOpenClawAdapter,
-} from "./register.js";
+import { registerOpenClawAdapter } from "./register.js";
+import { defaultScopeFromExactOpenClawAuthority } from "./authority.js";
 import {
   OPENCLAW_LEGACY_MEMORY_PLUGIN_IDS,
   OPENCLAW_MEMORY_PLUGIN_ID,
@@ -35,8 +34,18 @@ const memoryPlugin = {
   configSchema: memoryConfigSchema,
 
   register(api: OpenClawPluginApi) {
-    const cfg = memoryConfigSchema.parse(api.pluginConfig);
-    registerOpenClawAdapter(api, cfg);
+    const config = memoryConfigSchema.parse(api.pluginConfig);
+    if (!config.authority) {
+      throw new Error(
+        "Mengshu OpenClaw host integration requires an explicit authenticated AuthorityScope " +
+        "in the local operator-owned plugin config",
+      );
+    }
+    const defaultScope = defaultScopeFromExactOpenClawAuthority(config.authority);
+    return registerOpenClawAdapter(api, config, {
+      authority: config.authority,
+      defaultScope,
+    });
   },
 };
 

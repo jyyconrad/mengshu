@@ -1,9 +1,16 @@
+import { randomUUID } from "node:crypto";
 import type { MemoryConfig } from "../../../../../config.js";
 import type { DatabaseProvider, MemoryEntry, TableName } from "../../db/types.js";
 import { Embeddings } from "../../runtime/llm/embeddings.js";
 import { computeContentHash } from "../../scoring/hash-utils.js";
 import { FileScanner, type FileScannerOptions } from "./file-scanner.js";
 import { MarkdownProcessor, type MarkdownProcessorOptions } from "./markdown-processor.js";
+import type { MemoryScope } from "../../domain/types.js";
+import { memoryScopeToCanonicalEntryFields } from "../../domain/legacy-mapping.js";
+
+export interface ScannerEmbeddingWriteGate {
+  assertWriteAllowed(): void;
+}
 
 export interface ScanResult {
   /** 扫描的目录路径 */
@@ -23,6 +30,8 @@ export interface ScanResult {
 }
 
 export interface ScannerCoordinatorOptions {
+  /** 必填：生产 composition root 必须传入 runtime 的同一 write gate。 */
+  embeddingWriteGuard: ScannerEmbeddingWriteGate;
   /** 文件扫描选项 */
   scannerOptions?: FileScannerOptions;
   /** Markdown 处理选项 */
@@ -33,6 +42,10 @@ export interface ScannerCoordinatorOptions {
   targetTable?: TableName;
   /** 是否自动丰富元数据 */
   autoEnrichMetadata?: boolean;
+  /** 新写必需的 canonical authority scope；缺失时 scanner fail-closed。 */
+  scope?: MemoryScope;
+  /** 测试/可重复运行注入；生产默认 randomUUID。 */
+  idFactory?: () => string;
 }
 
 /**
@@ -47,13 +60,20 @@ export class ScannerCoordinator {
   private batchSize: number;
   private targetTable: TableName;
   private autoEnrichMetadata: boolean;
+  private canonicalScope?: MemoryScope;
+  private embeddingWriteGuard: ScannerEmbeddingWriteGate;
+  private idFactory: () => string;
 
   constructor(
     config: MemoryConfig,
     db: DatabaseProvider,
-    options: ScannerCoordinatorOptions = {},
+    options: ScannerCoordinatorOptions,
   ) {
+    if (!options?.embeddingWriteGuard || typeof options.embeddingWriteGuard.assertWriteAllowed !== "function") {
+      throw new Error("ScannerCoordinator requires an explicit embedding write guard");
+    }
     this.db = db;
+    this.embeddingWriteGuard = options.embeddingWriteGuard;
     this.embeddings = new Embeddings(config.embedding, config.batchProcessing);
     this.fileScanner = new FileScanner({
       ...options.scannerOptions,
@@ -70,6 +90,8 @@ export class ScannerCoordinator {
     this.batchSize = options.batchSize ?? config.batchProcessing?.maxBatchSize ?? 20;
     this.targetTable = options.targetTable ?? "knowledge";
     this.autoEnrichMetadata = options.autoEnrichMetadata ?? true;
+    this.canonicalScope = options.scope;
+    this.idFactory = options.idFactory ?? randomUUID;
   }
 
   /**
@@ -78,6 +100,9 @@ export class ScannerCoordinator {
    * @returns 扫描结果统计
    */
   async scanDirectory(directory: string): Promise<ScanResult> {
+    // Enforced runtime 在读取文件前即可 fail-fast；legacy gate 会显式放行。
+    this.embeddingWriteGuard.assertWriteAllowed();
+
     const result: ScanResult = {
       directory,
       totalFiles: 0,
@@ -120,19 +145,30 @@ export class ScannerCoordinator {
    * @returns 返回 {stored: 存储数量，duplicates: 重复数量}
    */
   private async processChunkBatch(chunks: string[], metadata: Record<string, unknown>, filePath: string): Promise<{ stored: number; duplicates: number }> {
-    // 计算所有分片的哈希
-    const hashes = chunks.map(chunk => computeContentHash(chunk));
+    // Registry 可能在长扫描期间变化，因此每个 batch 在任何 DB/embedding 工作前复检。
+    this.embeddingWriteGuard.assertWriteAllowed();
 
-    // 检查哪些已经存在
-    const existingHashes = await this.db.existsByContentHash(hashes);
-    const existingSet = new Set(existingHashes);
+    if (!this.canonicalScope) {
+      throw new Error("ScannerCoordinator requires canonical authority scope before storage");
+    }
+    const canonicalScopeFields = memoryScopeToCanonicalEntryFields(this.canonicalScope);
 
-    // 过滤出不存在的分片
-    const newChunks = chunks.filter((_, index) => !existingSet.has(hashes[index]));
-    const newHashes = hashes.filter(hash => !existingSet.has(hash));
-
-    // 统计重复数量
-    const duplicateCount = chunks.length - newChunks.length;
+    // 全局 existsByContentHash 是跨 authority existence oracle，不能参与持久去重。
+    // 这里只消除当前 request batch 内的重复；数据库复合唯一键负责持久幂等。
+    const seenHashes = new Set<string>();
+    const newChunks: string[] = [];
+    const newHashes: string[] = [];
+    let duplicateCount = 0;
+    for (const chunk of chunks) {
+      const hash = computeContentHash(chunk);
+      if (seenHashes.has(hash)) {
+        duplicateCount += 1;
+        continue;
+      }
+      seenHashes.add(hash);
+      newChunks.push(chunk);
+      newHashes.push(hash);
+    }
 
     if (newChunks.length === 0) {
       return { stored: 0, duplicates: duplicateCount };
@@ -157,7 +193,7 @@ export class ScannerCoordinator {
       }
 
       return {
-        id: "", // 数据库自动生成
+        id: this.idFactory(),
         text: chunk,
         contentHash: newHashes[index],
         vector: vectors[index],
@@ -167,12 +203,33 @@ export class ScannerCoordinator {
         tableName: this.targetTable,
         metadata: entryMetadata,
         createdAt: Date.now(),
+        ...canonicalScopeFields,
       };
     }) as MemoryEntry[];
 
     // 存储到数据库
-    await this.db.store(entries);
+    const outcome = await this.db.store(entries);
+    if (!outcome) {
+      throw new Error("Scanner storage provider did not return a durable store outcome");
+    }
+    if (outcome.inserted + outcome.duplicates !== entries.length ||
+        outcome.records.length !== entries.length ||
+        outcome.records.filter((record) => record.stored).length !== outcome.inserted) {
+      throw new Error("Scanner storage provider returned an inconsistent store outcome");
+    }
+    const expectedIds = new Set(entries.map((entry) => entry.id));
+    const seenRequestedIds = new Set<string>();
+    for (const record of outcome.records) {
+      if (!expectedIds.has(record.requestedId) || seenRequestedIds.has(record.requestedId) ||
+          typeof record.persistedId !== "string" || record.persistedId.length === 0) {
+        throw new Error("Scanner storage provider returned an invalid record identity outcome");
+      }
+      seenRequestedIds.add(record.requestedId);
+    }
 
-    return { stored: newChunks.length, duplicates: duplicateCount };
+    return {
+      stored: outcome.inserted,
+      duplicates: duplicateCount + outcome.duplicates,
+    };
   }
 }

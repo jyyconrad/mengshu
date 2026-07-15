@@ -11,13 +11,18 @@
  * 3. context/lookup 复用 MemoryService.recall；recall 需 embedding，不可用时降级提示不 crash。
  *
  * 关键边界（v0.1）：
- * - 不强制目录索引；status 的记录数走 getRecordCount（库级总数），scope 级精确计数待 v0.2 provider filter。
+ * - 不强制目录索引；缺少 authority-scoped count 时 status 不读取库级总数。
  * - 与 cli.ts 共用 CommanderLike 鸭子类型，避免引入 commander 硬依赖。
  * - 所有命令对缺失 manifest / 缺失 service 做友好提示，不抛未捕获异常。
  */
 
 import { basename, resolve } from "node:path";
-import type { CommanderLike } from "./index.js";
+import {
+  requireOpenClawCliAuthority,
+  resolveOpenClawCliScope,
+  type CommanderLike,
+  type OpenClawCliAuthorityContext,
+} from "./index.js";
 import type { MemoryService } from "../../../../core/service-types.js";
 import type { MemoryVisibility } from "../../../../core/types.js";
 import { scopeToKey } from "../../../../core/scope.js";
@@ -35,26 +40,21 @@ import {
 import { readRegistry, writeRegistry, upsertProject, touchProjectOpenedAt } from "../../../../core/registry.js";
 import { resolveProjectManifestPath, type HomePathOptions } from "../../../../core/paths.js";
 import { isGlobalConfigReady, runInteractiveSetup } from "./setup.js";
-import { registerIngestHistoryCommand } from "./ingest-history.js";
-import { registerBackfillObservationMetadataCommand } from "./backfill-observation-metadata.js";
-import type { DatabaseProvider } from "../../../../packages/core/src/db/types.js";
 
-/** project 命令依赖注入。service/getRecordCount 缺省时相关命令降级。 */
-export interface ProjectCliDeps {
+/** project 命令依赖注入。所有 identity 在访问 memory service 前经过 authority allowlist。 */
+export interface ProjectCliDeps extends OpenClawCliAuthorityContext {
   /** 用于 context/lookup 的召回服务（需 embedding）。 */
   service?: MemoryService;
-  /** 返回库内记录总数（status 展示用，scope 级精确计数待 v0.2）。 */
+  /** Deprecated raw count dependency; deliberately not consumed by authority-safe commands. */
   getRecordCount?: () => Promise<number>;
   /** 当前工作目录提供者，便于测试注入。 */
   cwd?: () => string;
   /** 全局 home 路径选项，便于测试注入。 */
   homePathOptions?: HomePathOptions;
-  /** Embeddings 客户端（用于 ingest-history 真实验证）。 */
-  embeddings?: any;
-  /** LLM 客户端（用于 ingest-history 真实验证）。 */
-  llmClient?: any;
-  /** 数据库 provider（用于 backfill-observation-metadata）。 */
-  db?: DatabaseProvider;
+  /** Deprecated unsafe dependencies retained only for source compatibility. */
+  embeddings?: unknown;
+  llmClient?: unknown;
+  db?: unknown;
 }
 
 interface InitOptions {
@@ -99,6 +99,14 @@ function printReusePolicy(manifest: MemoryAutodbManifest): void {
 }
 
 async function handleInit(positional: unknown, options: InitOptions, deps: ProjectCliDeps): Promise<void> {
+  const serverScope = requireOpenClawCliAuthority(deps);
+  if (options.userId !== undefined) {
+    throw new Error("OpenClaw --user-id is server-owned and cannot be set by CLI input");
+  }
+  const scope = resolveOpenClawCliScope(deps, {
+    projectId: options.projectId ?? serverScope.projectId,
+    visibility: options.visibility ?? serverScope.visibility ?? "private",
+  });
   // 首次使用时引导全局配置
   if (!isGlobalConfigReady(deps.homePathOptions)) {
     console.log("首次使用梦枢，需要先完成全局配置。\n");
@@ -109,6 +117,7 @@ async function handleInit(positional: unknown, options: InitOptions, deps: Proje
   const dir = resolveDir(positional, options, deps);
   const existing = readProjectManifest(dir, deps.homePathOptions);
   if (existing && !options.force) {
+    resolveManifestScope(existing, deps);
     console.log(`manifest 已存在（${manifestPath(dir)}），保留原 identity。使用 --force 覆盖。`);
     printIdentity(existing);
     // 更新 registry 的 lastOpenedAt
@@ -125,9 +134,9 @@ async function handleInit(positional: unknown, options: InitOptions, deps: Proje
   const manifest = createManifest({
     dir,
     workspaceId: options.workspaceId,
-    projectId: options.projectId,
-    userId: options.userId,
-    defaultVisibility: options.visibility,
+    projectId: scope.projectId,
+    userId: scope.userId,
+    defaultVisibility: scope.visibility,
   });
   writeProjectIdentity(dir, manifest, deps.homePathOptions);
   console.log(`已创建 ${MANIFEST_FILENAME}（${manifestPath(dir)}）`);
@@ -151,26 +160,21 @@ async function handleInit(positional: unknown, options: InitOptions, deps: Proje
 }
 
 async function handleStatus(positional: unknown, options: DirOptions, deps: ProjectCliDeps): Promise<void> {
+  requireOpenClawCliAuthority(deps);
   const dir = resolveDir(positional, options, deps);
   const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
     console.log(`未找到 ${MANIFEST_FILENAME}，请先运行 \`ms init\`。`);
     return;
   }
+  resolveManifestScope(manifest, deps);
 
   console.log("Project Workspace Status:");
   printIdentity(manifest);
   printReusePolicy(manifest);
   console.log(`- sourceRoots: ${manifest.sourceRoots.length} 个（v0.1 默认不索引目录）`);
 
-  if (deps.getRecordCount) {
-    try {
-      const count = await deps.getRecordCount();
-      console.log(`- 库内记录总数: ${count}（scope 级精确计数待 provider filter）`);
-    } catch (error) {
-      console.log(`- 库内记录总数: 不可用（${(error as Error).message}）`);
-    }
-  }
+  console.log("- 记录统计: 已禁用（缺少 authority-scoped count contract）");
 }
 
 async function handleContext(
@@ -178,6 +182,7 @@ async function handleContext(
   options: DirOptions & { task?: string },
   deps: ProjectCliDeps,
 ): Promise<void> {
+  requireOpenClawCliAuthority(deps);
   const dir = resolveDir(positional, options, deps);
   const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
@@ -185,7 +190,7 @@ async function handleContext(
     return;
   }
 
-  const scope = manifestToScope(manifest);
+  const scope = resolveManifestScope(manifest, deps);
   console.log("Project 5-Slot Context:");
   console.log(`- workspaceId: ${manifest.workspaceId}`);
   console.log(`- projectId:   ${manifest.projectId}`);
@@ -214,6 +219,7 @@ async function handleContext(
 }
 
 async function handleLookup(query: unknown, options: DirOptions, deps: ProjectCliDeps): Promise<void> {
+  requireOpenClawCliAuthority(deps);
   const dir = resolveDir(undefined, options, deps);
   const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
@@ -225,7 +231,7 @@ async function handleLookup(query: unknown, options: DirOptions, deps: ProjectCl
     return;
   }
 
-  const scope = manifestToScope(manifest);
+  const scope = resolveManifestScope(manifest, deps);
   const text = typeof query === "string" ? query : "";
   try {
     const result = await deps.service.recall({ query: text, scope, limit: 5, minScore: 0.1 });
@@ -252,7 +258,7 @@ export function registerProjectCliCommands(memory: CommanderLike, deps: ProjectC
     .description("Initialize project memory workspace (.mengshu.json)")
     .option("--workspace-id <id>", "Explicit workspace id")
     .option("--project-id <id>", "Explicit project id")
-    .option("--user-id <id>", "User id for scope")
+    .option("--user-id <id>", "Disabled: user identity is server-owned")
     .option("--visibility <level>", "Default visibility: private | workspace | team | public")
     .option("--force", "Overwrite existing manifest", false)
     .action(async (...args: unknown[]) => {
@@ -296,24 +302,19 @@ export function registerProjectCliCommands(memory: CommanderLike, deps: ProjectC
       await handleLookup(query, { dir: optString(asRecord(opts).dir) }, deps);
     });
 
-  registerIngestHistoryCommand(project, {
-    cwd: deps.cwd,
-    service: deps.service,
-    embeddings: deps.embeddings,
-    llmClient: deps.llmClient,
-    defaultScope: {
-      tenantId: "",
-      appId: "openclaw",
-      userId: "default",
-      projectId: "",
-      agentId: "",
-      namespace: "",
-    },
-  });
+}
 
-  registerBackfillObservationMetadataCommand(project, {
-    db: deps.db,
-    cwd: deps.cwd,
+function resolveManifestScope(
+  manifest: MemoryAutodbManifest,
+  deps: ProjectCliDeps,
+) {
+  const requested = manifestToScope(manifest);
+  return resolveOpenClawCliScope(deps, {
+    appId: requested.appId,
+    projectId: requested.projectId,
+    agentId: requested.agentId,
+    namespace: requested.namespace,
+    visibility: requested.visibility ?? "private",
   });
 }
 

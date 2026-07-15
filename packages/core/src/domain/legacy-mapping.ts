@@ -111,17 +111,49 @@ function buildProvenance(entry: MemoryEntry): RecordProvenance {
   };
 }
 
+/** 新写统一使用的 canonical scope → MemoryEntry 字段映射；禁止猜测或省略默认值。 */
+export function memoryScopeToCanonicalEntryFields(
+  scope: MemoryRecord["scope"],
+): Pick<
+  MemoryEntry,
+  "tenantId" | "userId" | "canonicalProjectId" | "productId" |
+  "producerId" | "namespace" | "visibility"
+> {
+  for (const [field, value] of Object.entries({
+    tenantId: scope.tenantId,
+    userId: scope.userId,
+    projectId: scope.projectId,
+    appId: scope.appId,
+    agentId: scope.agentId,
+    namespace: scope.namespace,
+  })) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new Error(`canonical scope field ${field} is required`);
+    }
+  }
+  return {
+    tenantId: scope.tenantId,
+    userId: scope.userId,
+    canonicalProjectId: scope.projectId,
+    productId: scope.appId,
+    producerId: scope.agentId,
+    namespace: scope.namespace,
+    visibility: scope.visibility ?? "private",
+  };
+}
+
 export function memoryEntryToRecord(entry: MemoryEntry, defaults: MemoryScopeInput = {}): MemoryRecord {
   const metadata = entry.metadata;
   const scope = normalizeScope({
-    tenantId: defaults.tenantId,
+    tenantId: entry.tenantId ?? defaults.tenantId,
     // D-25：优先使用独立列（projectName/appName/userId/agentId/workspaceId），NULL 时回退 defaults
-    appId: entry.appName ?? defaults.appId,
+    appId: entry.productId ?? entry.appName ?? defaults.appId,
     userId: entry.userId ?? (typeof metadata.userId === "string" ? metadata.userId : defaults.userId),
-    projectId: entry.projectName ?? (typeof metadata.projectPath === "string" ? metadata.projectPath : defaults.projectId),
-    agentId: entry.agentId ?? (typeof metadata.agentName === "string" ? metadata.agentName : defaults.agentId),
-    namespace: tableNameToNamespace(entry.tableName),
+    projectId: entry.canonicalProjectId ?? entry.projectName ?? (typeof metadata.projectPath === "string" ? metadata.projectPath : defaults.projectId),
+    agentId: entry.producerId ?? entry.agentId ?? (typeof metadata.agentName === "string" ? metadata.agentName : defaults.agentId),
+    namespace: entry.namespace ?? tableNameToNamespace(entry.tableName),
     workspaceId: entry.workspaceId ?? defaults.workspaceId,
+    visibility: entry.visibility ?? defaults.visibility,
   });
 
   const recordKind = inferKind(entry);
@@ -146,6 +178,7 @@ export function memoryEntryToRecord(entry: MemoryEntry, defaults: MemoryScopeInp
       : undefined,
     confidence: typeof metadata.confidence === "number" ? metadata.confidence : undefined,
     semanticType: resolveSemanticType(metadata, recordKind),
+    lifecycleStatus: entry.lifecycleStatus,
     vector: [...entry.vector],
   };
 }
@@ -167,13 +200,12 @@ export function recordToMemoryEntry(record: MemoryRecord, vector?: number[]): Me
     appName: record.scope.appId && record.scope.appId !== "default"
       ? record.scope.appId
       : undefined,
-    userId: record.scope.userId && record.scope.userId !== "default"
-      ? record.scope.userId
-      : undefined,
     agentId: record.scope.agentId && record.scope.agentId !== "default"
       ? record.scope.agentId
       : undefined,
     workspaceId: record.scope.workspaceId,
+    ...memoryScopeToCanonicalEntryFields(record.scope),
+    lifecycleStatus: record.lifecycleStatus,
     metadata: {
       ...record.metadata,
       ...(record.hotness !== undefined && { hotness: record.hotness }),

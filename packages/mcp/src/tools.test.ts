@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +6,9 @@ import type { MemoryService } from "../../../core/service-types.js";
 import type { ContextBlock, MemoryRecord, RecallResult } from "../../../core/types.js";
 import type { IngestInput, IngestResult } from "../../core/src/ingest/types.js";
 import type { IngestionPipeline } from "../../core/src/ingest/pipeline.js";
+import type { AuthorityScope } from "../../core/src/domain/authority-scope.js";
+import { createAuthorityScopedForgetCapability } from "../../core/src/service/authority-forget-capability.js";
+import { PostgresForgetTransactionPort } from "../../core/src/db/providers/postgres-forget-transaction.js";
 import { createMcpMemoryTools } from "./tools.js";
 
 const scope = {
@@ -85,9 +88,140 @@ const ingestScope = {
   namespace: "knowledge",
 };
 
+const transportAuthority: AuthorityScope = {
+  tenantId: "server-tenant",
+  userId: "server-user",
+  allow: {
+    appIds: ["mengshu"],
+    projectIds: ["project-1"],
+    agentIds: ["agent-1"],
+    namespaces: ["memories"],
+    visibilities: ["private"],
+  },
+};
+
+const attackerScope = {
+  tenantId: "attacker-tenant",
+  userId: "attacker-user",
+  appId: "mengshu",
+  projectId: "project-1",
+  agentId: "agent-1",
+  namespace: "memories",
+  visibility: "private",
+};
+
+function mintedForgetCapability(service: { forget(input: never): Promise<never> }) {
+  return createAuthorityScopedForgetCapability(
+    service as never,
+    new PostgresForgetTransactionPort({
+      connect: async () => ({
+        query: async () => ({ rows: [] }),
+        release: () => undefined,
+      }),
+    }),
+  );
+}
+
 describe("MCP memory tools", () => {
+  test("server authority makes tenant/user client override zero across save/recall/context/observe/forget", async () => {
+    const service = new FakeMemoryService();
+    const capturedScopes: unknown[] = [];
+    service.storeMemory = (async (input: { record: { scope: unknown } }) => {
+      capturedScopes.push(input.record.scope);
+      return { id: "mem-1", stored: true };
+    }) as unknown as typeof service.storeMemory;
+    service.recall = (async (input: { scope: unknown }) => {
+      capturedScopes.push(input.scope);
+      return { scope, query: "", hits: [] };
+    }) as unknown as typeof service.recall;
+    service.buildContext = (async (input: { scope: unknown }) => {
+      capturedScopes.push(input.scope);
+      return { scope, content: "", hits: [], tokenEstimate: 0 };
+    }) as unknown as typeof service.buildContext;
+    const forgetService = {
+      async forget(input: { clientScope: unknown; serverAuthority: AuthorityScope }) {
+        capturedScopes.push({
+          ...(input.clientScope as Record<string, unknown>),
+          tenantId: input.serverAuthority.tenantId,
+          userId: input.serverAuthority.userId,
+        });
+        return {
+          action: "delete" as const,
+          affected: 0,
+          deleted: 0,
+          affectedIds: [],
+          transactional: true as const,
+          idempotentReplay: false,
+        };
+      },
+    };
+    const tools = createMcpMemoryTools({
+      service,
+      forgetCapability: mintedForgetCapability(forgetService as never),
+      authority: transportAuthority,
+      defaultScope: {
+        tenantId: "server-tenant",
+        userId: "server-user",
+        appId: "mengshu",
+        projectId: "project-1",
+        agentId: "agent-1",
+        namespace: "memories",
+      },
+    });
+    const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
+
+    await byName.memory_save.execute({ text: "save", scope: attackerScope });
+    await byName.memory_recall.execute({ query: "recall", scope: attackerScope });
+    await byName.memory_context.execute({ query: "context", scope: attackerScope });
+    await byName.memory_observe.execute({ text: "observe", scope: attackerScope });
+    await byName.memory_forget.execute({
+      filter: { category: "core" },
+      scope: attackerScope,
+      idempotencyKey: "request-1",
+    });
+
+    expect(capturedScopes).toHaveLength(5);
+    for (const captured of capturedScopes) {
+      expect(captured).toMatchObject({ tenantId: "server-tenant", userId: "server-user" });
+      expect(captured).not.toMatchObject({ tenantId: "attacker-tenant" });
+    }
+  });
+
+  test.each([
+    ["invalid action", { action: "destroy", ids: ["mem-1"] }],
+    ["non-string id", { ids: ["mem-1", 42] }],
+    ["empty id", { ids: [""] }],
+    ["duplicate ids", { ids: ["mem-1", "mem-1"] }],
+  ])("RED: authority forget rejects %s before service", async (_label, invalid) => {
+    const inputs: unknown[] = [];
+    const forgetService = {
+      async forget(input: unknown) {
+        inputs.push(input);
+        return { action: "delete" as const, affected: 0, deleted: 0, affectedIds: [], transactional: true as const, idempotentReplay: false };
+      },
+    };
+    const tools = createMcpMemoryTools({
+      service: new FakeMemoryService(),
+      forgetCapability: mintedForgetCapability(forgetService as never),
+      authority: transportAuthority,
+    });
+    const forget = tools.find((tool) => tool.name === "memory_forget")!;
+
+    await expect(forget.execute({
+      ...invalid,
+      scope: {
+        appId: "mengshu",
+        projectId: "project-1",
+        agentId: "agent-1",
+        namespace: "memories",
+        visibility: "private",
+      },
+      idempotencyKey: "request-1",
+    })).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+    expect(inputs).toEqual([]);
+  });
   test("exposes the planned core tool names", () => {
-    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
 
     expect(tools.map((tool) => tool.name)).toEqual([
       "memory_save",
@@ -96,35 +230,59 @@ describe("MCP memory tools", () => {
       "memory_observe",
       "memory_ingest",
       "memory_namespaces",
-      "memory_forget",
       "memory_health",
     ]);
   });
 
+  test("authority mode does not list memory_forget without explicit transactional capability", () => {
+    const service = Object.assign(new FakeMemoryService(), {
+      forget: async () => { throw new Error("method presence is not a capability"); },
+    });
+    const tools = createMcpMemoryTools({ service, authority: transportAuthority });
+    expect(tools.map((tool) => tool.name)).not.toContain("memory_forget");
+  });
+
+  test("explicit structural fake capability still does not list memory_forget", () => {
+    const forgetService = {
+      forget: async () => ({
+        action: "delete" as const,
+        affected: 0,
+        deleted: 0,
+        affectedIds: [],
+        transactional: true as const,
+        idempotentReplay: false,
+      }),
+    };
+    const tools = createMcpMemoryTools({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      forgetCapability: forgetService as never,
+    });
+    expect(tools.map((tool) => tool.name)).not.toContain("memory_forget");
+  });
+
   test("maps core tools to MemoryService calls", async () => {
     const service = new FakeMemoryService();
-    const tools = createMcpMemoryTools({ service });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service });
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
 
     await expect(byName.memory_save.execute({ record })).resolves.toEqual({ id: "mem-1", stored: true });
     await expect(byName.memory_observe.execute({ record })).resolves.toEqual({ id: "mem-1", stored: true });
     await expect(byName.memory_recall.execute({ query: "concise" })).resolves.toContain("User prefers concise replies");
     await expect(byName.memory_context.execute({ query: "concise" })).resolves.toMatchObject({ content: "safe" });
-    await expect(byName.memory_forget.execute({ ids: ["mem-1"] })).resolves.toEqual({ deleted: 1 });
-    await expect(byName.memory_health.execute({})).resolves.toEqual({ ok: true, records: 1 });
+    await expect(byName.memory_health.execute({})).resolves.toEqual({ ok: true });
 
     expect(service.calls).toEqual([
       "storeMemory",
       "storeMemory",
       "recall",
       "buildContext",
-      "delete",
       "health",
     ]);
   });
 
   test("memory_recall returns text-first output by default", async () => {
-    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
 
     const result = await byName.memory_recall.execute({ query: "concise" });
@@ -135,7 +293,7 @@ describe("MCP memory tools", () => {
   });
 
   test("memory_recall returns structured output when raw is requested", async () => {
-    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
 
     await expect(byName.memory_recall.execute({ query: "concise", raw: true })).resolves.toMatchObject({
@@ -161,7 +319,7 @@ describe("MCP memory tools", () => {
       query: "long",
       hits: [{ record: longRecord, score: 0.9, source: "vector" }],
     })) as unknown as typeof service.recall;
-    const tools = createMcpMemoryTools({ service });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service });
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
 
     const result = await byName.memory_recall.execute({ query: "long", maxTextChars: 120 });
@@ -179,7 +337,7 @@ describe("MCP memory tools", () => {
       return { id: "mem-1", stored: true };
     }) as unknown as typeof service.storeMemory;
 
-    const tools = createMcpMemoryTools({
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
       service,
       defaultScope: {
         tenantId: "local",
@@ -221,7 +379,7 @@ describe("MCP memory tools", () => {
   });
 
   test("memory_save schema makes text the required memory body", () => {
-    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
     const save = tools.find((tool) => tool.name === "memory_save");
     const schema = save?.inputSchema as {
       description?: string;
@@ -245,7 +403,7 @@ describe("MCP memory tools", () => {
   });
 
   test("memory_save fails fast with an actionable text-field hint", async () => {
-    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
 
     await expect(byName.memory_save.execute({ content: "wrong field" })).rejects.toThrow(
@@ -254,7 +412,7 @@ describe("MCP memory tools", () => {
   });
 
   test("reports namespaces from configured defaults", async () => {
-    const tools = createMcpMemoryTools({
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
       service: new FakeMemoryService(),
       namespaces: ["memories", "knowledge"],
     });
@@ -263,8 +421,56 @@ describe("MCP memory tools", () => {
     await expect(namespaces?.execute({})).resolves.toEqual({ namespaces: ["memories", "knowledge"] });
   });
 
+  test("authority mode reports only allowlisted namespaces", async () => {
+    const tools = createMcpMemoryTools({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      defaultScope: {
+        tenantId: "server-tenant",
+        userId: "server-user",
+        appId: "mengshu",
+        projectId: "project-1",
+        agentId: "agent-1",
+        namespace: "memories",
+        visibility: "private",
+      },
+      namespaces: ["memories", "knowledge"],
+    });
+    const namespaces = tools.find((tool) => tool.name === "memory_namespaces");
+
+    await expect(namespaces?.execute({})).resolves.toEqual({ namespaces: ["memories"] });
+  });
+
+  test("memory_health omits global counts and raw provider errors", async () => {
+    const service = new FakeMemoryService();
+    service.health = vi.fn(async () => ({
+      ok: false,
+      records: 12345,
+      error: "postgres://user:raw-secret@host/db",
+    }));
+    const tools = createMcpMemoryTools({
+      service,
+      authority: transportAuthority,
+      defaultScope: {
+        tenantId: "server-tenant",
+        userId: "server-user",
+        appId: "mengshu",
+        projectId: "project-1",
+        agentId: "agent-1",
+        namespace: "memories",
+        visibility: "private",
+      },
+    });
+    const health = tools.find((tool) => tool.name === "memory_health");
+
+    await expect(health?.execute({})).resolves.toEqual({
+      ok: false,
+      code: "SERVICE_UNAVAILABLE",
+    });
+  });
+
   test("memory_ingest stays unimplemented when no pipeline is injected", async () => {
-    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
     const ingest = tools.find((tool) => tool.name === "memory_ingest");
 
     const result = (await ingest?.execute({ source: "file-system" })) as {
@@ -294,7 +500,7 @@ describe("MCP memory tools", () => {
 
     test("ingests raw text and returns document summary", async () => {
       const pipeline = new FakePipeline();
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service: new FakeMemoryService(),
         pipeline: pipeline as unknown as IngestionPipeline,
       });
@@ -317,7 +523,7 @@ describe("MCP memory tools", () => {
 
     test("ingests a file path via safe loader", async () => {
       const pipeline = new FakePipeline();
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service: new FakeMemoryService(),
         pipeline: pipeline as unknown as IngestionPipeline,
       });
@@ -336,7 +542,7 @@ describe("MCP memory tools", () => {
 
     test("dryRun returns chunk preview without persisting", async () => {
       const pipeline = new FakePipeline();
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service: new FakeMemoryService(),
         pipeline: pipeline as unknown as IngestionPipeline,
       });
@@ -357,7 +563,7 @@ describe("MCP memory tools", () => {
 
     test("rejects path traversal in file source", async () => {
       const pipeline = new FakePipeline();
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service: new FakeMemoryService(),
         pipeline: pipeline as unknown as IngestionPipeline,
       });
@@ -371,7 +577,7 @@ describe("MCP memory tools", () => {
 
     test("rejects unsupported file extension", async () => {
       const pipeline = new FakePipeline();
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service: new FakeMemoryService(),
         pipeline: pipeline as unknown as IngestionPipeline,
       });
@@ -385,7 +591,7 @@ describe("MCP memory tools", () => {
   });
 
   test("every tool exposes a JSON Schema inputSchema object", () => {
-    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
 
     for (const tool of tools) {
       expect(tool.inputSchema).toBeTypeOf("object");
@@ -394,9 +600,9 @@ describe("MCP memory tools", () => {
     }
   });
 
-  test("keeps 8 base tools when no agentFastPath is injected", () => {
-    const tools = createMcpMemoryTools({ service: new FakeMemoryService() });
-    expect(tools).toHaveLength(8);
+  test("keeps 7 safe base tools when no agentFastPath is injected", () => {
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
+    expect(tools).toHaveLength(7);
     expect(tools.map((tool) => tool.name)).not.toContain("memory_context_fast");
   });
 
@@ -417,7 +623,7 @@ describe("MCP memory tools", () => {
       },
     };
 
-    const tools = createMcpMemoryTools({
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
       service: new FakeMemoryService(),
       // 只用到 3 个方法，用最小桩替身注入
       agentFastPath: fastPath as unknown as Parameters<
@@ -425,7 +631,7 @@ describe("MCP memory tools", () => {
       >[0]["agentFastPath"],
     });
 
-    expect(tools).toHaveLength(11);
+    expect(tools).toHaveLength(10);
     const names = tools.map((tool) => tool.name);
     expect(names).toContain("memory_context_fast");
     expect(names).toContain("memory_observe_light");
@@ -442,7 +648,7 @@ describe("MCP memory tools", () => {
   describe("defaultScope 自动填充（DEFECT-001 修复）", () => {
     test("未配置 defaultScope 时，客户端未传递 scope 不会崩溃", async () => {
       const service = new FakeMemoryService();
-      const tools = createMcpMemoryTools({ service });
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service });
       const observeTool = tools.find((t) => t.name === "memory_observe");
 
       // 客户端未传递 scope
@@ -476,7 +682,7 @@ describe("MCP memory tools", () => {
         return { id: "mem-1", stored: true };
       }) as unknown as typeof service.storeMemory;
 
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service,
         defaultScope: {
           tenantId: "claude-code",
@@ -523,7 +729,7 @@ describe("MCP memory tools", () => {
         return { id: "mem-1", stored: true };
       }) as unknown as typeof service.storeMemory;
 
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service,
         defaultScope: {
           tenantId: "default-tenant",
@@ -571,7 +777,7 @@ describe("MCP memory tools", () => {
         return { scope: scope, query: "", hits: [] };
       }) as unknown as typeof service.recall;
 
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service,
         defaultScope: {
           tenantId: "recall-tenant",
@@ -606,7 +812,7 @@ describe("MCP memory tools", () => {
         },
       };
 
-      const tools = createMcpMemoryTools({
+      const tools = createMcpMemoryTools({ unsafeLegacyScope: true,
         service: new FakeMemoryService(),
         agentFastPath: fastPath as unknown as Parameters<
           typeof createMcpMemoryTools

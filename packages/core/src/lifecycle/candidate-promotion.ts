@@ -14,7 +14,7 @@
  * - 不修改入参；contentHash 由文本派生，保证同文本幂等。
  */
 
-import { computeContentHash } from "../scoring/hash-utils.js";
+import { computeContentHash, deterministicUuid } from "../scoring/hash-utils.js";
 import type { MemoryCategory } from "../../../../config.js";
 import type { CandidateRecord } from "./candidate-types.js";
 import type { MemoryKind, MemoryRecord } from "../domain/types.js";
@@ -43,7 +43,7 @@ export function candidateToMemoryRecord(
   now: number = Date.now(),
 ): MemoryRecord {
   return {
-    id: `mem-${candidate.id}`,
+    id: deterministicUuid(`mengshu:candidate-memory\0${candidate.id}`),
     scope: candidate.scope,
     kind: toMemoryKind(candidate.kind),
     semanticType: candidate.semanticType,

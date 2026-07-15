@@ -62,6 +62,7 @@ describe("web console smoke", () => {
     const service = new FakeMemoryService();
     running = await startMemoryServer({
       service,
+      defaultScope: { ...scope, visibility: "private" },
       console: createConsoleApi({ service }),
       host: "127.0.0.1",
       port: 0,

@@ -38,7 +38,7 @@ export interface CreateConsoleApiOptions {
   jobs?: JobRepository;
   tree?: TreeRepository;
   /** 候选区只读仓库（用于列出 / 计数 pending 候选） */
-  candidates?: CandidateRepository;
+  candidates?: Pick<CandidateRepository, "list" | "count">;
   /** 候选区审核服务（approve 才会通过 promoteCandidate 写入主库） */
   candidateReview?: CandidateReviewService;
 }
@@ -216,8 +216,8 @@ export function createConsoleApi(options: CreateConsoleApiOptions): ConsoleApi {
     /**
      * 批量审核候选。
      *
-     * 安全边界：只有 approve 才会通过 candidateReview.promoteCandidate →
-     * MemoryService.store 把候选写入主库；reject/archive 仅推进状态机，不注入主库。
+     * 安全边界：只有具备原子 promotion capability 的 approve 才能写入主库；
+     * capability 缺失时 review service 必须 fail-closed。reject/archive 仅推进状态机。
      * 未注入 candidateReview 时返回错误结果，绝不静默放行。
      */
     async reviewCandidates(

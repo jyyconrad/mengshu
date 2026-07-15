@@ -1,6 +1,8 @@
 // 从 config 导入并重导出类型
+import { types as nodeUtilTypes } from "node:util";
 export type { RoutingRule, KnowledgeBaseConfig } from "../../../../config.js";
 import type { MemoryCategory } from "../../../../config.js";
+import type { KnownEmbeddingSpace } from "../domain/embedding-space.js";
 
 /**
  * 数据类型区分：
@@ -126,6 +128,15 @@ export interface MemoryEntry {
   agentId?: string;
   /** 工作区标识（对应 scope.workspaceId） */
   workspaceId?: string;
+
+  // P0-B canonical scope 双写字段。旧记录可缺失；新 MemoryRecord 映射必须完整提供。
+  tenantId?: string;
+  canonicalProjectId?: string;
+  productId?: string;
+  producerId?: string;
+  namespace?: string;
+  visibility?: "private" | "workspace" | "team" | "public";
+  lifecycleStatus?: "active" | "archived" | "revoked" | "superseded" | "promoted";
 }
 
 /**
@@ -149,6 +160,13 @@ export interface MemoryQueryOptions {
   /** 是否跨所有表搜索 */
   searchAll?: boolean;
 
+  // Server-owned authority boundary. Providers must bind these to dedicated
+  // columns before LIMIT; they are never metadata filters or soft ranking hints.
+  /** Exact tenant authority filter (tenant_id). */
+  tenantId?: string;
+  /** Exact user authority filter (user_id). */
+  userId?: string;
+
   // Scope 维度列过滤（D-25 / T0：前置到 T0 以便 T1-T3 编译通过）
   /** 项目名称精确过滤（对应 project_name 列） */
   projectName?: string;
@@ -170,6 +188,227 @@ export interface TableStats {
   dataType?: DataType;
 }
 
+/** 单条 durable write 的真实落库结果。 */
+export interface DatabaseStoreRecordResult {
+  /** 调用方本次生成的 ID。 */
+  requestedId: string;
+  /** 数据库中最终持久化记录的 ID；幂等命中时可能与 requestedId 不同。 */
+  persistedId: string;
+  /** true 表示本次插入；false 表示命中同 authority 的既有记录。 */
+  stored: boolean;
+}
+
+/** 支持 provider 将幂等 no-op 明确传回 service，避免虚报 stored。 */
+export interface DatabaseStoreResult {
+  inserted: number;
+  duplicates: number;
+  records: DatabaseStoreRecordResult[];
+  cleanup?: DatabaseStoreCleanupMetadata;
+}
+
+export const DATABASE_STORE_CLEANUP_WARNING = "database_store_cleanup_failed" as const;
+
+export interface DatabaseStoreCleanupMetadata {
+  cleanupFailed: true;
+  operationStatus: "completed" | "partial";
+  warning: typeof DATABASE_STORE_CLEANUP_WARNING;
+}
+
+function isSafeStoreId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 &&
+    value === value.trim() && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function readExactDataObject(
+  value: unknown,
+  requiredKeys: readonly string[],
+  optionalKeys: readonly string[] = [],
+): Readonly<Record<string, unknown>> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value) || nodeUtilTypes.isProxy(value)) {
+    return undefined;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return undefined;
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key !== "string")) return undefined;
+  const strings = ownKeys as string[];
+  const allowed = new Set([...requiredKeys, ...optionalKeys]);
+  if (strings.length < requiredKeys.length || strings.some((key) => !allowed.has(key)) ||
+      requiredKeys.some((key) => !strings.includes(key))) {
+    return undefined;
+  }
+  const snapshot: Record<string, unknown> = {};
+  for (const key of strings) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || descriptor.enumerable !== true ||
+        !Object.prototype.hasOwnProperty.call(descriptor, "value") ||
+        descriptor.get !== undefined || descriptor.set !== undefined) {
+      return undefined;
+    }
+    snapshot[key] = descriptor.value;
+  }
+  return Object.freeze(snapshot);
+}
+
+function readExactDataArray(value: unknown): readonly unknown[] | undefined {
+  if (!Array.isArray(value) || nodeUtilTypes.isProxy(value)) return undefined;
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (!lengthDescriptor || !Object.prototype.hasOwnProperty.call(lengthDescriptor, "value") ||
+      !Number.isSafeInteger(lengthDescriptor.value) || Number(lengthDescriptor.value) < 0 ||
+      lengthDescriptor.get !== undefined || lengthDescriptor.set !== undefined) {
+    return undefined;
+  }
+  const length = Number(lengthDescriptor.value);
+  const ownKeys = Reflect.ownKeys(value);
+  const expected = new Set(["length", ...Array.from({ length }, (_, index) => String(index))]);
+  if (ownKeys.some((key) => typeof key !== "string" || !expected.has(key)) ||
+      ownKeys.length !== expected.size) {
+    return undefined;
+  }
+  const snapshot: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || descriptor.enumerable !== true ||
+        !Object.prototype.hasOwnProperty.call(descriptor, "value") ||
+        descriptor.get !== undefined || descriptor.set !== undefined) {
+      return undefined;
+    }
+    snapshot.push(descriptor.value);
+  }
+  return Object.freeze(snapshot);
+}
+
+export function parseDatabaseStoreResult(value: unknown): DatabaseStoreResult | undefined {
+  const top = readExactDataObject(value, ["inserted", "duplicates", "records"], ["cleanup"]);
+  if (!top) return undefined;
+  const insertedValue = top.inserted;
+  const duplicatesValue = top.duplicates;
+  const rawRecords = readExactDataArray(top.records);
+  if (!Number.isSafeInteger(insertedValue) || Number(insertedValue) < 0 ||
+      !Number.isSafeInteger(duplicatesValue) || Number(duplicatesValue) < 0 || !rawRecords ||
+      Number(insertedValue) + Number(duplicatesValue) !== rawRecords.length) {
+    return undefined;
+  }
+
+  let inserted = 0;
+  let duplicates = 0;
+  const requestedIds = new Set<string>();
+  const records: DatabaseStoreRecordResult[] = [];
+  for (const rawRecord of rawRecords) {
+    const record = readExactDataObject(rawRecord, ["requestedId", "persistedId", "stored"]);
+    if (!record || !isSafeStoreId(record.requestedId) || !isSafeStoreId(record.persistedId) ||
+        typeof record.stored !== "boolean" || requestedIds.has(record.requestedId)) {
+      return undefined;
+    }
+    requestedIds.add(record.requestedId);
+    if (record.stored) inserted += 1;
+    else duplicates += 1;
+    records.push(Object.freeze({
+      requestedId: record.requestedId,
+      persistedId: record.persistedId,
+      stored: record.stored,
+    }));
+  }
+  if (inserted !== insertedValue || duplicates !== duplicatesValue) return undefined;
+
+  let cleanup: DatabaseStoreCleanupMetadata | undefined;
+  if (Object.prototype.hasOwnProperty.call(top, "cleanup")) {
+    const parsedCleanup = readExactDataObject(
+      top.cleanup,
+      ["cleanupFailed", "operationStatus", "warning"],
+    );
+    if (!parsedCleanup || parsedCleanup.cleanupFailed !== true ||
+        (parsedCleanup.operationStatus !== "completed" && parsedCleanup.operationStatus !== "partial") ||
+        parsedCleanup.warning !== DATABASE_STORE_CLEANUP_WARNING) {
+      return undefined;
+    }
+    cleanup = Object.freeze({
+      cleanupFailed: true,
+      operationStatus: parsedCleanup.operationStatus,
+      warning: DATABASE_STORE_CLEANUP_WARNING,
+    });
+  }
+
+  return Object.freeze({
+    inserted,
+    duplicates,
+    records: Object.freeze(records) as DatabaseStoreRecordResult[],
+    ...(cleanup ? { cleanup } : {}),
+  });
+}
+
+export function isDatabaseStoreResult(value: unknown): value is DatabaseStoreResult {
+  return parseDatabaseStoreResult(value) !== undefined;
+}
+
+export class DatabaseStoreCleanupError extends Error {
+  readonly #contractBrand = true;
+  readonly code = "DATABASE_STORE_CLEANUP_FAILED" as const;
+  readonly cleanupFailed = true;
+  readonly warning = DATABASE_STORE_CLEANUP_WARNING;
+
+  readonly receipt: DatabaseStoreResult;
+  readonly operationStatus: "completed" | "partial";
+
+  constructor(receipt: DatabaseStoreResult, operationStatus: "completed" | "partial") {
+    super(operationStatus === "completed"
+      ? "Database store completed but cleanup failed"
+      : "Database store partially completed and cleanup failed");
+    this.name = "DatabaseStoreCleanupError";
+    const normalized = parseDatabaseStoreResult(receipt);
+    if (!normalized ||
+        (operationStatus === "completed" && normalized.cleanup?.operationStatus === "partial")) {
+      throw new Error("Database store cleanup receipt is invalid");
+    }
+    this.receipt = normalized;
+    this.operationStatus = operationStatus;
+    Object.defineProperties(this, {
+      code: { writable: false, configurable: false },
+      cleanupFailed: { writable: false, configurable: false },
+      warning: { writable: false, configurable: false },
+      receipt: { writable: false, configurable: false },
+      operationStatus: { writable: false, configurable: false },
+    });
+  }
+
+  static hasContractBrand(error: unknown): error is DatabaseStoreCleanupError {
+    return typeof error === "object" && error !== null && #contractBrand in error;
+  }
+}
+
+export function parseDatabaseStoreCleanupError(error: unknown): Readonly<{
+  receipt: DatabaseStoreResult;
+  operationStatus: "completed" | "partial";
+  cleanupFailed: true;
+  warning: typeof DATABASE_STORE_CLEANUP_WARNING;
+}> | undefined {
+  if (!error || typeof error !== "object" || nodeUtilTypes.isProxy(error)) return undefined;
+  if (!DatabaseStoreCleanupError.hasContractBrand(error)) return undefined;
+  const readContractField = (key: "code" | "cleanupFailed" | "warning" | "operationStatus" | "receipt") => {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value") ||
+        descriptor.get !== undefined || descriptor.set !== undefined) {
+      return undefined;
+    }
+    return descriptor.value;
+  };
+  const code = readContractField("code");
+  const cleanupFailed = readContractField("cleanupFailed");
+  const warning = readContractField("warning");
+  const operationStatus = readContractField("operationStatus");
+  const receipt = parseDatabaseStoreResult(readContractField("receipt"));
+  if (code !== "DATABASE_STORE_CLEANUP_FAILED" || cleanupFailed !== true ||
+      warning !== DATABASE_STORE_CLEANUP_WARNING ||
+      (operationStatus !== "completed" && operationStatus !== "partial") || !receipt) {
+    return undefined;
+  }
+  return Object.freeze({ receipt, operationStatus, cleanupFailed: true, warning });
+}
+
+export function isDatabaseStoreCleanupError(error: unknown): error is DatabaseStoreCleanupError {
+  return parseDatabaseStoreCleanupError(error) !== undefined;
+}
+
 /**
  * 数据库提供者接口
  * 所有数据库实现都需要实现这个接口
@@ -189,7 +428,7 @@ export interface DatabaseProvider {
    * 存储记忆条目
    * @param entries 要存储的记忆条目数组
    */
-  store(entries: MemoryEntry[]): Promise<void>;
+  store(entries: MemoryEntry[]): Promise<DatabaseStoreResult | void>;
 
   /**
    * 查询相关记忆
@@ -241,6 +480,12 @@ export interface DatabaseProvider {
    * 获取表统计信息
    */
   getTableStats?(): Promise<TableStats[]>;
+
+  /** Postgres persisted active embedding registry capability. */
+  getActiveEmbeddingSpace?(): Promise<KnownEmbeddingSpace | null>;
+
+  /** Explicit operator transition: first registration wins; mismatch fails closed. */
+  registerActiveEmbeddingSpace?(space: KnownEmbeddingSpace): Promise<KnownEmbeddingSpace>;
 
   /**
    * 按 id 更新记录的 metadata（jsonb merge，仅部分后端实现）。

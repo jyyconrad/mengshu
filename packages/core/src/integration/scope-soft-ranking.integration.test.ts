@@ -1,9 +1,9 @@
 /**
  * scope 软排序集成测试。
  *
- * 验证 scope 从硬过滤改为软排序后的端到端行为：
- * - 跨 scope 记忆可被检索（不被 SQL WHERE 拦截）
- * - 同 scope 记忆排序靠前（scopeFit 高）
+ * 验证 authority 硬隔离 + scope 软排序后的端到端行为：
+ * - tenant/user 跨 authority 记忆不可见
+ * - 同 authority 内跨 project/agent 仍可检索，并由 scopeFit 排序
  * - 显式 filter 仍然透传生效
  */
 
@@ -19,8 +19,17 @@ class StubProvider implements DatabaseProvider {
   async initialize(): Promise<void> {}
   async close(): Promise<void> {}
 
-  async store(entries: MemoryEntry[]): Promise<void> {
+  async store(entries: MemoryEntry[]) {
     this.entries.push(...entries);
+    return {
+      inserted: entries.length,
+      duplicates: 0,
+      records: entries.map((entry) => ({
+        requestedId: entry.id,
+        persistedId: entry.id,
+        stored: true,
+      })),
+    };
   }
 
   async query(): Promise<Array<MemoryEntry & { score: number }>> {
@@ -59,7 +68,7 @@ describe("scope soft ranking integration", () => {
     service = new DefaultMemoryService({ repository: adapter, embeddings: new StubEmbeddings() });
   });
 
-  test("recalls memories across different scopes (no hard WHERE filter)", async () => {
+  test("filters memories from a different tenant/user authority", async () => {
     const scopeA = {
       tenantId: "local",
       appId: "openclaw",
@@ -111,16 +120,16 @@ describe("scope soft ranking integration", () => {
       },
     });
 
-    // 用 scopeA 召回：应该同时能检索到 mem-A 和 mem-B（跨 scope）
+    // 用 scopeA 召回：provider 即使错误返回全量，service 也必须剔除另一用户。
     const result = await service.recall({
       query: "preference",
       scope: scopeA,
     });
 
-    expect(result.hits).toHaveLength(2);
+    expect(result.hits).toHaveLength(1);
     const ids = result.hits.map((h: { record: { id: string } }) => h.record.id);
     expect(ids).toContain("mem-A");
-    expect(ids).toContain("mem-B");
+    expect(ids).not.toContain("mem-B");
   });
 
   test("ranks same-scope memory first via scopeFit signal", async () => {

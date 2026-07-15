@@ -5,9 +5,12 @@
   "updatedAt": "2026-06-16",
   "suites": {
     "mengshu-v0.1": {
+      "kind": "baseline",
+      "runner": "slot-context-v1",
       "file": "mengshu-v0.1.jsonl",
-      "size": 30,
-      "sha256": "92c8d45a50b33c08e2b258800a6b88bbebefe748d2265cf9648203309641c3ff",
+      "caseCount": 30,
+      "bytes": 19147,
+      "sha256": "082bd7165c76ab17639cabf00d10ca7280d8bc0696d4717eb03b96e9027278dc",
       "coverage": {
         "profile_workspace_reuse": 6,
         "rules_workspace_reuse": 6,
@@ -19,9 +22,12 @@
       "metrics": ["slot_recall", "wrong_injection", "latency"]
     },
     "mengshu-safety": {
+      "kind": "baseline",
+      "runner": "slot-context-v1",
       "file": "mengshu-safety.jsonl",
-      "size": 40,
-      "sha256": "ed6da2125b0d622642918bf4f6f6e07c333de218bfed8fa385c776489bebade6",
+      "caseCount": 40,
+      "bytes": 25105,
+      "sha256": "773cbaa12023b2c2436cc687d95184bf94ac934deb0fb25377cc2343b2af4ffc",
       "coverage": {
         "visibility_private": 6,
         "lifecycle_revoked": 6,
@@ -37,8 +43,11 @@
       "metrics": ["wrong_injection", "sensitive_blocked", "must_escape", "latency"]
     },
     "mengshu-extraction": {
+      "kind": "extension",
+      "runner": "candidate-extraction-v1",
       "file": "mengshu-extraction.jsonl",
-      "size": 45566,
+      "caseCount": 100,
+      "bytes": 45566,
       "sha256": "d6aef5a467e831cdb01eaac41f8e083235084b1087349d679dea3aaa79d0fc12",
       "coverage": {
         "profile_extraction": 20,
@@ -49,18 +58,23 @@
         "rejection_gates": 16,
         "boundary_cases": 14
       },
-      "metrics": ["type_precision", "extraction_precision", "over_capture"],
+      "metrics": ["type_precision", "extraction_precision", "type_recall", "extraction_recall", "over_capture"],
       "description": "候选抽取 + 5 type 分类。覆盖 11 闸门、5 type、边界样例（应抽不抽/不应抽却抽）",
       "phase": "P0-c",
       "gate": {
         "type_precision": 0.85,
         "extraction_precision": 0.80,
+        "type_recall": 0.80,
+        "extraction_recall": 0.80,
         "over_capture": 0.10
       }
     },
     "mengshu-dedup": {
+      "kind": "extension",
+      "runner": "semantic-dedup-v1",
       "file": "mengshu-dedup.jsonl",
-      "size": 22191,
+      "caseCount": 80,
+      "bytes": 22191,
       "sha256": "36797aebf46bc0fc6e6cb6da29616c375eb8d10f60c3908a2ebcc88791a2412e",
       "coverage": {
         "duplicate": 30,
@@ -79,9 +93,12 @@
       "notes": "验证 D-06 中文短文本 0.88 / 英文 0.85 阈值"
     },
     "mengshu-recall-explain": {
+      "kind": "extension",
+      "runner": "recall-explain-v1",
       "file": "mengshu-recall-explain.jsonl",
-      "size": 25042,
-      "sha256": "0e4bfd2f9f3fe6760fcfb02a30c7a02db5218735ffbf198d00a2d5fb02bbcf6b",
+      "caseCount": 60,
+      "bytes": 23567,
+      "sha256": "669b59c8eb80e9d425c75005c228d07e067d19a520a0c70eb5ee22ae65421b1d",
       "coverage": {
         "profile_intent": 10,
         "rules_intent": 10,
@@ -98,9 +115,12 @@
       }
     },
     "mengshu-conflict": {
+      "kind": "extension",
+      "runner": "conflict-detection-v1",
       "file": "mengshu-conflict.jsonl",
-      "size": 3436,
-      "sha256": "50c1e70bfc0b8a5dfe750d1cf6df01b4ce6eaa13ddc78ed6ea15d27d98d5fd26",
+      "caseCount": 10,
+      "bytes": 3613,
+      "sha256": "deca420420157177691bd5b1ddcca2d01521fe57d2a201c19948c679966b409c",
       "coverage": {
         "rules_conflict": 8,
         "profile_conflict": 1,
@@ -116,9 +136,12 @@
       "notes": "P1/P3 待扩充至 50 条"
     },
     "mengshu-tree-summary": {
+      "kind": "extension",
+      "runner": "tree-summary-v1",
       "file": "mengshu-tree-summary.jsonl",
-      "size": 3551,
-      "sha256": "176cdb31cdc0291cdf5be31eb2dcfe876ae4da65e87c6606151e1dbf4456ade3",
+      "caseCount": 8,
+      "bytes": 4916,
+      "sha256": "3a241731c69682a27389b538ea7df1a2441138e924bbcd0a9094cf034395bce5",
       "coverage": {
         "source_tree": 3,
         "topic_tree": 2,
@@ -135,9 +158,12 @@
       "notes": "P3 待扩充至 50 条"
     },
     "mengshu-skill-candidate": {
+      "kind": "extension",
+      "runner": "skill-candidate-v1",
       "file": "mengshu-skill-candidate.jsonl",
-      "size": 3335,
-      "sha256": "91caec9e581dff8c8190bc7d3f0a4b90724d5373002c8a458cdd19441f21cd6d",
+      "caseCount": 8,
+      "bytes": 5488,
+      "sha256": "f1848b40f41b869cc4dc30b4ff5f2ae65fcd7d0703a577dc675a09e3e49eeb60",
       "coverage": {
         "aggregation_threshold": 3,
         "independent_schema": 2,
@@ -155,7 +181,7 @@
     }
   },
   "notes": [
-    "本 manifest 在每次黄金集变更时同步更新 sha256 与 size。",
+    "本 manifest 在每次黄金集变更时同步更新 sha256、bytes 与 caseCount。",
     "release gate：safety wrong_injection_rate=0；v0.1 pass rate>=80%。",
     "P0-c 新增 6 个 suite：extraction(100)、dedup(80)、recall-explain(60) 充分样例；conflict(10)、tree-summary(8)、skill-candidate(8) 骨架占位。",
     "P0-c gate：extraction type precision>=0.85、extraction precision>=0.80、over-capture<=0.10；dedup duplicate precision>=0.90、false merge<=0.03；recall-explain breakdown 输出率=1.0。"

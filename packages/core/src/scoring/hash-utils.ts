@@ -19,3 +19,27 @@ export function computeContentHash(text: string): string {
 export function computeContentHashes(texts: string[]): string[] {
   return texts.map(text => computeContentHash(text));
 }
+
+/**
+ * 从稳定逻辑键生成 RFC 9562 UUIDv8。
+ *
+ * Postgres durable 表使用 UUID 主键；调用方仍可把 sourceId/candidateId 等逻辑键
+ * 留在 metadata/provenance，但不得把带前缀的业务字符串直接写入 UUID 列。
+ */
+export function deterministicUuid(input: string): string {
+  const hex = createHash("sha256").update(input).digest("hex").slice(0, 32).split("");
+  hex[12] = "8";
+  hex[16] = ((Number.parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+  const value = hex.join("");
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** 已是 UUID 则保留，否则用带 domain 的逻辑键派生 durable UUID。 */
+export function durableUuid(domain: string, logicalId: string): string {
+  if (!domain || !logicalId) throw new Error("durable UUID domain and logical id are required");
+  return UUID.test(logicalId)
+    ? logicalId
+    : deterministicUuid(`mengshu:${domain}\0${logicalId}`);
+}

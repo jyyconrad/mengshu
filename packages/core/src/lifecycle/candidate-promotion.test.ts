@@ -41,7 +41,7 @@ function candidate(overrides: Partial<CandidateRecord> = {}): CandidateRecord {
 describe("candidateToMemoryRecord", () => {
   test("映射核心字段并固定 active 状态", () => {
     const record = candidateToMemoryRecord(candidate(), 5000);
-    expect(record.id).toBe("mem-cand-1");
+    expect(record.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(record.scope).toEqual(scope);
     expect(record.text).toBe("复杂方案先给短结论");
     expect(record.semanticType).toBe("profile");
@@ -56,6 +56,9 @@ describe("candidateToMemoryRecord", () => {
     const a = candidateToMemoryRecord(candidate(), 1);
     const b = candidateToMemoryRecord(candidate({ id: "cand-2" }), 2);
     expect(a.contentHash).toBe(b.contentHash);
+    expect(candidateToMemoryRecord(candidate(), 1).id).toBe(
+      candidateToMemoryRecord(candidate(), 2).id,
+    );
   });
 
   test("evidence 保留且记录原候选 id 可追溯", () => {

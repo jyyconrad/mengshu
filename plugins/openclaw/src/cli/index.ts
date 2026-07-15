@@ -5,11 +5,25 @@
  * 仍保留在 index.ts，避免一次性迁移全部 CLI。
  */
 
+import { createConnection } from "node:net";
 import type { MemoryConfig } from "../../../../config.js";
 import type { MemoryService } from "../../../../core/service-types.js";
 import type { TableStats } from "../../../../db/types.js";
-import { startMemoryServer, type StartMemoryServerOptions } from "../../../../server/daemon.js";
-import { planV4Migration } from "../../../../migration/v4.js";
+import type { MemoryScope } from "../../../../packages/core/src/domain/types.js";
+import type { AuthorityScope } from "../../../../packages/core/src/domain/authority-scope.js";
+import type { MemoryAutodbRegistry } from "../../../../packages/core/src/runtime/registry.js";
+import {
+  startMemoryServer,
+  type MemoryServerLifecycleHost,
+  type StartMemoryServerOptions,
+} from "../../../../server/daemon.js";
+import { resolveOpenClawAuthorityScope } from "../authority.js";
+import {
+  POSTGRES_SCHEMA_CUTOVER_TARGET,
+  PostgresSchemaCutoverCliError,
+  runPostgresSchemaCutover,
+  type PostgresSchemaCutoverPort,
+} from "./migrate-v10.js";
 
 export interface CommanderLike {
   command(name: string): CommanderLike;
@@ -18,7 +32,31 @@ export interface CommanderLike {
   action(handler: (...args: unknown[]) => unknown): CommanderLike;
 }
 
-export interface RegisterMemoryServerCliOptions {
+export interface OpenClawCliAuthorityContext {
+  /** Authenticated server authority. CLI code must never synthesize this value. */
+  authority?: AuthorityScope;
+  /** Runtime-owned default request, validated against authority before use. */
+  defaultScope?: MemoryScope;
+}
+
+export function requireOpenClawCliAuthority(
+  context: Partial<OpenClawCliAuthorityContext>,
+): MemoryScope {
+  if (!context.authority || !context.defaultScope) {
+    throw new Error("OpenClaw CLI authenticated authority and defaultScope are required");
+  }
+  return resolveOpenClawAuthorityScope(context.authority, context.defaultScope);
+}
+
+export function resolveOpenClawCliScope(
+  context: OpenClawCliAuthorityContext,
+  request?: Record<string, unknown>,
+): MemoryScope {
+  requireOpenClawCliAuthority(context);
+  return resolveOpenClawAuthorityScope(context.authority!, context.defaultScope!, request);
+}
+
+export interface RegisterMemoryServerCliOptions extends OpenClawCliAuthorityContext {
   config: Pick<MemoryConfig, "dbType" | "dbPath" | "server">;
   service: MemoryService;
   getTableStats?: () => Promise<TableStats[]>;
@@ -28,8 +66,20 @@ export interface RegisterMemoryServerCliOptions {
   console?: StartMemoryServerOptions["console"];
   /** Agent 快路径服务，注入后 daemon 暴露 /v1/agent/*（context/observe/lookup/session）。 */
   agentFastPath?: StartMemoryServerOptions["agentFastPath"];
-  /** 后台 job worker，注入后 daemon 在 listen 期间 drain extract_candidate 等 job。 */
-  worker?: StartMemoryServerOptions["worker"];
+  /** Production serve 必须显式构造 Durable Job v2 RuntimeHost；缺失时 fail-closed。 */
+  runtimeHostFactory?: () => MemoryServerLifecycleHost;
+  /** Listener 探针；测试可注入，默认执行有超时的 TCP connect。 */
+  probeServer?: (target: ServerProbeTarget) => Promise<boolean>;
+  /** PostgreSQL-only, provider-owned fixed migration facade plus one-run registry snapshot. */
+  schemaCutover?: {
+    readonly port: PostgresSchemaCutoverPort;
+    readonly getRegistry: () => MemoryAutodbRegistry;
+  };
+}
+
+export interface ServerProbeTarget {
+  host: string;
+  port: number;
 }
 
 function serverHost(config: RegisterMemoryServerCliOptions["config"]): string {
@@ -44,6 +94,38 @@ function serverUrl(config: RegisterMemoryServerCliOptions["config"]): string {
   return `http://${serverHost(config)}:${serverPort(config)}`;
 }
 
+function listenerConnectHost(host: string): string {
+  if (host === "0.0.0.0") {
+    return "127.0.0.1";
+  }
+  if (host === "::") {
+    return "::1";
+  }
+  return host;
+}
+
+export function probeTcpListener(target: ServerProbeTarget, timeoutMs = 500): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (reachable: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(reachable);
+    };
+    const socket = createConnection({
+      host: listenerConnectHost(target.host),
+      port: target.port,
+    });
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.once("timeout", () => finish(false));
+  });
+}
+
 export function registerMemoryServerCliCommands(
   memory: CommanderLike,
   options: RegisterMemoryServerCliOptions,
@@ -54,14 +136,22 @@ export function registerMemoryServerCliCommands(
     .option("--host <host>", "Host to bind")
     .option("--port <port>", "Port to bind")
     .action(async (opts = {}) => {
+      requireOpenClawCliAuthority(options);
       const values = opts as { host?: string; port?: string };
       const host = values.host ?? serverHost(options.config);
       const port = values.port ? Number.parseInt(values.port, 10) : serverPort(options.config);
+      if (!options.runtimeHostFactory) {
+        throw new Error("Durable Job v2 RuntimeHost factory is required for serve");
+      }
+      const runtimeHost = options.runtimeHostFactory();
       const running = await (options.startServer ?? startMemoryServer)({
         service: options.service,
         console: options.console,
         agentFastPath: options.agentFastPath,
-        worker: options.worker,
+        authority: options.authority,
+        runtimeHost,
+        // Production serve 禁止回退到 legacy ingestionStore.jobs worker。
+        worker: undefined,
         host,
         port,
         secret: options.config.server?.secret,
@@ -80,14 +170,24 @@ export function registerMemoryServerCliCommands(
     .command("status")
     .description("Show memory middleware status")
     .action(async () => {
-      const health = await options.service.health();
+      requireOpenClawCliAuthority(options);
+      const target = {
+        host: serverHost(options.config),
+        port: serverPort(options.config),
+      };
+      const [health, serverReachable] = await Promise.all([
+        options.service.health(),
+        (options.probeServer ?? probeTcpListener)(target),
+      ]);
+      const serviceHealthy = health.ok && serverReachable;
       console.log("Memory Middleware Status:");
       console.log(`- Server URL: ${serverUrl(options.config)}`);
       console.log(`- Database type: ${options.config.dbType ?? "lancedb"}`);
       if (options.config.dbPath) {
         console.log(`- Database path: ${options.config.dbPath}`);
       }
-      console.log(`- Service healthy: ${health.ok}`);
+      console.log(`- Server reachable: ${serverReachable}`);
+      console.log(`- Service healthy: ${serviceHealthy}`);
       if (typeof health.records === "number") {
         console.log(`- Records: ${health.records}`);
       }
@@ -98,48 +198,88 @@ export function registerMemoryServerCliCommands(
           console.log(`- ${stat.name}: ${stat.count} entries`);
         }
       }
+      if (!serverReachable) {
+        throw new Error(`Memory server is not reachable at ${serverUrl(options.config)}`);
+      }
+      if (!health.ok) {
+        throw new Error("Memory service is unhealthy");
+      }
     });
 
   memory
     .command("health")
     .description("Show memory service health as JSON")
     .action(async () => {
+      requireOpenClawCliAuthority(options);
       console.log(JSON.stringify(await options.service.health(), null, 2));
     });
 
   memory
     .command("migrate")
-    .description("Plan or run memory schema migration")
-    .option("--to-schema <schema>", "Target schema version", "v4")
-    .option("--dry-run", "Only print migration estimates", true)
+    .description("Inspect or apply the PostgreSQL schema/canonical-scope cutover")
+    .option(
+      "--to-schema <schema>",
+      "Target schema version",
+      `v${POSTGRES_SCHEMA_CUTOVER_TARGET}`,
+    )
+    .option("--dry-run", "Only inspect migration and scope backfill state", true)
+    .option("--apply", "Apply canonical scope backfill and schema contracts", false)
+    .option("--maintenance", "Confirm the runtime is in maintenance mode", false)
+    .option("--quiescence-confirmed", "Confirm all old writers are stopped", false)
+    .option("--confirm <token>", "Exact confirmation token printed by dry-run")
+    .option(
+      "--allow-quarantine <count>",
+      "Exact existing + planned quarantine count accepted for apply",
+    )
     .action(async (opts = {}) => {
-      const values = opts as { toSchema?: string; dryRun?: boolean };
-      if ((values.toSchema ?? "v4") !== "v4") {
-        throw new Error("Only --to-schema v4 is supported");
+      requireOpenClawCliAuthority(options);
+      if (options.config.dbType !== "postgres") {
+        throw new Error("ms migrate schema cutover is supported only for PostgreSQL");
       }
-      const health = await options.service.health();
-      const sourceRecords = health.records ?? 0;
-      const plan = planV4Migration(Array.from({ length: sourceRecords }, (_, index) => ({
-        id: `record-${index}`,
-        scope: {
-          tenantId: "local",
-          appId: "openclaw",
-          userId: "default",
-          projectId: "default",
-          agentId: "default",
-          namespace: "memories",
-        },
-        kind: "fact",
-        text: "",
-        contentHash: `hash-${index}`,
-        importance: 0,
-        category: "other",
-        dataType: "memory",
-        tableName: "memories",
-        metadata: {},
-        provenance: {},
-        createdAt: 0,
-      })), values.dryRun ?? true);
-      console.log(JSON.stringify(plan, null, 2));
+      if (!options.schemaCutover) {
+        throw new Error("PostgreSQL schema cutover capability is unavailable");
+      }
+      const values = opts as {
+        toSchema?: string;
+        apply?: boolean;
+        maintenance?: boolean;
+        quiescenceConfirmed?: boolean;
+        confirm?: string;
+        allowQuarantine?: string;
+      };
+      try {
+        let allowQuarantine: number | undefined;
+        if (values.allowQuarantine !== undefined) {
+          if (!/^(0|[1-9][0-9]*)$/.test(values.allowQuarantine)) {
+            throw new PostgresSchemaCutoverCliError(
+              "SCHEMA_CUTOVER_INVALID_QUARANTINE_ALLOWANCE",
+            );
+          }
+          allowQuarantine = Number(values.allowQuarantine);
+          if (!Number.isSafeInteger(allowQuarantine)) {
+            throw new PostgresSchemaCutoverCliError(
+              "SCHEMA_CUTOVER_INVALID_QUARANTINE_ALLOWANCE",
+            );
+          }
+        }
+        const report = await runPostgresSchemaCutover(
+          options.schemaCutover.port,
+          options.schemaCutover.getRegistry(),
+          {
+            targetSchema: values.toSchema,
+            apply: values.apply === true,
+            maintenance: values.maintenance === true,
+            quiescenceConfirmed: values.quiescenceConfirmed === true,
+            confirmationToken: values.confirm,
+            allowQuarantine,
+          },
+        );
+        console.log(JSON.stringify(report, null, 2));
+      } catch (error) {
+        if (error instanceof PostgresSchemaCutoverCliError && error.report) {
+          console.log(JSON.stringify(error.report, null, 2));
+        }
+        throw error;
+      }
     });
 }

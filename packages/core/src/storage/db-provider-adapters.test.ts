@@ -18,6 +18,15 @@ import { IngestionPipeline } from "../ingest/pipeline.js";
 import type { DatabaseProvider, MemoryEntry } from "../db/types.js";
 import type { MemoryScope } from "../domain/types.js";
 import type { Embeddings } from "../runtime/llm/embeddings.js";
+import { createEmbeddingSpace } from "../domain/embedding-space.js";
+
+const embeddingSpace = createEmbeddingSpace({
+  provider: "openai",
+  baseURL: "https://api.openai.com/v1",
+  model: "text-embedding-3-small",
+  dim: 1536,
+  normalization: "none",
+});
 
 /**
  * 创建支持 metadata 字段过滤的 in-memory DatabaseProvider。
@@ -121,7 +130,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("应正确映射 ChunkRecord.text → MemoryEntry.text", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     await repos.chunks.upsertMany([
       {
@@ -150,7 +159,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("应同步生成 1536 维向量", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     await repos.chunks.upsertMany([
       {
@@ -172,7 +181,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("upsertMany 不再做去重：相同 contentHash 也会再次写入（去重交给 pipeline 层）", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     await repos.chunks.upsertMany([
       {
@@ -212,8 +221,8 @@ describe("db-provider-adapters", () => {
     const scope1 = { ...scope, projectId: "proj-1" };
     const scope2 = { ...scope, projectId: "proj-2" };
 
-    const repos1 = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope: scope1 });
-    const repos2 = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope: scope2 });
+    const repos1 = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope: scope1, embeddingSpace });
+    const repos2 = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope: scope2, embeddingSpace });
 
     await repos1.chunks.upsertMany([
       {
@@ -250,7 +259,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("应保留 chunk.provenance.sourceId（用于追溯）", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     await repos.chunks.upsertMany([
       {
@@ -270,7 +279,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("空数组不应触发 store/embed 调用", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     await repos.chunks.upsertMany([]);
 
@@ -279,7 +288,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("chunk 缺失 id 时应生成 UUID", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     await repos.chunks.upsertMany([
       {
@@ -300,7 +309,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("documents.upsert 应映射为 dataType=document 并生成向量", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     await repos.documents.upsert({
       id: "doc-1",
@@ -315,16 +324,129 @@ describe("db-provider-adapters", () => {
     expect(mockDb.store).toHaveBeenCalledTimes(1);
     const [callEntries] = (mockDb.store as any).mock.calls[0];
     expect(callEntries[0].dataType).toBe("document");
-    expect(callEntries[0].tableName).toBe("documents");
+    expect(callEntries[0].tableName).toBe("knowledge");
+    expect(callEntries[0].id).toMatch(/^[0-9a-f-]{36}$/);
     expect(callEntries[0].text).toBe("My Document");
     expect(callEntries[0].contentHash).toBe("doc-hash");
     expect(callEntries[0].vector).toHaveLength(1536);
     expect(callEntries[0].metadata.uri).toBe("file:///path/doc.md");
+    expect(callEntries[0].metadata.sourceRecordId).toBe("doc-1");
     expect(callEntries[0].metadata.language).toBe("zh");
+    expect(callEntries[0]).toMatchObject({
+      tenantId: scope.tenantId,
+      userId: scope.userId,
+      canonicalProjectId: scope.projectId,
+      productId: scope.appId,
+      producerId: scope.agentId,
+      namespace: scope.namespace,
+      visibility: "private",
+    });
+  });
+
+  it("document/chunk writes stamp canonical embedding metadata", async () => {
+    const repos = createPersistentRepositories({
+      db: mockDb,
+      embeddings: mockEmbeddings,
+      scope,
+      embeddingSpace,
+    });
+
+    await repos.documents.upsert({
+      id: "doc-space",
+      scope,
+      title: "Space Document",
+      contentHash: "doc-space-hash",
+      metadata: {},
+      createdAt: 1,
+    });
+    await repos.chunks.upsertMany([{
+      id: "chunk-space",
+      scope,
+      documentId: "doc-space",
+      text: "chunk",
+      contentHash: "chunk-space-hash",
+      ordinal: 0,
+      metadata: {},
+      provenance: { source: "scan" },
+      createdAt: 1,
+    }]);
+
+    const entries = storedEntries;
+    expect(entries).toHaveLength(2);
+    for (const entry of entries) {
+      expect(entry.metadata.embeddingSpaceId).toBe(
+        embeddingSpace.embeddingSpaceId,
+      );
+      expect(entry.metadata.embeddingSpaceState).toBe("known-queryable");
+      expect(entry).toMatchObject({
+        tenantId: scope.tenantId,
+        userId: scope.userId,
+        canonicalProjectId: scope.projectId,
+        productId: scope.appId,
+        producerId: scope.agentId,
+        namespace: scope.namespace,
+        visibility: "private",
+      });
+    }
+  });
+
+  it("persistent writes reject conflicting embedding metadata before embed/store", async () => {
+    const repos = createPersistentRepositories({
+      db: mockDb,
+      embeddings: mockEmbeddings,
+      scope,
+      embeddingSpace,
+    });
+
+    await expect(repos.documents.upsert({
+      id: "doc-conflict",
+      scope,
+      title: "Conflict",
+      contentHash: "doc-conflict-hash",
+      metadata: { embeddingSpaceId: "other-space" },
+      createdAt: 1,
+    })).rejects.toThrow(/embeddingSpaceId/);
+    await expect(repos.chunks.upsertMany([{
+      id: "chunk-conflict",
+      scope,
+      text: "conflict",
+      contentHash: "chunk-conflict-hash",
+      ordinal: 0,
+      metadata: { embeddingSpaceState: "unknown-unqueryable" },
+      provenance: { source: "scan" },
+      createdAt: 1,
+    }])).rejects.toThrow(/embeddingSpaceState/);
+
+    expect(mockEmbeddings.embed).not.toHaveBeenCalled();
+    expect(mockDb.store).not.toHaveBeenCalled();
+  });
+
+  it("chunk metadata 不可伪造 canonical scope，冲突时在 embed/store 前拒绝", async () => {
+    const repos = createPersistentRepositories({
+      db: mockDb,
+      embeddings: mockEmbeddings,
+      scope,
+      embeddingSpace,
+    });
+
+    await expect(repos.chunks.upsertMany([{
+      id: "chunk-scope-spoof",
+      scope,
+      documentId: "doc-a",
+      text: "scope spoof",
+      contentHash: "scope-spoof-hash",
+      ordinal: 0,
+      metadata: { tenantId: "tenant-other" },
+      provenance: { source: "scan" },
+      createdAt: 1,
+    }])).rejects.toThrow(/chunk metadata conflict: tenantId/);
+
+    expect(mockEmbeddings.embed).not.toHaveBeenCalled();
+    expect(mockDb.store).not.toHaveBeenCalled();
   });
 
   it("jobs 队列应支持 enqueue 去重与 lease/complete 生命周期", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     const job1 = await repos.jobs.enqueue({ type: "embed", payload: { a: 1 }, dedupeKey: "key-1" });
     const job2 = await repos.jobs.enqueue({ type: "embed", payload: { a: 2 }, dedupeKey: "key-1" });
@@ -344,7 +466,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("jobs.fail 应标记 failed 并记录 error", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     const job = await repos.jobs.enqueue({ type: "embed", payload: {}, dedupeKey: "key-fail" });
     await repos.jobs.fail(job.id, "boom");
@@ -355,7 +477,7 @@ describe("db-provider-adapters", () => {
   });
 
   it("audit.append 应返回带 id 的记录", async () => {
-    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope });
+    const repos = createPersistentRepositories({ db: mockDb, embeddings: mockEmbeddings, scope, embeddingSpace });
 
     const record = await repos.audit.append({
       scope,
@@ -384,7 +506,7 @@ describe("db-provider-adapters", () => {
 
     it("写入 scopeA 后，list({scope:scopeA}) 能查到，list({scope:scopeB}) 查不到", async () => {
       const db = createInMemoryDb();
-      const repos = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA });
+      const repos = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA, embeddingSpace });
 
       await repos.chunks.upsertMany([
         {
@@ -410,8 +532,8 @@ describe("db-provider-adapters", () => {
 
     it("相同 contentHash 不同 scope 分别写入：两个 scope 各自都能 list 到（不跨域误去重）", async () => {
       const db = createInMemoryDb();
-      const reposA = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA });
-      const reposB = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeB });
+      const reposA = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA, embeddingSpace });
+      const reposB = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeB, embeddingSpace });
 
       const sharedHash = "shared-hash";
       await reposA.chunks.upsertMany([
@@ -440,7 +562,7 @@ describe("db-provider-adapters", () => {
 
     it("list 反向映射正确（documentId/ordinal/provenance/scope/tokenCount 还原）", async () => {
       const db = createInMemoryDb();
-      const repos = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA });
+      const repos = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA, embeddingSpace });
 
       await repos.chunks.upsertMany([
         {
@@ -458,12 +580,13 @@ describe("db-provider-adapters", () => {
       ]);
 
       const [chunk] = await repos.chunks.list({ scope: scopeA });
-      expect(chunk.id).toBe("chunk-x");
+      expect(chunk.id).toMatch(/^[0-9a-f-]{36}$/);
       expect(chunk.documentId).toBe("doc-x");
       expect(chunk.text).toBe("mapping content");
       expect(chunk.contentHash).toBe("hash-x");
       expect(chunk.ordinal).toBe(7);
       expect(chunk.tokenCount).toBe(42);
+      expect(chunk.metadata.sourceRecordId).toBe("chunk-x");
       expect(chunk.provenance).toEqual({ source: "scan", sourceId: "file-x" });
       expect(chunk.scope).toEqual(scopeA);
       // 自定义 metadata 应保留，且不含 scope/保留字段
@@ -475,8 +598,8 @@ describe("db-provider-adapters", () => {
 
     it("无 filter 时返回全部 knowledge chunk", async () => {
       const db = createInMemoryDb();
-      const reposA = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA });
-      const reposB = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeB });
+      const reposA = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA, embeddingSpace });
+      const reposB = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeB, embeddingSpace });
 
       await reposA.chunks.upsertMany([
         { id: "c1", scope: scopeA, text: "a", contentHash: "h1", ordinal: 0, metadata: {}, provenance: {}, createdAt: 1 },
@@ -505,7 +628,7 @@ describe("db-provider-adapters", () => {
 
     it("同 scope 摄入两次相同内容 → 第二次 chunksDropped > 0（pipeline scope 去重生效）", async () => {
       const db = createInMemoryDb();
-      const repos = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA });
+      const repos = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA, embeddingSpace });
       const pipeline = new IngestionPipeline({
         documents: repos.documents,
         chunks: repos.chunks,
@@ -528,8 +651,8 @@ describe("db-provider-adapters", () => {
 
     it("不同 scope 摄入相同内容 → 都 admitted（无跨域误去重）", async () => {
       const db = createInMemoryDb();
-      const reposA = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA });
-      const reposB = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeB });
+      const reposA = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeA, embeddingSpace });
+      const reposB = createPersistentRepositories({ db, embeddings: makeEmbeddings(), scope: scopeB, embeddingSpace });
 
       const pipelineA = new IngestionPipeline({
         documents: reposA.documents, chunks: reposA.chunks, jobs: reposA.jobs, audit: reposA.audit,

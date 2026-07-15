@@ -117,6 +117,13 @@ describe("legacy memory mapping", () => {
       userId: "user-1",
       agentId: "openclaw-agent",
       workspaceId: undefined,
+      tenantId: "local",
+      canonicalProjectId: "/workspace/app",
+      productId: "openclaw",
+      producerId: "openclaw-agent",
+      namespace: "memories",
+      visibility: "private",
+      lifecycleStatus: undefined,
     });
   });
 
@@ -266,6 +273,15 @@ describe("legacy memory mapping", () => {
       expect(entry.userId).toBe("user-123");
       expect(entry.agentId).toBe("agent-456");
       expect(entry.workspaceId).toBe("workspace-789");
+      expect(entry).toMatchObject({
+        tenantId: "tenant-a",
+        userId: "user-123",
+        canonicalProjectId: "project-alpha",
+        productId: "codex",
+        producerId: "agent-456",
+        namespace: "memories",
+        visibility: "private",
+      });
     });
 
     test("recordToMemoryEntry 不写入默认值（避免污染）", () => {
@@ -283,12 +299,20 @@ describe("legacy memory mapping", () => {
 
       const entry = recordToMemoryEntry(record);
 
-      // 验证默认值不写入独立字段
+      // legacy 字段仍避免默认污染；userId 同时承担 canonical user_id，必须完整写入。
       expect(entry.projectName).toBeUndefined();
       expect(entry.appName).toBeUndefined();
-      expect(entry.userId).toBeUndefined();
+      expect(entry.userId).toBe("default");
       expect(entry.agentId).toBeUndefined();
       expect(entry.workspaceId).toBeUndefined();
+      expect(entry).toMatchObject({
+        tenantId: "tenant-a",
+        canonicalProjectId: "default",
+        productId: "default",
+        producerId: "default",
+        namespace: "memories",
+        visibility: "private",
+      });
     });
 
     test("memoryEntryToRecord 读回时优先使用独立列（新数据）", () => {

@@ -1,9 +1,13 @@
 /**
  * forget-handler.ts
  *
- * 工作内容：忘记 / 治理命令族的核心逻辑。通过 MemoryRepository 的
- *           read-modify-write 模式原子地变更记忆的生命周期状态、固定标记、
- *           审计日志及合并回滚，状态全部持久化在 metadata 中（与向量库解耦）。
+ * 工作内容：旧版本地 CLI 忘记 / 治理命令族的兼容逻辑。通过 MemoryRepository 的
+ *           read-modify-write 模式变更生命周期状态、固定标记、内联审计及合并回滚。
+ *
+ * 安全边界：本兼容入口不携带 server-owned AuthorityScope，也没有 provider transaction
+ * receipt，不能用于 MCP/REST 等不可信 adapter，且绝不返回 transactional=true。
+ * 新 adapter 必须调用 AuthorityScopedForgetService.forget()，由 forget-transaction.ts
+ * 完成 authority 校验、真实事务、audit/outbox 和幂等提交。
  *
  * 关键流程：
  *   1. query 获取目标记忆（scope 从第一条结果推导，或由调用方提供）
@@ -35,6 +39,7 @@ interface ForgetHandlerInput extends ForgetCommandInput {
   embeddings?: { embed(text: string): Promise<number[]> };
 }
 
+/** @deprecated 仅用于可信本地 CLI 兼容；外部 adapter 必须使用 AuthorityScopedForgetService。 */
 export async function forgetCommand(input: ForgetHandlerInput): Promise<ForgetCommandResult> {
   const { repository, id, action, actor, reason, now = Date.now(), correction, scope, embeddings } = input;
 

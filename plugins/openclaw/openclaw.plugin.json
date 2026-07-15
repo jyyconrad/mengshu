@@ -33,6 +33,16 @@
       "sensitive": true,
       "placeholder": "${SUPABASE_SERVICE_KEY}",
       "help": "Supabase service role key for dbType=supabase. Do not use the anon key."
+    },
+    "authority.tenantId": {
+      "label": "Trusted Tenant ID",
+      "advanced": true,
+      "help": "Operator-owned local identity. Never derive this value from tool input or messages."
+    },
+    "authority.userId": {
+      "label": "Trusted User ID",
+      "advanced": true,
+      "help": "Operator-owned local identity. Never derive this value from tool input or messages."
     }
   },
   "configSchema": {
@@ -42,11 +52,38 @@
       "embedding": {
         "type": "object",
         "properties": {
+          "provider": { "type": "string", "enum": ["openai"] },
           "apiKey": { "type": "string" },
           "baseURL": { "type": "string" },
           "model": { "type": "string" }
         },
         "required": ["apiKey", "baseURL"]
+      },
+      "authority": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "tenantId": { "type": "string", "minLength": 1 },
+          "userId": { "type": "string", "minLength": 1 },
+          "allow": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "appIds": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "type": "string", "minLength": 1 } },
+              "projectIds": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "type": "string", "minLength": 1 } },
+              "agentIds": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "type": "string", "minLength": 1 } },
+              "namespaces": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "type": "string", "minLength": 1 } },
+              "visibilities": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 1,
+                "items": { "type": "string", "enum": ["private", "workspace", "team", "public"] }
+              }
+            },
+            "required": ["appIds", "projectIds", "agentIds", "namespaces", "visibilities"]
+          }
+        },
+        "required": ["tenantId", "userId", "allow"]
       },
       "dbType": {
         "type": "string",
@@ -83,6 +120,6 @@
         "default": true
       }
     },
-    "required": ["embedding"]
+    "required": ["embedding", "authority"]
   }
 }

@@ -7,7 +7,7 @@
 
 import type { ChunkRecord, DocumentRecord } from "../domain/types.js";
 import { scopeToKey } from "../domain/scope.js";
-import { computeContentHash } from "../scoring/hash-utils.js";
+import { computeContentHash, deterministicUuid } from "../scoring/hash-utils.js";
 import type {
   AuditRepository,
   ChunkRepository,
@@ -40,14 +40,15 @@ export class IngestionPipeline {
     const createdAt = this.now();
     const canonical = canonicalize(input);
     const scopeKey = scopeToKey(input.scope);
-    const documentId = `doc:${computeContentHash(`${scopeKey}:${canonical.sourceId}:${canonical.markdown}`)}`;
+    const documentLogicalId = `doc:${computeContentHash(`${scopeKey}:${canonical.sourceId}:${canonical.markdown}`)}`;
+    const documentId = deterministicUuid(`mengshu:document\0${documentLogicalId}`);
     const document: DocumentRecord = {
       id: documentId,
       scope: input.scope,
       title: typeof canonical.metadata.title === "string" ? canonical.metadata.title : undefined,
       uri: canonical.sourceId,
       contentHash: computeContentHash(canonical.markdown),
-      metadata: canonical.metadata,
+      metadata: { ...canonical.metadata, logicalId: documentLogicalId },
       createdAt,
       updatedAt: createdAt,
     };

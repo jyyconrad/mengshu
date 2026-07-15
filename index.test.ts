@@ -12,10 +12,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
+import { isLiveTestEnabled } from "./tests/eval/runners/live-test-policy.js";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "test-key";
 const HAS_OPENAI_KEY = Boolean(process.env.OPENAI_API_KEY);
-const liveEnabled = HAS_OPENAI_KEY && process.env.OPENCLAW_LIVE_TEST === "1";
+const liveEnabled = HAS_OPENAI_KEY && isLiveTestEnabled(process.env);
 const describeLive = liveEnabled ? describe : describe.skip;
 
 describe("memory plugin e2e", () => {

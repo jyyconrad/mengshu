@@ -79,6 +79,15 @@ export class InMemoryMemoryStore {
         for (const record of records) {
           this.memoryRecords.set(record.id, record);
         }
+        return {
+          inserted: records.length,
+          duplicates: 0,
+          records: records.map((record) => ({
+            requestedId: record.id,
+            persistedId: record.id,
+            stored: true,
+          })),
+        };
       },
       query: async (input: MemoryRepositoryQuery) => {
         return Array.from(this.memoryRecords.values())

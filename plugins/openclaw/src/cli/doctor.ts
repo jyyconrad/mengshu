@@ -4,7 +4,7 @@
  * 本文件做什么：让产品开发者在 10 分钟内启动、诊断并接入一个 OpenClaw adapter。
  * - `ms doctor [dir]`：逐项体检（config / DB / embedding / model / 磁盘 / manifest），区分 ok/warning/fatal。
  * - `ms demo [dir]`：写入单 appId 样本工作上下文并演示 context/lookup 闭环。
- * - `ms connect [appId]`：输出可复制的接入信息（server URL / secret / scope 示例 / curl）。
+ * - `ms connect [appId]`：输出可复制的接入信息（server URL / 脱敏 secret / scope 示例 / curl）。
  *
  * 核心流程：
  * 1. 每个检查项做成独立纯函数（checkXxx），返回 { name, status, message }，便于单测。
@@ -17,12 +17,19 @@
 
 import { accessSync, constants } from "node:fs";
 import { dirname, resolve } from "node:path";
-import type { CommanderLike } from "./index.js";
+import {
+  requireOpenClawCliAuthority,
+  resolveOpenClawCliScope,
+  type CommanderLike,
+  type OpenClawCliAuthorityContext,
+} from "./index.js";
 import type { MemoryService } from "../../../../core/service-types.js";
 import type { MemoryScope } from "../../../../core/types.js";
 import { expandHome } from "../../../../core/paths.js";
 import { vectorDimsForModel } from "../../../../config.js";
 import { buildAgentService } from "./agent-service-helper.js";
+import { createConfigFingerprint } from "./config-fingerprint.js";
+import type { OpenClawEmbeddingStatus } from "../embedding-status.js";
 import {
   MANIFEST_FILENAME,
   manifestToScope,
@@ -36,14 +43,16 @@ export interface CheckResult {
   message: string;
 }
 
-/** doctor 命令的依赖注入，全部可选，缺省时对应检查降级。 */
-export interface DoctorCliDeps {
+/** doctor 命令依赖；只读 doctor 可无 authority，demo/connect 仍强制 authenticated authority。 */
+export interface DoctorCliDeps extends OpenClawCliAuthorityContext {
   /** 已解析的插件配置（含 embedding/dbType/dbPath/server）。 */
   config?: unknown;
   /** 召回与健康探测服务。 */
   service?: Pick<MemoryService, "health" | "storeMemory" | "recall">;
   /** embedding 探针，仅需 embed 方法。 */
   embeddings?: { embed(text: string): Promise<number[]> };
+  /** OpenClaw runtime 的 persisted embedding registry 脱敏状态。 */
+  embeddingStatus?: () => OpenClawEmbeddingStatus | Promise<OpenClawEmbeddingStatus>;
   /** 当前工作目录提供者，便于测试注入。 */
   cwd?: () => string;
 }
@@ -102,6 +111,31 @@ export async function checkEmbedding(
       message: `embedding 不可达（可降级）：${(error as Error).message}`,
     };
   }
+}
+
+/** 这里只验证 registry policy；真实 write path 未执行，因此必须明确标为 not-probed。 */
+export function checkEmbeddingRegistry(
+  embeddingStatus: OpenClawEmbeddingStatus,
+): CheckResult {
+  const message =
+    `status=${embeddingStatus.status}, registryWriteMode=${embeddingStatus.writeMode}, ` +
+    "writePath=not-probed, " +
+    `embeddingReadMode=${embeddingStatus.embeddingReadMode}, ` +
+    `lifecycleState=${embeddingStatus.lifecycleState}, ` +
+    `lifecycleReady=${embeddingStatus.lifecycleReady}`;
+  if (
+    embeddingStatus.status === "active" &&
+    embeddingStatus.writeMode === "write-enabled"
+  ) {
+    return { name: "embedding-registry", status: "ok", message };
+  }
+  if (
+    embeddingStatus.status === "legacy" &&
+    embeddingStatus.writeMode === "legacy-write-through"
+  ) {
+    return { name: "embedding-registry", status: "info", message };
+  }
+  return { name: "embedding-registry", status: "warning", message };
 }
 
 /** vectorDimsForModel(model)：合法 -> ok，抛错 -> fatal，缺失 -> warning。 */
@@ -208,20 +242,10 @@ const DEMO_MEMORIES: Array<{ kind: string; semanticType: string; text: string }>
 ];
 
 async function runDemo(dir: string, deps: DoctorCliDeps): Promise<void> {
+  requireOpenClawCliAuthority(deps);
   console.log("Mengshu Demo（单 appId 样本）");
   const manifest = readManifest(dir);
-  const scope: MemoryScope = manifest
-    ? manifestToScope(manifest)
-    : {
-        tenantId: "local",
-        appId: "openclaw",
-        userId: "demo-user",
-        projectId: "demo-project",
-        agentId: "default",
-        namespace: "memories",
-        workspaceId: "demo-workspace",
-        visibility: "workspace",
-      };
+  const scope = resolveDoctorScope(deps, manifest);
 
   if (!deps.service) {
     console.log("未注入 MemoryService，无法运行 demo。");
@@ -270,26 +294,33 @@ async function runDemo(dir: string, deps: DoctorCliDeps): Promise<void> {
   }
 }
 
-function runConnect(appId: string, dir: string, deps: DoctorCliDeps): void {
+function runConnect(
+  appId: string,
+  dir: string,
+  deps: DoctorCliDeps,
+  options: { showSecret?: boolean } = {},
+): void {
+  requireOpenClawCliAuthority(deps);
   const config = deps.config;
   const url = `http://${serverHost(config)}:${serverPort(config)}`;
   const secret = serverSecret(config);
   const manifest = readManifest(dir);
-  const scope = manifest
-    ? manifestToScope(manifest, { appId })
-    : { tenantId: "local", appId, userId: "default", projectId: "default", namespace: "memories" };
+  const scope = resolveDoctorScope(deps, manifest, appId);
 
   console.log(`Connect ${appId}`);
   console.log(`- server URL: ${url}`);
+  console.log(`- config fingerprint: ${createConfigFingerprint(config)}`);
   if (secret) {
-    console.log(`- secret: ${secret}`);
+    console.log(options.showSecret ? `- secret: ${secret}` : "- secret: 已配置（默认隐藏）");
   } else {
     console.log("- secret: 未配置，请用 `--secret` 生成或在 config.server.secret 设置。");
   }
   console.log("- scope 示例:");
   console.log(JSON.stringify(scope, null, 2));
   console.log("- 调用示例:");
-  const authHeader = secret ? ` -H "authorization: Bearer ${secret}"` : "";
+  const authHeader = secret
+    ? ` -H "authorization: Bearer ${options.showSecret ? secret : "$MENGSHU_SERVER_SECRET"}"`
+    : "";
   console.log(
     `curl -X POST ${url}/v1/agent/context -H "content-type: application/json"${authHeader} ` +
       `-d '${JSON.stringify({ scope, task: "示例任务" })}'`,
@@ -306,8 +337,25 @@ async function runDoctor(dir: string, deps: DoctorCliDeps): Promise<void> {
     checkStorage(config),
     checkManifest(dir),
   ];
+  if (deps.embeddingStatus) {
+    let status: OpenClawEmbeddingStatus;
+    try {
+      status = await deps.embeddingStatus();
+    } catch {
+      status = {
+        status: "unavailable",
+        writeMode: "read-only",
+        embeddingReadMode: "fail-closed",
+        lifecycleState: "degraded",
+        lifecycleReady: false,
+        reasonCode: "registry-unavailable",
+      };
+    }
+    results.push(checkEmbeddingRegistry(status));
+  }
 
   console.log("Mengshu Doctor");
+  console.log(`Config fingerprint: ${createConfigFingerprint(config)}`);
   for (const result of results) {
     console.log(`[${result.status}] ${result.name}: ${result.message}`);
   }
@@ -339,6 +387,7 @@ export function registerDoctorCliCommands(memory: CommanderLike, deps: DoctorCli
     .command("demo [dir]")
     .description("Seed single-appId sample working context and demo context/lookup")
     .action(async (...args: unknown[]) => {
+      requireOpenClawCliAuthority(deps);
       const [positional, opts] = args;
       const dir = resolveDir(positional, { dir: optString(asRecord(opts).dir) }, deps);
       await runDemo(dir, deps);
@@ -346,11 +395,33 @@ export function registerDoctorCliCommands(memory: CommanderLike, deps: DoctorCli
 
   memory
     .command("connect [appId]")
-    .description("Print copy-paste connection info (URL / secret / scope / curl)")
+    .description("Print copy-paste connection info (URL / redacted secret / scope / curl)")
     .option("--dir <dir>", "Project directory for scope example")
+    .option("--show-secret", "Explicitly include the configured server secret")
     .action((...args: unknown[]) => {
+      requireOpenClawCliAuthority(deps);
       const [appId, opts] = args;
-      const dir = resolveDir(undefined, { dir: optString(asRecord(opts).dir) }, deps);
-      runConnect(optString(appId) ?? "openclaw", dir, deps);
+      const parsedOptions = asRecord(opts);
+      const dir = resolveDir(undefined, { dir: optString(parsedOptions.dir) }, deps);
+      runConnect(optString(appId) ?? "openclaw", dir, deps, {
+        showSecret: parsedOptions.showSecret === true,
+      });
     });
+}
+
+function resolveDoctorScope(
+  deps: DoctorCliDeps,
+  manifest?: ReturnType<typeof readManifest>,
+  appId?: string,
+): MemoryScope {
+  const requested = manifest
+    ? manifestToScope(manifest, { appId: appId ?? deps.defaultScope!.appId })
+    : deps.defaultScope!;
+  return resolveOpenClawCliScope(deps, {
+    appId: appId ?? requested.appId,
+    projectId: requested.projectId,
+    agentId: requested.agentId,
+    namespace: requested.namespace,
+    visibility: requested.visibility ?? "private",
+  });
 }

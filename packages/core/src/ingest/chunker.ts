@@ -6,7 +6,7 @@
  */
 
 import type { ChunkRecord } from "../domain/types.js";
-import { computeContentHash } from "../scoring/hash-utils.js";
+import { computeContentHash, deterministicUuid } from "../scoring/hash-utils.js";
 import type { ChunkMarkdownOptions } from "./types.js";
 
 function splitParagraph(paragraph: string, chunkSize: number): string[] {
@@ -53,8 +53,10 @@ export function chunkMarkdown(markdown: string, options: ChunkMarkdownOptions): 
     texts.push(current);
   }
 
-  return texts.map((text, ordinal) => ({
-    id: `${options.documentId}:chunk:${ordinal}`,
+  return texts.map((text, ordinal) => {
+    const logicalId = `${options.documentId}:chunk:${ordinal}`;
+    return {
+    id: deterministicUuid(`mengshu:chunk\0${logicalId}`),
     scope: options.scope ?? {
       tenantId: "",
       appId: "",
@@ -67,8 +69,9 @@ export function chunkMarkdown(markdown: string, options: ChunkMarkdownOptions): 
     text,
     contentHash: computeContentHash(text),
     ordinal,
-    metadata: { scopeKey: options.scopeKey },
+    metadata: { scopeKey: options.scopeKey, logicalId },
     provenance: { sourceId: options.documentId, createdAt: options.createdAt },
     createdAt: options.createdAt,
-  }));
+    };
+  });
 }

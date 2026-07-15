@@ -28,7 +28,13 @@ import { normalizeScope } from "../core/scope.js";
 import type { MemoryKind, MemoryRecord, MemoryScope, MemorySemanticType } from "../core/types.js";
 import { Embeddings } from "../processing/embeddings.js";
 import { computeContentHash } from "../processing/hash-utils.js";
-import { startMcpStdioServer } from "../packages/mcp/src/stdio-server.js";
+import {
+  startMcpStdioServer,
+  waitForMcpServerShutdown,
+  closeMcpServerAndRuntime,
+  type RunningMcpStdioServer,
+} from "../packages/mcp/src/stdio-server.js";
+import { loadMcpServerAuthorityFromEnv } from "../packages/mcp/src/server.js";
 import { createMengshuRuntime } from "../runtime.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -300,20 +306,15 @@ async function main(): Promise<void> {
   }
   ensureLocalNoProxy();
 
+  // Host-owned authority is validated before config/runtime/DB/server work.
+  const authorityConfig = loadMcpServerAuthorityFromEnv(process.env);
+
   // 解析 config 路径：显式 env > 新全局 ~/.mengshu/config.json。
   const explicitConfig = process.env.MENGSHU_CONFIG;
   const configPath = explicitConfig ? expandHome(explicitConfig) : resolveConfigPath();
   const rawConfig = readConfig(configPath);
   const cfg = memoryConfigSchema.parse(rawConfig);
-  const defaultScope: MemoryScope = {
-    tenantId: "local",
-    appId: "mengshu",
-    userId: "default",
-    projectId: "default",
-    agentId: "default",
-    namespace: "working-context",
-    visibility: "private",
-  };
+  const defaultScope: MemoryScope = authorityConfig.defaultScope;
   const runtime = createMengshuRuntime({
     config: cfg,
     resolvedDbPath: resolveDbPath(cfg, configPath),
@@ -323,30 +324,41 @@ async function main(): Promise<void> {
       warn: (message) => process.stderr.write(`[mengshu] ${message}\n`),
     },
   });
-  await runtime.start();
+  let running: RunningMcpStdioServer | undefined;
+  let runtimeStarted = false;
+  try {
+    await runtime.start();
+    runtimeStarted = true;
+    const service = createMcpFriendlyMemoryService(runtime.memoryService, {
+      embeddings: runtime.embeddings,
+      defaultScope,
+      embeddingModel: cfg.embedding.model,
+    });
 
-  const service = createMcpFriendlyMemoryService(runtime.memoryService, {
-    embeddings: runtime.embeddings,
-    defaultScope,
-    embeddingModel: cfg.embedding.model,
-  });
-
-  process.stderr.write(`mengshu MCP started (${configPath})\n`);
-  await startMcpStdioServer({
-    service,
-    agentFastPath: runtime.agentFastPath,
-    namespaces: ["memories", "knowledge"],
-    pipeline: runtime.ingestionPipeline,
-    llmClient: runtime.llmClient,
-  });
-
-  await new Promise<void>(() => {
-    // MCP stdio server lives until the host process exits.
-  });
+    process.stderr.write(`mengshu MCP started (${configPath})\n`);
+    running = await startMcpStdioServer({
+      service,
+      forgetCapability: runtime.authorityScopedForgetCapability,
+      authority: authorityConfig.authority,
+      defaultScope: authorityConfig.defaultScope,
+      agentFastPath: runtime.agentFastPath,
+      namespaces: ["memories", "knowledge"],
+      pipeline: runtime.ingestionPipeline,
+      llmClient: runtime.llmClient,
+    });
+    const reason = await waitForMcpServerShutdown(running);
+    if (reason === "SIGINT") process.exitCode = 130;
+    if (reason === "SIGTERM") process.exitCode = 143;
+  } finally {
+    if (runtimeStarted) {
+      await closeMcpServerAndRuntime(running, runtime);
+    } else {
+      await running?.close();
+    }
+  }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.stack ?? error.message : String(error);
-  process.stderr.write(`mengshu MCP failed: ${message}\n`);
-  process.exit(1);
+main().catch(() => {
+  process.stderr.write("mengshu MCP failed (STARTUP_OR_SHUTDOWN_ERROR)\n");
+  process.exitCode = 1;
 });

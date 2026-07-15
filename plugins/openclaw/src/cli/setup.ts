@@ -419,7 +419,11 @@ export async function runInteractiveSetup(options: InteractiveSetupOptions = {})
       };
     }
 
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.chmodSync(configPath, 0o600);
 
     // .env
     const envEntries = new Map<string, string>();
@@ -439,7 +443,11 @@ export async function runInteractiveSetup(options: InteractiveSetupOptions = {})
     for (const [key, value] of envEntries) {
       envLines.push(`${key}=${value}`);
     }
-    fs.writeFileSync(envPath, envLines.join("\n") + "\n", "utf8");
+    fs.writeFileSync(envPath, envLines.join("\n") + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.chmodSync(envPath, 0o600);
 
     console.log("\n✓ 配置已写入:");
     console.log(`  ${configPath}`);

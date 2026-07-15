@@ -41,14 +41,94 @@ function makeFakeCommander(): {
 }
 
 const fakeService = {} as MemoryService;
+const defaultScope = {
+  tenantId: "local",
+  appId: "mengshu",
+  userId: "default",
+  projectId: "default",
+  agentId: "default",
+  namespace: "working-context",
+  visibility: "private" as const,
+};
+const authority = {
+  tenantId: defaultScope.tenantId,
+  userId: defaultScope.userId,
+  allow: {
+    appIds: [defaultScope.appId],
+    projectIds: [defaultScope.projectId, "project-b"],
+    agentIds: [defaultScope.agentId],
+    namespaces: [defaultScope.namespace],
+    visibilities: [defaultScope.visibility],
+  },
+} as const;
+const forgetService = { forget: vi.fn() };
 
 describe("registerMcpCliCommands", () => {
+  test("缺少 server-owned defaultScope 时拒绝启动", async () => {
+    const { commander, commands } = makeFakeCommander();
+    const startServer = vi.fn();
+    registerMcpCliCommands(commander, {
+      service: fakeService,
+      authority,
+      startServer: startServer as never,
+      keepAlive: false,
+    });
+    await expect(commands.find((c) => c.name === "mcp")?.action?.()).rejects.toThrow(/defaultScope/i);
+    expect(startServer).not.toHaveBeenCalled();
+  });
+
+  test("有 defaultScope 但缺少显式 authenticated authority 仍拒绝启动", async () => {
+    const { commander, commands } = makeFakeCommander();
+    const startServer = vi.fn();
+    registerMcpCliCommands(commander, {
+      service: fakeService,
+      defaultScope,
+      startServer: startServer as never,
+      keepAlive: false,
+    });
+    await expect(commands.find((c) => c.name === "mcp")?.action?.()).rejects.toThrow(/authority/i);
+    expect(startServer).not.toHaveBeenCalled();
+  });
+
+  test("MCP 启动透传显式 wider authority，不从 defaultScope 自动缩窄", async () => {
+    const { commander, commands } = makeFakeCommander();
+    const close = vi.fn(async () => {});
+    const startServer = vi.fn(async () => ({ close }));
+    registerMcpCliCommands(commander, {
+      service: fakeService,
+      defaultScope,
+      authority,
+      forgetService,
+      startServer: startServer as never,
+      keepAlive: false,
+    } as never);
+
+    await commands.find((c) => c.name === "mcp")?.action?.();
+    expect(startServer).toHaveBeenCalledWith(expect.objectContaining({ authority }));
+  });
+
   test("注册 mcp 命令并带描述", () => {
     const { commander, commands } = makeFakeCommander();
-    registerMcpCliCommands(commander, { service: fakeService });
+    registerMcpCliCommands(commander, { service: fakeService, authority, defaultScope });
     const mcp = commands.find((c) => c.name === "mcp");
     expect(mcp).toBeDefined();
     expect(mcp?.description).toContain("MCP");
+  });
+
+  test("无 transactional forget capability 时在 server 启动前明确拒绝", async () => {
+    const { commander, commands } = makeFakeCommander();
+    const startServer = vi.fn();
+    registerMcpCliCommands(commander, {
+      service: fakeService,
+      authority,
+      defaultScope,
+      startServer: startServer as never,
+      keepAlive: false,
+    });
+
+    await expect(commands.find((c) => c.name === "mcp")?.action?.())
+      .rejects.toThrow(/transactional forget capability/i);
+    expect(startServer).not.toHaveBeenCalled();
   });
 
   test("action 用注入的 startServer 启动，传入 service 与 namespaces", async () => {
@@ -57,6 +137,9 @@ describe("registerMcpCliCommands", () => {
     const startServer = vi.fn(async () => ({ close }));
     registerMcpCliCommands(commander, {
       service: fakeService,
+      authority,
+      defaultScope,
+      forgetService,
       namespaces: ["memories", "knowledge"],
       startServer: startServer as never,
       keepAlive: false,
@@ -76,6 +159,9 @@ describe("registerMcpCliCommands", () => {
     const startServer = vi.fn(async () => ({ close }));
     registerMcpCliCommands(commander, {
       service: fakeService,
+      authority,
+      defaultScope,
+      forgetService,
       startServer: startServer as never,
       keepAlive: false,
     });

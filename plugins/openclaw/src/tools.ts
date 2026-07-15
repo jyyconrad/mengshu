@@ -7,14 +7,18 @@
 
 import { randomUUID } from "node:crypto";
 import type { MemoryCategory } from "../../../config.js";
-import { MEMORY_CATEGORIES } from "../../../config.js";
+import { MEMORY_CATEGORIES, type KnowledgeBaseConfig } from "../../../config.js";
 import type { DataType, TableName } from "../../../db/types.js";
-import type { MemoryService } from "../../../core/service-types.js";
+import type {
+  AuthorityScopedForgetService,
+  MemoryService,
+} from "../../../core/service-types.js";
 import type { MemoryRecord, RecallHit, MemoryScope } from "../../../core/types.js";
+import type { AuthorityScope } from "../../../packages/core/src/domain/authority-scope.js";
 import type { IngestionPipeline } from "../../../ingest/pipeline.js";
 import { ingestMarkdownDirectory } from "../../../ingest/adapters/file-system.js";
 import { computeContentHash } from "../../../processing/hash-utils.js";
-import { buildOpenClawScope } from "./scope.js";
+import { resolveOpenClawAuthorityScope } from "./authority.js";
 
 const STORAGE_CATEGORY_MAP: Record<string, "memories" | "knowledge"> = {
   "核心记忆": "memories",
@@ -62,6 +66,165 @@ const CATEGORY_LABEL_MAP: Record<string, MemoryCategory> = {
   "参考": "other",
 };
 
+export type OpenClawInputErrorCode =
+  | "FILTER_INVALID"
+  | "TABLE_NAME_INVALID"
+  | "OLDER_THAN_DAYS_INVALID"
+  | "RANGE_DELETE_UNSUPPORTED";
+
+export class OpenClawInputError extends Error {
+  readonly code: OpenClawInputErrorCode;
+  readonly field: string;
+
+  constructor(code: OpenClawInputErrorCode, message: string, field: string) {
+    super(message);
+    this.name = "OpenClawInputError";
+    this.code = code;
+    this.field = field;
+  }
+}
+
+export class OpenClawPartialStoreError extends Error {
+  constructor(readonly receipt: {
+    createdCount: number;
+    duplicateCount: number;
+    outcomes: Array<{
+      tableName: TableName;
+      id: string;
+      action: "created" | "duplicate";
+    }>;
+  }) {
+    super("OpenClaw memory store partially completed");
+    this.name = "OpenClawPartialStoreError";
+  }
+}
+
+const SAFE_TABLE_NAME = /^(?:memories|knowledge|knowledge_[a-z][a-z0-9_]{0,63})$/;
+const DEFAULT_ALLOWED_TABLES: readonly TableName[] = ["memories", "knowledge"];
+const SAFE_FILTER_KEYS = new Set([
+  "id",
+  "contentHash",
+  "appId",
+  "projectId",
+  "agentId",
+  "namespace",
+  "visibility",
+  "category",
+  "kind",
+  "semanticType",
+  "lifecycleStatus",
+  "source",
+  "createdAt",
+  "importance",
+  "pinned",
+]);
+const NUMERIC_FILTER_KEYS = new Set(["createdAt", "importance"]);
+const SAFE_VISIBILITIES = new Set(["private", "workspace", "team", "public"]);
+const PROTOTYPE_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const CONTROL_OR_SQL_TOKEN = /[\u0000-\u001f\u007f;'"`]|--|\/\*|\*\//;
+
+function inputError(
+  code: OpenClawInputErrorCode,
+  field: string,
+): OpenClawInputError {
+  const messages: Record<OpenClawInputErrorCode, string> = {
+    FILTER_INVALID: "OpenClaw filter contains an unsupported key or value",
+    TABLE_NAME_INVALID: "OpenClaw table name is not allowlisted",
+    OLDER_THAN_DAYS_INVALID: "OpenClaw olderThanDays must be a finite positive number",
+    RANGE_DELETE_UNSUPPORTED:
+      "OpenClaw cleanup cannot transactionally delete by age range in this runtime",
+  };
+  return new OpenClawInputError(code, messages[code], field);
+}
+
+function assertSafeTableName(
+  value: unknown,
+  field: string,
+  allowedTables: readonly TableName[] = DEFAULT_ALLOWED_TABLES,
+): TableName {
+  if (
+    typeof value !== "string" ||
+    !SAFE_TABLE_NAME.test(value) ||
+    !allowedTables.includes(value as TableName)
+  ) {
+    throw inputError("TABLE_NAME_INVALID", field);
+  }
+  return value as TableName;
+}
+
+export function resolveOpenClawAllowedTables(
+  knowledgeBases?: KnowledgeBaseConfig,
+): readonly TableName[] {
+  const tables = new Set<TableName>(DEFAULT_ALLOWED_TABLES);
+  if (!knowledgeBases?.enabled) return [...tables];
+
+  const categories = [
+    ...(knowledgeBases.builtinCategories ?? []),
+    ...(knowledgeBases.customCategories ?? []),
+  ];
+  for (const category of categories) {
+    const tableName = `knowledge_${category}`;
+    if (!SAFE_TABLE_NAME.test(tableName)) {
+      throw inputError("TABLE_NAME_INVALID", "knowledgeBases");
+    }
+    tables.add(tableName as TableName);
+  }
+  return [...tables];
+}
+
+function validateFilter(
+  value: unknown,
+  field = "filter",
+): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw inputError("FILTER_INVALID", field);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw inputError("FILTER_INVALID", field);
+  }
+  if (Reflect.ownKeys(value).some((key) => typeof key !== "string")) {
+    throw inputError("FILTER_INVALID", field);
+  }
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    if (PROTOTYPE_KEYS.has(key) || !SAFE_FILTER_KEYS.has(key)) {
+      throw inputError("FILTER_INVALID", field);
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw inputError("FILTER_INVALID", field);
+    }
+    const item = descriptor.value;
+    if (key === "pinned") {
+      if (typeof item !== "boolean") throw inputError("FILTER_INVALID", field);
+    } else if (key === "visibility") {
+      if (typeof item !== "string" || !SAFE_VISIBILITIES.has(item)) {
+        throw inputError("FILTER_INVALID", field);
+      }
+    } else if (NUMERIC_FILTER_KEYS.has(key)) {
+      if (typeof item !== "number" || !Number.isFinite(item) || item < 0) {
+        throw inputError("FILTER_INVALID", field);
+      }
+      if (key === "importance" && item > 1) {
+        throw inputError("FILTER_INVALID", field);
+      }
+    } else if (
+      typeof item !== "string" ||
+      item.length === 0 ||
+      item.length > 512 ||
+      item !== item.trim() ||
+      item.normalize("NFKC") !== item ||
+      CONTROL_OR_SQL_TOKEN.test(item)
+    ) {
+      throw inputError("FILTER_INVALID", field);
+    }
+    result[key] = item;
+  }
+  return result;
+}
+
 export interface ToolResponse {
   content: Array<{ type: "text"; text: string }>;
   details: Record<string, unknown>;
@@ -106,7 +269,13 @@ export interface MemoryScanDirectoryParams {
   autoEnrichMetadata?: boolean;
 }
 
-export interface MemoryStoreContext {
+export interface OpenClawAuthorityContext {
+  authority?: AuthorityScope;
+  defaultScope?: MemoryScope;
+  allowedTables?: readonly TableName[];
+}
+
+export interface MemoryStoreContext extends OpenClawAuthorityContext {
   service: MemoryService;
   embed(text: string): Promise<number[]>;
   existsByContentHash(contentHashes: string[]): Promise<string[]>;
@@ -124,13 +293,18 @@ export interface MemoryStoreContext {
   now?: () => number;
 }
 
-export interface MemoryServiceContext {
+export interface MemoryServiceContext extends OpenClawAuthorityContext {
   service: MemoryService;
   now?: () => number;
-  metadata?: Record<string, unknown> | MemoryScope;
+  metadata?: Record<string, unknown>;
 }
 
-export interface MemoryScanDirectoryContext {
+export interface MemoryForgetContext extends MemoryServiceContext {
+  forgetService: AuthorityScopedForgetService;
+  idempotencyKeyFactory?: () => string;
+}
+
+export interface MemoryScanDirectoryContext extends OpenClawAuthorityContext {
   pipeline: IngestionPipeline;
   resolvePath(path: string): string;
   defaultIgnorePaths?: string[];
@@ -138,6 +312,21 @@ export interface MemoryScanDirectoryContext {
   defaultTargetTable?: TableName;
   defaultAutoEnrichMetadata?: boolean;
   chunkSize?: number;
+}
+
+const PIPELINE_AUTHORITIES = new WeakMap<
+  IngestionPipeline,
+  { readonly authority: AuthorityScope; readonly defaultScope: MemoryScope }
+>();
+
+/** Bind legacy CLI scan composition to the same server authority without a client fallback. */
+export function bindOpenClawPipelineAuthority(
+  pipeline: IngestionPipeline,
+  authority: AuthorityScope,
+  defaultScope: MemoryScope,
+): void {
+  resolveOpenClawAuthorityScope(authority, defaultScope);
+  PIPELINE_AUTHORITIES.set(pipeline, Object.freeze({ authority, defaultScope }));
 }
 
 export function resolveTableName(category?: string): "memories" | "knowledge" {
@@ -157,15 +346,9 @@ export function resolveCategoryName(tableName?: string): string {
 }
 
 export function resolveDataType(tableName?: "memories" | "knowledge" | string): "memory" | "knowledge" {
-  switch (tableName) {
-    case "knowledge":
-    case "knowledge_personal":
-    case "knowledge_work":
-      return "knowledge";
-    case "memories":
-    default:
-      return "memory";
-  }
+  return tableName === "knowledge" || tableName?.startsWith("knowledge_")
+    ? "knowledge"
+    : "memory";
 }
 
 export function resolveCategoryLabel(category?: string): MemoryCategory {
@@ -173,7 +356,10 @@ export function resolveCategoryLabel(category?: string): MemoryCategory {
   return CATEGORY_LABEL_MAP[category] || "other";
 }
 
-function resolveRecallRouting(params: MemoryRecallParams): {
+function resolveRecallRouting(
+  params: MemoryRecallParams,
+  allowedTables?: readonly TableName[],
+): {
   dataTypes: DataType[];
   tableName?: TableName;
   searchAll: boolean;
@@ -182,9 +368,11 @@ function resolveRecallRouting(params: MemoryRecallParams): {
   let dataTypes: DataType[];
   let tableName: TableName | undefined;
 
-  if (params.knowledgeBase) {
-    tableName = params.knowledgeBase as TableName;
-    dataTypes = params.knowledgeBase.startsWith("knowledge_") ? ["knowledge"] : ["memory"];
+  if (params.knowledgeBase !== undefined) {
+    tableName = assertSafeTableName(params.knowledgeBase, "knowledgeBase", allowedTables);
+    dataTypes = tableName === "knowledge" || tableName.startsWith("knowledge_")
+      ? ["knowledge"]
+      : ["memory"];
   } else if (params.category) {
     tableName = resolveTableName(params.category);
     if (tableName === "knowledge") {
@@ -201,7 +389,7 @@ function resolveRecallRouting(params: MemoryRecallParams): {
   return {
     dataTypes,
     tableName,
-    searchAll: Boolean(params.searchAll || params.knowledgeBase),
+    searchAll: params.knowledgeBase === undefined && Boolean(params.searchAll),
   };
 }
 
@@ -248,23 +436,10 @@ export async function handleMemoryRecall(
     query,
     limit = 5,
     minScore = 0.1,
-    filter,
   } = params;
-  const routing = resolveRecallRouting(params);
-
-  // Build scope from metadata if provided
-  // If metadata is already a MemoryScope, use it directly
-  // If it's OpenClaw event metadata, convert through buildOpenClawScope
-  let scope: MemoryScope | undefined;
-  if (context.metadata) {
-    if ("tenantId" in context.metadata && "appId" in context.metadata) {
-      // Already a MemoryScope (e.g. runtime.defaultScope)
-      scope = context.metadata as MemoryScope;
-    } else {
-      // OpenClaw event metadata, convert through buildOpenClawScope
-      scope = buildOpenClawScope(context.metadata);
-    }
-  }
+  const filter = validateFilter(params.filter);
+  const routing = resolveRecallRouting(params, context.allowedTables);
+  const scope = resolveContextScope(context, params);
 
   const result = await context.service.recall({
     query,
@@ -305,21 +480,11 @@ export async function handleMemoryStore(
     metadata = {},
     storageCategory,
   } = params;
+  // Authority resolution must precede routing, embedding and storage.
+  const scope = resolveContextScope(context, params);
 
   const contentHash = computeContentHash(text);
-  const existingHashes = await context.existsByContentHash([contentHash]);
-  if (existingHashes.length > 0) {
-    return {
-      content: [{ type: "text", text: "Similar memory already exists." }],
-      details: {
-        action: "duplicate",
-        contentHash,
-      },
-    };
-  }
-
   const now = context.now ?? Date.now;
-  const vector = await context.embed(text);
   const enrichedMetadata: Record<string, unknown> = {
     ...metadata,
     source: "user" as const,
@@ -335,19 +500,27 @@ export async function handleMemoryStore(
   let targetTables: TableName[] = [tableName];
   if (context.routingEngine && tableName === "knowledge") {
     const routingResult = context.routingEngine.routeToKnowledgeBases(text, enrichedMetadata);
-    targetTables = routingResult.targetTables;
+    targetTables = routingResult.targetTables.map((table) =>
+      assertSafeTableName(table, "routingEngine.targetTables", context.allowedTables));
     context.logger?.info?.(
       `mengshu: routing to ${targetTables.join(", ")} (matched rules: ${routingResult.matchedRules.map((r) => r.name).join(", ")})`,
     );
   }
 
-  const ids: string[] = [];
+  // Global content-hash lookup is not authority-scoped and therefore cannot be
+  // used as a cross-tenant existence oracle. Scoped write-kernel dedupe owns it.
+  const vector = await context.embed(text);
+
+  const outcomes: Array<{
+    tableName: TableName;
+    id: string;
+    action: "created" | "duplicate";
+  }> = [];
   for (const table of targetTables) {
     const id = context.idFactory?.() ?? randomUUID();
-    ids.push(id);
     const record: MemoryRecord = {
       id,
-      scope: buildOpenClawScope({ ...enrichedMetadata, tableName: table }),
+      scope,
       kind: resolveDataType(table) === "knowledge" ? "knowledge" : resolvedCategory === "other" || resolvedCategory === "core" ? "other" : resolvedCategory,
       text,
       contentHash,
@@ -367,15 +540,45 @@ export async function handleMemoryStore(
       createdAt: now(),
       updatedAt: now(),
     };
-    await context.service.storeMemory({ record });
+    let outcome: Awaited<ReturnType<MemoryService["storeMemory"]>>;
+    try {
+      outcome = await context.service.storeMemory({ record });
+    } catch (error) {
+      if (outcomes.length === 0) throw error;
+      throw new OpenClawPartialStoreError({
+        createdCount: outcomes.filter((item) => item.action === "created").length,
+        duplicateCount: outcomes.filter((item) => item.action === "duplicate").length,
+        outcomes: [...outcomes],
+      });
+    }
+    outcomes.push({
+      tableName: table,
+      id: outcome.id,
+      action: outcome.stored ? "created" : "duplicate",
+    });
   }
 
   const tableNamesDisplay = targetTables.map((table) => resolveCategoryName(table)).join(", ");
+  const createdCount = outcomes.filter((outcome) => outcome.action === "created").length;
+  const duplicateCount = outcomes.length - createdCount;
+  const action = createdCount === outcomes.length
+    ? "created"
+    : duplicateCount === outcomes.length
+      ? "duplicate"
+      : "mixed";
+  const responseText = action === "created"
+    ? `Stored: "${text.slice(0, 100)}..." to ${tableNamesDisplay}`
+    : action === "duplicate"
+      ? `Already stored: "${text.slice(0, 100)}..." in ${tableNamesDisplay}`
+      : `Memory store completed: ${createdCount} created, ${duplicateCount} duplicate in ${tableNamesDisplay}`;
   return {
-    content: [{ type: "text", text: `Stored: "${text.slice(0, 100)}..." to ${tableNamesDisplay}` }],
+    content: [{ type: "text", text: responseText }],
     details: {
-      action: "created",
-      id: ids[0],
+      action,
+      id: outcomes[0]?.id,
+      createdCount,
+      duplicateCount,
+      outcomes,
       contentHash,
       targetTables,
       storageCategory: resolveCategoryName(tableName),
@@ -386,11 +589,29 @@ export async function handleMemoryStore(
 
 export async function handleMemoryForget(
   params: MemoryForgetParams,
-  context: MemoryServiceContext,
+  context: MemoryForgetContext,
 ): Promise<ToolResponse> {
-  const { query, memoryId, filter } = params;
+  const { query, memoryId } = params;
+  const filter = validateFilter(params.filter);
+  const scope = resolveContextScope(context, params);
+  if (!context.forgetService || typeof context.forgetService.forget !== "function") {
+    throw new Error("OpenClaw transactional forget service is required");
+  }
+  const forget = async (selection: { ids?: readonly string[]; filter?: Record<string, unknown> }) =>
+    context.forgetService.forget({
+      serverAuthority: context.authority!,
+      clientScope: clientScopeRequest(scope),
+      action: "delete",
+      ...selection,
+      tableName: "memories",
+      dataTypes: ["memory"],
+      idempotencyKey: context.idempotencyKeyFactory?.() ?? `openclaw-forget:${randomUUID()}`,
+      actor: "openclaw",
+      reason: "memory_forget tool",
+      now: context.now?.(),
+    });
   if (memoryId) {
-    await context.service.delete({ ids: [memoryId] });
+    await forget({ ids: [memoryId] });
     return {
       content: [{ type: "text", text: `Memory ${memoryId} forgotten.` }],
       details: { action: "deleted", id: memoryId },
@@ -398,7 +619,7 @@ export async function handleMemoryForget(
   }
 
   if (filter) {
-    const result = await context.service.delete({ filter });
+    const result = await forget({ filter });
     return {
       content: [{ type: "text", text: `Deleted ${result.deleted} memories matching filter.` }],
       details: { action: "bulk_deleted", count: result.deleted },
@@ -406,7 +627,7 @@ export async function handleMemoryForget(
   }
 
   if (query) {
-    const result = await context.service.recall({ query, limit: 5, minScore: 0.7 });
+    const result = await context.service.recall({ query, limit: 5, minScore: 0.7, scope });
     if (result.hits.length === 0) {
       return {
         content: [{ type: "text", text: "No matching memories found." }],
@@ -415,7 +636,7 @@ export async function handleMemoryForget(
     }
 
     if (result.hits.length === 1 && result.hits[0].score > 0.9) {
-      await context.service.delete({ ids: [result.hits[0].record.id] });
+      await forget({ ids: [result.hits[0].record.id] });
       const record = result.hits[0].record;
       const text = "text" in record ? record.text : record.id;
       return {
@@ -456,17 +677,22 @@ export async function handleMemoryForget(
 
 export async function handleMemoryCleanup(
   params: MemoryCleanupParams,
-  context: MemoryServiceContext,
+  context: MemoryForgetContext,
 ): Promise<ToolResponse> {
-  const { dataType, olderThanDays, filter = {} } = params;
-  const deleteFilter: Record<string, unknown> = { ...filter };
-  if (dataType) {
-    deleteFilter.dataType = dataType;
+  const { dataType, olderThanDays } = params;
+  const validatedFilter = validateFilter(params.filter) ?? {};
+  if (olderThanDays !== undefined) {
+    if (
+      typeof olderThanDays !== "number" ||
+      !Number.isFinite(olderThanDays) ||
+      olderThanDays <= 0
+    ) {
+      throw inputError("OLDER_THAN_DAYS_INVALID", "olderThanDays");
+    }
+    throw inputError("RANGE_DELETE_UNSUPPORTED", "olderThanDays");
   }
-  if (olderThanDays) {
-    const now = context.now ?? Date.now;
-    deleteFilter.createdAt = { $lt: now() - (olderThanDays * 24 * 60 * 60 * 1000) };
-  }
+  const scope = resolveContextScope(context, params);
+  const deleteFilter: Record<string, unknown> = { ...validatedFilter };
 
   if (Object.keys(deleteFilter).length === 0) {
     return {
@@ -474,8 +700,28 @@ export async function handleMemoryCleanup(
       details: { error: "no_filter_provided" },
     };
   }
+  if (!context.forgetService || typeof context.forgetService.forget !== "function") {
+    throw new Error("OpenClaw transactional forget service is required");
+  }
 
-  const result = await context.service.delete({ filter: deleteFilter });
+  const tableName = dataType === "document" ? "knowledge" : "memories";
+  const dataTypes: DataType[] = dataType
+    ? [dataType]
+    : tableName === "knowledge"
+      ? ["document"]
+      : ["memory"];
+  const result = await context.forgetService.forget({
+    serverAuthority: context.authority!,
+    clientScope: clientScopeRequest(scope),
+    action: "delete",
+    filter: deleteFilter,
+    tableName,
+    dataTypes,
+    idempotencyKey: context.idempotencyKeyFactory?.() ?? `openclaw-cleanup:${randomUUID()}`,
+    actor: "openclaw",
+    reason: "memory_cleanup tool",
+    now: context.now?.(),
+  });
   return {
     content: [{ type: "text", text: `Cleanup completed. Deleted ${result.deleted} entries.` }],
     details: { action: "cleanup", deletedCount: result.deleted, filter: deleteFilter },
@@ -486,10 +732,14 @@ export async function handleMemoryScanDirectory(
   params: MemoryScanDirectoryParams,
   context: MemoryScanDirectoryContext,
 ): Promise<ToolResponse> {
-  const targetTable = (params.targetTable ?? context.defaultTargetTable ?? "knowledge") as TableName;
+  const targetTable = assertSafeTableName(
+    params.targetTable ?? context.defaultTargetTable ?? "knowledge",
+    "targetTable",
+    context.allowedTables,
+  );
+  const scope = resolveContextScope(context, params);
   const autoEnrichMetadata = params.autoEnrichMetadata ?? context.defaultAutoEnrichMetadata ?? true;
   const resolvedDir = context.resolvePath(params.directory);
-  const scope = buildOpenClawScope({ tableName: targetTable });
   const result = await ingestMarkdownDirectory({
     directory: resolvedDir,
     scope,
@@ -532,6 +782,35 @@ export async function handleMemoryScanDirectory(
       autoEnrichMetadata,
     },
   };
+}
+
+function clientScopeRequest(scope: MemoryScope): Record<string, unknown> {
+  return {
+    appId: scope.appId,
+    projectId: scope.projectId,
+    agentId: scope.agentId,
+    namespace: scope.namespace,
+    visibility: scope.visibility ?? "private",
+  };
+}
+
+function resolveContextScope(
+  context: OpenClawAuthorityContext,
+  untrusted: unknown,
+): MemoryScope {
+  let authority = context.authority;
+  let defaultScope = context.defaultScope;
+  if ((!authority || !defaultScope) && "pipeline" in context) {
+    const bound = PIPELINE_AUTHORITIES.get(
+      (context as MemoryScanDirectoryContext).pipeline,
+    );
+    authority = bound?.authority;
+    defaultScope = bound?.defaultScope;
+  }
+  if (!authority || !defaultScope) {
+    throw new Error("OpenClaw server authority and defaultScope are required");
+  }
+  return resolveOpenClawAuthorityScope(authority, defaultScope, untrusted);
 }
 
 export { MEMORY_CATEGORIES };

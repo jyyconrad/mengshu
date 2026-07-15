@@ -22,6 +22,9 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseProvider, MemoryEntry } from "../db/types.js";
 import type { Embeddings } from "../runtime/llm/embeddings.js";
 import type { ChunkRecord, DocumentRecord, MemoryScope, RecordProvenance } from "../domain/types.js";
+import type { KnownEmbeddingSpace } from "../domain/embedding-space.js";
+import { memoryScopeToCanonicalEntryFields } from "../domain/legacy-mapping.js";
+import { durableUuid } from "../scoring/hash-utils.js";
 import type {
   AuditRepository,
   ChunkRepository,
@@ -38,6 +41,7 @@ export interface CreatePersistentRepositoriesInput {
   db: DatabaseProvider;
   embeddings: Embeddings;
   scope: MemoryScope;
+  embeddingSpace: KnownEmbeddingSpace;
 }
 
 export interface PersistentRepositories {
@@ -46,6 +50,49 @@ export interface PersistentRepositories {
   /** Jobs 为瞬态队列，使用 in-memory 实现（不需要跨进程持久化）。 */
   jobs: JobRepository;
   audit: AuditRepository;
+}
+
+const EMBEDDING_SPACE_METADATA = {
+  id: "embeddingSpaceId",
+  state: "embeddingSpaceState",
+} as const;
+
+function attachAuthoritativeMetadata(
+  metadata: Record<string, unknown>,
+  authoritative: Record<string, unknown>,
+  label: string,
+): Record<string, unknown> {
+  for (const [key, value] of Object.entries(authoritative)) {
+    if (Object.prototype.hasOwnProperty.call(metadata, key) && metadata[key] !== value) {
+      throw new Error(`${label} metadata conflict: ${key}`);
+    }
+  }
+  return { ...metadata, ...authoritative };
+}
+
+/**
+ * 为新写记录附加 canonical embedding space 标识。
+ *
+ * 已有相同值可幂等通过；已有不同值必须拒绝，避免 metadata spread 静默覆盖来源空间。
+ * 错误只报告冲突字段名，不回显 metadata 内容，防止意外泄露调用方数据或 secret。
+ */
+export function attachEmbeddingSpaceMetadata(
+  metadata: Record<string, unknown>,
+  embeddingSpace: KnownEmbeddingSpace,
+): Record<string, unknown> {
+  const expected = {
+    [EMBEDDING_SPACE_METADATA.id]: embeddingSpace.embeddingSpaceId,
+    [EMBEDDING_SPACE_METADATA.state]: embeddingSpace.state,
+  };
+  for (const [key, value] of Object.entries(expected)) {
+    if (
+      Object.prototype.hasOwnProperty.call(metadata, key) &&
+      metadata[key] !== value
+    ) {
+      throw new Error(`embedding metadata conflict: ${key}`);
+    }
+  }
+  return { ...metadata, ...expected };
 }
 
 /**
@@ -160,25 +207,31 @@ async function queryKnowledgeChunks(
 export function createPersistentRepositories(
   deps: CreatePersistentRepositoriesInput
 ): PersistentRepositories {
-  const { db, embeddings, scope: defaultScope } = deps;
+  const { db, embeddings, scope: defaultScope, embeddingSpace } = deps;
 
   const documents: DocumentRepository = {
     upsert: async (document: DocumentRecord) => {
+      const metadata = attachEmbeddingSpaceMetadata(
+        attachAuthoritativeMetadata(document.metadata, {
+          uri: document.uri,
+          sourceRecordId: document.id,
+        }, "document"),
+        embeddingSpace,
+      );
       // DocumentRecord → MemoryEntry (dataType: "document")
       const entry = {
-        id: document.id,
+        id: durableUuid("document-record", document.id),
         text: document.title ?? "",
         contentHash: document.contentHash,
         vector: await embeddings.embed(document.title ?? ""),
         importance: 0.5,
         category: "fact" as const,
         dataType: "document" as const,
-        tableName: "documents" as const,
-        metadata: {
-          ...document.metadata,
-          uri: document.uri,
-        },
+        // Postgres/LanceDB provider default contract: document dataType 存入 knowledge 表。
+        tableName: "knowledge" as const,
+        metadata,
         createdAt: document.createdAt,
+        ...memoryScopeToCanonicalEntryFields(document.scope),
       };
       await db.store([entry]);
     },
@@ -202,18 +255,10 @@ export function createPersistentRepositories(
       // 映射 ChunkRecord → MemoryEntry，同步生成 vector
       const entries = await Promise.all(
         chunks.map(async (chunk) => {
-          const vector = await embeddings.embed(chunk.text);
-          return {
-            id: chunk.id || randomUUID(),
-            text: chunk.text,
-            contentHash: chunk.contentHash,
-            vector,
-            importance: 0.5,
-            category: "fact" as const,
-            dataType: "knowledge" as const,
-            tableName: "knowledge" as const,
-            metadata: {
+          const metadata = attachEmbeddingSpaceMetadata(
+            attachAuthoritativeMetadata(chunk.metadata, {
               documentId: chunk.documentId,
+              sourceRecordId: chunk.id,
               ordinal: chunk.ordinal,
               provenance: chunk.provenance,
               tokenCount: chunk.tokenCount,
@@ -224,9 +269,22 @@ export function createPersistentRepositories(
               projectId: chunk.scope.projectId,
               agentId: chunk.scope.agentId,
               namespace: chunk.scope.namespace,
-              ...chunk.metadata,
-            },
+            }, "chunk"),
+            embeddingSpace,
+          );
+          const vector = await embeddings.embed(chunk.text);
+          return {
+            id: chunk.id ? durableUuid("chunk-record", chunk.id) : randomUUID(),
+            text: chunk.text,
+            contentHash: chunk.contentHash,
+            vector,
+            importance: 0.5,
+            category: "fact" as const,
+            dataType: "knowledge" as const,
+            tableName: "knowledge" as const,
+            metadata,
             createdAt: chunk.createdAt,
+            ...memoryScopeToCanonicalEntryFields(chunk.scope),
           };
         })
       );

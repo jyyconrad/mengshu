@@ -22,9 +22,26 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerProjectCliCommands } from "./project.js";
+import { registerProjectCliCommands as registerProjectCliCommandsRaw } from "./project.js";
 import { MANIFEST_FILENAME, readManifest, createManifest, writeManifest, readProjectManifest } from "../manifest.js";
 import { readRegistry } from "../../../../core/registry.js";
+
+const defaultScope = {
+  tenantId: "tenant-a", appId: "openclaw", userId: "server-user", projectId: "project-default",
+  agentId: "default", namespace: "memories", visibility: "private" as const,
+};
+const authority = {
+  tenantId: "tenant-a", userId: "server-user",
+  allow: {
+    appIds: ["openclaw"],
+    projectIds: ["project-default", "proj-acme", "proj-global", "proj-keep", "proj-legacy", "proj-new", "proj-other", "proj-reg", "proj-touch"],
+    agentIds: ["default"], namespaces: ["memories"],
+    visibilities: ["private" as const, "workspace" as const, "team" as const, "public" as const],
+  },
+};
+function registerProjectCliCommands(memory: never, deps: Record<string, unknown> = {}) {
+  return registerProjectCliCommandsRaw(memory, { authority, defaultScope, ...deps } as never);
+}
 
 /** 鸭子类型 fake：支持 command 字符串含位置参数（init [dir] / lookup <query>）。 */
 class FakeCommand {
@@ -84,6 +101,13 @@ afterEach(() => {
 });
 
 describe("registerProjectCliCommands 注册", () => {
+  test("缺少 authenticated authority 时在 init 写文件前拒绝", async () => {
+    const ms = new FakeCommand("ms");
+    registerProjectCliCommandsRaw(ms as never, {} as never);
+    await expect(ms.find("init")?.actionHandler?.(workDir, {})).rejects.toThrow(/authority/i);
+    expect(existsSync(join(workDir, MANIFEST_FILENAME))).toBe(false);
+  });
+
   test("注册 init 与 project 子命令族", () => {
     const ms = new FakeCommand("ms");
     registerProjectCliCommands(ms as never, { homePathOptions: { homeDir: testHome } });
@@ -95,8 +119,6 @@ describe("registerProjectCliCommands 注册", () => {
       "status",
       "context",
       "lookup",
-      "ingest-history",
-      "backfill-observation-metadata",
     ]);
   });
 });
@@ -106,13 +128,22 @@ describe("ms init", () => {
     const ms = new FakeCommand("ms");
     registerProjectCliCommands(ms as never, { homePathOptions: { homeDir: testHome } });
 
-    await ms.find("init")?.actionHandler?.(workDir, { userId: "user-1" });
+    await ms.find("init")?.actionHandler?.(workDir, {});
 
     expect(existsSync(join(workDir, MANIFEST_FILENAME))).toBe(true);
     const manifest = readProjectManifest(workDir, { homeDir: testHome });
-    expect(manifest?.userId).toBe("user-1");
+    expect(manifest?.userId).toBe("server-user");
     expect(logs.join("\n")).toContain(manifest!.workspaceId);
     expect(logs.join("\n")).toContain(manifest!.projectId);
+  });
+
+  test("--user-id 不能覆盖 server identity，且拒绝发生在文件写入前", async () => {
+    const ms = new FakeCommand("ms");
+    registerProjectCliCommands(ms as never, { homePathOptions: { homeDir: testHome } });
+
+    await expect(ms.find("init")?.actionHandler?.(workDir, { userId: "attacker" }))
+      .rejects.toThrow(/server-owned/i);
+    expect(existsSync(join(workDir, MANIFEST_FILENAME))).toBe(false);
   });
 
   test("已存在且无 --force 时不覆盖，保留原 id", async () => {
@@ -209,7 +240,7 @@ describe("ms project status", () => {
     expect(text).toContain("ws-acme");
     expect(text).toContain("proj-acme");
     expect(text).toContain("profile");
-    expect(text).toContain("7");
+    expect(text).toMatch(/authority-scoped count|已禁用/);
   });
 
   test("无 manifest 时提示先运行 init", async () => {
@@ -237,6 +268,21 @@ describe("ms project status", () => {
 });
 
 describe("ms project lookup", () => {
+  test("manifest 的越权 project 在 recall 前拒绝", async () => {
+    const ms = new FakeCommand("ms");
+    const recall = vi.fn();
+    registerProjectCliCommands(ms as never, {
+      service: { recall } as never,
+      homePathOptions: { homeDir: testHome },
+    });
+    writeManifest(workDir, createManifest({ dir: workDir, projectId: "project-not-allowed", userId: "attacker" }));
+
+    await expect(
+      ms.find("project")?.find("lookup")?.actionHandler?.("q", { dir: workDir }),
+    ).rejects.toThrow(/not allowed|allowlist|authorized/i);
+    expect(recall).not.toHaveBeenCalled();
+  });
+
   test("基于 manifest scope 调 service.recall 并打印命中", async () => {
     const ms = new FakeCommand("ms");
     const recall = vi.fn(async (_input: { query: string; scope: { projectId: string } }) => ({

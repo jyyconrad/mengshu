@@ -11,19 +11,26 @@
  *
  * 关键边界：
  * - stdio 模式下不能往 stdout 打印日志（会污染 JSON-RPC 流），状态信息走 stderr。
- * - scope 由客户端调用方在工具入参里传入，本命令不做鉴权。
+ * - authority 必须由认证 host 显式注入；defaultScope 只作为 allowlist 内的默认请求。
  * - 与 cli.ts 共用 CommanderLike 鸭子类型，不引入 commander 硬依赖。
  */
 
-import type { CommanderLike } from "./index.js";
-import type { MemoryService } from "../../../../core/service-types.js";
+import {
+  requireOpenClawCliAuthority,
+  type CommanderLike,
+  type OpenClawCliAuthorityContext,
+} from "./index.js";
+import type {
+  AuthorityScopedForgetService,
+  MemoryService,
+} from "../../../../core/service-types.js";
 import type { AgentFastPathService } from "../../../../packages/api/src/agent-fast-path/index.js";
 import type { IngestionPipeline } from "../../../../packages/core/src/ingest/pipeline.js";
 import type { LlmClient } from "../../../../packages/core/src/runtime/llm/llm-client.js";
 import { startMcpStdioServer } from "../../../../packages/mcp/src/stdio-server.js";
 
-/** mcp 命令依赖注入。 */
-export interface McpCliDeps {
+/** mcp 命令依赖注入；authority 缺失时 action 在启动 stdio server 前失败。 */
+export interface McpCliDeps extends OpenClawCliAuthorityContext {
   service: MemoryService;
   /** 注入后额外暴露 context_fast / observe_light / lookup 快路径工具。 */
   agentFastPath?: AgentFastPathService;
@@ -32,20 +39,8 @@ export interface McpCliDeps {
   pipeline?: IngestionPipeline;
   /** 预留给 ingest 增强；当前热路径不调用 LLM。 */
   llmClient?: LlmClient;
-  /**
-   * 默认 scope。当 MCP 客户端调用工具未传递 scope 时自动填充（DEFECT-002 修复）。
-   *
-   * 设计理念：一个 MCP server 实例对应一个特定产品/项目，scope（尤其 tenantId）
-   * 应该是 server 启动时确定的上下文，而不是依赖客户端每次调用时传递（容易遗漏）。
-   */
-  defaultScope?: {
-    tenantId?: string;
-    appId?: string;
-    userId?: string;
-    projectId?: string;
-    agentId?: string;
-    namespace?: string;
-  };
+  /** Explicit capability. Never inferred from a method that may lack a transaction port. */
+  forgetService?: AuthorityScopedForgetService;
   /** 启动器（测试可注入 fake）。默认 startMcpStdioServer。 */
   startServer?: typeof startMcpStdioServer;
   /** 进程存活控制（测试可注入立即返回的版本）。 */
@@ -58,14 +53,21 @@ export function registerMcpCliCommands(memory: CommanderLike, deps: McpCliDeps):
     .command("mcp")
     .description("Start MCP stdio server for local clients (Claude Desktop / Cursor)")
     .action(async () => {
+      requireOpenClawCliAuthority(deps);
       const start = deps.startServer ?? startMcpStdioServer;
+      if (!deps.forgetService) {
+        throw new Error(
+          "ms mcp is unavailable: authority-scoped transactional forget capability is required",
+        );
+      }
       const running = await start({
         service: deps.service,
+        forgetService: deps.forgetService,
+        authority: deps.authority!,
         agentFastPath: deps.agentFastPath,
         namespaces: deps.namespaces,
         pipeline: deps.pipeline,
         llmClient: deps.llmClient,
-        defaultScope: deps.defaultScope,
       });
 
       // stdio 模式：状态信息只能走 stderr，避免污染 stdout 的 JSON-RPC 流。

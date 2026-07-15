@@ -404,6 +404,51 @@ export interface CaseResult {
   graderResults?: Record<string, GraderResult>;
 }
 
+/** 评测执行层级；只有 runtime-e2e 可参与 production release 判定。 */
+export type EvalRunMode =
+  | "offline-component"
+  | "live-provider"
+  | "runtime-e2e";
+
+/** 单次 suite 的可复现执行元数据。null 表示该离线运行不涉及对应 provider 字段。 */
+export interface EvalExecutionMetadata {
+  runMode: EvalRunMode;
+  provider: string | null;
+  model: string | null;
+  prompt: string | null;
+  version: string;
+  fallback: boolean;
+  degraded: boolean;
+}
+
+/** metric gate 的比较方向。 */
+export type EvalMetricDirection = "min" | "max" | "exact";
+
+/**
+ * 可审计 metric 定义。
+ * value 始终由 numerator / denominator 得出；denominator=0 时 value=0 且 fail-closed。
+ */
+export interface EvalMetricResult {
+  name: string;
+  numerator: number;
+  denominator: number;
+  value: number;
+  direction: EvalMetricDirection;
+  threshold: number;
+  passed: boolean;
+  failure?: string;
+}
+
+/** Extension fixture loader 发现的可审计合同缺口。 */
+export interface EvalContractIssue {
+  suite: string;
+  caseId?: string;
+  severity: string;
+  code: string;
+  path: string;
+  message: string;
+}
+
 /** 单个套件汇总。 */
 export interface SuiteSummary {
   suite: GoldenSuite;
@@ -418,17 +463,51 @@ export interface SuiteSummary {
   latencyP50Ms: number;
   latencyP95Ms: number;
   failedCases: CaseResult[];
+  /** suite 产出的全部可审计 metrics。 */
+  metrics?: EvalMetricResult[];
+  /** runner 的执行模式、provider 指纹与降级状态。 */
+  execution?: EvalExecutionMetadata;
+  /** manifest + metric protocol gate 的最终结果；由 buildReport 统一回填。 */
+  gatePassed?: boolean;
+  /** fail-closed 原因；空数组表示 suite gate 通过。 */
+  gateFailures?: string[];
+  /** runner 原样上报的 fixture 合同问题；buildReport 独立 fail-closed。 */
+  contractIssues?: EvalContractIssue[];
+}
+
+/** report 内嵌的 manifest/gate 复现身份。 */
+export interface EvalReportManifestSuite {
+  name: string;
+  kind: "baseline" | "extension";
+  runner: string;
+  fixtureCaseCount: number;
+  fixtureSha256: string;
+  metrics: string[];
+  gate: Record<string, number> | null;
+  gateIdentity: string;
+}
+
+export interface EvalReportManifestMetadata {
+  schemaVersion: number;
+  version: string | null;
+  suites: EvalReportManifestSuite[];
 }
 
 /** runner 一次跑出的整体报告。 */
 export interface EvalReport {
   generatedAt: string;
+  manifest: EvalReportManifestMetadata;
   suites: SuiteSummary[];
   totalCases: number;
   totalPassed: number;
   totalFailed: number;
-  /** release gate 是否通过（safety 套件 wrong_injection_rate=0 且整体 pass>=80%）。 */
+  /** suite manifest metric + case contract 的质量 gate；不代表 production E2E 资格。 */
   releaseGatePassed: boolean;
+  /**
+   * production release gate：质量 gate 通过，且所有 suite 都是真实 runtime-e2e，
+   * 没有 fallback/degraded。与历史 releaseGatePassed 分开，避免离线 baseline 假冒生产验收。
+   */
+  productionReleaseGatePassed: boolean;
   notes?: string[];
 }
 

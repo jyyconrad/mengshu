@@ -10,7 +10,7 @@
  * 5. 同 scope 同文本的重复 observation 不产生重复 pending 候选。
  */
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { createExtractCandidateHandler } from "./extract-candidate-handler.js";
 import { InMemoryCandidateRepository } from "./candidate-repository.js";
 import { HeuristicTypeExtractor } from "./type-extractor.js";
@@ -35,7 +35,7 @@ function job(payload: Record<string, unknown>): JobRecord {
   return {
     id: "job-1",
     type: "extract_candidate",
-    payload,
+    payload: { traceId: "test-event", ...payload },
     dedupeKey: "extract_candidate:job-1",
     status: "running",
     attempts: 1,
@@ -45,6 +45,42 @@ function job(payload: Record<string, unknown>): JobRecord {
 }
 
 describe("createExtractCandidateHandler", () => {
+  test("payload 仅接受 exact own-data snapshot，getter/Proxy/symbol/extra/nonplain 零执行拒绝", async () => {
+    const candidates = new InMemoryCandidateRepository();
+    const extractor = { name: "spy", extract: vi.fn(async () => []) };
+    const handler = createExtractCandidateHandler({ extractor, candidates });
+    const getter = vi.fn(() => "swapped-trace");
+    const accessor = { scope, text: "禁止自动删除数据。", intent: "auto" };
+    Object.defineProperty(accessor, "traceId", { enumerable: true, get: getter });
+    let proxyTraps = 0;
+    const proxied = new Proxy({
+      scope, text: "禁止自动删除数据。", traceId: "trace-1", intent: "auto",
+    }, {
+      ownKeys(target) { proxyTraps += 1; return Reflect.ownKeys(target); },
+      get(target, key, receiver) { proxyTraps += 1; return Reflect.get(target, key, receiver); },
+    });
+    const symbol = {
+      scope, text: "禁止自动删除数据。", traceId: "trace-1", intent: "auto",
+      [Symbol("foreign")]: true,
+    };
+    const extra = {
+      scope, text: "禁止自动删除数据。", traceId: "trace-1", intent: "auto", foreign: true,
+    };
+    class Payload {
+      scope = scope;
+      text = "禁止自动删除数据。";
+      traceId = "trace-1";
+      intent = "auto";
+    }
+    for (const payload of [accessor, proxied, symbol, extra, new Payload()]) {
+      const record = { ...job({}), payload } as JobRecord;
+      await expect(handler(record)).rejects.toThrow(/payload/i);
+    }
+    expect(getter).not.toHaveBeenCalled();
+    expect(proxyTraps).toBe(0);
+    expect(extractor.extract).not.toHaveBeenCalled();
+    expect(await candidates.count({ scope })).toBe(0);
+  });
   test("rules 类文本抽取后进入候选区 pending", async () => {
     const candidates = new InMemoryCandidateRepository();
     const handler = createExtractCandidateHandler({
@@ -171,6 +207,12 @@ class StubLlmClient extends FakeLlmClient {
 class ThrowingLlmClient extends FakeLlmClient {
   async extractStructured<T>(): Promise<T> {
     throw new Error("simulated LLM failure");
+  }
+}
+
+class AbortingLlmClient extends FakeLlmClient {
+  async extractStructured<T>(): Promise<T> {
+    throw Object.assign(new Error("cancelled"), { name: "AbortError" });
   }
 }
 
@@ -345,7 +387,7 @@ describe("createExtractCandidateHandler - LLM 异步路径（§0.8 / §2.3 / §1
     expect(pending[0].evidenceIds).toContain(customTraceId);
   });
 
-  test("P1-Q3：无 traceId 时使用 unknown-event 兜底", async () => {
+  test("无 traceId 时 fail-closed，不制造 unknown-event", async () => {
     const candidates = new InMemoryCandidateRepository();
     const text = "禁止在未确认前删除生产数据。";
     const llmClient = new StubLlmClient({
@@ -355,8 +397,7 @@ describe("createExtractCandidateHandler - LLM 异步路径（§0.8 / §2.3 / §1
           semanticType: "rules",
           kind: "constraint",
           targetScope: "project",
-          // eventIds 对齐 unknown-event（handler 的兜底 eventId）
-          evidence: { eventIds: ["unknown-event"], quote: "禁止在未确认前删除生产数据" },
+          evidence: { eventIds: [], quote: "禁止在未确认前删除生产数据" },
           salience: 0.9,
           temporality: "durable",
         },
@@ -369,9 +410,9 @@ describe("createExtractCandidateHandler - LLM 异步路径（§0.8 / §2.3 / §1
       llmClient,
     });
 
-    // 不传 traceId
-    const result = (await handler(job({ scope, text, intent: "auto" }))) as { created: number };
-    expect(result.created).toBe(1);
+    await expect(handler(job({ scope, text, traceId: undefined, intent: "auto" })))
+      .rejects.toThrow(/traceId/i);
+    expect(await candidates.count({ scope })).toBe(0);
   });
 
   test("llmClient.available 时走 LLM 路径，候选过 validator 后入库", async () => {
@@ -415,10 +456,12 @@ describe("createExtractCandidateHandler - LLM 异步路径（§0.8 / §2.3 / §1
 
   test("LLM 抛错时 fallback 到 heuristic 路径（链路不断）", async () => {
     const candidates = new InMemoryCandidateRepository();
+    const auditActions: string[] = [];
     const handler = createExtractCandidateHandler({
       extractor: new HeuristicTypeExtractor(),
       candidates,
       llmClient: new ThrowingLlmClient(),
+      audit: async ({ action }) => { auditActions.push(action); },
     });
 
     const text = "禁止在未确认前删除生产数据。";
@@ -429,6 +472,27 @@ describe("createExtractCandidateHandler - LLM 异步路径（§0.8 / §2.3 / §1
     const pending = await candidates.list({ scope, status: "pending" });
     expect(pending.length).toBeGreaterThanOrEqual(1);
     expect(pending[0].extractor).toBe("heuristic");
+    expect(auditActions).toEqual(["llm_extraction_failed", "candidate.extract"]);
+  });
+
+  test("LLM AbortError 不审计 fallback 且不持久化", async () => {
+    const candidates = new InMemoryCandidateRepository();
+    const auditActions: string[] = [];
+    const handler = createExtractCandidateHandler({
+      extractor: new HeuristicTypeExtractor(),
+      candidates,
+      llmClient: new AbortingLlmClient(),
+      audit: async ({ action }) => { auditActions.push(action); },
+    });
+
+    await expect(handler(job({
+      scope,
+      text: "禁止在未确认前删除生产数据。",
+      traceId,
+      intent: "auto",
+    }))).rejects.toMatchObject({ name: "AbortError" });
+    expect(auditActions).toEqual([]);
+    expect(await candidates.count({ scope })).toBe(0);
   });
 
   test("validator 拒绝的 LLM 候选不入库（quote 不在源文本 + 低 salience）", async () => {

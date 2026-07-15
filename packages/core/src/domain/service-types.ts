@@ -5,7 +5,18 @@
  * 旧 `DatabaseProvider` 或具体向量库实现。
  */
 
-import type { DataType, TableName } from "../db/types.js";
+import type {
+  DatabaseStoreCleanupMetadata,
+  DataType,
+  TableName,
+} from "../db/types.js";
+import { DATABASE_STORE_CLEANUP_WARNING } from "../db/types.js";
+import type { AuthorityScope } from "./authority-scope.js";
+import type {
+  NormalizedProviderFilter,
+  ProviderFilterTable,
+  ProviderFilterValues,
+} from "./provider-filter.js";
 import type { ContextBlock, MemoryRecord, MemoryScope, MemoryScopeInput, RecallResult } from "./types.js";
 
 export type { RecallResult } from "./types.js";
@@ -17,6 +28,20 @@ export interface StoreMemoryInput {
 export interface StoreMemoryResult {
   id: string;
   stored: boolean;
+  warnings?: Array<typeof DATABASE_STORE_CLEANUP_WARNING>;
+}
+
+export interface MemoryRepositoryStoreRecordResult {
+  requestedId: string;
+  persistedId: string;
+  stored: boolean;
+}
+
+export interface MemoryRepositoryStoreResult {
+  inserted: number;
+  duplicates: number;
+  records: MemoryRepositoryStoreRecordResult[];
+  cleanup?: DatabaseStoreCleanupMetadata;
 }
 
 export interface RecallInput {
@@ -53,6 +78,104 @@ export interface DeleteMemoryResult {
   deleted: number;
 }
 
+/** AuthorityScope 驱动的事务化 forget 动作。旧 forgetCommand 继续兼容其它治理动作。 */
+export type AuthorityScopedForgetAction = "revoke" | "archive" | "delete";
+
+/**
+ * RB1 adapter 调用合同。serverAuthority 必须由认证后的服务端上下文提供；
+ * clientScope 只允许 AuthorityScope allowlist 中的非身份字段。
+ */
+export interface AuthorityScopedForgetInput {
+  serverAuthority: AuthorityScope;
+  clientScope: unknown;
+  action: AuthorityScopedForgetAction;
+  ids?: readonly string[];
+  filter?: ProviderFilterValues;
+  tableName?: ProviderFilterTable;
+  dataTypes?: readonly DataType[];
+  idempotencyKey: string;
+  actor?: string;
+  reason?: string;
+  now?: number;
+}
+
+export interface AuthorityScopedForgetResult {
+  action: AuthorityScopedForgetAction;
+  affected: number;
+  deleted: number;
+  affectedIds: readonly string[];
+  transactional: true;
+  idempotentReplay: boolean;
+}
+
+interface ForgetTargetSelectionBase {
+  readonly scope: MemoryScope;
+  readonly tableName: ProviderFilterTable;
+  readonly dataTypes: readonly DataType[];
+}
+
+export type ForgetTargetSelection =
+  | (ForgetTargetSelectionBase & {
+      readonly kind: "ids";
+      /** 每个 id 都已经经过 provider-neutral filter 归一化并注入 authority。 */
+      readonly filters: readonly NormalizedProviderFilter[];
+    })
+  | (ForgetTargetSelectionBase & {
+      readonly kind: "filter";
+      readonly filter: NormalizedProviderFilter;
+    });
+
+export interface ForgetAuditEvent {
+  readonly idempotencyKey: string;
+  readonly action: AuthorityScopedForgetAction;
+  readonly targetId: string;
+  readonly scope: MemoryScope;
+  readonly actor?: string;
+  readonly reason?: string;
+  readonly at: number;
+  readonly before?: Record<string, unknown>;
+  readonly after?: Record<string, unknown>;
+}
+
+export interface ForgetOutboxEvent {
+  readonly eventId: string;
+  readonly idempotencyKey: string;
+  readonly topic: "memory.lifecycle.changed" | "memory.deleted";
+  readonly action: AuthorityScopedForgetAction;
+  readonly targetId: string;
+  readonly scope: MemoryScope;
+  readonly occurredAt: number;
+}
+
+export interface AuthorityScopedForgetReceipt {
+  readonly idempotencyKey: string;
+  /** receipt identity 的 authority namespace；数据库使用 tenant/user/key 复合主键。 */
+  readonly scope: MemoryScope;
+  readonly requestFingerprint: string;
+  readonly result: AuthorityScopedForgetResult;
+}
+
+/** 同一 transaction context 内必须覆盖记录、audit、outbox 和 idempotency receipt。 */
+export interface ForgetTransactionContext {
+  findTargets(selection: ForgetTargetSelection): Promise<MemoryRecord[]>;
+  replace(records: readonly MemoryRecord[]): Promise<void>;
+  delete(ids: readonly string[]): Promise<void>;
+  appendAudit(events: readonly ForgetAuditEvent[]): Promise<void>;
+  appendOutbox(events: readonly ForgetOutboxEvent[]): Promise<void>;
+  getReceipt(scope: MemoryScope, idempotencyKey: string): Promise<AuthorityScopedForgetReceipt | undefined>;
+  saveReceipt(receipt: AuthorityScopedForgetReceipt): Promise<void>;
+}
+
+/** Provider 必须提供真实 callback transaction；不支持时不得注入空壳实现。 */
+export interface ForgetTransactionPort {
+  transaction<T>(work: (transaction: ForgetTransactionContext) => Promise<T>): Promise<T>;
+}
+
+/** 独立于旧 MemoryService，避免未升级 adapter 把 raw client authority 塞入 delete DTO。 */
+export interface AuthorityScopedForgetService {
+  forget(input: AuthorityScopedForgetInput): Promise<AuthorityScopedForgetResult>;
+}
+
 export interface HealthSnapshot {
   ok: boolean;
   records?: number;
@@ -82,7 +205,7 @@ export interface MemoryRepositoryQuery {
 }
 
 export interface MemoryRepository {
-  store(records: MemoryRecord[]): Promise<void>;
+  store(records: MemoryRecord[]): Promise<MemoryRepositoryStoreResult | void>;
   query(input: MemoryRepositoryQuery): Promise<Array<MemoryRecord & { score: number }>>;
   delete(ids: string[]): Promise<void>;
   deleteByFilter(filter: Record<string, unknown>): Promise<number>;

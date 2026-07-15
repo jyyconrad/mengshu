@@ -6,7 +6,7 @@
  */
 
 import type { MemoryScope } from "../domain/types.js";
-import type { InMemoryGraphRepository } from "./repository.js";
+import type { EntityFilter, RelationFilter } from "./repository.js";
 import type { GraphEntityRecord, GraphRelationRecord } from "./types.js";
 
 export interface GraphQueryInput {
@@ -23,13 +23,20 @@ export interface GraphQueryResult {
   evidenceChunkIds: string[];
 }
 
+export interface GraphReadRepository {
+  getEntity(id: string, scope?: MemoryScope): Promise<GraphEntityRecord | undefined>;
+  findEntities(filter: EntityFilter): Promise<GraphEntityRecord[]>;
+  findRelations(filter: RelationFilter): Promise<GraphRelationRecord[]>;
+}
+
 export class GraphQueryService {
-  constructor(private readonly repository: InMemoryGraphRepository) {}
+  constructor(private readonly repository: GraphReadRepository) {}
 
   async query(input: GraphQueryInput): Promise<GraphQueryResult> {
     const maxDepth = Math.max(1, Math.min(input.depth ?? 1, 2));
     const seedEntities = input.entityId
-      ? [await this.repository.getEntity(input.entityId)].filter((entity): entity is GraphEntityRecord => Boolean(entity))
+      ? [await this.repository.getEntity(input.entityId, input.scope)]
+        .filter((entity): entity is GraphEntityRecord => Boolean(entity))
       : await this.repository.findEntities({
         scope: input.scope,
         query: input.query,
@@ -51,7 +58,7 @@ export class GraphQueryService {
           visitedRelations.set(relation.id, relation);
           for (const nextEntityId of [relation.subjectId, relation.objectId]) {
             if (!visitedEntities.has(nextEntityId)) {
-              const entity = await this.repository.getEntity(nextEntityId);
+              const entity = await this.repository.getEntity(nextEntityId, input.scope);
               if (entity) {
                 visitedEntities.set(entity.id, entity);
                 next.add(entity.id);

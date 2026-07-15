@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
-import type { MemoryConfig } from "./config.js";
+import { vectorDimsForModel, type MemoryConfig } from "./config.js";
 import { DatabaseFactory } from "./db/factory.js";
 import type { DatabaseProvider } from "./db/types.js";
-import type { MemoryService } from "./core/service-types.js";
+import type { ForgetTransactionPort, MemoryService } from "./core/service-types.js";
+import {
+  createAuthorityScopedForgetCapability,
+  type AuthorityScopedForgetCapability,
+} from "./packages/core/src/service/authority-forget-capability.js";
 import { DefaultMemoryService } from "./core/memory-service.js";
+import type { ProviderOwnedAtomicMemoryStorePort } from
+  "./packages/core/src/service/write-kernel-transaction.js";
 import { normalizeScope } from "./core/scope.js";
 import type { MemoryRecord, MemoryScope } from "./core/types.js";
 import { Embeddings } from "./processing/embeddings.js";
@@ -11,9 +17,20 @@ import { computeContentHash } from "./processing/hash-utils.js";
 import { createLlmClient, type LlmClient } from "./processing/llm-client.js";
 import { createRoutingEngine, type RoutingEngine } from "./packages/core/src/routing/index.js";
 import { LegacyDatabaseAdapter } from "./storage/legacy-database-adapter.js";
-import { createPersistentRepositories, type PersistentRepositories } from "./packages/core/src/storage/db-provider-adapters.js";
+import {
+  attachEmbeddingSpaceMetadata,
+  createPersistentRepositories,
+  type PersistentRepositories,
+} from "./packages/core/src/storage/db-provider-adapters.js";
+import {
+  createEmbeddingSpace,
+  type KnownEmbeddingSpace,
+} from "./packages/core/src/domain/embedding-space.js";
+import {
+  EmbeddingReadGuard,
+  EmbeddingWriteGuard,
+} from "./packages/core/src/storage/embedding-space-policy.js";
 import { IngestionPipeline } from "./ingest/pipeline.js";
-import { enqueueUniqueJob } from "./ingest/jobs.js";
 import { AgentFastPathService } from "./api/agent-fast-path.js";
 import { createConsoleApi } from "./console/api.js";
 import type { ConsoleApi } from "./console/types.js";
@@ -21,6 +38,8 @@ import { extractRecords } from "./adapters/openclaw/agent-service-helper.js";
 import { CandidateReviewService } from "./lifecycle/candidate-review.js";
 import { candidateToMemoryRecord } from "./lifecycle/candidate-promotion.js";
 import { InMemoryCandidateRepository } from "./lifecycle/candidate-repository.js";
+import type { ScopeBoundCandidateReviewRepository } from
+  "./packages/core/src/lifecycle/postgres-candidate-review-repository.js";
 import { createExtractCandidateHandler } from "./lifecycle/extract-candidate-handler.js";
 import { defaultTypeExtractor } from "./lifecycle/type-extractor.js";
 import { InMemoryTreeRepository } from "./tree/buffer.js";
@@ -28,10 +47,31 @@ import { createBuildTreeHandler } from "./tree/build-tree-handler.js";
 import { PostgresTreeRepository } from "./tree/postgres-repository.js";
 import type { TreeRepository } from "./tree/types.js";
 import { InMemoryGraphRepository } from "./graph/repository.js";
+import { GraphQueryService, type GraphReadRepository } from "./graph/query.js";
 import { createExtractGraphHandler } from "./graph/extract-graph-handler.js";
 import { QueryHitsTracker } from "./graph/query-hits-tracker.js";
 import { CentralityCalculator } from "./graph/centrality-calculator.js";
 import type { JobHandler } from "./server/workers.js";
+import {
+  RuntimeLifecycle,
+  type RuntimeLifecycleStepResult,
+} from "./packages/core/src/runtime/runtime-lifecycle.js";
+import {
+  RuntimeDurableJobV2Error,
+  createRuntimeDurableJobV2Enqueuer,
+  type RuntimeDurableJobV2Enqueuer,
+} from "./runtime-durable-job-v2.js";
+import {
+  assertNativeDurableJobV2ServeCapability,
+  type DurableJobV2ServeCapability,
+} from "./server/runtime-host-factory.js";
+import {
+  assertPostgresProviderOwnsDurableJobV2RuntimeBundle,
+  PostgresProvider,
+  type PostgresDurableJobV2RuntimeBundle,
+} from "./packages/core/src/db/providers/postgres.js";
+import { createNativeDurableJobV2Composition } from
+  "./server/native-durable-job-v2-composition.js";
 
 export interface RuntimeLogger {
   info?(message: string): void;
@@ -47,6 +87,11 @@ export interface RuntimeOptions {
   db?: DatabaseProvider;
   embeddings?: Embeddings;
   llmClient?: LlmClient;
+  treeRepository?: TreeRepository;
+  /** Trusted native-v2 composition only; structural/legacy-handler capabilities are rejected. */
+  durableJobV2ServeCapability?: DurableJobV2ServeCapability;
+  /** Same-provider atomic repository/effect/readiness capability required by production serve. */
+  durableJobV2RuntimeBundle?: PostgresDurableJobV2RuntimeBundle;
 }
 
 export interface MengshuRuntime {
@@ -56,8 +101,14 @@ export interface MengshuRuntime {
   defaultScope: MemoryScope;
   db: DatabaseProvider;
   embeddings: Embeddings;
+  embeddingSpace: KnownEmbeddingSpace;
+  embeddingWriteGuard: EmbeddingWriteGuard;
+  embeddingReadGuard: EmbeddingReadGuard;
   memoryRepository: LegacyDatabaseAdapter;
   memoryService: MemoryService;
+  authorityScopedForgetCapability?: AuthorityScopedForgetCapability;
+  durableJobV2ServeCapability?: DurableJobV2ServeCapability;
+  durableJobV2RuntimeBundle?: PostgresDurableJobV2RuntimeBundle;
   ingestionStore: PersistentRepositories;
   ingestionPipeline: IngestionPipeline;
   candidateRepository: InMemoryCandidateRepository;
@@ -71,6 +122,7 @@ export interface MengshuRuntime {
   agentFastPath: AgentFastPathService;
   routingEngine: RoutingEngine | null;
   handlers: Record<"extract_candidate" | "build_tree" | "extract_graph", JobHandler>;
+  lifecycle: RuntimeLifecycle;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -188,34 +240,163 @@ function defaultScope(appId: string): MemoryScope {
   };
 }
 
+function strictFastPathJobPayload(
+  type: string,
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const rawScope = payload.scope as MemoryScope | undefined;
+  if (!rawScope) return payload;
+  const scope: Record<string, unknown> = {
+    tenantId: rawScope.tenantId,
+    userId: rawScope.userId,
+    appId: rawScope.appId,
+    projectId: rawScope.projectId,
+    agentId: rawScope.agentId,
+    namespace: rawScope.namespace,
+    visibility: rawScope.visibility,
+    ...(rawScope.workspaceId === undefined ? {} : { workspaceId: rawScope.workspaceId }),
+    ...(rawScope.sessionId === undefined ? {} : { sessionId: rawScope.sessionId }),
+  };
+  if (type === "extract_candidate") {
+    return {
+      scope,
+      ...(payload.text === undefined ? {} : { text: payload.text }),
+      ...(payload.traceId === undefined ? {} : { traceId: payload.traceId }),
+      ...(payload.intent === undefined ? {} : { intent: payload.intent }),
+    };
+  }
+  if (type === "build_tree") {
+    return {
+      scope,
+      ...(payload.traceId === undefined ? {} : { traceId: payload.traceId }),
+      ...(payload.treeType === undefined ? {} : { treeType: payload.treeType }),
+      ...(payload.treeKey === undefined ? {} : { treeKey: payload.treeKey }),
+      ...(payload.leaf === undefined ? {} : { leaf: payload.leaf }),
+    };
+  }
+  if (type === "extract_graph") {
+    return {
+      scope,
+      ...(payload.chunkId === undefined ? {} : { chunkId: payload.chunkId }),
+      ...(payload.text === undefined ? {} : { text: payload.text }),
+      ...(payload.sourceId === undefined ? {} : { sourceId: payload.sourceId }),
+      ...(payload.context === undefined ? {} : { context: payload.context }),
+    };
+  }
+  return payload;
+}
+
+function postgresForgetTransactionPort(
+  config: MemoryConfig,
+  db: DatabaseProvider,
+): ForgetTransactionPort | undefined {
+  if (config.dbType !== "postgres") return undefined;
+  const provider = db as DatabaseProvider & {
+    createForgetTransactionPort?: () => ForgetTransactionPort;
+  };
+  return typeof provider.createForgetTransactionPort === "function"
+    ? provider.createForgetTransactionPort()
+    : undefined;
+}
+
+function postgresAtomicMemoryStorePort(
+  config: MemoryConfig,
+  db: DatabaseProvider,
+): ProviderOwnedAtomicMemoryStorePort | undefined {
+  if (config.dbType !== "postgres") return undefined;
+  const provider = db as DatabaseProvider & {
+    createAtomicMemoryStorePort?: () => ProviderOwnedAtomicMemoryStorePort;
+  };
+  // DatabaseFactory's real PostgresProvider exposes this capability. Injected
+  // provider-neutral test/custom adapters retain their legacy path explicitly;
+  // a transaction-shaped duck type is rejected later by MemoryService branding.
+  return typeof provider.createAtomicMemoryStorePort === "function"
+    ? provider.createAtomicMemoryStorePort()
+    : undefined;
+}
+
 export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
   validateEmbeddingConfig(options.config.embedding);
 
   const appId = options.appId ?? "mengshu";
   const db = options.db ?? DatabaseFactory.createProvider(options.config, options.resolvedDbPath);
   const embeddings = options.embeddings ?? new Embeddings(options.config.embedding, options.config.batchProcessing);
+  const embeddingModel = options.config.embedding.model ?? "text-embedding-3-small";
+  const embeddingSpace = createEmbeddingSpace({
+    provider: options.config.embedding.provider,
+    baseURL: options.config.embedding.baseURL ?? "",
+    model: embeddingModel,
+    // 必须反映当前 Embeddings/provider 真正使用的模型维度；
+    // knowledgeBases.vectorDimensions 目前没有接入向量生成或 provider schema，不能作为指纹真源。
+    dim: vectorDimsForModel(embeddingModel),
+    // 当前 Embeddings 实现不在客户端侧执行向量归一化。
+    normalization: "none",
+  });
+  // Postgres 从本次升级起强制 persisted registry；其他 provider 保留显式兼容过渡，
+  // snapshot 仍为 registry-unavailable，绝不伪装为 active-space-match。
+  const embeddingWriteGuard = new EmbeddingWriteGuard(
+    embeddingSpace,
+    options.config.dbType === "postgres" ? "enforced" : "legacy-write-through",
+  );
+  // 所有 provider 的读链都严格执行：没有已验证的 active registry 时，
+  // runtime 不得在 legacy/unknown/mixed embedding 记录上执行 ANN。
+  const embeddingReadGuard = new EmbeddingReadGuard(embeddingSpace);
+  const resetEmbeddingGuards = () => {
+    embeddingWriteGuard.update({ status: "unavailable" });
+    embeddingReadGuard.update({ status: "unavailable" });
+  };
+  const guardedPersistenceEmbeddings = {
+    get modelName() {
+      return embeddings.modelName;
+    },
+    embed: async (text: string) => {
+      embeddingWriteGuard.assertWriteAllowed();
+      return embeddings.embed(text);
+    },
+    embedBatch: async (texts: string[]) => {
+      embeddingWriteGuard.assertWriteAllowed();
+      return embeddings.embedBatch(texts);
+    },
+  } as unknown as Embeddings;
   const graphRepository = new InMemoryGraphRepository();
   const queryHitsTracker = new QueryHitsTracker({ graphRepo: graphRepository });
   const centralityCalculator = new CentralityCalculator({ graphRepo: graphRepository });
+  const runtimeDefaultScope = options.defaultScope ?? defaultScope(appId);
+  // F5 stage-1 repositories are also the shared audit path for direct memory
+  // writes, including cleanup-warning receipts that already prove persistence.
+  const persistentRepos = createPersistentRepositories({
+    db,
+    embeddings: guardedPersistenceEmbeddings,
+    scope: runtimeDefaultScope,
+    embeddingSpace,
+  });
   const memoryRepository = new LegacyDatabaseAdapter(db, { appId });
+  const forgetTransactions = postgresForgetTransactionPort(options.config, db);
+  const atomicStore = postgresAtomicMemoryStorePort(options.config, db);
   const memoryService = new DefaultMemoryService({
     repository: memoryRepository,
     embeddings,
+    atomicStore,
+    audit: persistentRepos.audit,
     queryHitsTracker,
+    forgetTransactions,
+    embeddingReadGuard,
+    // 与 candidate/document/chunk/observation 共用同一 mutable registry gate；
+    // public REST/MCP/script/doctor 经 memoryService 写入时不再有 vector 旁路。
+    embeddingWriteGuard,
+    stampEmbeddingMetadata: (metadata) =>
+      attachEmbeddingSpaceMetadata({ ...metadata }, embeddingSpace),
   });
+  const authorityScopedForgetCapability = forgetTransactions
+    ? createAuthorityScopedForgetCapability(memoryService, forgetTransactions)
+    : undefined;
 
   const llmClient = options.llmClient ?? createLlmClient(options.config.llm);
-  const treeRepository: TreeRepository = options.config.dbType === "postgres" && options.config.postgres
-    ? new PostgresTreeRepository(options.config.postgres)
-    : new InMemoryTreeRepository();
-  const runtimeDefaultScope = options.defaultScope ?? defaultScope(appId);
-
-  // F5 阶段 1：使用持久化 repository 替代 in-memory store
-  const persistentRepos = createPersistentRepositories({
-    db,
-    embeddings,
-    scope: runtimeDefaultScope,
-  });
+  const treeRepository: TreeRepository = options.treeRepository ?? (
+    options.config.dbType === "postgres" && options.config.postgres
+      ? new PostgresTreeRepository(options.config.postgres)
+      : new InMemoryTreeRepository()
+  );
   const ingestionPipeline = new IngestionPipeline({
     documents: persistentRepos.documents,
     chunks: persistentRepos.chunks,
@@ -224,21 +405,130 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
   });
 
   const candidateRepository = new InMemoryCandidateRepository();
+  // Production Postgres review is bound to the provider's private pool and the
+  // runtime authority scope. The legacy in-memory repository remains the
+  // direct-handler compatibility path for non-Postgres providers.
+  const candidateReviewRepository: InMemoryCandidateRepository | ScopeBoundCandidateReviewRepository =
+    options.config.dbType === "postgres" && db instanceof PostgresProvider
+      ? db.createCandidateReviewRepository(runtimeDefaultScope)
+      : candidateRepository;
+  const durableCandidateReview = candidateReviewRepository !== candidateRepository;
   const candidateReview = new CandidateReviewService({
-    repository: candidateRepository,
-    promoteCandidate: async ({ candidate }) => {
-      const record = candidateToMemoryRecord(candidate);
-      await memoryService.storeMemory({ record });
-      return { memoryId: record.id };
-    },
+    repository: candidateReviewRepository,
+    promoteCandidate: durableCandidateReview
+      ? async () => {
+          // v8 candidate rows do not yet carry a promotion receipt/lease.
+          // Never create a memory first and mark the candidate afterwards:
+          // a crash in that window would violate exactly-once semantics.
+          throw new Error("candidate_approval_requires_atomic_promotion");
+        }
+      : async ({ candidate }) => {
+          embeddingWriteGuard.assertWriteAllowed();
+          const candidateRecord = candidateToMemoryRecord(candidate);
+          const record: MemoryRecord = {
+            ...candidateRecord,
+            metadata: attachEmbeddingSpaceMetadata(
+              candidateRecord.metadata,
+              embeddingSpace,
+            ),
+          };
+          const outcome = await memoryService.storeMemory({ record });
+          return { memoryId: outcome.id };
+        },
     audit: async ({ scope, action, targetId, metadata }) => {
       await persistentRepos.audit.append({ scope, action, targetId, metadata });
     },
   });
 
+  let rawDurableJobV2ServeCapability = options.durableJobV2ServeCapability;
+  let durableJobV2RuntimeBundle = options.durableJobV2RuntimeBundle;
+  if (!rawDurableJobV2ServeCapability && !durableJobV2RuntimeBundle &&
+      options.config.dbType === "postgres" && db instanceof PostgresProvider &&
+      runtimeDefaultScope.visibility !== undefined) {
+    const runtimeBundle = db.createDurableJobV2RuntimeBundle({
+      clock: Date.now,
+      tokenFactory: randomUUID,
+      backoffMs: (attempts) => Math.min(60_000, 1_000 * (2 ** Math.max(0, attempts - 1))),
+    });
+    const composition = createNativeDurableJobV2Composition({
+      runtimeBundle,
+      scope: {
+        tenantId: runtimeDefaultScope.tenantId,
+        userId: runtimeDefaultScope.userId,
+        appId: runtimeDefaultScope.appId,
+        projectId: runtimeDefaultScope.projectId,
+        agentId: runtimeDefaultScope.agentId,
+        namespace: runtimeDefaultScope.namespace,
+        visibility: runtimeDefaultScope.visibility,
+      },
+      candidateComputation: { extractor: defaultTypeExtractor, llmClient },
+      llmClient,
+    });
+    durableJobV2RuntimeBundle = composition.runtimeBundle;
+    rawDurableJobV2ServeCapability = composition.serveCapability;
+  }
+  let durableJobV2ServeCapability: DurableJobV2ServeCapability | undefined;
+  let durableJobV2Enqueuer: RuntimeDurableJobV2Enqueuer | undefined;
+  if (rawDurableJobV2ServeCapability || durableJobV2RuntimeBundle) {
+    if (options.config.dbType !== "postgres") {
+      throw new RuntimeDurableJobV2Error("CAPABILITY_UNAVAILABLE");
+    }
+    if (!rawDurableJobV2ServeCapability || !durableJobV2RuntimeBundle) {
+      throw new RuntimeDurableJobV2Error("CAPABILITY_UNAVAILABLE");
+    }
+    try {
+      durableJobV2ServeCapability = assertNativeDurableJobV2ServeCapability(
+        rawDurableJobV2ServeCapability,
+      );
+      assertPostgresProviderOwnsDurableJobV2RuntimeBundle(db, durableJobV2RuntimeBundle);
+    } catch {
+      throw new RuntimeDurableJobV2Error("CAPABILITY_UNAVAILABLE");
+    }
+    if (durableJobV2ServeCapability.repository !== durableJobV2RuntimeBundle.repository) {
+      throw new RuntimeDurableJobV2Error("CAPABILITY_UNAVAILABLE");
+    }
+    durableJobV2Enqueuer = createRuntimeDurableJobV2Enqueuer({
+      runtimeBundle: durableJobV2RuntimeBundle,
+      scope: durableJobV2ServeCapability.scope,
+    }, {
+      defaultScope: runtimeDefaultScope,
+    });
+  }
+
+  const canonicalDomainReadsReady = async (): Promise<boolean> => {
+    if (!durableJobV2RuntimeBundle || !(db instanceof PostgresProvider)) return false;
+    try {
+      await durableJobV2RuntimeBundle.assertEnqueueReady();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const graphReadRepository: GraphReadRepository = {
+    getEntity: async (id, requestedScope = runtimeDefaultScope) => {
+      if (await canonicalDomainReadsReady() && db instanceof PostgresProvider) {
+        return db.createCanonicalGraphReadRepository(requestedScope)
+          .getEntity(id, requestedScope);
+      }
+      return graphRepository.getEntity(id);
+    },
+    findEntities: async (filter) => {
+      if (await canonicalDomainReadsReady() && db instanceof PostgresProvider) {
+        return db.createCanonicalGraphReadRepository(filter.scope).findEntities(filter);
+      }
+      return graphRepository.findEntities(filter);
+    },
+    findRelations: async (filter) => {
+      if (await canonicalDomainReadsReady() && db instanceof PostgresProvider) {
+        return db.createCanonicalGraphReadRepository(filter.scope).findRelations(filter);
+      }
+      return graphRepository.findRelations(filter);
+    },
+  };
   const consoleApi = createConsoleApi({
     service: memoryService,
-    candidates: candidateRepository,
+    graph: new GraphQueryService(graphReadRepository),
+    candidates: candidateReviewRepository,
     candidateReview,
   });
 
@@ -264,6 +554,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         searchAll: appId !== "openclaw",
       }),
     storeObservation: async ({ scope, text, metadata }) => {
+      embeddingWriteGuard.assertWriteAllowed();
       const resolvedScope = normalizeScope(scope, runtimeDefaultScope);
       const now = Date.now();
       const traceId = typeof metadata.traceId === "string" ? metadata.traceId : undefined;
@@ -282,16 +573,19 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         category: "core",
         dataType: "memory",
         tableName: "memories",
-        metadata: {
-          ...metadata,
-          source: metadata.source ?? "agent-fast-path",
-          eventType,
-          updatedAt: now,
-          embeddingModel: options.config.embedding.model,
-          userId: resolvedScope.userId ?? "default",
-          projectPath: resolvedScope.projectId ?? "default",
-          agentName: resolvedScope.agentId ?? "default",
-        },
+        metadata: attachEmbeddingSpaceMetadata(
+          {
+            ...metadata,
+            source: metadata.source ?? "agent-fast-path",
+            eventType,
+            updatedAt: now,
+            embeddingModel,
+            userId: resolvedScope.userId ?? "default",
+            projectPath: resolvedScope.projectId ?? "default",
+            agentName: resolvedScope.agentId ?? "default",
+          },
+          embeddingSpace,
+        ),
         provenance: {
           source: typeof metadata.source === "string" ? metadata.source : "agent-fast-path",
           sessionId: resolvedScope.sessionId,
@@ -301,16 +595,35 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         updatedAt: now,
         vector: await embeddings.embed(text),
       };
-      await memoryService.storeMemory({ record });
-      return { id: record.id };
+      const outcome = await memoryService.storeMemory({ record });
+      return {
+        id: outcome.id,
+        stored: outcome.stored,
+        ...(outcome.warnings ? { warnings: outcome.warnings } : {}),
+      };
     },
     enqueueJob: async ({ type, payload }) => {
-      const targetId =
-        typeof payload.traceId === "string" ? payload.traceId : computeContentHash(JSON.stringify(payload));
-      const job = await enqueueUniqueJob(persistentRepos.jobs, { type, targetId, payload });
-      return job.id;
+      if (!durableJobV2Enqueuer) {
+        throw new RuntimeDurableJobV2Error("CAPABILITY_UNAVAILABLE");
+      }
+      return durableJobV2Enqueuer.enqueue({
+        type,
+        payload: strictFastPathJobPayload(type, payload),
+      });
     },
-    loadTreeSummaries: async (resolvedScope) => treeRepository.listSummaries({ scope: resolvedScope }),
+    ensureJob: durableJobV2Enqueuer
+      ? async ({ type, payload }) => durableJobV2Enqueuer.enqueue({
+          type,
+          payload: strictFastPathJobPayload(type, payload),
+        })
+      : undefined,
+    loadTreeSummaries: async (resolvedScope) => {
+      if (await canonicalDomainReadsReady() && db instanceof PostgresProvider) {
+        return db.createCanonicalTreeReadRepository(resolvedScope)
+          .listSummaries({ scope: resolvedScope });
+      }
+      return treeRepository.listSummaries({ scope: resolvedScope });
+    },
     logger: options.logger,
   });
 
@@ -334,9 +647,93 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     },
   });
 
+  const handlers = {
+    extract_candidate: extractCandidateHandler,
+    build_tree: buildTreeHandler,
+    extract_graph: extractGraphHandler,
+  } satisfies Record<"extract_candidate" | "build_tree" | "extract_graph", JobHandler>;
+
   const routingEngine = options.config.knowledgeBases?.enabled
     ? createRoutingEngine(options.config.routingRules)
     : null;
+
+  const initializeEmbeddingRegistry = async (): Promise<RuntimeLifecycleStepResult | void> => {
+    if (options.config.dbType !== "postgres") return;
+    if (typeof db.getActiveEmbeddingSpace !== "function") {
+      embeddingWriteGuard.update({ status: "unavailable" });
+      embeddingReadGuard.update({ status: "unavailable" });
+      return { ready: false, reason: "registry-capability-missing" };
+    }
+    try {
+      const activeSpace = await db.getActiveEmbeddingSpace();
+      // stop() 会先同步撤销能力。若 registry read 随后才返回，不得在
+      // stopping/stopped 窗口把 read/write guard 重新激活。
+      if (lifecycle.snapshot().state !== "starting") {
+        resetEmbeddingGuards();
+        return;
+      }
+      const registry = activeSpace
+        ? { status: "ready" as const, activeSpace }
+        : { status: "missing" as const };
+      embeddingWriteGuard.update(registry);
+      embeddingReadGuard.update(registry);
+      const decision = embeddingWriteGuard.snapshot().decision;
+      if (!decision.allowed) {
+        return { ready: false, reason: decision.reasonCode };
+      }
+    } catch {
+      embeddingWriteGuard.update({ status: "unavailable" });
+      embeddingReadGuard.update({ status: "unavailable" });
+      options.logger?.warn?.(
+        "embedding registry unavailable; runtime is not ready (registry-read-failed)",
+      );
+      return { ready: false, reason: "registry-read-failed" };
+    }
+  };
+
+  const lifecycle = new RuntimeLifecycle([
+    {
+      name: "database",
+      start: () => db.initialize(),
+      stop: () => db.close(),
+    },
+    {
+      name: "embedding-registry",
+      start: initializeEmbeddingRegistry,
+      stop: () => {
+        // 正常 stop 与 startup rollback 都必须先撤销 active 能力，再关闭 DB。
+        resetEmbeddingGuards();
+      },
+    },
+    {
+      name: "tree",
+      start: async () => {
+        try {
+          if ("initialize" in treeRepository && typeof treeRepository.initialize === "function") {
+            await treeRepository.initialize();
+          }
+        } catch (initializeFailure) {
+          // 失败 step 尚未进入 lifecycle rollback 栈，必须自行释放部分初始化资源。
+          if ("close" in treeRepository && typeof treeRepository.close === "function") {
+            try {
+              await treeRepository.close();
+            } catch (closeFailure) {
+              throw new AggregateError(
+                [initializeFailure, closeFailure],
+                "tree startup and cleanup failed",
+              );
+            }
+          }
+          throw initializeFailure;
+        }
+      },
+      stop: async () => {
+        if ("close" in treeRepository && typeof treeRepository.close === "function") {
+          await treeRepository.close();
+        }
+      },
+    },
+  ]);
 
   return {
     config: options.config,
@@ -345,8 +742,14 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     defaultScope: runtimeDefaultScope,
     db,
     embeddings,
+    embeddingSpace,
+    embeddingWriteGuard,
+    embeddingReadGuard,
     memoryRepository,
     memoryService,
+    authorityScopedForgetCapability,
+    durableJobV2ServeCapability,
+    durableJobV2RuntimeBundle,
     ingestionStore: persistentRepos,
     ingestionPipeline,
     candidateRepository,
@@ -359,22 +762,14 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     centralityCalculator,
     agentFastPath,
     routingEngine,
-    handlers: {
-      extract_candidate: extractCandidateHandler,
-      build_tree: buildTreeHandler,
-      extract_graph: extractGraphHandler,
-    },
-    start: async () => {
-      await db.initialize();
-      if ("initialize" in treeRepository && typeof treeRepository.initialize === "function") {
-        await treeRepository.initialize();
-      }
-    },
-    stop: async () => {
-      await db.close();
-      if ("close" in treeRepository && typeof treeRepository.close === "function") {
-        await treeRepository.close();
-      }
+    handlers,
+    lifecycle,
+    start: () => lifecycle.start(),
+    stop: () => {
+      // lifecycle 按逆序关闭；同步撤销 guard，避免等待 tree/registry cleanup
+      // 时仍有写入窗口。registry step 的 stop 仍保留用于 startup rollback。
+      resetEmbeddingGuards();
+      return lifecycle.stop();
     },
   };
 }

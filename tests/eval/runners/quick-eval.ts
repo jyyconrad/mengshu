@@ -20,9 +20,11 @@
  *   - 不调任何 LLM、不连任何向量库；输入只看 seedMemories 和 expected。
  *   - 评测目的是验证 slot-context-builder + scope-policy + sensitive-filter 的集成
  *     语义正确性，不是完整 retrieval pipeline 的端到端。
- *   - release gate：safety 套件 wrong_injection_rate 必须为 0。
+ *   - quality gate：逐项执行 manifest metric；unsupported expected fail-closed。
+ *   - production gate：仅 runtime-e2e 且无 fallback/degraded 才可能通过。
  */
 
+import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,7 +44,24 @@ import type {
 } from "../../../core/types.js";
 
 import { loadGoldenJsonl } from "./load-jsonl.js";
+import {
+  assertRegisteredRunners,
+  loadEvalManifest,
+  selectEvalSuites,
+} from "./eval-manifest.js";
+import type { EvalSuitePlan } from "./eval-manifest.js";
+import {
+  createBaselineMetrics,
+  evaluateSuiteGate,
+  findUnsupportedExpectedFields,
+  isProductionReleaseEligible,
+  offlineSlotContextExecution,
+} from "./eval-metrics.js";
 import { defaultJudge, summarizeSuite } from "./judge.js";
+import {
+  EXTENSION_RUNNER_REGISTRY,
+  type QuickEvalRunner,
+} from "./extension-runner-adapters.js";
 import type {
   CaseResult,
   EvalReport,
@@ -50,6 +69,19 @@ import type {
   SeedMemorySpec,
   SuiteSummary,
 } from "./types.js";
+
+/** slot-context-v1 确实消费的 expected 字段；其他字段必须显式失败。 */
+const SLOT_CONTEXT_SUPPORTED_EXPECTED_FIELDS = new Set([
+  "requiredMemoryIds",
+  "forbiddenMemoryIds",
+  "requiredSlots",
+  "answerMustContain",
+  "mustEscape",
+  "mustEscapeMaxCount",
+  "expectSensitiveBlocked",
+  "answerMustNotContain",
+  "forbiddenBodyPatterns",
+]);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -134,7 +166,7 @@ async function runCase(
 
   const latencyMs = Date.now() - start;
 
-  return defaultJudge({
+  const result = defaultJudge({
     goldenCase,
     injectedMemoryIds,
     filledSlots,
@@ -143,6 +175,16 @@ async function runCase(
     tokenEstimate: response.telemetry.tokenEstimate ?? 0,
     sensitiveBlockedIds,
   });
+  const unsupported = findUnsupportedExpectedFields(
+    goldenCase.expected as unknown as Record<string, unknown>,
+    SLOT_CONTEXT_SUPPORTED_EXPECTED_FIELDS,
+  );
+  if (unsupported.length === 0) return result;
+  const failures = [
+    ...result.failures,
+    ...unsupported.map((field) => `unsupported expected field: ${field}`),
+  ];
+  return { ...result, passed: false, failures };
 }
 
 /** 一次跑完一个 suite。 */
@@ -158,16 +200,56 @@ export async function runSuite(suiteFile: string): Promise<{
     const result = await runCase(goldenCase, builder);
     results.push(result);
   }
-  const summary = summarizeSuite(
+  const baseSummary = summarizeSuite(
     cases[0]?.suite ?? path.basename(suiteFile, ".jsonl"),
     cases,
     results,
   );
+  const summary: SuiteSummary = {
+    ...baseSummary,
+    metrics: createBaselineMetrics(cases, results, baseSummary),
+    execution: offlineSlotContextExecution(),
+  };
   return { cases, results, summary };
 }
 
 function formatPercent(value: number): string {
   return `${(value * 100).toFixed(2)}%`;
+}
+
+/**
+ * 给 production gate 的布尔值补上可审计原因。
+ * quality gate 和 production gate 是两层不同契约：offline component 可以让前者
+ * 通过，但只有无 fallback/degraded 的 runtime-e2e 执行才允许后者通过。
+ */
+export function describeProductionGateFailures(report: EvalReport): string[] {
+  if (report.productionReleaseGatePassed) return [];
+  const failures: string[] = [];
+  if (!report.releaseGatePassed) failures.push("quality release gate failed");
+  const nonRuntimeSuites = new Map<string, string[]>();
+  for (const suite of report.suites) {
+    const execution = suite.execution;
+    if (!execution) {
+      failures.push(`${suite.suite}: missing execution metadata`);
+      continue;
+    }
+    if (execution.runMode !== "runtime-e2e") {
+      const names = nonRuntimeSuites.get(execution.runMode) ?? [];
+      names.push(suite.suite);
+      nonRuntimeSuites.set(execution.runMode, names);
+      continue;
+    }
+    if (!execution.provider) failures.push(`${suite.suite}: missing provider`);
+    if (!execution.model) failures.push(`${suite.suite}: missing model`);
+    if (!execution.prompt) failures.push(`${suite.suite}: missing prompt`);
+    if (!execution.version) failures.push(`${suite.suite}: missing version`);
+    if (execution.fallback) failures.push(`${suite.suite}: fallback=true`);
+    if (execution.degraded) failures.push(`${suite.suite}: degraded=true`);
+  }
+  for (const [runMode, suites] of nonRuntimeSuites) {
+    failures.push(`runMode=${runMode} suites=${suites.join(",")}`);
+  }
+  return failures;
 }
 
 /** 把一个 suite 的报告渲染成 markdown 文本。 */
@@ -176,30 +258,84 @@ export function renderReport(report: EvalReport): string {
   lines.push(`# mengshu 评测报告`);
   lines.push("");
   lines.push(`- 生成时间：${report.generatedAt}`);
+  lines.push(`- manifest schema：${report.manifest.schemaVersion}`);
+  lines.push(`- manifest version：${report.manifest.version ?? "-"}`);
   lines.push(`- 总 case 数：${report.totalCases}`);
   lines.push(`- 通过：${report.totalPassed}`);
   lines.push(`- 失败：${report.totalFailed}`);
   lines.push(
     `- release gate：${report.releaseGatePassed ? "通过" : "未通过"}`,
   );
+  lines.push(
+    `- production release gate：${report.productionReleaseGatePassed ? "通过" : "未通过"}`,
+  );
+  for (const failure of describeProductionGateFailures(report)) {
+    lines.push(`- production gate reason：${failure}`);
+  }
   lines.push("");
 
   for (const suite of report.suites) {
+    const manifestSuite = report.manifest.suites.find((item) => item.name === suite.suite)!;
     lines.push(`## suite: ${suite.suite}`);
     lines.push("");
     lines.push(`- 总数：${suite.total}`);
     lines.push(`- 通过：${suite.passed}`);
     lines.push(`- 失败：${suite.failed}`);
     lines.push(`- pass rate：${formatPercent(suite.passRate)}`);
-    lines.push(
-      `- slot recall pass rate：${formatPercent(suite.slotRecallPassRate)}`,
-    );
-    lines.push(
-      `- wrong injection rate：${formatPercent(suite.wrongInjectionRate)}`,
-    );
-    lines.push(`- latency P50：${suite.latencyP50Ms} ms`);
-    lines.push(`- latency P95：${suite.latencyP95Ms} ms`);
+    if (manifestSuite.kind === "baseline") {
+      lines.push(
+        `- slot recall pass rate：${formatPercent(suite.slotRecallPassRate)}`,
+      );
+      lines.push(
+        `- wrong injection rate：${formatPercent(suite.wrongInjectionRate)}`,
+      );
+      lines.push(`- latency P50：${suite.latencyP50Ms} ms`);
+      lines.push(`- latency P95：${suite.latencyP95Ms} ms`);
+    }
+    lines.push(`- suite gate：${suite.gatePassed ? "通过" : "未通过"}`);
+    lines.push(`- runner：${manifestSuite.runner}`);
+    lines.push(`- fixture sha256：${manifestSuite.fixtureSha256}`);
+    lines.push(`- gate identity：${manifestSuite.gateIdentity}`);
+    const execution = suite.execution ?? offlineSlotContextExecution();
+    lines.push(`- run mode：${execution.runMode}`);
+    lines.push(`- provider：${execution.provider ?? "-"}`);
+    lines.push(`- model：${execution.model ?? "-"}`);
+    lines.push(`- prompt：${execution.prompt ?? "-"}`);
+    lines.push(`- version：${execution.version}`);
+    lines.push(`- fallback：${execution.fallback}`);
+    lines.push(`- degraded：${execution.degraded}`);
     lines.push("");
+
+    if ((suite.metrics?.length ?? 0) > 0) {
+      lines.push(`### Metrics`);
+      lines.push("");
+      for (const metric of suite.metrics ?? []) {
+        lines.push(
+          `- ${metric.name}: numerator=${metric.numerator}, denominator=${metric.denominator}, value=${metric.value}, direction=${metric.direction}, threshold=${metric.threshold}, passed=${metric.passed}`,
+        );
+      }
+      lines.push("");
+    }
+
+    if ((suite.gateFailures?.length ?? 0) > 0) {
+      lines.push(`### Gate failures`);
+      lines.push("");
+      for (const failure of suite.gateFailures ?? []) {
+        lines.push(`- ${failure}`);
+      }
+      lines.push("");
+    }
+
+    if ((suite.contractIssues?.length ?? 0) > 0) {
+      lines.push(`### Contract issues`);
+      lines.push("");
+      for (const issue of suite.contractIssues ?? []) {
+        lines.push(
+          `- ${issue.code}: suite=${issue.suite}, case=${issue.caseId ?? "-"}, path=${issue.path}, message=${issue.message}`,
+        );
+      }
+      lines.push("");
+    }
 
     if (suite.failedCases.length > 0) {
       lines.push(`### 失败 case`);
@@ -229,30 +365,146 @@ export function renderReport(report: EvalReport): string {
 export function buildReport(
   summaries: SuiteSummary[],
   notes: string[] = [],
+  suitePlans?: ReadonlyArray<
+    Pick<
+      EvalSuitePlan,
+      | "name"
+      | "kind"
+      | "runner"
+      | "caseCount"
+      | "sha256"
+      | "metrics"
+      | "gate"
+      | "manifestSchemaVersion"
+      | "manifestVersion"
+    >
+  >,
 ): EvalReport {
-  const totalCases = summaries.reduce((sum, s) => sum + s.total, 0);
-  const totalPassed = summaries.reduce((sum, s) => sum + s.passed, 0);
-  const totalFailed = summaries.reduce((sum, s) => sum + s.failed, 0);
+  if (!suitePlans || suitePlans.length === 0 || summaries.length === 0) {
+    throw new Error("buildReport requires non-empty manifest suitePlans and summaries");
+  }
+  assertUniqueNames(summaries.map((summary) => summary.suite), "summary suite");
+  assertUniqueNames(suitePlans.map((plan) => plan.name), "manifest suite plan");
+  const summaryNames = new Set(summaries.map((summary) => summary.suite));
+  const planNames = new Set(suitePlans.map((plan) => plan.name));
+  const missingPlans = [...summaryNames].filter((name) => !planNames.has(name));
+  const extraPlans = [...planNames].filter((name) => !summaryNames.has(name));
+  if (missingPlans.length > 0 || extraPlans.length > 0) {
+    throw new Error(
+      `manifest suitePlans 与 summaries 必须一一对应；missing=${missingPlans.join(",")}; extra=${extraPlans.join(",")}`,
+    );
+  }
+  const planByName = new Map(suitePlans.map((plan) => [plan.name, plan]));
+  const evaluated = summaries.map((summary) => {
+    const metrics = summary.metrics ?? [];
+    const execution = summary.execution ?? offlineSlotContextExecution();
+    const plan = planByName.get(summary.suite);
+    if (!plan) throw new Error(`summary suite '${summary.suite}' 缺少 manifest plan`);
+    assertSummaryIntegrity(summary, plan.caseCount);
+    const contract = { kind: plan.kind, metrics: plan.metrics, gate: plan.gate };
+    const gate = evaluateSuiteGate(
+      { ...summary, metrics, execution },
+      contract,
+    );
+    const contractIssueFailures = (summary.contractIssues ?? []).map(
+      (issue) =>
+        `contract issue '${issue.code}' at ${issue.caseId ?? issue.suite}:${issue.path}`,
+    );
+    const gateFailures = [...new Set([
+      ...(summary.gateFailures ?? []),
+      ...contractIssueFailures,
+      ...gate.failures,
+    ])];
+    return {
+      ...summary,
+      metrics,
+      execution,
+      gatePassed: summary.failed === 0 && gate.passed && gateFailures.length === 0,
+      gateFailures,
+    };
+  });
 
-  // release gate：safety 套件 wrong_injection_rate 必须为 0；
-  // 其他套件 pass rate 必须 >= 80%。
-  const safetySuite = summaries.find((s) =>
-    s.suite.includes("safety"),
+  const totalCases = evaluated.reduce((sum, s) => sum + s.total, 0);
+  const totalPassed = evaluated.reduce((sum, s) => sum + s.passed, 0);
+  const totalFailed = evaluated.reduce((sum, s) => sum + s.failed, 0);
+  const releaseGatePassed =
+    evaluated.length > 0 && evaluated.every((suite) => suite.gatePassed);
+  const productionReleaseGatePassed =
+    releaseGatePassed && isProductionReleaseEligible(evaluated);
+  const manifestSchemaVersions = new Set(
+    suitePlans.map((plan) => plan.manifestSchemaVersion),
   );
-  const safetyOk = safetySuite ? safetySuite.wrongInjectionRate === 0 : true;
-  const overallOk = summaries.every((s) =>
-    s.suite.includes("safety") ? true : s.passRate >= 0.8,
-  );
+  const manifestVersions = new Set(suitePlans.map((plan) => plan.manifestVersion));
+  if (manifestSchemaVersions.size !== 1 || manifestVersions.size !== 1) {
+    throw new Error("suite plans 来自不一致的 manifest identity");
+  }
+  const manifestSuites = summaries.map((summary) => {
+    const plan = planByName.get(summary.suite)!;
+    const gate = plan.gate ?? null;
+    const gateIdentity = createHash("sha256").update(JSON.stringify({
+      kind: plan.kind,
+      metrics: plan.metrics,
+      gate,
+    })).digest("hex");
+    return {
+      name: plan.name,
+      kind: plan.kind,
+      runner: plan.runner,
+      fixtureCaseCount: plan.caseCount,
+      fixtureSha256: plan.sha256,
+      metrics: [...plan.metrics],
+      gate,
+      gateIdentity,
+    };
+  });
 
   return {
     generatedAt: new Date().toISOString(),
-    suites: summaries,
+    manifest: {
+      schemaVersion: [...manifestSchemaVersions][0]!,
+      version: [...manifestVersions][0]!,
+      suites: manifestSuites,
+    },
+    suites: evaluated,
     totalCases,
     totalPassed,
     totalFailed,
-    releaseGatePassed: safetyOk && overallOk,
+    releaseGatePassed,
+    productionReleaseGatePassed,
     notes,
   };
+}
+
+function assertUniqueNames(names: readonly string[], label: string): void {
+  const seen = new Set<string>();
+  for (const name of names) {
+    if (seen.has(name)) throw new Error(`${label} '${name}' 重复`);
+    seen.add(name);
+  }
+}
+
+function assertSummaryIntegrity(summary: SuiteSummary, manifestCaseCount: number): void {
+  if (!Number.isInteger(summary.total) || summary.total <= 0 ||
+      !Number.isInteger(summary.passed) || summary.passed < 0 ||
+      !Number.isInteger(summary.failed) || summary.failed < 0 ||
+      summary.total !== summary.passed + summary.failed) {
+    throw new Error(`suite '${summary.suite}' summary total/passed/failed 不一致`);
+  }
+  if (summary.total !== manifestCaseCount) {
+    throw new Error(`suite '${summary.suite}' summary total 与 manifest caseCount 不一致`);
+  }
+  const expectedPassRate = summary.passed / summary.total;
+  if (!Number.isFinite(summary.passRate) || summary.passRate !== expectedPassRate) {
+    throw new Error(`suite '${summary.suite}' summary passRate 不一致`);
+  }
+  if (!Array.isArray(summary.failedCases) || summary.failedCases.length !== summary.failed) {
+    throw new Error(`suite '${summary.suite}' summary failedCases 不一致`);
+  }
+  const failedIds = summary.failedCases.map((result) => result.caseId);
+  assertUniqueNames(failedIds, `suite '${summary.suite}' failed case`);
+  if (summary.failedCases.some((result) => result.suite !== summary.suite || result.passed)) {
+    throw new Error(`suite '${summary.suite}' summary failedCases 内容非法`);
+  }
 }
 
 function timestampDir(): string {
@@ -266,33 +518,55 @@ async function main(argv: string[]): Promise<void> {
   const resultsDir = path.resolve(__dirname, "../results");
 
   const args = argv.slice(2);
-  const suiteName = args[0] ?? "mengshu-v0.1";
-
-  // 简易参数解析
+  // 默认必须覆盖 manifest 全量；extension 的真实失败必须进入统一报告，
+  // 避免无参数命令只跑一套 baseline 却输出 release gate PASS。
+  let suiteName = "all";
+  let suiteWasSet = false;
   let outDir = path.join(resultsDir, timestampDir());
-  for (let i = 1; i < args.length; i++) {
-    if (args[i] === "--out" && args[i + 1]) {
-      outDir = args[i + 1];
+  let manifestPath = path.join(goldensDir, "manifest.json");
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--out") {
+      if (!args[i + 1]) throw new Error("[quick-eval] --out 缺少路径");
+      outDir = path.resolve(args[i + 1]);
       i++;
+    } else if (args[i] === "--manifest") {
+      if (!args[i + 1]) throw new Error("[quick-eval] --manifest 缺少路径");
+      manifestPath = path.resolve(args[i + 1]);
+      i++;
+    } else if (args[i].startsWith("--")) {
+      throw new Error(`[quick-eval] 未知参数 '${args[i]}'`);
+    } else if (!suiteWasSet) {
+      suiteName = args[i];
+      suiteWasSet = true;
+    } else {
+      throw new Error(`[quick-eval] 多余参数 '${args[i]}'`);
     }
   }
 
-  const suiteFile = path.join(goldensDir, `${suiteName}.jsonl`);
-  // 跑单 suite，但若用户传 "all"，就把全部 jsonl 都跑
+  const runnerRegistry = new Map<string, QuickEvalRunner>([
+    ["slot-context-v1", runSuite],
+    ...EXTENSION_RUNNER_REGISTRY,
+  ]);
+  const manifest = loadEvalManifest(manifestPath);
+  const selectedSuites = selectEvalSuites(manifest, suiteName, manifestPath);
+  assertRegisteredRunners(selectedSuites, new Set(runnerRegistry.keys()));
+
   const summaries: SuiteSummary[] = [];
-  if (suiteName === "all") {
-    const allFiles = ["mengshu-v0.1", "mengshu-safety"];
-    for (const name of allFiles) {
-      const file = path.join(goldensDir, `${name}.jsonl`);
-      const { summary } = await runSuite(file);
-      summaries.push(summary);
+  for (const suite of selectedSuites) {
+    const runner = runnerRegistry.get(suite.runner);
+    if (!runner) {
+      throw new Error(`[quick-eval] 未实现 runner '${suite.runner}'`);
     }
-  } else {
-    const { summary } = await runSuite(suiteFile);
+    const { summary } = await runner(suite.filePath);
+    if (summary.suite !== suite.name) {
+      throw new Error(
+        `[quick-eval] fixture schema 错误：manifest suite '${suite.name}' 与 fixture suite '${summary.suite}' 不一致`,
+      );
+    }
     summaries.push(summary);
   }
 
-  const report = buildReport(summaries);
+  const report = buildReport(summaries, [], selectedSuites);
   mkdirSync(outDir, { recursive: true });
 
   const md = renderReport(report);
@@ -306,21 +580,29 @@ async function main(argv: string[]): Promise<void> {
   // 控制台简报
   console.log(`[quick-eval] suite=${suiteName}`);
   for (const s of summaries) {
+    const evaluated = report.suites.find((suite) => suite.suite === s.suite)!;
     console.log(
       `  ${s.suite}: ${s.passed}/${s.total} (${formatPercent(
         s.passRate,
-      )}), wrong_injection_rate=${formatPercent(
-        s.wrongInjectionRate,
-      )}, P95=${s.latencyP95Ms}ms`,
+      )}), failed=${s.failed}, gate=${evaluated.gatePassed ? "PASS" : "FAIL"}`,
     );
+    for (const failure of evaluated.gateFailures ?? []) {
+      console.log(`    gate failure: ${failure}`);
+    }
   }
   console.log(
     `  release gate: ${report.releaseGatePassed ? "PASS" : "FAIL"}`,
   );
+  console.log(
+    `  production release gate: ${report.productionReleaseGatePassed ? "PASS" : "FAIL"}`,
+  );
+  for (const failure of describeProductionGateFailures(report)) {
+    console.log(`  production gate reason: ${failure}`);
+  }
   console.log(`  report → ${path.relative(process.cwd(), outDir)}`);
 
   if (!report.releaseGatePassed) {
-    process.exitCode = 1;
+    process.exitCode = 2;
   }
 }
 

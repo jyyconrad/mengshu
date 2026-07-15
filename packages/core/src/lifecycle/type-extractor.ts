@@ -18,6 +18,8 @@ export interface ExtractedCandidate {
   semanticType?: MemorySemanticType;
   kind: string;
   text: string;
+  /** 原文证据。若省略，兼容路径继续使用 text；validator 会校验其真实来自输入。 */
+  evidenceQuote?: string;
   confidence: number;
   reason: string;
   hasWhy?: boolean;
@@ -72,18 +74,20 @@ const RULES: Array<{
       /(tried|attempted).+(failed|didn't work).+(switched|changed to)/i,
       /发现.*(导致|引起|造成).*(无限循环|内存泄漏|性能问题|崩溃)/,
       /(尝试|试过).*(方案|办法).*(但|可是).*(问题|失败)/,
+      /踩(?:了)?坑/,
       /(之前|曾).+(超时|失败|问题).+(改用|后来|现在)/,
       /\b(before|previously).+(timeout|failed|issue).+(changed|switched|now use)/i,
     ],
     baseConfidence: 0.78,
     reason: "决策/经验",
     priority: 10, // 高优先级，优先于 resource 匹配
-    guards: (text) => /因为|because|why|due to|导致|failed|switched|改用|后来|问题|超时|timeout|issue|changed/i.test(text),
+    guards: (text) => /因为|because|why|due to|导致|failed|switched|改用|后来|问题|超时|timeout|issue|changed|踩(?:了)?坑/i.test(text),
   },
   {
     semanticType: "rules",
     patterns: [
       /禁止|不要|不能|永远不|从不/,
+      /^所有.+必须/,
       /must not|never|do not|don't/i,
       /合规|compliance|policy|约束/i,
     ],
@@ -107,9 +111,12 @@ const RULES: Array<{
       /项目目标|当前任务|阶段|deadline|milestone/,
       /current (project|task|phase|sprint)/i,
       /要在.+(月|日|前)完成/,
+      /等.+完成后才能.+/,
+      /还没.+(?:阻塞|blocked)/i,
     ],
     baseConfidence: 0.75,
     reason: "项目/任务上下文",
+    priority: 8,
   },
   {
     semanticType: "resource",
@@ -169,6 +176,7 @@ export class HeuristicTypeExtractor implements TypeExtractor {
                   ? "document"
                   : "preference",
         text,
+        evidenceQuote: text,
         confidence: baseConfidence,
         reason: rule.reason,
         hasWhy,
@@ -186,6 +194,7 @@ export class HeuristicTypeExtractor implements TypeExtractor {
         semanticType: input.hints?.suggestedType,
         kind: "other",
         text,
+        evidenceQuote: text,
         confidence: 0.7,
         reason: "explicit_save_fallback",
         metadata: input.context ?? {},

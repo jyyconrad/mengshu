@@ -19,15 +19,28 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  registerDoctorCliCommands,
+  registerDoctorCliCommands as registerDoctorCliCommandsRaw,
   checkConfig,
   checkDb,
   checkEmbedding,
   checkModel,
   checkDisk,
+  checkEmbeddingRegistry,
   checkManifest,
 } from "./doctor.js";
 import { MANIFEST_FILENAME } from "../manifest.js";
+
+const defaultScope = {
+  tenantId: "tenant-a", appId: "openclaw", userId: "server-user", projectId: "default",
+  agentId: "default", namespace: "memories", visibility: "private" as const,
+};
+const authority = {
+  tenantId: "tenant-a", userId: "server-user",
+  allow: { appIds: ["openclaw"], projectIds: ["default"], agentIds: ["default"], namespaces: ["memories"], visibilities: ["private" as const] },
+};
+function registerDoctorCliCommands(memory: never, deps: Record<string, unknown>) {
+  return registerDoctorCliCommandsRaw(memory, { authority, defaultScope, ...deps } as never);
+}
 
 /** 鸭子类型 fake：支持 command 字符串含位置参数（doctor [dir] / connect [appId]）。 */
 class FakeCommand {
@@ -144,6 +157,66 @@ describe("checkEmbedding", () => {
   });
 });
 
+describe("checkEmbeddingRegistry", () => {
+  test("active is the only Postgres write-enabled state", () => {
+    expect(checkEmbeddingRegistry({
+      status: "active",
+      writeMode: "write-enabled",
+      embeddingReadMode: "same-space-ann",
+      lifecycleState: "ready",
+      lifecycleReady: true,
+      reasonCode: "active-space-match",
+    })).toEqual({
+      name: "embedding-registry",
+      status: "ok",
+      message:
+        "status=active, registryWriteMode=write-enabled, writePath=not-probed, " +
+        "embeddingReadMode=same-space-ann, lifecycleState=ready, lifecycleReady=true",
+    });
+  });
+
+  test.each(["missing", "mismatch", "unavailable", "unsupported"] as const)(
+    "%s is visible as a read-only warning",
+    (status) => {
+      const result = checkEmbeddingRegistry({
+        status,
+        writeMode: "read-only",
+        embeddingReadMode: "fail-closed",
+        lifecycleState: "degraded",
+        lifecycleReady: false,
+        reasonCode: status === "missing"
+          ? "registry-active-space-missing"
+          : status === "mismatch"
+            ? "active-space-mismatch"
+            : "registry-unavailable",
+      });
+      expect(result).toMatchObject({
+        name: "embedding-registry",
+        status: "warning",
+        message:
+          `status=${status}, registryWriteMode=read-only, writePath=not-probed, ` +
+          "embeddingReadMode=fail-closed, lifecycleState=degraded, lifecycleReady=false",
+      });
+    },
+  );
+
+  test("legacy providers remain explicit and never pretend active", () => {
+    expect(checkEmbeddingRegistry({
+      status: "legacy",
+      writeMode: "legacy-write-through",
+      embeddingReadMode: "fail-closed",
+      lifecycleState: "ready",
+      lifecycleReady: true,
+      reasonCode: "registry-unavailable",
+    })).toMatchObject({
+      status: "info",
+      message:
+        "status=legacy, registryWriteMode=legacy-write-through, writePath=not-probed, " +
+        "embeddingReadMode=fail-closed, lifecycleState=ready, lifecycleReady=true",
+    });
+  });
+});
+
 describe("checkModel", () => {
   test("合法 model 返回 ok", () => {
     expect(checkModel("text-embedding-3-small").status).toBe("ok");
@@ -205,6 +278,27 @@ describe("checkManifest", () => {
 });
 
 describe("registerDoctorCliCommands 注册", () => {
+  test("doctor 是只读诊断，缺少 authenticated authority 也必须可运行", async () => {
+    const ms = new FakeCommand("ms");
+    const health = vi.fn(async () => ({ ok: true, records: 0 }));
+    registerDoctorCliCommandsRaw(ms as never, {
+      config: validConfig,
+      service: { health },
+      embeddings: { embed: vi.fn(async () => [0.1]) },
+    } as never);
+
+    await expect(ms.find("doctor")?.actionHandler?.(workDir, {})).resolves.not.toThrow();
+    expect(health).toHaveBeenCalledTimes(1);
+  });
+
+  test("demo/connect 仍必须要求 authenticated authority", async () => {
+    const ms = new FakeCommand("ms");
+    registerDoctorCliCommandsRaw(ms as never, { config: validConfig } as never);
+
+    await expect(ms.find("demo")?.actionHandler?.(workDir, {})).rejects.toThrow(/authority/i);
+    expect(() => ms.find("connect")?.actionHandler?.("openclaw", {})).toThrow(/authority/i);
+  });
+
   test("注册 doctor / demo / connect 命令", () => {
     const ms = new FakeCommand("ms");
     registerDoctorCliCommands(ms as never, {});
@@ -231,6 +325,8 @@ describe("ms doctor", () => {
     const text = logs.join("\n");
     expect(text).toMatch(/warning/i);
     expect(text).not.toMatch(/FATAL/);
+    expect(text).toMatch(/Config fingerprint: cfg_v1_[a-f0-9]{16}/);
+    expect(text).not.toContain("s3cr3t");
   });
 
   test("DB 异常时输出 fatal", async () => {
@@ -268,6 +364,79 @@ describe("ms doctor", () => {
     const text = logs.join("\n");
     expect(text).toContain("[info] storage: PostgreSQL 后端，跳过本地 dbPath 磁盘检查");
     expect(text).not.toContain("未配置 dbPath");
+  });
+
+  test("OpenClaw doctor exposes registry read-only state without provider details", async () => {
+    const ms = new FakeCommand("ms");
+    registerDoctorCliCommands(ms as never, {
+      config: { ...validConfig, dbType: "postgres" },
+      service: { health: vi.fn(async () => ({ ok: true, records: 3 })) } as never,
+      embeddings: { embed: vi.fn(async () => [0.1]) },
+      embeddingStatus: () => ({
+        status: "mismatch",
+        writeMode: "read-only",
+        embeddingReadMode: "fail-closed",
+        lifecycleState: "degraded",
+        lifecycleReady: false,
+        reasonCode: "active-space-mismatch",
+      }),
+    });
+
+    await ms.find("doctor")?.actionHandler?.(workDir, {});
+    const text = logs.join("\n");
+    expect(text).toContain(
+      "[warning] embedding-registry: status=mismatch, registryWriteMode=read-only, " +
+        "writePath=not-probed, embeddingReadMode=fail-closed, " +
+        "lifecycleState=degraded, lifecycleReady=false",
+    );
+    expect(text).not.toContain("baseURL");
+    expect(text).not.toContain("apiKey");
+  });
+
+  test("OpenClaw doctor awaits an asynchronous persisted-registry probe", async () => {
+    const ms = new FakeCommand("ms");
+    const embeddingStatus = vi.fn(async () => ({
+      status: "active" as const,
+      writeMode: "write-enabled" as const,
+      embeddingReadMode: "same-space-ann" as const,
+      lifecycleState: "ready" as const,
+      lifecycleReady: true,
+      reasonCode: "active-space-match" as const,
+    }));
+    registerDoctorCliCommands(ms as never, {
+      config: { ...validConfig, dbType: "postgres" },
+      service: { health: vi.fn(async () => ({ ok: true, records: 3 })) } as never,
+      embeddings: { embed: vi.fn(async () => [0.1]) },
+      embeddingStatus,
+    });
+
+    await ms.find("doctor")?.actionHandler?.(workDir, {});
+    expect(embeddingStatus).toHaveBeenCalledTimes(1);
+    expect(logs.join("\n")).toContain(
+      "[ok] embedding-registry: status=active, registryWriteMode=write-enabled, " +
+        "writePath=not-probed, embeddingReadMode=same-space-ann, " +
+        "lifecycleState=ready, lifecycleReady=true",
+    );
+  });
+
+  test("registry status callback failures are sanitized as unavailable", async () => {
+    const ms = new FakeCommand("ms");
+    registerDoctorCliCommands(ms as never, {
+      config: { ...validConfig, dbType: "postgres" },
+      service: { health: vi.fn(async () => ({ ok: true, records: 3 })) } as never,
+      embeddings: { embed: vi.fn(async () => [0.1]) },
+      embeddingStatus: () => {
+        throw new Error("password=provider-secret");
+      },
+    });
+
+    await ms.find("doctor")?.actionHandler?.(workDir, {});
+    const text = logs.join("\n");
+    expect(text).toContain(
+      "status=unavailable, registryWriteMode=read-only, writePath=not-probed, " +
+        "embeddingReadMode=fail-closed, lifecycleState=degraded, lifecycleReady=false",
+    );
+    expect(text).not.toContain("provider-secret");
   });
 });
 
@@ -307,7 +476,16 @@ describe("ms demo", () => {
 });
 
 describe("ms connect", () => {
-  test("输出 server URL 与 scope 示例", async () => {
+  test("越权 appId 在输出连接信息前拒绝", async () => {
+    const ms = new FakeCommand("ms");
+    registerDoctorCliCommands(ms as never, { config: validConfig });
+
+    expect(() => ms.find("connect")?.actionHandler?.("evil-app", { dir: workDir }))
+      .toThrow(/not allowed|allowlist|authorized/i);
+    expect(logs).toEqual([]);
+  });
+
+  test("默认输出 server URL 与 scope 示例但不泄露 secret", async () => {
     const ms = new FakeCommand("ms");
     registerDoctorCliCommands(ms as never, { config: validConfig });
 
@@ -315,6 +493,18 @@ describe("ms connect", () => {
     const text = logs.join("\n");
     expect(text).toContain("http://127.0.0.1:3847");
     expect(text).toContain("scope");
+    expect(text).toMatch(/config fingerprint: cfg_v1_[a-f0-9]{16}/i);
+    expect(text).not.toContain("s3cr3t");
+    expect(text).toMatch(/secret.*已配置.*隐藏/i);
+  });
+
+  test("仅显式 --show-secret 时输出原始 secret", async () => {
+    const ms = new FakeCommand("ms");
+    registerDoctorCliCommands(ms as never, { config: validConfig });
+
+    await ms.find("connect")?.actionHandler?.("openclaw", { dir: workDir, showSecret: true });
+
+    expect(logs.join("\n")).toContain("s3cr3t");
   });
 
   test("缺 secret 时提示生成", async () => {

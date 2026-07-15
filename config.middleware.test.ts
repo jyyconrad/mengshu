@@ -31,6 +31,69 @@ describe("middleware config", () => {
     });
   });
 
+  test("解析并冻结本机 host authority，供插件入口建立可信身份边界", () => {
+    const config = memoryConfigSchema.parse({
+      ...baseConfig,
+      authority: {
+        tenantId: "default",
+        userId: "default",
+        allow: {
+          appIds: ["openclaw"],
+          projectIds: ["default"],
+          agentIds: ["default"],
+          namespaces: ["default"],
+          visibilities: ["private"],
+        },
+      },
+    });
+
+    expect(config.authority).toEqual({
+      tenantId: "default",
+      userId: "default",
+      allow: {
+        appIds: ["openclaw"],
+        projectIds: ["default"],
+        agentIds: ["default"],
+        namespaces: ["default"],
+        visibilities: ["private"],
+      },
+    });
+    expect(Object.isFrozen(config.authority)).toBe(true);
+    expect(Object.isFrozen(config.authority?.allow.appIds)).toBe(true);
+  });
+
+  test.each([
+    { authority: { tenantId: "default", userId: "default", allow: {} } },
+    {
+      authority: {
+        tenantId: "default",
+        userId: "default",
+        allow: {
+          appIds: ["openclaw", "OPENCLAW"],
+          projectIds: ["default"],
+          agentIds: ["default"],
+          namespaces: ["default"],
+          visibilities: ["private"],
+        },
+      },
+    },
+    {
+      authority: {
+        tenantId: "default",
+        userId: "default",
+        allow: {
+          appIds: ["openclaw"],
+          projectIds: ["../other"],
+          agentIds: ["default"],
+          namespaces: ["default"],
+          visibilities: ["private"],
+        },
+      },
+    },
+  ])("拒绝缺失、歧义或路径混淆的 host authority: %#", (extra) => {
+    expect(() => memoryConfigSchema.parse({ ...baseConfig, ...extra })).toThrow(/authority|allowlist|project/i);
+  });
+
   test("parses explicit server mode and feature flags", () => {
     const config = memoryConfigSchema.parse({
       ...baseConfig,

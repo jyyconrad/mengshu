@@ -123,9 +123,12 @@
   "scripts": {
     "clean": "rm -rf dist",
     "build": "npm run clean && tsc -p tsconfig.build.json",
-    "prepack": "npm run build",
+    "postbuild": "chmod +x dist/bin/ms.js",
+    "prepack": "npm run version:check && npm run build",
     "pack:dry-run": "npm pack --dry-run",
+    "version:check": "node scripts/check-version-consistency.mjs",
     "test": "vitest run",
+    "test:live": "MENGSHU_RUN_LIVE_TESTS=1 vitest run index.test.ts hybrid-integration.test.ts",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "eval:quick": "tsx tests/eval/runners/quick-eval.ts"

@@ -1,11 +1,27 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { afterEach, describe, expect, test } from "vitest";
+import type { MemoryService } from "../../core/service-types.js";
+import { createMcpStdioServer } from "../../packages/mcp/src/stdio-server.js";
+import { createExactMcpAuthority } from "../../packages/mcp/src/authority.js";
 
 const rootDir = process.cwd();
 const children: ChildProcessWithoutNullStreams[] = [];
+const mcpScope = {
+  tenantId: "smoke-tenant",
+  appId: "mengshu",
+  userId: "smoke-user",
+  projectId: "smoke-project",
+  agentId: "codex",
+  namespace: "working-context",
+  visibility: "private" as const,
+};
+const authorityConfig = {
+  authority: createExactMcpAuthority(mcpScope),
+  defaultScope: mcpScope,
+};
 
 function makeMsShim(dir: string): void {
   const shim = join(dir, "ms");
@@ -78,6 +94,14 @@ afterEach(() => {
 });
 
 describe("Codex MCP plugin smoke", () => {
+  test("Codex manifest declares the host-owned 0600 authority file boundary", () => {
+    const manifest = JSON.parse(
+      readFileSync(join(rootDir, "plugins/codex/.mcp.json"), "utf8"),
+    ) as { mcpServers?: { mengshu?: { env?: Record<string, string> } } };
+    expect(manifest.mcpServers?.mengshu?.env?.MENGSHU_AUTHORITY_FILE)
+      .toBe("${MENGSHU_AUTHORITY_FILE}");
+  });
+
   test("starts through plugins/codex/mcp/server.mjs and lists mengshu tools", async () => {
     const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-mcp-"));
     try {
@@ -104,6 +128,8 @@ describe("Codex MCP plugin smoke", () => {
         env: {
           ...process.env,
           MENGSHU_HOME: homeDir,
+          MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
+          MENGSHU_AUTHORITY_FILE: "",
           PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
         },
         stdio: ["pipe", "pipe", "pipe"],
@@ -132,8 +158,313 @@ describe("Codex MCP plugin smoke", () => {
       expect(toolNames).toContain("memory_recall");
       expect(toolNames).toContain("memory_save");
       expect(toolNames).toContain("memory_health");
+      expect(toolNames).not.toContain("memory_forget");
+
+      const exited = new Promise<number | null>((resolve) => {
+        child.once("exit", (code) => resolve(code));
+      });
+      child.stdin.end();
+      await expect(Promise.race([
+        exited,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("MCP wrapper did not exit after stdin EOF")),
+          5_000,
+        )),
+      ])).resolves.toBe(0);
     } finally {
       rmSync(temp, { recursive: true, force: true });
     }
   });
+
+  test("missing authority rejects before config/runtime and does not echo raw config", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-mcp-no-auth-"));
+    try {
+      const binDir = join(temp, "bin");
+      const homeDir = join(temp, "home");
+      mkdirSync(binDir, { recursive: true });
+      mkdirSync(homeDir, { recursive: true });
+      makeMsShim(binDir);
+      writeFileSync(join(homeDir, "config.json"), "raw-secret-invalid-config");
+      const child = spawn("node", ["mcp/server.mjs"], {
+        cwd: join(rootDir, "plugins/codex"),
+        env: {
+          ...process.env,
+          MENGSHU_HOME: homeDir,
+          MENGSHU_AUTHORITY_JSON: "",
+          MENGSHU_AUTHORITY_FILE: "",
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      children.push(child);
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        let stderr = "";
+        child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+        child.on("exit", (code) => resolve({ code, stderr }));
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toMatch(/authority configuration.*requires/i);
+      expect(result.stderr).not.toContain("raw-secret-invalid-config");
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test("unresolved authority placeholders fail before spawning ms", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-placeholder-"));
+    try {
+      const binDir = join(temp, "bin");
+      const marker = join(temp, "spawned");
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(
+        join(binDir, "ms"),
+        "#!/bin/sh\ntouch \"$MENGSHU_TEST_SPAWN_MARKER\"\n",
+        { mode: 0o755 },
+      );
+      const child = spawn("node", ["mcp/server.mjs"], {
+        cwd: join(rootDir, "plugins/codex"),
+        env: {
+          ...process.env,
+          MENGSHU_AUTHORITY_JSON: "",
+          MENGSHU_AUTHORITY_FILE: "\${MENGSHU_AUTHORITY_FILE}",
+          MENGSHU_TEST_SPAWN_MARKER: marker,
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      children.push(child);
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        let stderr = "";
+        child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+        child.once("exit", (code) => resolve({ code, stderr }));
+      });
+
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toMatch(/authority configuration/i);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test("structural fake forget capability cannot expose memory_forget", () => {
+    const service = {
+      async storeMemory() { return { id: "mem-1", stored: true }; },
+      async recall() { return { scope: mcpScope, query: "", hits: [] }; },
+      async buildContext() { return { scope: mcpScope, content: "", hits: [] }; },
+      async delete() { return { deleted: 0 }; },
+      async health() { return { ok: true }; },
+    } satisfies MemoryService;
+    const forgetService = {
+      async forget() {
+        return {
+          action: "delete" as const,
+          affected: 0,
+          deleted: 0,
+          affectedIds: [],
+          transactional: true as const,
+          idempotentReplay: false,
+        };
+      },
+    };
+    const { tools } = createMcpStdioServer({
+      service,
+      forgetCapability: forgetService as never,
+      authority: authorityConfig.authority,
+      defaultScope: authorityConfig.defaultScope,
+    });
+    expect(tools.map((tool) => tool.name)).not.toContain("memory_forget");
+  });
+
+  test("wrapper forwards SIGTERM and waits for its child to exit", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-signal-"));
+    try {
+      const binDir = join(temp, "bin");
+      const pidFile = join(temp, "child.pid");
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(
+        join(binDir, "ms"),
+        [
+          "#!/usr/bin/env node",
+          "const fs = require('node:fs');",
+          "fs.writeFileSync(process.env.MENGSHU_TEST_CHILD_PID_FILE, String(process.pid));",
+          "const timer = setInterval(() => {}, 1000);",
+          "process.on('SIGTERM', () => { process.exitCode = 0; clearInterval(timer); });",
+          "process.on('SIGINT', () => { process.exitCode = 0; clearInterval(timer); });",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      const wrapper = spawn("node", ["mcp/server.mjs"], {
+        cwd: join(rootDir, "plugins/codex"),
+        env: {
+          ...process.env,
+          MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
+          MENGSHU_AUTHORITY_FILE: "",
+          MENGSHU_TEST_CHILD_PID_FILE: pidFile,
+          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      children.push(wrapper);
+      const deadline = Date.now() + 3_000;
+      while (!existsSync(pidFile) || !readFileSync(pidFile, "utf8").trim()) {
+        if (Date.now() >= deadline) throw new Error("wrapper child pid was not written");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const childPid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+      const exited = new Promise<number | null>((resolve) => wrapper.once("exit", resolve));
+
+      wrapper.kill("SIGTERM");
+      await expect(Promise.race([
+        exited,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("wrapper did not stop its child")),
+          5_000,
+        )),
+      ])).resolves.toBe(143);
+      expect(() => process.kill(childPid, 0)).toThrow();
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "wrapper SIGTERM terminates the real POSIX child process group including grandchildren",
+    async () => {
+      const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-process-group-"));
+      let childPid: number | undefined;
+      let grandchildPid: number | undefined;
+      try {
+        const binDir = join(temp, "bin");
+        const pidFile = join(temp, "processes.json");
+        mkdirSync(binDir, { recursive: true });
+        writeFileSync(
+          join(binDir, "ms"),
+          [
+            "#!/usr/bin/env node",
+            "const { spawn } = require('node:child_process');",
+            "const fs = require('node:fs');",
+            "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+            "fs.writeFileSync(process.env.MENGSHU_TEST_PROCESS_FILE, JSON.stringify({ child: process.pid, grandchild: grandchild.pid }));",
+            "const timer = setInterval(() => {}, 1000);",
+            "process.on('SIGTERM', () => { clearInterval(timer); });",
+            "process.on('SIGINT', () => { clearInterval(timer); });",
+            "",
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const wrapper = spawn("node", ["mcp/server.mjs"], {
+          cwd: join(rootDir, "plugins/codex"),
+          env: {
+            ...process.env,
+            MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
+            MENGSHU_AUTHORITY_FILE: "",
+            MENGSHU_TEST_PROCESS_FILE: pidFile,
+            PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        children.push(wrapper);
+        let stderr = "";
+        wrapper.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+        const deadline = Date.now() + 3_000;
+        while (!existsSync(pidFile) || !readFileSync(pidFile, "utf8").trim()) {
+          if (Date.now() >= deadline) throw new Error("wrapper process group pids were not written");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        const pids = JSON.parse(readFileSync(pidFile, "utf8")) as { child: number; grandchild: number };
+        childPid = pids.child;
+        grandchildPid = pids.grandchild;
+        const exited = new Promise<{ code: number | null; stderr: string }>((resolve) =>
+          wrapper.once("exit", (code) => resolve({ code, stderr })),
+        );
+
+        wrapper.kill("SIGTERM");
+        await expect(Promise.race([
+          exited,
+          new Promise<never>((_, reject) => setTimeout(
+            () => reject(new Error("wrapper did not stop its process group")),
+            7_000,
+          )),
+        ])).resolves.toEqual({ code: 143, stderr: "" });
+
+        expect(() => process.kill(childPid!, 0)).toThrow();
+        expect(() => process.kill(grandchildPid!, 0)).toThrow();
+      } finally {
+        for (const pid of [grandchildPid, childPid]) {
+          if (!pid) continue;
+          try { process.kill(pid, "SIGKILL"); } catch { /* already stopped */ }
+        }
+        rmSync(temp, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "wrapper stdin EOF cleans grandchildren left after the direct child exits normally",
+    async () => {
+      const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-eof-group-"));
+      let grandchildPid: number | undefined;
+      try {
+        const binDir = join(temp, "bin");
+        const pidFile = join(temp, "grandchild.pid");
+        mkdirSync(binDir, { recursive: true });
+        writeFileSync(
+          join(binDir, "ms"),
+          [
+            "#!/usr/bin/env node",
+            "const { spawn } = require('node:child_process');",
+            "const fs = require('node:fs');",
+            "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+            "fs.writeFileSync(process.env.MENGSHU_TEST_GRANDCHILD_FILE, String(grandchild.pid));",
+            "process.stdin.resume();",
+            "process.stdin.once('end', () => process.exit(0));",
+            "",
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const wrapper = spawn("node", ["mcp/server.mjs"], {
+          cwd: join(rootDir, "plugins/codex"),
+          env: {
+            ...process.env,
+            MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
+            MENGSHU_AUTHORITY_FILE: "",
+            MENGSHU_TEST_GRANDCHILD_FILE: pidFile,
+            PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        children.push(wrapper);
+        let stderr = "";
+        wrapper.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+        const deadline = Date.now() + 3_000;
+        while (!existsSync(pidFile) || !readFileSync(pidFile, "utf8").trim()) {
+          if (Date.now() >= deadline) throw new Error("EOF grandchild pid was not written");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        grandchildPid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+        const exited = new Promise<{ code: number | null; stderr: string }>((resolve) =>
+          wrapper.once("exit", (code) => resolve({ code, stderr })),
+        );
+
+        wrapper.stdin.end();
+        await expect(Promise.race([
+          exited,
+          new Promise<never>((_, reject) => setTimeout(
+            () => reject(new Error("wrapper did not finish EOF process-group cleanup")),
+            7_000,
+          )),
+        ])).resolves.toEqual({ code: 0, stderr: "" });
+        expect(() => process.kill(grandchildPid!, 0)).toThrow();
+      } finally {
+        if (grandchildPid) {
+          try { process.kill(grandchildPid, "SIGKILL"); } catch { /* already stopped */ }
+        }
+        rmSync(temp, { recursive: true, force: true });
+      }
+    },
+    15_000,
+  );
 });

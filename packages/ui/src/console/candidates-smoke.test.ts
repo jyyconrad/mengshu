@@ -93,6 +93,7 @@ describe("console candidates end-to-end via daemon", () => {
 
     running = await startMemoryServer({
       service,
+      defaultScope: { ...scope, visibility: "private" },
       console: createConsoleApi({ service, candidates: repository, candidateReview }),
       host: "127.0.0.1",
       port: 0,

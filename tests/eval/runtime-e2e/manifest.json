@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "version": "v1-runtime-e2e",
+  "suites": {
+    "mengshu-runtime-rest": {
+      "kind": "extension",
+      "runner": "production-rest-runtime-host-v1",
+      "file": "mengshu-runtime-rest.jsonl",
+      "caseCount": 1,
+      "bytes": 372,
+      "sha256": "32ae8427661d2f92fb548f1f554e404de0d70e02c9df9adee87a5e9850ca0bc7",
+      "metrics": ["case_pass_rate"],
+      "gate": {
+        "case_pass_rate": 1
+      },
+      "runMode": "runtime-e2e",
+      "liveGate": "MENGSHU_RUN_LIVE_TESTS=1",
+      "transport": "rest-http",
+      "composition": "ms-serve-runtime-host",
+      "description": "隔离 PostgreSQL 上从生产 ms serve 入口验证 RuntimeHost、durable exact-three worker 与 REST health。"
+    }
+  }
+}

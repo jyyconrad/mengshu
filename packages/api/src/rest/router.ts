@@ -14,6 +14,10 @@ import type { MemoryConfig } from "../../../../config.js";
 import type { GraphQueryInput } from "../../../../graph/query.js";
 import type { ConsoleCandidatesRequest, ConsoleCandidateReviewRequest, ConsoleLookupRequest } from "../../../../console/types.js";
 import type { MemoryScope } from "../../../../core/types.js";
+import {
+  AuthorityScopeError,
+  type AuthorityScope,
+} from "../../../core/src/domain/authority-scope.js";
 import { createMengshuRuntime } from "../../../../runtime.js";
 import type { MengshuRuntime } from "../../../../runtime.js";
 import { authorizeRestRequest } from "./auth.js";
@@ -24,6 +28,7 @@ import type {
   AgentLookupRequest,
   AgentSessionCommitRequest,
 } from "../agent-fast-path/index.js";
+import { resolveRestAuthorityScope } from "./authority.js";
 
 export interface RestRouter {
   handle(request: RestRequest): Promise<RestResponse>;
@@ -34,11 +39,21 @@ export interface RestApi {
   router: RestRouter;
 }
 
-export function createRestApi(config: MemoryConfig, resolvedDbPath: string): RestApi {
+export function createRestApi(
+  config: MemoryConfig,
+  resolvedDbPath: string,
+  authority: AuthorityScope,
+): RestApi {
+  // A single Runtime owns one scope-bound PostgreSQL candidate repository.
+  // Therefore this convenience composition accepts only an authority that can
+  // resolve one exact default scope; multi-scope hosts must compose separate
+  // runtimes instead of silently binding candidate review to local defaults.
+  const defaultScope = resolveRestAuthorityScope(authority, {});
   const runtime = createMengshuRuntime({
     config,
     resolvedDbPath,
-    appId: "rest",
+    appId: defaultScope.appId,
+    defaultScope,
   });
   return {
     runtime,
@@ -47,6 +62,7 @@ export function createRestApi(config: MemoryConfig, resolvedDbPath: string): Res
       console: runtime.consoleApi,
       agentFastPath: runtime.agentFastPath,
       server: config.server,
+      authority,
     }),
   };
 }
@@ -70,7 +86,39 @@ function requireObjectBody(body: unknown): Record<string, unknown> | undefined {
   return body as Record<string, unknown>;
 }
 
+function resolvedScope(
+  options: RestRouterOptions,
+  clientScope: unknown,
+): { scope: MemoryScope } | { response: RestResponse } {
+  if (!options.authority) {
+    return { scope: (requireObjectBody(clientScope) ?? {}) as unknown as MemoryScope };
+  }
+  try {
+    return { scope: resolveRestAuthorityScope(options.authority, clientScope) };
+  } catch (error) {
+    if (error instanceof AuthorityScopeError) {
+      return { response: badRequest(`Invalid scope: ${error.code}`) };
+    }
+    return { response: badRequest("Invalid scope") };
+  }
+}
+
+function scopeOrResponse(
+  options: RestRouterOptions,
+  clientScope: unknown,
+): MemoryScope | RestResponse {
+  const result = resolvedScope(options, clientScope);
+  return "response" in result ? result.response : result.scope;
+}
+
+function isRestResponse(value: MemoryScope | RestResponse): value is RestResponse {
+  return "status" in value;
+}
+
 export function createRestRouter(options: RestRouterOptions): RestRouter {
+  if (!options.authority && options.unsafeLegacyScope !== true) {
+    throw new Error("REST authority is required; unsafeLegacyScope is test-only and deprecated");
+  }
   return {
     async handle(request: RestRequest): Promise<RestResponse> {
       const auth = authorizeRestRequest({
@@ -95,12 +143,17 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return methodNotAllowed();
         }
         const body = requireObjectBody(request.body);
-        if (!body?.record) {
+        const record = requireObjectBody(body?.record);
+        if (!record) {
           return badRequest("record is required");
         }
+        const scope = scopeOrResponse(options, record.scope ?? body?.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 201,
-          body: await options.service.storeMemory(body as unknown as StoreMemoryInput),
+          body: await options.service.storeMemory({
+            record: { ...record, scope },
+          } as unknown as StoreMemoryInput),
         };
       }
 
@@ -112,9 +165,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         if (typeof body?.query !== "string") {
           return badRequest("query is required");
         }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.service.recall(body as unknown as RecallInput),
+          body: await options.service.recall({ ...body, scope } as unknown as RecallInput),
         };
       }
 
@@ -126,9 +181,88 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         if (typeof body?.query !== "string") {
           return badRequest("query is required");
         }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.service.buildContext(body as unknown as BuildContextInput),
+          body: await options.service.buildContext({ ...body, scope } as unknown as BuildContextInput),
+        };
+      }
+
+      if (request.path === "/v1/forget") {
+        if (request.method !== "POST") {
+          return methodNotAllowed();
+        }
+        const body = requireObjectBody(request.body);
+        if (!body) {
+          return badRequest("body is required");
+        }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
+        const idempotencyKey = typeof body.idempotencyKey === "string" && body.idempotencyKey.trim()
+          ? body.idempotencyKey
+          : undefined;
+        if (!idempotencyKey) {
+          return badRequest("idempotencyKey is required");
+        }
+        const action = body.action === undefined
+          ? "delete"
+          : body.action === "revoke" || body.action === "archive" || body.action === "delete"
+            ? body.action
+            : undefined;
+        if (!action) {
+          return badRequest("action is invalid");
+        }
+        let ids: string[] | undefined;
+        if (body.ids !== undefined) {
+          if (!Array.isArray(body.ids) || body.ids.length === 0) {
+            return badRequest("ids must be a non-empty array");
+          }
+          ids = [];
+          const seen = new Set<string>();
+          for (const id of body.ids) {
+            if (typeof id !== "string" || id.length === 0 || id !== id.trim() || seen.has(id)) {
+              return badRequest("ids contain an invalid or duplicate value");
+            }
+            seen.add(id);
+            ids.push(id);
+          }
+        }
+        const filter = body.filter === undefined ? undefined : requireObjectBody(body.filter);
+        if (body.filter !== undefined && (!filter || Object.keys(filter).length === 0)) {
+          return badRequest("filter must be a non-empty object");
+        }
+        if ((ids === undefined) === (filter === undefined)) {
+          return badRequest("exactly one of ids or filter is required");
+        }
+        const forgetService = options.forgetService ?? (
+          typeof (options.service as unknown as { forget?: unknown }).forget === "function"
+            ? options.service as unknown as NonNullable<RestRouterOptions["forgetService"]>
+            : undefined
+        );
+        if (!forgetService || !options.authority) {
+          return { status: 503, body: { error: "Authority-scoped forget is unavailable" } };
+        }
+        return {
+          status: 200,
+          body: await forgetService.forget({
+            serverAuthority: options.authority,
+            clientScope: {
+              appId: scope.appId,
+              projectId: scope.projectId,
+              agentId: scope.agentId,
+              namespace: scope.namespace,
+              visibility: scope.visibility ?? "private",
+            },
+            action,
+            ids,
+            filter,
+            tableName: body.tableName as never,
+            dataTypes: Array.isArray(body.dataTypes) ? body.dataTypes as never : undefined,
+            idempotencyKey,
+            actor: typeof body.actor === "string" ? body.actor : undefined,
+            reason: typeof body.reason === "string" ? body.reason : undefined,
+          }),
         };
       }
 
@@ -140,12 +274,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return methodNotAllowed();
         }
         const body = requireObjectBody(request.body);
-        if (!body?.scope || typeof body.scope !== "object" || Array.isArray(body.scope)) {
-          return badRequest("scope is required");
-        }
+        const scope = scopeOrResponse(options, body?.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.graph.query(body as unknown as GraphQueryInput),
+          body: await options.graph.query({ ...body, scope } as unknown as GraphQueryInput),
         };
       }
 
@@ -157,12 +290,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return methodNotAllowed();
         }
         const body = requireObjectBody(request.body);
-        if (!body?.scope || typeof body.scope !== "object" || Array.isArray(body.scope)) {
-          return badRequest("scope is required");
-        }
+        const scope = scopeOrResponse(options, body?.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.console.overview(body.scope as MemoryScope),
+          body: await options.console.overview(scope),
         };
       }
 
@@ -174,15 +306,14 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return methodNotAllowed();
         }
         const body = requireObjectBody(request.body);
-        if (!body?.scope || typeof body.scope !== "object" || Array.isArray(body.scope)) {
-          return badRequest("scope is required");
-        }
-        if (typeof body.query !== "string") {
+        if (typeof body?.query !== "string") {
           return badRequest("query is required");
         }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.console.lookup(body as unknown as ConsoleLookupRequest),
+          body: await options.console.lookup({ ...body, scope } as unknown as ConsoleLookupRequest),
         };
       }
 
@@ -194,12 +325,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return methodNotAllowed();
         }
         const body = requireObjectBody(request.body);
-        if (!body?.scope || typeof body.scope !== "object" || Array.isArray(body.scope)) {
-          return badRequest("scope is required");
-        }
+        const scope = scopeOrResponse(options, body?.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.console.graph(body as unknown as GraphQueryInput),
+          body: await options.console.graph({ ...body, scope } as unknown as GraphQueryInput),
         };
       }
 
@@ -224,12 +354,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return methodNotAllowed();
         }
         const body = requireObjectBody(request.body);
-        if (!body?.scope || typeof body.scope !== "object" || Array.isArray(body.scope)) {
-          return badRequest("scope is required");
-        }
+        const scope = scopeOrResponse(options, body?.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.console.candidates(body as unknown as ConsoleCandidatesRequest),
+          body: await options.console.candidates({ ...body, scope } as unknown as ConsoleCandidatesRequest),
         };
       }
 
@@ -241,6 +370,8 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return methodNotAllowed();
         }
         const body = requireObjectBody(request.body);
+        const scope = scopeOrResponse(options, body?.scope);
+        if (isRestResponse(scope)) return scope;
         const action = body?.action;
         if (!action || typeof action !== "object" || Array.isArray(action)) {
           return badRequest("action is required");
@@ -263,9 +394,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         if (typeof body?.task !== "string") {
           return badRequest("task is required");
         }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.agentFastPath.context(body as unknown as AgentTaskContextRequest),
+          body: await options.agentFastPath.context({ ...body, scope } as unknown as AgentTaskContextRequest),
         };
       }
 
@@ -280,9 +413,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         if (typeof body?.text !== "string") {
           return badRequest("text is required");
         }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.agentFastPath.observeLight(body as unknown as AgentObserveLightRequest),
+          body: await options.agentFastPath.observeLight({ ...body, scope } as unknown as AgentObserveLightRequest),
         };
       }
 
@@ -297,9 +432,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         if (typeof body?.query !== "string") {
           return badRequest("query is required");
         }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.agentFastPath.lookup(body as unknown as AgentLookupRequest),
+          body: await options.agentFastPath.lookup({ ...body, scope } as unknown as AgentLookupRequest),
         };
       }
 
@@ -311,9 +448,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return methodNotAllowed();
         }
         const body = requireObjectBody(request.body);
+        const scope = scopeOrResponse(options, body?.scope);
+        if (isRestResponse(scope)) return scope;
         return {
           status: 200,
-          body: await options.agentFastPath.sessionCommit(body as unknown as AgentSessionCommitRequest),
+          body: await options.agentFastPath.sessionCommit({ ...body, scope } as unknown as AgentSessionCommitRequest),
         };
       }
 

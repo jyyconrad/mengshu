@@ -8,15 +8,22 @@
  * 关键边界：未知工具与 execute 抛错均包成 isError content。
  */
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { MemoryService } from "../../../core/service-types.js";
 import {
   buildCallToolHandler,
   buildListToolsResult,
+  closeMcpServerAndRuntime,
   createMcpStdioServer,
+  startMcpStdioServer,
+  waitForMcpServerShutdown,
 } from "./stdio-server.js";
+import { createExactMcpAuthority } from "./authority.js";
+import type { McpMemoryTool } from "./tools.js";
+import { AuthorityScopeError } from "../../core/src/domain/authority-scope.js";
+import { AuthorityScopedForgetError } from "../../core/src/lifecycle/forget-transaction.js";
 
 const scope = {
   tenantId: "local",
@@ -26,6 +33,8 @@ const scope = {
   agentId: "agent-1",
   namespace: "memories",
 };
+const authority = createExactMcpAuthority({ ...scope, visibility: "private" });
+const defaultScope = { ...scope, visibility: "private" as const };
 
 class FakeMemoryService implements MemoryService {
   async storeMemory() {
@@ -72,14 +81,19 @@ class FakeTransport implements Transport {
   responseFor(id: number): JSONRPCMessage | undefined {
     return this.sent.find((m) => (m as { id?: number }).id === id);
   }
+
+  disconnect(): void {
+    this.onclose?.();
+  }
 }
 
 describe("buildListToolsResult", () => {
   test("maps tools to MCP tool descriptors with inputSchema", () => {
-    const { tools } = createMcpStdioServer({ service: new FakeMemoryService() });
+    const { tools } = createMcpStdioServer({ authority, defaultScope, service: new FakeMemoryService() });
     const result = buildListToolsResult(tools);
 
-    expect(result.tools).toHaveLength(8);
+    expect(result.tools).toHaveLength(7);
+    expect(result.tools.map((tool) => tool.name)).not.toContain("memory_forget");
     const health = result.tools.find((t) => t.name === "memory_health");
     expect(health).toBeDefined();
     expect(health?.inputSchema).toHaveProperty("type", "object");
@@ -88,17 +102,17 @@ describe("buildListToolsResult", () => {
 
 describe("buildCallToolHandler", () => {
   test("routes a known tool and wraps result as text content", async () => {
-    const { tools } = createMcpStdioServer({ service: new FakeMemoryService() });
+    const { tools } = createMcpStdioServer({ authority, defaultScope, service: new FakeMemoryService() });
     const call = buildCallToolHandler(tools);
 
     const result = await call("memory_health", {});
     expect(result.isError).toBeUndefined();
     expect(result.content[0].type).toBe("text");
-    expect(JSON.parse(result.content[0].text)).toEqual({ ok: true, records: 1 });
+    expect(JSON.parse(result.content[0].text)).toEqual({ ok: true });
   });
 
   test("returns an isError content for unknown tools", async () => {
-    const { tools } = createMcpStdioServer({ service: new FakeMemoryService() });
+    const { tools } = createMcpStdioServer({ authority, defaultScope, service: new FakeMemoryService() });
     const call = buildCallToolHandler(tools);
 
     const result = await call("missing", {});
@@ -119,7 +133,66 @@ describe("buildCallToolHandler", () => {
 
     const result = await call("boom", {});
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("kaboom");
+    expect(result.content[0].text).toContain("INTERNAL_ERROR");
+    expect(result.content[0].text).not.toContain("kaboom");
+  });
+
+  test("never echoes secret-like provider errors to the MCP client", async () => {
+    const secret = "postgres://user:raw-secret@host/db";
+    const call = buildCallToolHandler([{
+      name: "boom",
+      description: "throws",
+      inputSchema: { type: "object" },
+      execute: async () => { throw new Error(secret); },
+    }]);
+
+    const result = await call("boom", {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).not.toContain(secret);
+    expect(result.content[0].text).toContain("INTERNAL_ERROR");
+  });
+
+  test("returns a stable scope error code without exposing authority details", async () => {
+    const call = buildCallToolHandler([{
+      name: "scope_error",
+      description: "throws a typed scope error",
+      inputSchema: { type: "object" },
+      execute: async () => {
+        throw new AuthorityScopeError(
+          "CLIENT_VALUE_NOT_ALLOWED",
+          "secret allowlist value is not allowed",
+          "appId",
+        );
+      },
+    }]);
+
+    const result = await call("scope_error", {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("CLIENT_VALUE_NOT_ALLOWED");
+    expect(result.content[0].text).not.toContain("secret allowlist value");
+  });
+
+  test("forget target mismatch explains tableName and dataTypes defaults", async () => {
+    const call = buildCallToolHandler([{
+      name: "forget_error",
+      description: "throws a typed forget error",
+      inputSchema: { type: "object" },
+      execute: async () => {
+        throw new AuthorityScopedForgetError(
+          "TARGET_NOT_FOUND_OR_FORBIDDEN",
+          "forget target was not found or is not authorized",
+        );
+      },
+    }]);
+
+    const result = await call("forget_error", {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("TARGET_NOT_FOUND_OR_FORBIDDEN");
+    expect(result.content[0].text).toContain("tableName");
+    expect(result.content[0].text).toContain("dataTypes");
   });
 
   test("passes string tool results through without JSON quoting", async () => {
@@ -138,8 +211,39 @@ describe("buildCallToolHandler", () => {
 });
 
 describe("createMcpStdioServer", () => {
+  test("rejects production stdio construction without authority", () => {
+    expect(() => createMcpStdioServer({ service: new FakeMemoryService() } as never)).toThrow(
+      /MCP authority is required|authority configuration/i,
+    );
+  });
+
+  test("rejects missing or mismatched defaultScope before transport startup", () => {
+    expect(() => createMcpStdioServer({
+      authority,
+      service: new FakeMemoryService(),
+    } as never)).toThrow(/defaultScope|authority configuration/i);
+    expect(() => createMcpStdioServer({
+      authority,
+      defaultScope: { ...defaultScope, namespace: "other" },
+      service: new FakeMemoryService(),
+    })).toThrow(/defaultScope|authority configuration/i);
+  });
+
+  test("freezes the registry used by list and call so it cannot drift after startup", () => {
+    const { tools } = createMcpStdioServer({ authority, defaultScope, service: new FakeMemoryService() });
+
+    expect(Object.isFrozen(tools)).toBe(true);
+    expect(() => (tools as unknown as McpMemoryTool[]).push({
+      name: "late",
+      description: "late",
+      inputSchema: { type: "object" },
+      execute: async () => "late",
+    })).toThrow();
+    expect(buildListToolsResult(tools).tools.map((tool) => tool.name)).not.toContain("late");
+  });
+
   test("registers ListTools/CallTool handlers driven via transport", async () => {
-    const { server } = createMcpStdioServer({ service: new FakeMemoryService() });
+    const { server } = createMcpStdioServer({ authority, defaultScope, service: new FakeMemoryService() });
     const transport = new FakeTransport();
     await server.connect(transport);
 
@@ -162,7 +266,7 @@ describe("createMcpStdioServer", () => {
     // tools/list
     await transport.inject({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const listResponse = transport.responseFor(2) as { result?: { tools?: unknown[] } };
-    expect(listResponse?.result?.tools).toHaveLength(8);
+    expect(listResponse?.result?.tools).toHaveLength(7);
 
     // tools/call
     await transport.inject({
@@ -175,7 +279,7 @@ describe("createMcpStdioServer", () => {
       result?: { content?: Array<{ text: string }> };
     };
     const text = callResponse?.result?.content?.[0]?.text ?? "{}";
-    expect(JSON.parse(text)).toEqual({ ok: true, records: 1 });
+    expect(JSON.parse(text)).toEqual({ ok: true });
 
     await server.close();
   });
@@ -189,7 +293,7 @@ describe("createMcpStdioServer", () => {
       },
     };
 
-    const { tools } = createMcpStdioServer({
+    const { tools } = createMcpStdioServer({ authority, defaultScope,
       service: new FakeMemoryService(),
       pipeline: pipeline as unknown as Parameters<typeof createMcpStdioServer>[0]["pipeline"],
     });
@@ -206,5 +310,68 @@ describe("createMcpStdioServer", () => {
       chunksAdmitted: 1,
     });
     expect(inputs).toHaveLength(1);
+  });
+
+  test("transport close resolves the running server lifecycle", async () => {
+    const transport = new FakeTransport();
+    const running = await startMcpStdioServer(
+      { authority, defaultScope, service: new FakeMemoryService() },
+      { transport },
+    );
+    let closed = false;
+    void running.closed.then(() => { closed = true; });
+
+    transport.disconnect();
+    await running.closed;
+
+    expect(closed).toBe(true);
+    await expect(running.close()).resolves.toBeUndefined();
+  });
+
+  test("signal shutdown closes transport and resolves without process.exit", async () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const signals = {
+      once: (signal: string, listener: (...args: unknown[]) => void) => {
+        listeners.set(signal, listener);
+        return signals;
+      },
+      off: (signal: string) => {
+        listeners.delete(signal);
+        return signals;
+      },
+    };
+    let resolveClosed!: () => void;
+    const close = vi.fn(async () => { resolveClosed(); });
+    const running = {
+      close,
+      closed: new Promise<void>((resolve) => { resolveClosed = resolve; }),
+    };
+    const waiting = waitForMcpServerShutdown(running, signals);
+
+    listeners.get("SIGTERM")?.();
+    const reason = await waiting;
+
+    expect(reason).toBe("SIGTERM");
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(listeners.size).toBe(0);
+  });
+
+  test("shutdown still stops runtime when transport close fails", async () => {
+    const closeFailure = new Error("close-secret");
+    const runtimeFailure = new Error("runtime-secret");
+    const running = {
+      closed: Promise.resolve(),
+      close: vi.fn(async () => { throw closeFailure; }),
+    };
+    const runtime = {
+      stop: vi.fn(async () => { throw runtimeFailure; }),
+    };
+
+    const failure = await closeMcpServerAndRuntime(running, runtime).catch((error) => error);
+
+    expect(running.close).toHaveBeenCalledTimes(1);
+    expect(runtime.stop).toHaveBeenCalledTimes(1);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([closeFailure, runtimeFailure]);
   });
 });

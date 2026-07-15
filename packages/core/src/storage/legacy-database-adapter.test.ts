@@ -1,5 +1,10 @@
 import { describe, expect, test } from "vitest";
 import type { DatabaseProvider, MemoryEntry, MemoryQueryOptions, TableStats } from "../db/types.js";
+import {
+  DATABASE_STORE_CLEANUP_WARNING,
+  DatabaseStoreCleanupError,
+} from "../db/types.js";
+import { LanceDBStoreCleanupError } from "../db/providers/lancedb.js";
 import { LegacyDatabaseAdapter } from "./legacy-database-adapter.js";
 
 const entry: MemoryEntry = {
@@ -18,6 +23,8 @@ const entry: MemoryEntry = {
     source: "user",
   },
   createdAt: 1710000000000,
+  tenantId: "local",
+  userId: "user-1",
 };
 
 class FakeProvider implements DatabaseProvider {
@@ -31,8 +38,17 @@ class FakeProvider implements DatabaseProvider {
   async initialize(): Promise<void> {}
   async close(): Promise<void> {}
 
-  async store(entries: MemoryEntry[]): Promise<void> {
+  async store(entries: MemoryEntry[]) {
     this.stored.push(entries);
+    return {
+      inserted: entries.length,
+      duplicates: 0,
+      records: entries.map((item) => ({
+        requestedId: item.id,
+        persistedId: item.id,
+        stored: true,
+      })),
+    };
   }
 
   async query(options: MemoryQueryOptions): Promise<Array<MemoryEntry & { score: number }>> {
@@ -89,8 +105,78 @@ describe("LegacyDatabaseAdapter", () => {
         userId: "user-1",
         agentId: "agent-1",
         workspaceId: undefined,
+        tenantId: "local",
+        canonicalProjectId: "project-1",
+        productId: "openclaw",
+        producerId: "agent-1",
+        namespace: "memories",
+        visibility: "private",
+        lifecycleStatus: undefined,
       }],
     ]);
+  });
+
+  test("converts a validated provider-neutral cleanup error into receipt metadata", async () => {
+    const provider = new FakeProvider();
+    provider.store = async () => {
+      throw new LanceDBStoreCleanupError({
+        inserted: 1,
+        duplicates: 0,
+        records: [{ requestedId: "mem-1", persistedId: "mem-1", stored: true }],
+      }, "completed");
+    };
+    const adapter = new LegacyDatabaseAdapter(provider, { appId: "openclaw" });
+
+    await expect(adapter.storeLegacyEntries([entry])).resolves.toEqual({
+      inserted: 1,
+      duplicates: 0,
+      records: [{ requestedId: "mem-1", persistedId: "mem-1", stored: true }],
+      cleanup: {
+        cleanupFailed: true,
+        operationStatus: "completed",
+        warning: DATABASE_STORE_CLEANUP_WARNING,
+      },
+    });
+  });
+
+  test("keeps a valid partial receipt but does not invent missing records", async () => {
+    const provider = new FakeProvider();
+    provider.store = async () => {
+      throw new DatabaseStoreCleanupError({
+        inserted: 1,
+        duplicates: 0,
+        records: [{ requestedId: "mem-1", persistedId: "mem-1", stored: true }],
+      }, "partial");
+    };
+    const adapter = new LegacyDatabaseAdapter(provider);
+
+    await expect(adapter.storeLegacyEntries([
+      entry,
+      { ...entry, id: "mem-2", contentHash: "hash-2" },
+    ])).resolves.toMatchObject({
+      inserted: 1,
+      records: [{ requestedId: "mem-1", stored: true }],
+      cleanup: { operationStatus: "partial" },
+    });
+  });
+
+  test("rejects a forged cleanup error with malformed receipt instead of swallowing it", async () => {
+    const provider = new FakeProvider();
+    const forged = Object.assign(Object.create(DatabaseStoreCleanupError.prototype), {
+      code: "DATABASE_STORE_CLEANUP_FAILED",
+      cleanupFailed: true,
+      warning: DATABASE_STORE_CLEANUP_WARNING,
+      operationStatus: "completed",
+      receipt: {
+        inserted: 1,
+        duplicates: 0,
+        records: [{ requestedId: "mem-1", persistedId: "", stored: true }],
+      },
+    });
+    provider.store = async () => { throw forged; };
+    const adapter = new LegacyDatabaseAdapter(provider);
+
+    await expect(adapter.storeLegacyEntries([entry])).rejects.toBe(forged);
   });
 
   test("queries provider with legacy options and returns core records with scores", async () => {
@@ -115,7 +201,7 @@ describe("LegacyDatabaseAdapter", () => {
       searchAll: true,
     });
 
-    // scope 不再塞进 filter（跨 scope 软排序，硬过滤已移除）
+    // authority 使用独立列下推；project/app/agent/namespace 仍按既有策略处理。
     expect(provider.queries).toEqual([
       {
         query: "concise",
@@ -126,6 +212,8 @@ describe("LegacyDatabaseAdapter", () => {
         dataTypes: ["memory"],
         searchAll: true,
         filter: undefined,
+        tenantId: "local",
+        userId: "user-1",
       },
     ]);
     expect(hits[0]).toMatchObject({
@@ -141,8 +229,8 @@ describe("LegacyDatabaseAdapter", () => {
     });
   });
 
-  test("does not push non-default scope into the SQL filter (no hard scope WHERE)", async () => {
-    const provider = new FakeProvider([{ ...entry, score: 0.5 }]);
+  test("仅下推 tenant/user authority，不把 project/agent/namespace 误升级成硬隔离", async () => {
+    const provider = new FakeProvider([{ ...entry, userId: "user-7", score: 0.5 }]);
     const adapter = new LegacyDatabaseAdapter(provider, { appId: "openclaw" });
 
     await adapter.query({
@@ -158,7 +246,10 @@ describe("LegacyDatabaseAdapter", () => {
     });
 
     const options = provider.queries[0];
+    expect(options).toMatchObject({ tenantId: "local", userId: "user-7" });
     expect(options.filter).toBeUndefined();
+    expect(options).not.toHaveProperty("agentId");
+    expect(options).not.toHaveProperty("namespace");
   });
 
   test("still passes through caller-provided structured filter", async () => {
@@ -179,11 +270,60 @@ describe("LegacyDatabaseAdapter", () => {
     });
 
     const options = provider.queries[0];
-    // 显式 filter 透传，但不混入任何 scope 字段
+    // 显式 filter 透传；authority 走独立列，不混入 metadata filter。
     expect(options.filter).toEqual({ tableName: "memories", kind: "preference" });
+    expect(options).toMatchObject({ tenantId: "local", userId: "user-7" });
     expect(options.filter).not.toHaveProperty("userId");
     expect(options.filter).not.toHaveProperty("projectPath");
     expect(options.filter).not.toHaveProperty("agentName");
+  });
+
+  test("legacy NULL authority 记录 fail-closed，不允许 metadata/default 回填后可见", async () => {
+    const legacyNullTenant = { ...entry, id: "legacy-null-tenant", tenantId: undefined, score: 1 };
+    const legacyNullUser = { ...entry, id: "legacy-null-user", userId: undefined, score: 1 };
+    const authorized = { ...entry, id: "authorized", score: 0.8 };
+    const provider = new FakeProvider([legacyNullTenant, legacyNullUser, authorized]);
+    const adapter = new LegacyDatabaseAdapter(provider, {
+      tenantId: "local",
+      userId: "user-1",
+      appId: "openclaw",
+    });
+
+    const hits = await adapter.query({
+      query: "x",
+      scope: {
+        tenantId: "local", appId: "openclaw", userId: "user-1",
+        projectId: "project-1", agentId: "agent-1", namespace: "memories",
+      },
+      limit: 10,
+    });
+
+    expect(hits.map(({ id }) => id)).toEqual(["authorized"]);
+    expect(JSON.stringify(hits)).not.toContain("legacy-null");
+  });
+
+  test("100 组 cross tenant/user provider 污染结果在 adapter 边界被 exact post-filter", async () => {
+    const alien = Array.from({ length: 100 }, (_, index) => ({
+      ...entry,
+      id: `alien-${index}`,
+      tenantId: index % 2 === 0 ? `tenant-${index}` : "local",
+      userId: index % 2 === 0 ? "user-1" : `alien-user-${index}`,
+      score: 1,
+    }));
+    const provider = new FakeProvider([...alien, { ...entry, id: "allowed", score: 0.7 }]);
+    const adapter = new LegacyDatabaseAdapter(provider);
+
+    const hits = await adapter.query({
+      query: "x",
+      scope: {
+        tenantId: "local", appId: "openclaw", userId: "user-1",
+        projectId: "project-1", agentId: "agent-1", namespace: "memories",
+      },
+      limit: 5,
+    });
+
+    expect(provider.queries[0]).toMatchObject({ tenantId: "local", userId: "user-1", limit: 5 });
+    expect(hits.map(({ id }) => id)).toEqual(["allowed"]);
   });
 
   // D-25：toLegacyQueryOptions 内部 key 提取（_projectName/_appName/_projectPattern）

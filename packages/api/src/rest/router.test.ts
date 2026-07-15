@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { MemoryService } from "../../../../core/service-types.js";
 import type { ContextBlock, MemoryRecord, RecallResult } from "../../../../core/types.js";
 import { InMemoryGraphRepository } from "../../../../graph/repository.js";
@@ -6,7 +6,9 @@ import { GraphQueryService } from "../../../../graph/query.js";
 import { createConsoleApi } from "../../../../console/api.js";
 import { InMemoryCandidateRepository } from "../../../../lifecycle/candidate-repository.js";
 import { CandidateReviewService } from "../../../../lifecycle/candidate-review.js";
-import { createRestRouter } from "./router.js";
+import { createRestApi, createRestRouter } from "./router.js";
+import type { AuthorityScope } from "../../../core/src/domain/authority-scope.js";
+import type { MemoryConfig } from "../../../../config.js";
 
 const scope = {
   tenantId: "local",
@@ -30,6 +32,39 @@ const record: MemoryRecord = {
   metadata: {},
   provenance: {},
   createdAt: 1710000000000,
+};
+
+const transportAuthority: AuthorityScope = {
+  tenantId: "server-tenant",
+  userId: "server-user",
+  allow: {
+    appIds: ["rest"],
+    projectIds: ["project-1"],
+    agentIds: ["agent-1"],
+    namespaces: ["memories"],
+    visibilities: ["private"],
+  },
+};
+
+const attackerScope = {
+  tenantId: "attacker-tenant",
+  userId: "attacker-user",
+  appId: "rest",
+  projectId: "project-1",
+  agentId: "agent-1",
+  namespace: "memories",
+  visibility: "private",
+};
+
+const restConfig: MemoryConfig = {
+  embedding: {
+    provider: "openai",
+    apiKey: "test-key",
+    baseURL: "http://127.0.0.1:9/v1",
+    model: "text-embedding-3-small",
+  },
+  dbType: "lancedb",
+  dbPath: "/tmp/mengshu-rest-router-test",
 };
 
 class FakeMemoryService implements MemoryService {
@@ -64,8 +99,175 @@ class FakeMemoryService implements MemoryService {
 }
 
 describe("REST router", () => {
+  test("rejects production router construction without authority", () => {
+    expect(() => createRestRouter({ service: new FakeMemoryService() })).toThrow(
+      /REST authority is required/,
+    );
+  });
+
+  test("createRestApi 将 exact authority 解析为 runtime 的唯一持久 scope", () => {
+    const api = createRestApi(restConfig, restConfig.dbPath!, transportAuthority);
+
+    expect(api.runtime.defaultScope).toEqual({
+      tenantId: "server-tenant",
+      userId: "server-user",
+      appId: "rest",
+      projectId: "project-1",
+      agentId: "agent-1",
+      namespace: "memories",
+      visibility: "private",
+    });
+  });
+
+  test("createRestApi 拒绝无法解析为单一 runtime scope 的多值 authority", () => {
+    expect(() => createRestApi(restConfig, restConfig.dbPath!, {
+      ...transportAuthority,
+      allow: {
+        ...transportAuthority.allow,
+        projectIds: ["project-1", "project-2"],
+      },
+    })).toThrow();
+  });
+
+  test("candidate review 在进入 Console 前解析并校验 server authority scope", async () => {
+    const reviewCandidates = vi.fn(async () => ({ affected: 0, promoted: [], errors: [] }));
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      console: { reviewCandidates } as unknown as NonNullable<
+        Parameters<typeof createRestRouter>[0]["console"]
+      >,
+    });
+
+    const response = await router.handle({
+      method: "POST",
+      path: "/v1/console/candidates/review",
+      headers: {},
+      body: {
+        scope: { ...attackerScope, appId: "outside-authority" },
+        action: { action: "approve", ids: ["candidate-1"] },
+      },
+    });
+
+    expect(response.status).toBe(400);
+    expect(reviewCandidates).not.toHaveBeenCalled();
+  });
+
+  test("authority makes attacker tenant/user override zero before save/recall/context/observe/forget", async () => {
+    const service = new FakeMemoryService();
+    const capturedScopes: unknown[] = [];
+    service.storeMemory = (async (input: { record: { scope: unknown } }) => {
+      capturedScopes.push(input.record.scope);
+      return { id: "mem-1", stored: true };
+    }) as unknown as typeof service.storeMemory;
+    service.recall = (async (input: { scope: unknown }) => {
+      capturedScopes.push(input.scope);
+      return { scope, query: "", hits: [] };
+    }) as unknown as typeof service.recall;
+    service.buildContext = (async (input: { scope: unknown }) => {
+      capturedScopes.push(input.scope);
+      return { scope, content: "", hits: [], tokenEstimate: 0 };
+    }) as unknown as typeof service.buildContext;
+    const forgetService = {
+      async forget(input: { clientScope: unknown; serverAuthority: AuthorityScope }) {
+        capturedScopes.push({
+          ...(input.clientScope as Record<string, unknown>),
+          tenantId: input.serverAuthority.tenantId,
+          userId: input.serverAuthority.userId,
+        });
+        return { action: "delete" as const, affected: 0, deleted: 0, affectedIds: [], transactional: true as const, idempotentReplay: false };
+      },
+    };
+    const agentFastPath = {
+      async observeLight(input: { scope: unknown }) {
+        capturedScopes.push(input.scope);
+        return { ack: true as const, traceId: "trace-1", queuedJobs: [] };
+      },
+    } as unknown as NonNullable<Parameters<typeof createRestRouter>[0]["agentFastPath"]>;
+    const router = createRestRouter({ service, forgetService, agentFastPath, authority: transportAuthority });
+
+    const responses = await Promise.all([
+      router.handle({
+        method: "POST",
+        path: "/v1/memories",
+        headers: {},
+        body: { record: { ...record, scope: attackerScope } },
+      }),
+      router.handle({
+        method: "POST",
+        path: "/v1/recall",
+        headers: {},
+        body: { query: "recall", scope: attackerScope },
+      }),
+      router.handle({
+        method: "POST",
+        path: "/v1/context",
+        headers: {},
+        body: { query: "context", scope: attackerScope },
+      }),
+      router.handle({
+        method: "POST",
+        path: "/v1/agent/observe",
+        headers: {},
+        body: { text: "observe", eventType: "user_input", scope: attackerScope },
+      }),
+      router.handle({
+        method: "POST",
+        path: "/v1/forget",
+        headers: {},
+        body: { filter: { category: "core" }, scope: attackerScope, idempotencyKey: "request-1" },
+      }),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([201, 200, 200, 200, 200]);
+    expect(capturedScopes).toHaveLength(5);
+    for (const captured of capturedScopes) {
+      expect(captured).toMatchObject({ tenantId: "server-tenant", userId: "server-user" });
+      expect(captured).not.toMatchObject({ tenantId: "attacker-tenant" });
+    }
+  });
+
+  test.each([
+    ["invalid action", { action: "destroy", ids: ["mem-1"] }],
+    ["non-string id", { ids: ["mem-1", 42] }],
+    ["empty id", { ids: [""] }],
+    ["duplicate ids", { ids: ["mem-1", "mem-1"] }],
+  ])("RED: REST forget rejects %s before service", async (_label, invalid) => {
+    const inputs: unknown[] = [];
+    const forgetService = {
+      async forget(input: unknown) {
+        inputs.push(input);
+        return { action: "delete" as const, affected: 0, deleted: 0, affectedIds: [], transactional: true as const, idempotentReplay: false };
+      },
+    };
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      forgetService,
+      authority: transportAuthority,
+    });
+
+    const response = await router.handle({
+      method: "POST",
+      path: "/v1/forget",
+      headers: {},
+      body: {
+        ...invalid,
+        scope: {
+          appId: "rest",
+          projectId: "project-1",
+          agentId: "agent-1",
+          namespace: "memories",
+          visibility: "private",
+        },
+        idempotencyKey: "request-1",
+      },
+    });
+
+    expect(response.status).toBe(400);
+    expect(inputs).toEqual([]);
+  });
   test("returns health snapshot", async () => {
-    const router = createRestRouter({ service: new FakeMemoryService() });
+    const router = createRestRouter({ unsafeLegacyScope: true, service: new FakeMemoryService() });
 
     await expect(router.handle({ method: "GET", path: "/v1/health", headers: {} })).resolves.toEqual({
       status: 200,
@@ -74,7 +276,7 @@ describe("REST router", () => {
   });
 
   test("stores memory from JSON body", async () => {
-    const router = createRestRouter({ service: new FakeMemoryService() });
+    const router = createRestRouter({ unsafeLegacyScope: true, service: new FakeMemoryService() });
 
     await expect(
       router.handle({
@@ -92,7 +294,7 @@ describe("REST router", () => {
   });
 
   test("recalls memories and builds context", async () => {
-    const router = createRestRouter({ service: new FakeMemoryService() });
+    const router = createRestRouter({ unsafeLegacyScope: true, service: new FakeMemoryService() });
 
     const recall = await router.handle({
       method: "POST",
@@ -114,7 +316,7 @@ describe("REST router", () => {
   });
 
   test("applies auth guard and returns JSON errors", async () => {
-    const router = createRestRouter({
+    const router = createRestRouter({ unsafeLegacyScope: true,
       service: new FakeMemoryService(),
       server: { secret: "secret-token" },
     });
@@ -154,7 +356,7 @@ describe("REST router", () => {
         metadata: {},
       },
     ]);
-    const router = createRestRouter({
+    const router = createRestRouter({ unsafeLegacyScope: true,
       service: new FakeMemoryService(),
       graph: new GraphQueryService(repository),
     });
@@ -175,7 +377,7 @@ describe("REST router", () => {
 
   test("routes console overview, lookup and jobs", async () => {
     const service = new FakeMemoryService();
-    const router = createRestRouter({
+    const router = createRestRouter({ unsafeLegacyScope: true,
       service,
       console: createConsoleApi({ service }),
     });
@@ -222,7 +424,7 @@ describe("REST router", () => {
       repository,
       promoteCandidate: async ({ candidate: c }) => ({ memoryId: `mem-${c.id}` }),
     });
-    const router = createRestRouter({
+    const router = createRestRouter({ unsafeLegacyScope: true,
       service,
       console: createConsoleApi({ service, candidates: repository, candidateReview: review }),
     });
@@ -258,7 +460,7 @@ describe("REST router", () => {
   });
 
   test("returns 404 and 405 for unsupported routes", async () => {
-    const router = createRestRouter({ service: new FakeMemoryService() });
+    const router = createRestRouter({ unsafeLegacyScope: true, service: new FakeMemoryService() });
 
     await expect(router.handle({ method: "GET", path: "/v1/missing", headers: {} })).resolves.toEqual({
       status: 404,

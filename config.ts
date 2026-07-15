@@ -1,5 +1,10 @@
 import fs from "node:fs";
 import { resolveDefaultLanceDbPath, resolveLegacyLanceDbPath } from "./core/paths.js";
+import {
+  resolveAuthorityScope,
+  type AuthorityScope,
+} from "./packages/core/src/domain/authority-scope.js";
+import type { MemoryVisibility } from "./packages/core/src/domain/types.js";
 
 /**
  * 路由规则配置
@@ -38,6 +43,11 @@ export type MemoryConfig = {
     baseURL?: string;
     apiKey: string;
   };
+  /**
+   * 本机 host/operator 显式声明的可信身份边界。
+   * 仅插件宿主配置可提供；工具参数、消息和 hook 事件不得生成或覆盖 tenantId/userId。
+   */
+  authority?: AuthorityScope;
   /**
    * LLM chat completion 配置（可选）。
    * 提供后即可启用摘要 / 抽取等生成式能力；未提供时上层降级到 NullLlmClient。
@@ -278,6 +288,65 @@ function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], la
   throw new Error(`${label} has unknown keys: ${unknown.join(", ")}`);
 }
 
+function parseHostAuthority(value: unknown): AuthorityScope | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("authority must be an object");
+  }
+  const authority = value as Record<string, unknown>;
+  assertAllowedKeys(authority, ["tenantId", "userId", "allow"], "authority");
+  const allowValue = authority.allow;
+  if (!allowValue || typeof allowValue !== "object" || Array.isArray(allowValue)) {
+    throw new Error("authority.allow must be an object");
+  }
+  const allow = allowValue as Record<string, unknown>;
+  const allowFields = [
+    "appIds",
+    "projectIds",
+    "agentIds",
+    "namespaces",
+    "visibilities",
+  ] as const;
+  assertAllowedKeys(allow, [...allowFields], "authority.allow");
+  for (const field of allowFields) {
+    if (!Array.isArray(allow[field])) {
+      throw new Error(`authority allowlist ${field} is required`);
+    }
+  }
+
+  const candidate: AuthorityScope = {
+    tenantId: authority.tenantId as string,
+    userId: authority.userId as string,
+    allow: {
+      appIds: allow.appIds as string[],
+      projectIds: allow.projectIds as string[],
+      agentIds: allow.agentIds as string[],
+      namespaces: allow.namespaces as string[],
+      visibilities: allow.visibilities as MemoryVisibility[],
+    },
+  };
+  // 复用核心 SSOT 校验所有身份、allowlist、规范化歧义和路径混淆规则。
+  resolveAuthorityScope(candidate, {
+    appId: candidate.allow.appIds[0] as string,
+    projectId: candidate.allow.projectIds[0] as string,
+    agentId: candidate.allow.agentIds[0] as string,
+    namespace: candidate.allow.namespaces[0] as string,
+    visibility: candidate.allow.visibilities[0] as MemoryVisibility,
+  });
+
+  return Object.freeze({
+    tenantId: candidate.tenantId,
+    userId: candidate.userId,
+    allow: Object.freeze({
+      appIds: Object.freeze([...candidate.allow.appIds]),
+      projectIds: Object.freeze([...candidate.allow.projectIds]),
+      agentIds: Object.freeze([...candidate.allow.agentIds]),
+      namespaces: Object.freeze([...candidate.allow.namespaces]),
+      visibilities: Object.freeze([...candidate.allow.visibilities]),
+    }),
+  });
+}
+
 export function vectorDimsForModel(model: string): number {
   const dims = EMBEDDING_DIMENSIONS[model];
   if (!dims) {
@@ -357,10 +426,11 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "llm", "mode", "server", "features", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
+      ["embedding", "authority", "llm", "mode", "server", "features", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
       "memory config",
     );
 
+    const authority = parseHostAuthority(cfg.authority);
     const embedding = cfg.embedding as Record<string, unknown> | undefined;
     if (!embedding || typeof embedding.apiKey !== "string") {
       throw new Error("embedding.apiKey is required");
@@ -368,7 +438,10 @@ export const memoryConfigSchema = {
     if (!embedding || typeof embedding.baseURL !== "string") {
       throw new Error("embedding.baseURL is required");
     }
-    assertAllowedKeys(embedding, ["apiKey", "baseURL", "model"], "embedding config");
+    assertAllowedKeys(embedding, ["provider", "apiKey", "baseURL", "model"], "embedding config");
+    if (embedding.provider !== undefined && embedding.provider !== "openai") {
+      throw new Error("embedding.provider must be openai");
+    }
 
     const model = resolveEmbeddingModel(embedding);
 
@@ -634,6 +707,7 @@ export const memoryConfigSchema = {
     const dbType = (cfg.dbType === "supabase" ? "supabase" : cfg.dbType === "postgres" ? "postgres" : "lancedb");
 
     return {
+      authority,
       embedding: {
         provider: "openai",
         model,
@@ -745,6 +819,16 @@ export const memoryConfigSchema = {
       label: "Embedding Model",
       placeholder: DEFAULT_MODEL,
       help: "OpenAI embedding model to use",
+    },
+    "authority.tenantId": {
+      label: "Trusted Tenant ID",
+      advanced: true,
+      help: "Operator-owned local identity; never sourced from tool input or messages",
+    },
+    "authority.userId": {
+      label: "Trusted User ID",
+      advanced: true,
+      help: "Operator-owned local identity; never sourced from tool input or messages",
     },
     dbType: {
       label: "Database Type",

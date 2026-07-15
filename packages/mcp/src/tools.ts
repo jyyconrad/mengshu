@@ -19,7 +19,6 @@ import type {
 } from "../../api/src/agent-fast-path/index.js";
 import type {
   BuildContextInput,
-  DeleteMemoryInput,
   MemoryService,
   RecallInput,
   StoreMemoryInput,
@@ -27,9 +26,16 @@ import type {
 import type { IngestionPipeline } from "../../core/src/ingest/pipeline.js";
 import type { LlmClient } from "../../core/src/runtime/llm/llm-client.js";
 import type { MemoryScope, RecallHit, RecallResult } from "../../../core/types.js";
+import type { AuthorityScope } from "../../core/src/domain/authority-scope.js";
 import { chunkMarkdown } from "../../core/src/ingest/chunker.js";
 import { scopeToKey } from "../../core/src/domain/scope.js";
 import { loadFileContent } from "../../core/src/ingest/file-loader.js";
+import { resolveMcpAuthorityScope } from "./authority.js";
+import {
+  isAuthorityScopedForgetCapability,
+  type AuthorityScopedForgetCapability,
+} from "../../core/src/service/authority-forget-capability.js";
+import { McpInvalidRequestError } from "./tool-error.js";
 
 /** JSON Schema 对象（MCP inputSchema 形态，保持宽松类型） */
 export type JsonSchemaObject = Record<string, unknown>;
@@ -42,8 +48,30 @@ export interface McpMemoryTool {
   execute(input: Record<string, unknown>): Promise<unknown>;
 }
 
+function deepFreeze(value: unknown, seen = new WeakSet<object>()): void {
+  if (!value || typeof value !== "object" || seen.has(value)) return;
+  seen.add(value);
+  for (const child of Object.values(value as Record<string, unknown>)) {
+    deepFreeze(child, seen);
+  }
+  Object.freeze(value);
+}
+
+/** One immutable registry snapshot backs both tools/list and tools/call. */
+export function freezeMcpToolRegistry(
+  tools: McpMemoryTool[],
+): readonly McpMemoryTool[] {
+  const snapshot = tools.map((tool) => {
+    deepFreeze(tool.inputSchema);
+    return Object.freeze({ ...tool });
+  });
+  return Object.freeze(snapshot);
+}
+
 export interface McpMemoryToolsOptions {
   service: MemoryService;
+  /** Opaque runtime-minted destructive capability. Structural fakes are rejected. */
+  forgetCapability?: AuthorityScopedForgetCapability;
   namespaces?: string[];
   /** 可选 Agent 快路径服务；注入后额外暴露 3 个快路径工具 */
   agentFastPath?: AgentFastPathService;
@@ -51,6 +79,10 @@ export interface McpMemoryToolsOptions {
   pipeline?: IngestionPipeline;
   /** 可选 LLM 客户端（预留给后续 ingest 增强；当前 ingest 热路径不调用 LLM） */
   llmClient?: LlmClient;
+  /** Server-owned authority. Required by production server/stdio wrappers. */
+  authority?: AuthorityScope;
+  /** @deprecated Test-only compatibility channel for the pre-authority constructor. */
+  unsafeLegacyScope?: true;
   /**
    * 默认 scope，当客户端调用时未传递 scope 时自动填充。
    *
@@ -58,14 +90,7 @@ export interface McpMemoryToolsOptions {
    * 因此 scope（尤其是 tenantId）应该是 MCP server 启动时确定的上下文，
    * 而不是每次调用时由客户端传递（容易遗漏或不一致）。
    */
-  defaultScope?: {
-    tenantId?: string;
-    appId?: string;
-    userId?: string;
-    projectId?: string;
-    agentId?: string;
-    namespace?: string;
-  };
+  defaultScope?: Partial<MemoryScope>;
 }
 
 /**
@@ -87,16 +112,13 @@ function withUntrustedHeader(content: string): string {
 /** 通用 scope 字段定义，多个工具复用 */
 const scopeSchema: JsonSchemaObject = {
   type: "object",
-  description: "Memory scope (tenant/app/user/project/agent/namespace/workspace).",
+  description: "Requestable memory scope (app/project/agent/namespace/visibility). Tenant and user are server-owned.",
   properties: {
-    tenantId: { type: "string" },
     appId: { type: "string" },
-    userId: { type: "string" },
     projectId: { type: "string" },
     agentId: { type: "string" },
     namespace: { type: "string" },
-    // D-25：workspaceId 此前 schema 中缺失，补齐以支持完整 6 维 scope
-    workspaceId: { type: "string" },
+    visibility: { type: "string", enum: ["private", "workspace", "team", "public"] },
   },
   additionalProperties: false,
 };
@@ -191,6 +213,38 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function forgetAction(value: unknown): "revoke" | "archive" | "delete" {
+  if (value === undefined) return "delete";
+  if (value === "revoke" || value === "archive" || value === "delete") return value;
+  throw new McpInvalidRequestError("memory_forget action is invalid");
+}
+
+function forgetIds(value: unknown): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new McpInvalidRequestError("memory_forget ids must be a non-empty array");
+  }
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const id of value) {
+    if (typeof id !== "string" || id.length === 0 || id !== id.trim() || seen.has(id)) {
+      throw new McpInvalidRequestError("memory_forget ids contain an invalid or duplicate value");
+    }
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+function forgetFilter(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  const filter = asRecord(value);
+  if (Object.keys(filter).length === 0) {
+    throw new McpInvalidRequestError("memory_forget filter must be a non-empty object");
+  }
+  return filter;
+}
+
 function toStoreInput(
   input: Record<string, unknown>,
   mergeScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
@@ -198,7 +252,7 @@ function toStoreInput(
   const rawRecord = asRecord(input.record);
   const text = stringOrDefault(rawRecord.text, stringOrDefault(input.text, ""));
   if (!text) {
-    throw new Error(
+    throw new McpInvalidRequestError(
       "memory_save/memory_observe requires non-empty `text`. Use {\"text\":\"...\"} or {\"record\":{\"text\":\"...\"}}; MCP result `content` is not an input field.",
     );
   }
@@ -324,7 +378,7 @@ const NOT_IMPLEMENTED_INGEST: McpMemoryTool = {
  */
 function buildIngestTool(
   pipeline: IngestionPipeline,
-  defaultScope?: McpMemoryToolsOptions["defaultScope"],
+  resolveScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
 ): McpMemoryTool {
   return {
     name: "memory_ingest",
@@ -334,12 +388,11 @@ function buildIngestTool(
     execute: async (input) => {
       const source = typeof input.source === "string" ? input.source : "";
       if (!source.trim()) {
-        throw new Error("memory_ingest: `source` is required");
+        throw new McpInvalidRequestError("memory_ingest: `source` is required");
       }
       const sourceType = input.sourceType === "file" ? "file" : "text";
       const clientScope = (input.scope ?? {}) as Record<string, unknown>;
-      // 客户端 scope 优先，未传字段回落 MCP server 配置的 defaultScope（与读写工具一致）。
-      const scope = { ...(defaultScope ?? {}), ...clientScope } as unknown as MemoryScope;
+      const scope = resolveScope(clientScope) as unknown as MemoryScope;
       const dryRun = input.dryRun === true;
       const chunkSize = typeof input.chunkSize === "number" ? input.chunkSize : undefined;
 
@@ -392,26 +445,39 @@ function buildIngestTool(
 }
 
 export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryTool[] {
-  const namespaces = options.namespaces ?? ["memories", "knowledge"];
-  const ingestTool = options.pipeline
-    ? buildIngestTool(options.pipeline, options.defaultScope)
-    : NOT_IMPLEMENTED_INGEST;
+  if (!options.authority && options.unsafeLegacyScope !== true) {
+    throw new Error("MCP authority is required; unsafeLegacyScope is test-only and deprecated");
+  }
+  const configuredNamespaces = options.namespaces ?? ["memories", "knowledge"];
+  const namespaces = Object.freeze(options.authority
+    ? configuredNamespaces.filter((namespace) => options.authority!.allow.namespaces.includes(namespace))
+    : [...configuredNamespaces]);
 
-  /**
-   * 合并 scope 辅助函数：客户端传递的 scope 优先，未传递时使用 MCP server 配置的默认值。
-   * 这确保了即使客户端忘记传递 scope，也能自动使用 MCP server 启动时配置的租户隔离边界。
-   */
+  /** 生产模式解析 server authority；legacy merge 仅供显式测试兼容通道。 */
   const mergeScope = (clientScope?: Record<string, unknown>): Record<string, unknown> => {
-    if (!options.defaultScope) {
-      // 如果 MCP server 没有配置默认 scope，直接返回客户端传递的（可能是 undefined）
-      return clientScope ?? {};
+    if (options.authority) {
+      const serverDefault = options.defaultScope
+        ? {
+            appId: options.defaultScope.appId,
+            projectId: options.defaultScope.projectId,
+            agentId: options.defaultScope.agentId,
+            namespace: options.defaultScope.namespace,
+            visibility: options.defaultScope.visibility ?? "private",
+          }
+        : {};
+      return resolveMcpAuthorityScope(
+        options.authority,
+        { ...serverDefault, ...(clientScope ?? {}) },
+      ) as unknown as Record<string, unknown>;
     }
-    // 客户端传递的字段优先，未传递的字段使用默认值
     return {
       ...options.defaultScope,
       ...(clientScope ?? {}),
     };
   };
+  const ingestTool = options.pipeline
+    ? buildIngestTool(options.pipeline, mergeScope)
+    : NOT_IMPLEMENTED_INGEST;
 
   const baseTools: McpMemoryTool[] = [
     {
@@ -463,6 +529,26 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
       execute: async () => ({ namespaces }),
     },
     {
+      name: "memory_health",
+      description: "Return memory service health.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: async () => {
+        const health = await options.service.health();
+        return health.ok
+          ? { ok: true }
+          : { ok: false, code: "SERVICE_UNAVAILABLE" };
+      },
+    },
+  ];
+
+  // Tool discovery is itself a capability contract. Never advertise forget
+  // merely because MemoryService has a method that may lack a transaction port.
+  if (
+    options.authority &&
+    isAuthorityScopedForgetCapability(options.forgetCapability)
+  ) {
+    const forgetCapability = options.forgetCapability;
+    baseTools.splice(baseTools.length - 1, 0, {
       name: "memory_forget",
       description: "Forget memories by ids or filter.",
       inputSchema: {
@@ -470,18 +556,72 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
         properties: {
           ids: { type: "array", items: { type: "string" }, description: "Memory ids to delete." },
           filter: { type: "object", description: "Structured metadata filter." },
+          scope: scopeSchema,
+          action: { type: "string", enum: ["revoke", "archive", "delete"] },
+          idempotencyKey: { type: "string", description: "Required retry-safe operation key." },
+          tableName: {
+            type: "string",
+            enum: ["memories", "knowledge"],
+            description: "Target table. memory_ingest records are stored in knowledge.",
+          },
+          dataTypes: {
+            type: "array",
+            items: { type: "string", enum: ["memory", "document", "knowledge"] },
+            description: "Target data types. memory_ingest creates document/knowledge records.",
+          },
+          actor: { type: "string" },
+          reason: { type: "string" },
         },
-        additionalProperties: true,
+        required: ["idempotencyKey"],
+        oneOf: [
+          { required: ["ids"], not: { required: ["filter"] } },
+          { required: ["filter"], not: { required: ["ids"] } },
+        ],
+        additionalProperties: false,
       },
-      execute: (input) => options.service.delete(input as unknown as DeleteMemoryInput),
-    },
-    {
-      name: "memory_health",
-      description: "Return memory service health.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
-      execute: async () => options.service.health(),
-    },
-  ];
+      execute: async (input) => {
+        const effectiveScope = mergeScope(
+          input.scope as Record<string, unknown> | undefined,
+        ) as unknown as MemoryScope;
+        const idempotencyKey =
+          typeof input.idempotencyKey === "string" && input.idempotencyKey.trim()
+            ? input.idempotencyKey
+            : undefined;
+        if (!idempotencyKey) {
+          throw new McpInvalidRequestError(
+            "memory_forget requires idempotencyKey in authority mode",
+          );
+        }
+        const ids = forgetIds(input.ids);
+        const filter = forgetFilter(input.filter);
+        if ((ids === undefined) === (filter === undefined)) {
+          throw new McpInvalidRequestError(
+            "memory_forget requires exactly one of ids or filter",
+          );
+        }
+        return forgetCapability.forget({
+          serverAuthority: options.authority!,
+          clientScope: {
+            appId: effectiveScope.appId,
+            projectId: effectiveScope.projectId,
+            agentId: effectiveScope.agentId,
+            namespace: effectiveScope.namespace,
+            visibility: effectiveScope.visibility ?? "private",
+          },
+          action: forgetAction(input.action),
+          ids,
+          filter,
+          tableName: input.tableName as never,
+          dataTypes: Array.isArray(input.dataTypes)
+            ? input.dataTypes as never
+            : undefined,
+          idempotencyKey,
+          actor: typeof input.actor === "string" ? input.actor : undefined,
+          reason: typeof input.reason === "string" ? input.reason : undefined,
+        });
+      },
+    });
+  }
 
   if (!options.agentFastPath) {
     return baseTools;

@@ -4,7 +4,7 @@ This file provides guidance to Codex and AI coding assistants when working with 
 
 ## 项目概述
 
-mengshu（梦枢）是面向多产品 Agent Runtime 的本地优先记忆中间件。当前版本 v1.0.5，P0-P4 算法层已全量交付。
+mengshu（梦枢）是面向多产品 Agent Runtime 的本地优先记忆中间件。当前版本 v1.0.5。D-01~D-23 算法规格和模块资产覆盖较广，但真实运行主链尚未全量集成；当前状态与升级顺序见 `.memory-docs/original-docs/03-architecture/mengshu-local-runtime-audit-and-upgrade-plan-2026-07.md`。
 
 核心能力：LLM 结构化提取 → 11 闸门 validator → 4 套评分 → 语义去重 → L0-L3 树摘要 → 6 因子召回 → 5 槽位注入。
 
@@ -18,7 +18,8 @@ mengshu（梦枢）是面向多产品 Agent Runtime 的本地优先记忆中间�
 
 ```bash
 # 开发
-npm test                        # vitest run（100 文件 / 1101 测试）
+npm test                        # vitest run；默认离线，provider 凭据不会自动启用 live
+npm run test:live               # 仅显式 MENGSHU_RUN_LIVE_TESTS=1 的网络测试
 npx tsc --noEmit                # 类型检查
 npx vitest run core/            # 运行单目录测试
 npm run eval:quick              # 快速 golden set 评估

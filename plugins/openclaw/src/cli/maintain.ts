@@ -5,19 +5,25 @@
  * - calculate-centrality: 计算 entity 的 graphCentrality
  */
 
-import type { CommanderLike } from "./index.js";
+import {
+  requireOpenClawCliAuthority,
+  resolveOpenClawCliScope,
+  type CommanderLike,
+  type OpenClawCliAuthorityContext,
+} from "./index.js";
 import type { CentralityCalculator } from "../../../../graph/centrality-calculator.js";
 import type { MemoryScope } from "../../../../core/types.js";
 
-export interface MaintainCliDeps {
+export interface MaintainCliDeps extends OpenClawCliAuthorityContext {
   centralityCalculator: CentralityCalculator;
-  getDefaultScope: () => MemoryScope;
+  getDefaultScope?: () => MemoryScope;
 }
 
 export function registerMaintainCommands(
   parent: CommanderLike,
   deps: MaintainCliDeps,
 ): void {
+  const serverScope = requireOpenClawCliAuthority(deps);
   const maintain = parent
     .command("maintain")
     .description("数据维护工具（后台任务）");
@@ -28,24 +34,20 @@ export function registerMaintainCommands(
     .option("--scope <scope>", "指定 scope (JSON 格式)")
     .action(async (...args: unknown[]) => {
       const options = args[0] as { scope?: string };
-      try {
-        let scope: MemoryScope;
-        if (options.scope) {
-          scope = JSON.parse(options.scope);
-        } else {
-          scope = deps.getDefaultScope();
-        }
-
-        console.log("🔄 开始计算 graphCentrality...");
-        console.log(`   Scope: ${JSON.stringify(scope, null, 2)}`);
-
-        await deps.centralityCalculator.calculateCentrality(scope);
-
-        console.log("✅ graphCentrality 计算完成");
-      } catch (error) {
-        console.error("❌ 计算失败:", error);
-        process.exit(1);
+      let scope: MemoryScope;
+      if (options.scope) {
+        const requested = JSON.parse(options.scope) as Record<string, unknown>;
+        scope = resolveOpenClawCliScope(deps, requested);
+      } else {
+        scope = serverScope;
       }
+
+      console.log("🔄 开始计算 graphCentrality...");
+      console.log(`   Scope: ${JSON.stringify(scope, null, 2)}`);
+
+      await deps.centralityCalculator.calculateCentrality(scope);
+
+      console.log("✅ graphCentrality 计算完成");
     });
 
   maintain

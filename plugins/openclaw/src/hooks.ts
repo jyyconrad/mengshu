@@ -12,13 +12,14 @@ import {
 } from "../../../config.js";
 import type { DataType } from "../../../db/types.js";
 import type { MemoryService } from "../../../core/service-types.js";
-import type { MemoryRecord } from "../../../core/types.js";
+import type { MemoryRecord, MemoryScope } from "../../../core/types.js";
+import type { AuthorityScope } from "../../../packages/core/src/domain/authority-scope.js";
 import { computeContentHash } from "../../../processing/hash-utils.js";
 import {
   formatRelevantMemoriesContext,
   looksLikePromptInjection,
 } from "../../../retrieval/prompt-safety.js";
-import { buildOpenClawScope } from "./scope.js";
+import { resolveOpenClawAuthorityScope } from "./authority.js";
 
 export interface HookLogger {
   info?(message: string): void;
@@ -36,12 +37,16 @@ export interface AgentEndEvent extends Record<string, unknown> {
 
 export interface AutoRecallContext {
   service: MemoryService;
+  authority: AuthorityScope;
+  defaultScope: MemoryScope;
   recallIncludeDocuments?: boolean;
   logger?: HookLogger;
 }
 
 export interface AutoCaptureContext {
   service: MemoryService;
+  authority: AuthorityScope;
+  defaultScope: MemoryScope;
   embedBatch(texts: string[]): Promise<number[][]>;
   existsByContentHash(contentHashes: string[]): Promise<string[]>;
   shouldCapture?: (text: string, options?: { maxChars?: number }) => boolean;
@@ -145,6 +150,7 @@ export async function handleBeforeAgentStartRecall(
   if (!event.prompt || event.prompt.length < 5) {
     return undefined;
   }
+  const scope = resolveOpenClawAuthorityScope(context.authority, context.defaultScope, event);
 
   try {
     const result = await context.service.recall({
@@ -152,6 +158,7 @@ export async function handleBeforeAgentStartRecall(
       limit: 3,
       minScore: 0.3,
       dataTypes: context.recallIncludeDocuments ? ["memory", "document"] : ["memory"],
+      scope,
     });
 
     const memoryHits = result.hits.filter((hit) => "text" in hit.record && "category" in hit.record);
@@ -173,8 +180,8 @@ export async function handleBeforeAgentStartRecall(
         }),
       ),
     };
-  } catch (err) {
-    context.logger?.warn(`mengshu: recall failed: ${String(err)}`);
+  } catch {
+    context.logger?.warn("mengshu: recall failed [RECALL_FAILED]");
     return undefined;
   }
 }
@@ -186,6 +193,9 @@ export async function handleAgentEndCapture(
   if (!event.success || !event.messages || event.messages.length === 0) {
     return;
   }
+  // Resolve before capture/embedding. Authority violations are not swallowed by
+  // the legacy capture error handler and therefore fail the host event closed.
+  const scope = resolveOpenClawAuthorityScope(context.authority, context.defaultScope, event);
 
   try {
     const shouldCaptureFn = context.shouldCapture ?? shouldCapture;
@@ -198,17 +208,21 @@ export async function handleAgentEndCapture(
       return;
     }
 
-    const hashes = toCapture.map((text) => computeContentHash(text));
-    const existingHashes = await context.existsByContentHash(hashes);
-    const existingSet = new Set(existingHashes);
-    const newEntries = toCapture
-      .filter((_, index) => !existingSet.has(hashes[index]))
-      .map((text, index) => ({
+    // existsByContentHash is a legacy global port. Calling it would expose a
+    // cross-authority existence oracle, so only request-local duplicates are
+    // removed here; persistent dedupe belongs to the authority-scoped kernel.
+    const seenHashes = new Set<string>();
+    const newEntries = toCapture.flatMap((text) => {
+      const contentHash = computeContentHash(text);
+      if (seenHashes.has(contentHash)) return [];
+      seenHashes.add(contentHash);
+      return [{
         text,
-        contentHash: hashes[index],
+        contentHash,
         category: detectCategoryFn(text),
         importance: 0.7,
-      }));
+      }];
+    });
 
     if (newEntries.length === 0) {
       return;
@@ -225,7 +239,6 @@ export async function handleAgentEndCapture(
         sessionId: event.sessionId as string | undefined,
         conversationId: event.conversationId as string | undefined,
         messageId: event.messageId as string | undefined,
-        userId: event.userId as string | undefined,
         projectPath: event.projectPath as string | undefined,
         workspacePath: event.workspacePath as string | undefined,
         agentId: event.agentId as string | undefined,
@@ -239,7 +252,7 @@ export async function handleAgentEndCapture(
       const id = context.idFactory?.() ?? randomUUID();
       const record: MemoryRecord = {
         id,
-        scope: buildOpenClawScope({ ...enrichedMetadata, tableName: "memories" }),
+        scope,
         kind: entry.category === "core" || entry.category === "other" ? "other" : entry.category,
         text: entry.text,
         contentHash: entry.contentHash,
@@ -259,16 +272,16 @@ export async function handleAgentEndCapture(
         createdAt: now(),
         updatedAt: now(),
       };
-      await context.service.storeMemory({ record });
-      if (context.enqueueGraphExtraction) {
-        await context.enqueueGraphExtraction(record.id, entry.text, record.scope).catch(() => {
+      const outcome = await context.service.storeMemory({ record });
+      if (outcome.stored && context.enqueueGraphExtraction) {
+        await context.enqueueGraphExtraction(outcome.id, entry.text, record.scope).catch(() => {
           // 图谱提取入队失败不影响记忆写入
         });
       }
     }
 
     context.logger?.info?.(`mengshu: auto-captured ${newEntries.length} new memories`);
-  } catch (err) {
-    context.logger?.warn(`mengshu: capture failed: ${String(err)}`);
+  } catch {
+    context.logger?.warn("mengshu: capture failed [CAPTURE_FAILED]");
   }
 }

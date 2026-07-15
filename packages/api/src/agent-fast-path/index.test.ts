@@ -7,6 +7,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { AgentFastPathService } from "./index.js";
+import { DATABASE_STORE_CLEANUP_WARNING } from "../../../core/src/db/types.js";
 import type {
   MemoryRecord,
   MemoryScope,
@@ -102,7 +103,7 @@ describe("AgentFastPathService", () => {
           .filter((r) => r.text.includes(query))
           .map((r) => ({ record: r, score: 0.9, source: "text" as const })),
       })),
-      storeObservation: vi.fn().mockResolvedValue({ id: "obs-1" }),
+      storeObservation: vi.fn().mockResolvedValue({ id: "obs-1", stored: true }),
       enqueueJob: vi.fn().mockResolvedValue("job-1"),
     });
   });
@@ -196,6 +197,76 @@ describe("AgentFastPathService", () => {
       expect(response.queuedJobs.length).toBeGreaterThan(0);
     });
 
+    it("intent=ignore 返回明确 ignored ack，且不写入或入队", async () => {
+      const storeObservation = vi.fn().mockResolvedValue({ id: "must-not-store", stored: true });
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      const ignoreService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation,
+        enqueueJob,
+      });
+
+      const response = await ignoreService.observeLight({
+        scope: baseScope,
+        eventType: "system_event",
+        text: "ephemeral noise",
+        intent: "ignore",
+      });
+
+      expect(response).toMatchObject({
+        ack: true,
+        ignored: true,
+        queuedJobs: [],
+      });
+      expect(storeObservation).not.toHaveBeenCalled();
+      expect(enqueueJob).not.toHaveBeenCalled();
+    });
+
+    it.each(["remember", "auto"] as const)("intent=%s 继续写入并入队", async (intent) => {
+      const storeObservation = vi.fn().mockResolvedValue({ id: `obs-${intent}`, stored: true });
+      const enqueueJob = vi.fn().mockResolvedValue("job-x");
+      const durableService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation,
+        enqueueJob,
+      });
+
+      const response = await durableService.observeLight({
+        scope: baseScope,
+        eventType: "user_input",
+        text: `${intent} this`,
+        intent,
+      });
+
+      expect(response.ignored).not.toBe(true);
+      expect(response).toMatchObject({
+        persistedId: `obs-${intent}`,
+        stored: true,
+        duplicate: false,
+      });
+      expect(storeObservation).toHaveBeenCalledTimes(1);
+      expect(enqueueJob).toHaveBeenCalledTimes(3);
+      const callsByType = Object.fromEntries(enqueueJob.mock.calls.map(([input]) => [input.type, input.payload]));
+      expect(callsByType.extract_candidate).toMatchObject({ traceId: `obs-${intent}` });
+      expect(callsByType.build_tree).toMatchObject({
+        traceId: `obs-${intent}`,
+        leaf: { id: `obs-${intent}`, chunkId: `obs-${intent}` },
+      });
+      expect(callsByType.extract_graph).toMatchObject({
+        chunkId: `obs-${intent}`,
+        sourceId: baseScope.appId,
+        context: {
+          projectName: baseScope.projectId,
+          userName: baseScope.userId,
+          agentName: baseScope.agentId,
+        },
+      });
+    });
+
     it("storeObservation 失败时返回 warning", async () => {
       const failingService = new AgentFastPathService({
         defaultScope: baseScope,
@@ -212,14 +283,16 @@ describe("AgentFastPathService", () => {
       });
 
       expect(response.warnings?.[0]).toContain("observation_store_failed");
+      expect(response.queuedJobs).toEqual([]);
     });
 
-    it("F3-2：observe 同时入队 extract_candidate 与 build_tree", async () => {
+    it("F3-2：observe 同时入队 extract_candidate、build_tree 与 extract_graph", async () => {
       const enqueueJob = vi.fn().mockResolvedValue("job-x");
       const treeService = new AgentFastPathService({
         defaultScope: baseScope,
         loadRecordsForScope: async () => [],
         recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => ({ id: "persisted-tree-id", stored: true }),
         enqueueJob,
       });
 
@@ -232,10 +305,285 @@ describe("AgentFastPathService", () => {
       const types = enqueueJob.mock.calls.map((c) => (c[0] as { type: string }).type);
       expect(types).toContain("extract_candidate");
       expect(types).toContain("build_tree");
+      expect(types).toContain("extract_graph");
       const treeCall = enqueueJob.mock.calls.find((c) => (c[0] as { type: string }).type === "build_tree");
       const payload = (treeCall![0] as { payload: Record<string, unknown> }).payload;
       expect(payload.treeType).toBe("source");
       expect(payload.treeKey).toBe("s-1");
+      expect(payload).toMatchObject({
+        leaf: {
+          id: "persisted-tree-id",
+          chunkId: "persisted-tree-id",
+        },
+      });
+      const graphCall = enqueueJob.mock.calls.find((c) => (c[0] as { type: string }).type === "extract_graph");
+      expect((graphCall![0] as { payload: Record<string, unknown> }).payload).toMatchObject({
+        chunkId: "persisted-tree-id",
+        sourceId: "s-1",
+        context: {
+          projectName: baseScope.projectId,
+          userName: baseScope.userId,
+          agentName: baseScope.agentId,
+        },
+      });
+    });
+
+    it("100 persistent duplicates return explicit duplicate ack and enqueue no dangling side effects", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      let sequence = 0;
+      const duplicateService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => ({
+          id: `persisted-existing-${++sequence}`,
+          stored: false,
+        }),
+        enqueueJob,
+      });
+
+      const results = await Promise.all(Array.from({ length: 100 }, (_, index) =>
+        duplicateService.observeLight({
+          scope: baseScope,
+          eventType: "user_input",
+          text: `duplicate-${index}`,
+        })));
+
+      expect(results).toHaveLength(100);
+      results.forEach((result, index) => {
+        expect(result).toMatchObject({
+          ack: true,
+          duplicate: true,
+          stored: false,
+          persistedId: `persisted-existing-${index + 1}`,
+          queuedJobs: [],
+        });
+      });
+      expect(enqueueJob).not.toHaveBeenCalled();
+    });
+
+    it("continues all derived jobs for stored cleanup receipt and returns only the fixed warning", async () => {
+      const enqueueJob = vi.fn(async ({ type }: { type: string }) => `${type}-job`);
+      const cleanupService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => ({
+          id: "persisted-cleanup-id",
+          stored: true,
+          warnings: [DATABASE_STORE_CLEANUP_WARNING],
+        }),
+        enqueueJob,
+      });
+
+      await expect(cleanupService.observeLight({
+        scope: baseScope,
+        eventType: "user_input",
+        text: "stored despite cleanup failure",
+      })).resolves.toMatchObject({
+        persistedId: "persisted-cleanup-id",
+        stored: true,
+        duplicate: false,
+        queuedJobs: ["extract_candidate-job", "build_tree-job", "extract_graph-job"],
+        warnings: [DATABASE_STORE_CLEANUP_WARNING],
+      });
+      expect(enqueueJob).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not enqueue jobs for duplicate cleanup receipt and keeps the fixed warning", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      const cleanupService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => ({
+          id: "persisted-existing-id",
+          stored: false,
+          warnings: [DATABASE_STORE_CLEANUP_WARNING],
+        }),
+        enqueueJob,
+      });
+
+      await expect(cleanupService.observeLight({
+        scope: baseScope,
+        eventType: "user_input",
+        text: "duplicate cleanup receipt",
+      })).resolves.toMatchObject({
+        persistedId: "persisted-existing-id",
+        stored: false,
+        duplicate: true,
+        queuedJobs: [],
+        warnings: [DATABASE_STORE_CLEANUP_WARNING],
+      });
+      expect(enqueueJob).not.toHaveBeenCalled();
+    });
+
+    it("rejects forged cleanup warnings as an invalid store outcome", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      const cleanupService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => ({
+          id: "persisted-forged-id",
+          stored: true,
+          warnings: ["raw provider detail"] as never,
+        }),
+        enqueueJob,
+      });
+
+      const result = await cleanupService.observeLight({
+        scope: baseScope,
+        eventType: "user_input",
+        text: "forged cleanup warning",
+      });
+      expect(result.queuedJobs).toEqual([]);
+      expect(result.warnings).toContain("observation_store_outcome_invalid");
+      expect(enqueueJob).not.toHaveBeenCalled();
+    });
+
+    it("100 concurrent new observations bind every downstream payload to the persisted ID", async () => {
+      const enqueueJob = vi.fn(async ({ type, payload }: { type: string; payload: Record<string, unknown> }) =>
+        `${type}:${String(payload.traceId)}`);
+      const concurrentService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async ({ text }) => ({ id: `persisted-${text}`, stored: true }),
+        enqueueJob,
+      });
+
+      const results = await Promise.all(Array.from({ length: 100 }, (_, index) =>
+        concurrentService.observeLight({
+          scope: baseScope,
+          eventType: "tool_result",
+          text: `observation-${index}`,
+        })));
+
+      expect(results).toHaveLength(100);
+      expect(enqueueJob).toHaveBeenCalledTimes(300);
+      for (const [{ payload }] of enqueueJob.mock.calls) {
+        const persistedId = String(payload.traceId ?? payload.chunkId);
+        expect(persistedId).toMatch(/^persisted-observation-/);
+        if (payload.leaf && typeof payload.leaf === "object") {
+          expect(payload.leaf).toMatchObject({ id: persistedId, chunkId: persistedId });
+        }
+      }
+    });
+
+    it("100 malformed or unavailable store outcomes never create dangling jobs", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      const malformed = Array.from({ length: 100 }, (_, index) => {
+        if (index % 4 === 0) return { id: "", stored: true };
+        if (index % 4 === 1) return { id: ` bad-${index}`, stored: true };
+        if (index % 4 === 2) return { id: `bad-${index}\n`, stored: true };
+        return { id: `bad-${index}`, stored: "yes" };
+      });
+      let cursor = 0;
+      const malformedService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => malformed[cursor++] as never,
+        enqueueJob,
+      });
+
+      const results = [];
+      for (let index = 0; index < malformed.length; index += 1) {
+        results.push(await malformedService.observeLight({
+          scope: baseScope,
+          eventType: "system_event",
+          text: `malformed-${index}`,
+        }));
+      }
+
+      expect(results.every((result) => result.queuedJobs.length === 0)).toBe(true);
+      expect(results.every((result) => result.warnings?.includes("observation_store_outcome_invalid"))).toBe(true);
+      expect(enqueueJob).not.toHaveBeenCalled();
+    });
+
+    it("rejects proxy, getter and symbol-extended outcomes without reading attacker fields", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      let proxyDescriptorReads = 0;
+      let getterReads = 0;
+      const outcomes: unknown[] = [
+        new Proxy({ id: "proxy-id", stored: true }, {
+          getOwnPropertyDescriptor(target, key) {
+            proxyDescriptorReads += 1;
+            return Reflect.getOwnPropertyDescriptor(target, key);
+          },
+        }),
+        Object.defineProperties({}, {
+          id: { enumerable: true, get: () => { getterReads += 1; return "getter-id"; } },
+          stored: { enumerable: true, value: true },
+        }),
+        Object.assign({ id: "symbol-id", stored: true }, { [Symbol("extra")]: true }),
+      ];
+      let cursor = 0;
+      const strictService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => outcomes[cursor++] as never,
+        enqueueJob,
+      });
+
+      for (const text of ["proxy", "getter", "symbol"]) {
+        const result = await strictService.observeLight({
+          scope: baseScope,
+          eventType: "system_event",
+          text,
+        });
+        expect(result.queuedJobs).toEqual([]);
+        expect(result.warnings).toContain("observation_store_outcome_invalid");
+      }
+      expect(proxyDescriptorReads).toBe(0);
+      expect(getterReads).toBe(0);
+      expect(enqueueJob).not.toHaveBeenCalled();
+    });
+
+    it("duplicate repair uses only the explicit durable ensure capability", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("generic-must-not-run");
+      const ensureJob = vi.fn(async ({ type }: { type: string }) => `ensured-${type}`);
+      const repairService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => ({ id: "persisted-existing-repair", stored: false }),
+        enqueueJob,
+        ensureJob,
+      });
+
+      await expect(repairService.observeLight({
+        scope: baseScope,
+        eventType: "user_input",
+        text: "repair missing derived jobs",
+      })).resolves.toMatchObject({
+        duplicate: true,
+        queuedJobs: ["ensured-extract_candidate", "ensured-build_tree", "ensured-extract_graph"],
+      });
+      expect(ensureJob).toHaveBeenCalledTimes(3);
+      expect(enqueueJob).not.toHaveBeenCalled();
+    });
+
+    it("missing storeObservation dependency does not enqueue jobs with an unpersisted traceId", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      const noStoreService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        enqueueJob,
+      });
+
+      const response = await noStoreService.observeLight({
+        scope: baseScope,
+        eventType: "user_input",
+        text: "not persisted",
+      });
+
+      expect(response).toMatchObject({ queuedJobs: [] });
+      expect(response.warnings).toContain("observation_store_unavailable");
+      expect(enqueueJob).not.toHaveBeenCalled();
     });
   });
 
