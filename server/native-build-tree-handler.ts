@@ -8,6 +8,12 @@ import { PostgresDurableJobV2EffectError } from
   "../packages/core/src/storage/repositories/postgres-job-v2-effect.js";
 
 import { bufferId } from "../packages/core/src/tree/buffer.js";
+import { PostgresTreeFinalizeError } from
+  "../packages/core/src/tree/postgres-build-tree-effect.js";
+import {
+  planTreeFanOut,
+  type TreeFanOutRoutingInput,
+} from "../packages/core/src/tree/tree-fan-out.js";
 import type { MemoryTreeType, TreeLeaf } from "../packages/core/src/tree/types.js";
 import {
   DURABLE_JOB_V2_SAFE_IDENTIFIER_MAX_LENGTH,
@@ -34,7 +40,7 @@ export interface NativeBuildTreeContext {
   readonly sessionId?: string;
 }
 
-export interface NativeBuildTreeSemanticRequest {
+export interface NativeAppendTreeSemanticRequest {
   readonly type: "build_tree";
   readonly version: typeof BUILD_TREE_CONTRACT_VERSION;
   readonly traceId: string;
@@ -50,6 +56,22 @@ export interface NativeBuildTreeSemanticRequest {
   readonly expectedBufferId: string;
 }
 
+export interface NativeFinalizeTreeSemanticRequest {
+  readonly type: "finalize_tree_buffer";
+  readonly version: typeof BUILD_TREE_CONTRACT_VERSION;
+  readonly traceId: string;
+  readonly context: NativeBuildTreeContext;
+  readonly treeType: Exclude<MemoryTreeType, "global">;
+  readonly treeKey: string;
+  readonly level: 0;
+  readonly finalizeMode: "history_rebuild";
+  readonly expectedBufferId: string;
+}
+
+export type NativeBuildTreeSemanticRequest =
+  | NativeAppendTreeSemanticRequest
+  | NativeFinalizeTreeSemanticRequest;
+
 export interface NativeBuildTreeEffectRequest {
   readonly effectKey: typeof BUILD_TREE_EFFECT_KEY;
   readonly effectInput: DurableJobV2FencedInput;
@@ -61,6 +83,8 @@ export interface NativeBuildTreeEffectResult {
   readonly sealed: boolean;
   readonly bufferId: string | null;
   readonly nodeId: string | null;
+  /** Optional only at the provider boundary for replaying pre-folding v1 receipts. */
+  readonly foldedNodeIds?: readonly string[];
 }
 
 export type NativeBuildTreeEffectOutcome =
@@ -121,6 +145,7 @@ export interface ProviderOwnedNativeBuildTreeHandlerDependencies {
 
 export interface NativeBuildTreeHandlerResult extends NativeBuildTreeEffectResult {
   readonly status: "applied" | "replayed";
+  readonly foldedNodeIds: readonly string[];
 }
 
 const JOB_REQUIRED = Object.freeze([
@@ -131,13 +156,25 @@ const JOB_OPTIONAL = Object.freeze([
   "nextAttemptAt", "leaseOwner", "leaseToken", "leaseUntil", "heartbeatAt", "lastError",
 ] as const);
 const PAYLOAD_REQUIRED = Object.freeze([
-  "scope", "traceId", "treeType", "treeKey", "leaf",
+  "scope", "traceId", "treeType", "treeKey",
+] as const);
+const PAYLOAD_OPTIONAL = Object.freeze([
+  "leaf", "routing", "targetIdempotencyKey", "finalize",
 ] as const);
 const SCOPE_REQUIRED = Object.freeze([
   "tenantId", "userId", "appId", "projectId", "agentId", "namespace", "visibility",
 ] as const);
 const CONTEXT_OPTIONAL = Object.freeze(["workspaceId", "sessionId"] as const);
 const LEAF_REQUIRED = Object.freeze(["id", "chunkId", "sourceId", "text", "eventAt"] as const);
+const LEAF_OPTIONAL = Object.freeze(["entityIds"] as const);
+const ROUTING_REQUIRED = Object.freeze([
+  "valueScore", "importance", "semanticType", "scopeVisibility", "riskFlags",
+  "topicHotnessEligible",
+] as const);
+const ROUTING_OPTIONAL = Object.freeze([
+  "topicLabels", "explicitGlobal", "isWorkspaceRule", "globalHotnessEligible",
+] as const);
+const FINALIZE_REQUIRED = Object.freeze(["mode", "expectedBufferId"] as const);
 const LEASE_OWNER = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 const LEASE_TOKEN = /^[A-Za-z0-9._~-]{32,256}$/;
 const UNSAFE_TEXT = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u;
@@ -145,6 +182,10 @@ const UNPAIRED_SURROGATE =
   /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
 const VISIBILITIES = new Set(["private", "workspace", "team", "public"]);
 const TREE_TYPES = new Set<MemoryTreeType>(["source", "topic", "global"]);
+const SEMANTIC_TYPES = new Set(["profile", "task_context", "rules", "experience", "resource"]);
+const SCOPE_VISIBILITIES = new Set([
+  "session", "project", "workspace", "app", "user", "global",
+]);
 const MAX_TEXT_LENGTH = 100_000;
 
 function handlerFailure(code: string, retryable: boolean): DurableJobV2HandlerFailure {
@@ -215,6 +256,77 @@ function safeTime(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
+function safeScore(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function snapshotStringArray(value: unknown, allowEmpty: boolean): readonly string[] {
+  if (!Array.isArray(value) || nodeUtilTypes.isProxy(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype) invalidJob();
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== value.length + 1 || !keys.includes("length")) invalidJob();
+  const snapshot: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const key = String(index);
+    if (!keys.includes(key)) invalidJob();
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor) ||
+        !safeText(descriptor.value)) invalidJob();
+    snapshot.push(descriptor.value);
+  }
+  if (!allowEmpty && snapshot.length === 0) invalidJob();
+  return Object.freeze(snapshot);
+}
+
+function snapshotIdArray(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || nodeUtilTypes.isProxy(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype) invalidJob();
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== value.length + 1 || !keys.includes("length")) invalidJob();
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor) ||
+        !safeId(descriptor.value) || seen.has(descriptor.value)) invalidJob();
+    seen.add(descriptor.value);
+    ids.push(descriptor.value);
+  }
+  return Object.freeze(ids);
+}
+
+function snapshotRouting(value: unknown): TreeFanOutRoutingInput {
+  const raw = exactDataRecord(value, ROUTING_REQUIRED, ROUTING_OPTIONAL);
+  if (!safeScore(raw.valueScore) || !safeScore(raw.importance) ||
+      typeof raw.semanticType !== "string" || !SEMANTIC_TYPES.has(raw.semanticType) ||
+      typeof raw.scopeVisibility !== "string" ||
+      !SCOPE_VISIBILITIES.has(raw.scopeVisibility) ||
+      typeof raw.topicHotnessEligible !== "boolean") invalidJob();
+  for (const field of [
+    "explicitGlobal", "isWorkspaceRule", "globalHotnessEligible",
+  ] as const) {
+    if (Object.hasOwn(raw, field) && typeof raw[field] !== "boolean") invalidJob();
+  }
+  const riskFlags = snapshotStringArray(raw.riskFlags, true);
+  const topicLabels = Object.hasOwn(raw, "topicLabels")
+    ? snapshotStringArray(raw.topicLabels, true)
+    : undefined;
+  return Object.freeze({
+    valueScore: raw.valueScore as number,
+    importance: raw.importance as number,
+    semanticType: raw.semanticType as TreeFanOutRoutingInput["semanticType"],
+    scopeVisibility: raw.scopeVisibility as TreeFanOutRoutingInput["scopeVisibility"],
+    riskFlags: [...riskFlags],
+    topicHotnessEligible: raw.topicHotnessEligible as boolean,
+    ...(topicLabels === undefined ? {} : { topicLabels }),
+    ...(raw.explicitGlobal === undefined ? {} : { explicitGlobal: raw.explicitGlobal as boolean }),
+    ...(raw.isWorkspaceRule === undefined ? {} : { isWorkspaceRule: raw.isWorkspaceRule as boolean }),
+    ...(raw.globalHotnessEligible === undefined
+      ? {}
+      : { globalHotnessEligible: raw.globalHotnessEligible as boolean }),
+  });
+}
+
 function snapshotScope(value: unknown, withContext: boolean): {
   readonly core: DurableJobV2Scope;
   readonly context: NativeBuildTreeContext;
@@ -265,36 +377,100 @@ function computeEffectRequest(
   if (job.type !== "build_tree" || !safeId(job.id)) invalidJob();
   assertLease(rawJob, context);
   const jobScope = snapshotScope(job.scope, false).core;
-  const payload = exactDataRecord(job.payload, PAYLOAD_REQUIRED);
+  const payload = exactDataRecord(job.payload, PAYLOAD_REQUIRED, PAYLOAD_OPTIONAL);
   const payloadScope = snapshotScope(payload.scope, true);
   if (!sameScope(jobScope, payloadScope.core)) invalidJob();
-  if (!safeId(payload.traceId) || (payload.traceId as string).length > MAX_TRACE_ID_LENGTH ||
-      job.dedupeKey !== deriveDurableJobV2DomainDedupeKey(
-        "build_tree",
-        payload.traceId as string,
-        payloadScope.context,
-      ) ||
+  const hasLeaf = Object.hasOwn(payload, "leaf");
+  const hasFinalize = Object.hasOwn(payload, "finalize");
+  const hasRouting = Object.hasOwn(payload, "routing");
+  const hasTargetIdempotencyKey = Object.hasOwn(payload, "targetIdempotencyKey");
+  if (hasLeaf === hasFinalize || hasRouting !== hasTargetIdempotencyKey ||
+      (hasFinalize && (hasRouting || hasTargetIdempotencyKey)) ||
+      !safeId(payload.traceId) || (payload.traceId as string).length > MAX_TRACE_ID_LENGTH ||
+      (hasTargetIdempotencyKey && !safeId(payload.targetIdempotencyKey)) ||
       typeof payload.treeType !== "string" || !TREE_TYPES.has(payload.treeType as MemoryTreeType) ||
       !safeId(payload.treeKey)) invalidJob();
-  const leaf = exactDataRecord(payload.leaf, LEAF_REQUIRED);
+  const dedupeIdentity = hasTargetIdempotencyKey
+    ? payload.targetIdempotencyKey as string
+    : payload.traceId as string;
+  if (job.dedupeKey !== deriveDurableJobV2DomainDedupeKey(
+    "build_tree",
+    dedupeIdentity,
+    payloadScope.context,
+  )) invalidJob();
+
+  const fullScope = Object.freeze({ ...jobScope, ...payloadScope.context });
+  if (hasFinalize) {
+    if (payload.treeType === "global") invalidJob();
+    const finalize = exactDataRecord(payload.finalize, FINALIZE_REQUIRED);
+    const expectedBufferId = bufferId(
+      fullScope,
+      payload.treeType as Exclude<MemoryTreeType, "global">,
+      payload.treeKey as string,
+      0,
+    );
+    if (finalize.mode !== "history_rebuild" || finalize.expectedBufferId !== expectedBufferId) {
+      invalidJob();
+    }
+    return Object.freeze({
+      effectKey: BUILD_TREE_EFFECT_KEY,
+      effectInput: Object.freeze({
+        id: job.id as string,
+        scope: jobScope,
+        owner: rawJob.leaseOwner!,
+        leaseToken: rawJob.leaseToken!,
+        leaseGeneration: rawJob.leaseGeneration,
+      }),
+      semanticRequest: Object.freeze({
+        type: "finalize_tree_buffer" as const,
+        version: BUILD_TREE_CONTRACT_VERSION,
+        traceId: payload.traceId as string,
+        context: payloadScope.context,
+        treeType: payload.treeType as Exclude<MemoryTreeType, "global">,
+        treeKey: payload.treeKey as string,
+        level: 0 as const,
+        finalizeMode: "history_rebuild" as const,
+        expectedBufferId,
+      }),
+    });
+  }
+
+  const leaf = exactDataRecord(payload.leaf, LEAF_REQUIRED, LEAF_OPTIONAL);
   if (!safeId(leaf.id) || !safeId(leaf.chunkId) || !safeId(leaf.sourceId) ||
-      leaf.id !== payload.traceId || leaf.chunkId !== payload.traceId ||
+      leaf.id !== payload.traceId ||
       !safeText(leaf.text) || !safeTime(leaf.eventAt) ||
       !safeTime(job.createdAt) || (leaf.eventAt as number) > (job.createdAt as number)) invalidJob();
 
-  const fullScope = Object.freeze({ ...jobScope, ...payloadScope.context });
+  const routing = hasRouting ? snapshotRouting(payload.routing) : undefined;
+  const entityIds = Object.hasOwn(leaf, "entityIds")
+    ? snapshotIdArray(leaf.entityIds)
+    : Object.freeze([] as string[]);
   const normalizedLeaf = Object.freeze({
     id: leaf.id as string,
     scope: fullScope,
     chunkId: leaf.chunkId as string,
     sourceId: leaf.sourceId as string,
-    entityIds: Object.freeze([]) as readonly string[],
-    importance: 0.5,
+    entityIds,
+    importance: routing?.importance ?? 0.5,
     eventAt: leaf.eventAt as number,
     createdAt: leaf.eventAt as number,
     text: leaf.text as string,
     tokenCount: Math.max(1, Math.ceil((leaf.text as string).length / 4)),
   }) as unknown as Readonly<TreeLeaf>;
+  if (routing) {
+    const matchingTargets = planTreeFanOut({
+      scope: fullScope,
+      leaf: normalizedLeaf,
+      routing,
+    }).targets.filter((target) =>
+      target.treeType === payload.treeType &&
+      target.treeKey === payload.treeKey &&
+      target.idempotencyKey === payload.targetIdempotencyKey
+    );
+    if (matchingTargets.length !== 1) invalidJob();
+  } else if (payload.treeType !== "source" || payload.treeKey !== leaf.sourceId) {
+    invalidJob();
+  }
   const semanticRequest = Object.freeze({
     type: "build_tree" as const,
     version: BUILD_TREE_CONTRACT_VERSION,
@@ -347,8 +523,16 @@ function normalizeOutcome(
   const receipt = exactEffectRecord(envelope.receipt);
   if (Reflect.ownKeys(receipt).length !== 1) throw handlerFailure("BUILD_TREE_EFFECT_REJECTED", false);
   const result = exactEffectRecord(receipt.result);
-  if (Reflect.ownKeys(result).length !== 4 || result.leafId !== request.semanticRequest.leaf.id ||
+  const resultKeys = Reflect.ownKeys(result);
+  const hasFoldedNodeIds = Object.hasOwn(result, "foldedNodeIds");
+  if (resultKeys.length !== (hasFoldedNodeIds ? 5 : 4) ||
+      resultKeys.some((key) => typeof key !== "string" ||
+        !["leafId", "sealed", "bufferId", "nodeId", "foldedNodeIds"].includes(key)) ||
+      result.leafId !== request.semanticRequest.traceId ||
       typeof result.sealed !== "boolean") throw handlerFailure("BUILD_TREE_EFFECT_REJECTED", false);
+  const foldedNodeIds = hasFoldedNodeIds
+    ? snapshotEffectIdArray(result.foldedNodeIds)
+    : Object.freeze([] as string[]);
   if (result.sealed) {
     if (result.bufferId !== null || !safeId(result.nodeId)) {
       throw handlerFailure("BUILD_TREE_EFFECT_REJECTED", false);
@@ -362,7 +546,16 @@ function normalizeOutcome(
     sealed: result.sealed,
     bufferId: result.bufferId as string | null,
     nodeId: result.nodeId as string | null,
+    foldedNodeIds,
   });
+}
+
+function snapshotEffectIdArray(value: unknown): readonly string[] {
+  try {
+    return snapshotIdArray(value);
+  } catch {
+    throw handlerFailure("BUILD_TREE_EFFECT_REJECTED", false);
+  }
 }
 
 function exactEffectRecord(value: unknown): Readonly<Record<string, unknown>> {
@@ -395,6 +588,12 @@ function mapEffectError(error: unknown): DurableJobV2HandlerFailure {
   if (error instanceof NativeBuildTreeEffectError) {
     return handlerFailure(
       error.retryable ? "BUILD_TREE_EFFECT_RETRYABLE" : "BUILD_TREE_EFFECT_REJECTED",
+      error.retryable,
+    );
+  }
+  if (error instanceof PostgresTreeFinalizeError) {
+    return handlerFailure(
+      error.retryable ? "BUILD_TREE_FINALIZE_PENDING" : "BUILD_TREE_FINALIZE_REJECTED",
       error.retryable,
     );
   }

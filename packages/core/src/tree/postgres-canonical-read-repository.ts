@@ -12,6 +12,7 @@ import type {
   TreeRepository,
   TreeSummaryNode,
 } from "./types.js";
+import { resolvePostgresTopicTreeReadKeys } from "./postgres-topic-tree-migration.js";
 
 export interface PostgresCanonicalTreeReadQueryResult<
   Row extends Record<string, unknown> = Record<string, unknown>,
@@ -68,6 +69,10 @@ FROM mengshu_tree_summary_nodes
 WHERE ${SCOPE_WHERE}
   AND ($11::text IS NULL OR tree_type = $11)
   AND ($12::text IS NULL OR tree_key = $12)
+ORDER BY sealed_at DESC NULLS LAST, created_at DESC, id`;
+const LIST_TOPIC_SUMMARIES_BY_KEYS_SQL = `SELECT ${SUMMARY_COLUMNS}
+FROM mengshu_tree_summary_nodes
+WHERE ${SCOPE_WHERE} AND tree_type = 'topic' AND tree_key = ANY($11::text[])
 ORDER BY sealed_at DESC NULLS LAST, created_at DESC, id`;
 const GET_PARENT_SQL = `SELECT ${SUMMARY_COLUMNS}
 FROM mengshu_tree_summary_nodes
@@ -376,6 +381,21 @@ export class PostgresCanonicalTreeReadRepository implements Pick<
     this.#assertScope(filter.scope);
     if (filter.treeType !== undefined && !TREE_TYPES.has(filter.treeType)) throw invalid("Canonical tree filter is invalid");
     const treeKey = filter.treeKey === undefined ? null : safeId(filter.treeKey);
+    if (filter.treeType === "topic" && treeKey !== null) {
+      const resolved = await resolvePostgresTopicTreeReadKeys(this.#client, {
+        scope: filter.scope,
+        requestedTreeKey: treeKey,
+      });
+      const result = await this.#client.query(LIST_TOPIC_SUMMARIES_BY_KEYS_SQL, [
+        ...this.#scopeParams(), resolved.readTreeKeys,
+      ]);
+      const summaries = result.rows.map((row) =>
+        decodeSummary(row, this.#scope, this.#fingerprint));
+      if (summaries.some((summary) => !resolved.readTreeKeys.includes(summary.treeKey))) {
+        throw invalid("Canonical tree query returned an unexpected topic key");
+      }
+      return summaries;
+    }
     const result = await this.#client.query(LIST_SUMMARIES_SQL, [
       ...this.#scopeParams(), filter.treeType ?? null, treeKey,
     ]);

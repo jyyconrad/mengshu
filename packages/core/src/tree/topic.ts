@@ -13,6 +13,7 @@ import { appendLeafToBuffer, type SealPolicy } from "./buffer.js";
 import type { TreeRepository } from "./types.js";
 import { SCORING_WEIGHTS_V1, type RecencyDecayBucket } from "../scoring/scoring-weights.js";
 import { shouldRouteToTree, type LeafRoutingInput } from "./leaf-routing.js";
+import { normalizeTopicLabel } from "./tree-fan-out.js";
 
 export const TOPIC_CREATION_THRESHOLD = 6.0;
 export const TOPIC_ARCHIVE_THRESHOLD = 2.0;
@@ -118,10 +119,14 @@ export async function routeLeafToTopicTree(
     if (!leaf.entityIds.includes(entity.id) || !shouldCreateTopicTree(entity, now)) {
       continue;
     }
+    const topicLabel = normalizeTopicLabel(entity.canonicalName);
+    if (!topicLabel) {
+      continue;
+    }
     routed.push(await appendLeafToBuffer(repository, {
       scope: leaf.scope,
       treeType: "topic",
-      treeKey: entity.id,
+      treeKey: topicLabel,
       leaf,
       now,
     }, policy));

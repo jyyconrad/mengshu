@@ -28,6 +28,8 @@ export interface SealPolicy {
 export interface AppendLeafResult {
   buffer: TreeBuffer;
   shouldSeal: boolean;
+  /** false means this exact leaf id was already present in this target buffer. */
+  appended: boolean;
 }
 
 function treeId(prefix: string, parts: string[]): string {
@@ -106,8 +108,12 @@ export async function appendLeafToBuffer(
   await repository.upsertLeaf(input.leaf);
   const id = bufferId(input.scope, input.treeType, input.treeKey, level);
   const existing = await repository.getBuffer(id);
-  const leafIds = Array.from(new Set([...(existing?.leafIds ?? []), input.leaf.id]));
-  const tokenCount = (existing?.tokenCount ?? 0) + (input.leaf.tokenCount ?? Math.ceil((input.leaf.text?.length ?? 0) / 4));
+  const appended = !existing?.leafIds.includes(input.leaf.id);
+  const leafIds = appended
+    ? [...(existing?.leafIds ?? []), input.leaf.id]
+    : [...(existing?.leafIds ?? [])];
+  const leafTokenCount = input.leaf.tokenCount ?? Math.ceil((input.leaf.text?.length ?? 0) / 4);
+  const tokenCount = (existing?.tokenCount ?? 0) + (appended ? leafTokenCount : 0);
   const buffer: TreeBuffer = {
     id,
     scope: input.scope,
@@ -128,5 +134,5 @@ export async function appendLeafToBuffer(
     tokenCount >= (policy.maxTokenCount ?? 6000) ||
     (policy.staleAfterMs !== undefined && now - buffer.openedAt >= policy.staleAfterMs);
 
-  return { buffer, shouldSeal };
+  return { buffer, shouldSeal, appended };
 }

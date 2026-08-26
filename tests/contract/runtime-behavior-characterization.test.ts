@@ -10,7 +10,9 @@ import type {
 import type {
   MemoryRecord,
   MemoryScope,
+  RecallHit,
 } from "../../packages/core/src/domain/types.js";
+import { computeRecallScoreBreakdown } from "../../packages/core/src/domain/recall-scoring.js";
 import { DefaultMemoryService } from "../../packages/core/src/service/memory-service.js";
 import {
   createMcpMemoryTools,
@@ -126,9 +128,15 @@ describe("P0-0 runtime black-box characterization", () => {
       scope: TARGET_SCOPE,
       scopeFilterMode: "soft",
       filterProject: TARGET_SCOPE.projectId,
-    }) as { hits: Array<{ record: MemoryRecord }> };
+    }) as { hits: Array<{ text: string; score: number }> };
 
-    expect(result.hits.map((hit) => hit.record.id)).toEqual(["target", "other"]);
+    expect(result.hits).toEqual([
+      expect.objectContaining({
+        text: "target text",
+        score: expect.any(Number),
+        scoreBreakdown: expect.objectContaining({ matchedBy: ["vector"] }),
+      }),
+    ]);
   });
 
   test("hard recall passes project/product isolation through and excludes other projects", async () => {
@@ -145,9 +153,15 @@ describe("P0-0 runtime black-box characterization", () => {
       scopeFilterMode: "hard",
       filterProject: TARGET_SCOPE.projectId,
       filterProduct: TARGET_SCOPE.appId,
-    }) as { hits: Array<{ record: MemoryRecord }> };
+    }) as { hits: Array<{ text: string; score: number }> };
 
-    expect(result.hits.map((hit) => hit.record.id)).toEqual(["target"]);
+    expect(result.hits).toEqual([
+      expect.objectContaining({
+        text: "target text",
+        score: expect.any(Number),
+        scoreBreakdown: expect.objectContaining({ matchedBy: ["vector"] }),
+      }),
+    ]);
   });
 
   test("context_fast exposes five semantic slots and filters revoked records", async () => {
@@ -161,10 +175,24 @@ describe("P0-0 runtime black-box characterization", () => {
       lifecycleStatus: "revoked",
       text: "must not enter prompt",
     });
+    const recallHits: RecallHit[] = [...active, revoked].map((record) => {
+      const scoreBreakdown = computeRecallScoreBreakdown(
+        record,
+        { relevance: 0.8, scopeFit: 1 },
+        ["vector"],
+        { vector: 0.8 },
+      );
+      return {
+        record,
+        score: scoreBreakdown.score,
+        source: "vector",
+        scoreBreakdown,
+      };
+    });
     const fastPath = new AgentFastPathService({
       defaultScope: TARGET_SCOPE,
       builder: new SlotContextBuilder(new SlotSnapshotCache()),
-      loadRecordsForScope: async () => [...active, revoked],
+      loadRecallHitsForScope: async () => recallHits,
       recall: async (scope, query) => ({ scope, query, hits: [] }),
     });
     const context = findTool(
@@ -193,7 +221,7 @@ describe("P0-0 runtime black-box characterization", () => {
     expect(result.filtered).toEqual(expect.arrayContaining([expect.objectContaining({ recordId: "revoked" })]));
   });
 
-  test("observe_light remember acknowledges storage and enqueues candidate, source-tree, and graph work", async () => {
+  test("observe_light remember 只排 candidate；graph/tree 必须由 committed active 派生", async () => {
     const storeObservation = vi.fn(async () => ({ id: "observation-1", stored: true }));
     const enqueueJob = vi.fn(async ({ type }: { type: string }) => `${type}-job`);
     const fastPath = new AgentFastPathService({
@@ -217,7 +245,7 @@ describe("P0-0 runtime black-box characterization", () => {
 
     expect(result).toMatchObject({
       ack: true,
-      queuedJobs: ["extract_candidate-job", "build_tree-job", "extract_graph-job"],
+      queuedJobs: ["extract_candidate-job"],
     });
     expect(storeObservation).toHaveBeenCalledWith(expect.objectContaining({
       text: "remember this stable decision",

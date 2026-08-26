@@ -23,7 +23,10 @@ export interface MemoryClientOptions {
 }
 
 export type MemoryClientHealth = HealthSnapshot;
-export type MemoryClientStoreInput = StoreMemoryInput;
+export interface MemoryClientStoreInput extends StoreMemoryInput {
+  /** Retry-safe operation key required by the governed REST write path. */
+  idempotencyKey: string;
+}
 export type MemoryClientStoreResult = StoreMemoryResult;
 export type MemoryClientRecallInput = RecallInput;
 export type MemoryClientRecallResult = RecallResult;

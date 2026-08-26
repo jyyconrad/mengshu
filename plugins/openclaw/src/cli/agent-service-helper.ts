@@ -15,7 +15,7 @@
 
 import { AgentFastPathService } from "../../../../api/agent-fast-path.js";
 import type { MemoryService } from "../../../../core/service-types.js";
-import type { MemoryRecord, MemoryScope } from "../../../../core/types.js";
+import type { MemoryRecord, MemoryScope, RecallHit } from "../../../../core/types.js";
 
 /** 从 recall 命中里筛出形态合法的 MemoryRecord（需含 text/category）。 */
 export function extractRecords(hits: Array<{ record: unknown }>): MemoryRecord[] {
@@ -32,9 +32,15 @@ export function extractRecords(hits: Array<{ record: unknown }>): MemoryRecord[]
 /** 基于 MemoryService.recall 构造 AgentFastPathService，供 context/lookup 复用。 */
 export function buildAgentService(scope: MemoryScope, task: string, service: MemoryService): AgentFastPathService {
   return new AgentFastPathService({
-    loadRecordsForScope: async (resolvedScope) => {
-      const result = await service.recall({ query: task, scope: resolvedScope, limit: 50, minScore: 0.1 });
-      return extractRecords(result.hits);
+    loadRecallHitsForScope: async (resolvedScope, query) => {
+      const result = await service.recall({
+        query: query || task,
+        scope: resolvedScope,
+        limit: 50,
+        minScore: 0.1,
+      });
+      return result.hits.filter((hit): hit is RecallHit =>
+        "text" in hit.record && "importance" in hit.record);
     },
     recall: async (resolvedScope, query, opts) =>
       service.recall({ query, scope: resolvedScope, limit: opts?.limit ?? 10, minScore: opts?.minScore ?? 0.1 }),

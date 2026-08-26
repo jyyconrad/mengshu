@@ -4,13 +4,13 @@
  * 封装 AgentFastPathService 为 OpenClaw 工具，提供快速 5 槽位上下文。
  */
 
-import type { MemoryService } from "../../../core/service-types.js";
-import type { MemoryRecord, MemoryScope, MemoryScopeInput } from "../../../core/types.js";
+import type { MemoryScope, MemoryScopeInput } from "../../../core/types.js";
 import {
-  AgentFastPathService,
+  type AgentFastPathService,
   type AgentTaskContextRequest,
 } from "../../../packages/api/src/agent-fast-path/index.js";
 import { normalizeScope } from "../../../core/scope.js";
+import { requireContextFastRecallReceipts } from "../../../packages/core/src/domain/recall-receipt-validation.js";
 import { buildOpenClawScope } from "./scope.js";
 
 export interface MemoryContextFastParams {
@@ -21,7 +21,7 @@ export interface MemoryContextFastParams {
 }
 
 export interface MemoryContextFastContext {
-  service: MemoryService;
+  agentFastPath: Pick<AgentFastPathService, "context">;
   defaultScope?: MemoryScopeInput;
   logger?: { info?(msg: string): void };
 }
@@ -36,34 +36,6 @@ export async function handleMemoryContextFast(
   const inputScope = params.scope ?? context.defaultScope ?? buildOpenClawScope();
   const scope: MemoryScope = normalizeScope(inputScope);
 
-  const agentService = new AgentFastPathService({
-    loadRecordsForScope: async (resolvedScope) => {
-      const result = await context.service.recall({
-        query: params.task,
-        scope: resolvedScope,
-        limit: 50,
-        minScore: 0.1,
-      });
-      const memories: MemoryRecord[] = [];
-      for (const hit of result.hits) {
-        if (hit.record && "text" in hit.record && "category" in hit.record) {
-          memories.push(hit.record as MemoryRecord);
-        }
-      }
-      return memories;
-    },
-    recall: async (resolvedScope, query, options) => {
-      return context.service.recall({
-        query,
-        scope: resolvedScope,
-        limit: options?.limit ?? 10,
-        minScore: options?.minScore ?? 0.1,
-      });
-    },
-    defaultScope: scope,
-    logger: context.logger,
-  });
-
   const request: AgentTaskContextRequest = {
     scope,
     task: params.task,
@@ -71,7 +43,9 @@ export async function handleMemoryContextFast(
     latencyBudgetMs: params.latencyBudgetMs,
   };
 
-  const response = await agentService.context(request);
+  const response = requireContextFastRecallReceipts(
+    await context.agentFastPath.context(request),
+  );
 
   // 拼接结果为文本
   const lines: string[] = [];
@@ -120,6 +94,7 @@ export async function handleMemoryContextFast(
             nodeCount: v?.nodeCount,
             tokenEstimate: v?.tokenEstimate,
             sourceIds: v?.sourceIds,
+            recallReceipts: v?.recallReceipts,
           },
         ])
       ),

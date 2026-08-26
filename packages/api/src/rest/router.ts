@@ -8,7 +8,6 @@
 import type {
   BuildContextInput,
   RecallInput,
-  StoreMemoryInput,
 } from "../../../../core/service-types.js";
 import type { MemoryConfig } from "../../../../config.js";
 import type { GraphQueryInput } from "../../../../graph/query.js";
@@ -22,6 +21,16 @@ import { createMengshuRuntime } from "../../../../runtime.js";
 import type { MengshuRuntime } from "../../../../runtime.js";
 import { authorizeRestRequest } from "./auth.js";
 import type { RestRequest, RestResponse, RestRouterOptions } from "./types.js";
+import type { MemoryWriteKernelResult } from "../../../core/src/service/write-kernel.js";
+import type { RecallResult } from "../../../../core/types.js";
+import {
+  CONTEXT_RECALL_BREAKDOWN_REQUIRED,
+  RECALL_SCORE_BREAKDOWN_REQUIRED,
+  requireContextBlockRecallReceipts,
+  requireContextFastRecallReceipts,
+  requireLookupResultReceipts,
+  requireRecallResultReceipts,
+} from "../../../core/src/domain/recall-receipt-validation.js";
 import type {
   AgentTaskContextRequest,
   AgentObserveLightRequest,
@@ -29,6 +38,7 @@ import type {
   AgentSessionCommitRequest,
 } from "../agent-fast-path/index.js";
 import { resolveRestAuthorityScope } from "./authority.js";
+import { createHash } from "node:crypto";
 
 export interface RestRouter {
   handle(request: RestRequest): Promise<RestResponse>;
@@ -37,6 +47,13 @@ export interface RestRouter {
 export interface RestApi {
   runtime: MengshuRuntime;
   router: RestRouter;
+}
+
+function runtimeMemoryWriteCapability(runtime: MengshuRuntime): RestRouterOptions["memoryWrite"] {
+  const candidate = runtime as unknown as Partial<NonNullable<RestRouterOptions["memoryWrite"]>>;
+  return typeof candidate.executeMemoryWrite === "function"
+    ? { executeMemoryWrite: candidate.executeMemoryWrite.bind(runtime) }
+    : undefined;
 }
 
 export function createRestApi(
@@ -59,6 +76,7 @@ export function createRestApi(
     runtime,
     router: createRestRouter({
       service: runtime.memoryService,
+      memoryWrite: runtimeMemoryWriteCapability(runtime),
       console: runtime.consoleApi,
       agentFastPath: runtime.agentFastPath,
       server: config.server,
@@ -79,11 +97,63 @@ function badRequest(message: string): RestResponse {
   return { status: 400, body: { error: message } };
 }
 
+function writeResponse(result: MemoryWriteKernelResult): RestResponse {
+  if (result.status === "persisted") {
+    return {
+      status: 201,
+      body: {
+        id: result.memoryId,
+        stored: result.stored,
+        status: result.status,
+        ...("route" in result ? { route: result.route } : {}),
+        recordType: result.recordType,
+      },
+    };
+  }
+  if (result.status === "duplicate") {
+    return {
+      status: 200,
+      body: {
+        id: result.duplicateOf,
+        stored: false,
+        status: result.status,
+        kind: result.kind,
+        duplicateOf: result.duplicateOf,
+      },
+    };
+  }
+  if (result.status === "rejected") {
+    return { status: 422, body: { error: result.reason, status: result.status } };
+  }
+  return {
+    status: 422,
+    body: { error: "Explicit memory save cannot be ignored", status: result.status },
+  };
+}
+
 function requireObjectBody(body: unknown): Record<string, unknown> | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return undefined;
   }
   return body as Record<string, unknown>;
+}
+
+function validateRecallResult(result: RecallResult): string | undefined {
+  try {
+    requireRecallResultReceipts(result);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : RECALL_SCORE_BREAKDOWN_REQUIRED;
+  }
+}
+
+function validateAgentLookupResult(result: unknown): string | undefined {
+  try {
+    requireLookupResultReceipts(result);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : RECALL_SCORE_BREAKDOWN_REQUIRED;
+  }
 }
 
 function resolvedScope(
@@ -115,6 +185,34 @@ function isRestResponse(value: MemoryScope | RestResponse): value is RestRespons
   return "status" in value;
 }
 
+function legacyRestV1IdempotencyKey(
+  scope: MemoryScope,
+  record: Record<string, unknown>,
+): string {
+  const metadata = requireObjectBody(record.metadata) ?? {};
+  const provenance = requireObjectBody(record.provenance) ?? {};
+  const stableInput = [
+    scope.tenantId,
+    scope.userId,
+    scope.appId,
+    scope.projectId,
+    scope.agentId,
+    scope.namespace,
+    scope.visibility ?? "private",
+    scope.workspaceId ?? "",
+    scope.sessionId ?? "",
+    typeof record.id === "string" ? record.id : "",
+    typeof record.text === "string" ? record.text : "",
+    typeof record.contentHash === "string" ? record.contentHash : "",
+    typeof record.kind === "string" ? record.kind : "other",
+    typeof record.semanticType === "string" ? record.semanticType : "",
+    typeof provenance.sourceId === "string" ? provenance.sourceId : "",
+    typeof provenance.messageId === "string" ? provenance.messageId : "",
+    typeof metadata.sourceId === "string" ? metadata.sourceId : "",
+  ];
+  return `legacy-rest-v1:${createHash("sha256").update(JSON.stringify(stableInput)).digest("hex")}`;
+}
+
 export function createRestRouter(options: RestRouterOptions): RestRouter {
   if (!options.authority && options.unsafeLegacyScope !== true) {
     throw new Error("REST authority is required; unsafeLegacyScope is test-only and deprecated");
@@ -135,7 +233,8 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         if (request.method !== "GET") {
           return methodNotAllowed();
         }
-        return { status: 200, body: await options.service.health() };
+        const health = await options.service.health();
+        return { status: health.ok ? 200 : 503, body: health };
       }
 
       if (request.path === "/v1/memories") {
@@ -147,13 +246,48 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         if (!record) {
           return badRequest("record is required");
         }
+        if (options.unsafeLegacyScope !== true) {
+          let idempotencyKey = typeof body?.idempotencyKey === "string" && body.idempotencyKey.trim()
+            ? body.idempotencyKey
+            : undefined;
+          if (!options.memoryWrite) {
+            return { status: 503, body: { error: "Memory write capability is unavailable" } };
+          }
+          if (typeof record.text !== "string" || record.text.trim().length === 0) {
+            return badRequest("record.text is required");
+          }
+          const scope = scopeOrResponse(options, record.scope ?? body?.scope);
+          if (isRestResponse(scope)) return scope;
+          idempotencyKey ??= legacyRestV1IdempotencyKey(scope, record);
+          const metadata = requireObjectBody(record.metadata) ?? {};
+          const provenance = requireObjectBody(record.provenance) ?? {};
+          const result = await options.memoryWrite.executeMemoryWrite({
+            type: "saveExplicit",
+            idempotencyKey,
+            serverAuthority: options.authority!,
+            clientScope: scope,
+            text: record.text,
+            kind: (typeof record.kind === "string" ? record.kind : "other") as never,
+            ...(typeof record.semanticType === "string"
+              ? { semanticType: record.semanticType as never }
+              : {}),
+            ...(typeof record.container === "string" ? { container: record.container as never } : {}),
+            ...(typeof record.confidence === "number" ? { confidence: record.confidence } : {}),
+            ...(typeof record.category === "string" ? { category: record.category as never } : {}),
+            ...(typeof record.dataType === "string" ? { dataType: record.dataType as never } : {}),
+            ...(typeof record.tableName === "string" ? { tableName: record.tableName as never } : {}),
+            metadata: { ...metadata, source: "user" },
+            provenance: { ...provenance, source: "user" },
+          });
+          return writeResponse(result);
+        }
         const scope = scopeOrResponse(options, record.scope ?? body?.scope);
         if (isRestResponse(scope)) return scope;
         return {
           status: 201,
           body: await options.service.storeMemory({
             record: { ...record, scope },
-          } as unknown as StoreMemoryInput),
+          } as never),
         };
       }
 
@@ -167,10 +301,11 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         }
         const scope = scopeOrResponse(options, body.scope);
         if (isRestResponse(scope)) return scope;
-        return {
-          status: 200,
-          body: await options.service.recall({ ...body, scope } as unknown as RecallInput),
-        };
+        const recalled = await options.service.recall({ ...body, scope } as unknown as RecallInput);
+        const recallError = validateRecallResult(recalled);
+        return recallError
+          ? { status: 500, body: { error: recallError } }
+          : { status: 200, body: recalled };
       }
 
       if (request.path === "/v1/context") {
@@ -183,10 +318,22 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         }
         const scope = scopeOrResponse(options, body.scope);
         if (isRestResponse(scope)) return scope;
-        return {
-          status: 200,
-          body: await options.service.buildContext({ ...body, scope } as unknown as BuildContextInput),
-        };
+        const context = await options.service.buildContext(
+          { ...body, scope } as unknown as BuildContextInput,
+        );
+        try {
+          return {
+            status: 200,
+            body: requireContextBlockRecallReceipts(context),
+          };
+        } catch (error) {
+          return {
+            status: 500,
+            body: {
+              error: error instanceof Error ? error.message : RECALL_SCORE_BREAKDOWN_REQUIRED,
+            },
+          };
+        }
       }
 
       if (request.path === "/v1/forget") {
@@ -396,10 +543,22 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         }
         const scope = scopeOrResponse(options, body.scope);
         if (isRestResponse(scope)) return scope;
-        return {
-          status: 200,
-          body: await options.agentFastPath.context({ ...body, scope } as unknown as AgentTaskContextRequest),
-        };
+        const context = await options.agentFastPath.context(
+          { ...body, scope } as unknown as AgentTaskContextRequest,
+        );
+        try {
+          return {
+            status: 200,
+            body: requireContextFastRecallReceipts(context),
+          };
+        } catch (error) {
+          return {
+            status: 500,
+            body: {
+              error: error instanceof Error ? error.message : CONTEXT_RECALL_BREAKDOWN_REQUIRED,
+            },
+          };
+        }
       }
 
       if (request.path === "/v1/agent/observe") {
@@ -434,10 +593,13 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         }
         const scope = scopeOrResponse(options, body.scope);
         if (isRestResponse(scope)) return scope;
-        return {
-          status: 200,
-          body: await options.agentFastPath.lookup({ ...body, scope } as unknown as AgentLookupRequest),
-        };
+        const lookup = await options.agentFastPath.lookup(
+          { ...body, scope } as unknown as AgentLookupRequest,
+        );
+        const lookupError = validateAgentLookupResult(lookup);
+        return lookupError
+          ? { status: 500, body: { error: lookupError } }
+          : { status: 200, body: lookup };
       }
 
       if (request.path === "/v1/agent/session/commit") {

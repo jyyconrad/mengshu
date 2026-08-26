@@ -244,6 +244,44 @@ describe("sealBuffer", () => {
     expect(regularNode.metadata.faithfulnessValidated).toBeUndefined(); // Not high-risk, not validated
   });
 
+  test("high_risk mode uses persisted leaf importance and falls back when the judge fails", async () => {
+    const repository = new InMemoryTreeRepository();
+    const llmClient = new MockLlmClient("Abstractive summary with false claims");
+    llmClient.setFaithfulnessFail(true);
+    const faithfulnessConfig: SummaryFaithfulnessConfig = {
+      mode: "high_risk",
+      failAction: "fallback_extractive",
+    };
+
+    let buffer;
+    for (let index = 0; index < 10; index += 1) {
+      const appended = await appendLeafToBuffer(repository, {
+        scope,
+        treeType: "source",
+        treeKey: "high-importance-source",
+        leaf: leaf(
+          String(index + 1),
+          `persisted evidence ${index + 1}`,
+          index < 8 ? 0.85 : 0.2,
+          1710000000000 + index,
+        ),
+        now: 1710000000000 + index,
+      });
+      buffer = appended.buffer;
+    }
+
+    const node = await sealBuffer(repository, {
+      buffer: buffer!,
+      now: 1710000010000,
+      llmClient,
+      faithfulnessConfig,
+    });
+
+    expect(node.metadata.summaryMode).toBe("extractive");
+    expect(node.metadata.faithfulnessFailed).toBe(true);
+    expect(node.summary).toContain("persisted evidence");
+  });
+
   test("faithfulness validation with failAction=mark_untrusted keeps abstractive summary", async () => {
     const repository = new InMemoryTreeRepository();
     const llmClient = new MockLlmClient("Abstractive summary with questionable claims");

@@ -105,6 +105,49 @@ describe("RuntimeHost", () => {
     });
   });
 
+  test("在线 supervisor 熔断后动态降级 readiness，half-open 成功后自动恢复", async () => {
+    let workerHealth = {
+      state: "healthy" as "healthy" | "open",
+      ready: true,
+      consecutiveFailures: 0,
+      failingScopes: 0,
+    };
+    const worker = fakeWorker({
+      snapshot: vi.fn(() => workerHealth),
+    });
+    const host = new RuntimeHost(hostOptions([
+      { name: "db", start: async () => undefined },
+    ], worker));
+    await host.start();
+
+    workerHealth = {
+      state: "open",
+      ready: false,
+      consecutiveFailures: 5,
+      failingScopes: 2,
+    };
+    expect(host.snapshot()).toEqual({
+      state: "degraded",
+      ready: false,
+      accepting: false,
+      generation: 1,
+      issues: [{ component: "worker", code: "WORKER_RUNTIME_DEGRADED" }],
+    });
+
+    workerHealth = {
+      state: "healthy",
+      ready: true,
+      consecutiveFailures: 0,
+      failingScopes: 0,
+    };
+    expect(host.snapshot()).toEqual({
+      state: "ready",
+      ready: true,
+      accepting: true,
+      generation: 1,
+    });
+  });
+
   test("依赖降级时不启动 worker，Host 只报告脱敏 degraded", async () => {
     const worker = fakeWorker();
     const options = hostOptions([

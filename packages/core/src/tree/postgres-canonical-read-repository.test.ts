@@ -35,14 +35,18 @@ const scopeColumns = {
 class QueryClient implements PostgresCanonicalTreeReadQueryClient {
   readonly calls: Array<{ sql: string; params: readonly unknown[] }> = [];
 
-  constructor(private readonly responder: (sql: string) => readonly Record<string, unknown>[]) {}
+  constructor(private readonly responder: (
+    sql: string,
+    params: readonly unknown[],
+  ) => readonly Record<string, unknown>[]) {}
 
   async query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
     params: readonly unknown[] = [],
   ) {
     this.calls.push({ sql, params });
-    return { rows: this.responder(sql) as readonly Row[] };
+    const rows = this.responder(sql, params) as readonly Row[];
+    return { rows, rowCount: rows.length };
   }
 }
 
@@ -257,5 +261,61 @@ describe("PostgresCanonicalTreeReadRepository", () => {
     const duplicateClient = new QueryClient(() => [{}, {}]);
     await expect(new PostgresCanonicalTreeReadRepository(duplicateClient, scope).getLeaf("leaf-1"))
       .rejects.toThrow("Canonical tree query returned duplicate rows");
+  });
+
+  it("D-21 resolves an old entity key and dual-reads canonical plus legacy topic summaries", async () => {
+    const summary = (id: string, treeKey: string) => ({
+      ...scopeColumns,
+      id,
+      tree_type: "topic",
+      tree_key: treeKey,
+      level: 1,
+      title: treeKey,
+      summary: `${treeKey} summary`,
+      child_node_ids: [],
+      leaf_ids: [`leaf-${id}`],
+      evidence_chunk_ids: [`chunk-${id}`],
+      entity_ids: ["entity-pg"],
+      relation_ids: [],
+      token_count: 2,
+      start_at: 100,
+      end_at: 101,
+      status: "sealed",
+      created_at: 101,
+      sealed_at: 102,
+      metadata: {},
+    });
+    const client = new QueryClient((sql, params) => {
+      if (sql.includes("FROM mengshu_topic_tree_aliases")) return [{
+        ...scopeColumns,
+        legacy_tree_key: "entity-pg",
+        canonical_topic_label: "postgresql-migration",
+        status: "active",
+        merged_from: ["entity-pg"],
+        created_at: "90",
+        updated_at: "90",
+        sealed_node_id: null,
+        superseded_at: null,
+        archived_at: null,
+      }];
+      expect(params.at(-1)).toEqual(["postgresql-migration", "entity-pg"]);
+      return [
+        summary("summary-canonical", "postgresql-migration"),
+        summary("summary-legacy", "entity-pg"),
+      ];
+    });
+    const repository = new PostgresCanonicalTreeReadRepository(client, scope);
+
+    await expect(repository.listSummaries({
+      scope,
+      treeType: "topic",
+      treeKey: "entity-pg",
+    })).resolves.toMatchObject([
+      { id: "summary-canonical", treeKey: "postgresql-migration" },
+      { id: "summary-legacy", treeKey: "entity-pg" },
+    ]);
+    expect(client.calls).toHaveLength(2);
+    client.calls.forEach(expectCanonicalBinding);
+    expect(client.calls[1]?.sql).toContain("tree_key = ANY");
   });
 });

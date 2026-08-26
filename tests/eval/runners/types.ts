@@ -27,6 +27,10 @@ import type {
   MemorySemanticType,
   MemoryVisibility,
 } from "../../../core/types.js";
+import type { CompleteRecallScoreBreakdown } from
+  "../../../packages/core/src/domain/recall-scoring.js";
+import type { MemoryTreeType } from
+  "../../../packages/core/src/tree/types.js";
 
 // ===== OpenClaw history 评估扩展类型（P0-1）=====
 
@@ -410,6 +414,321 @@ export type EvalRunMode =
   | "live-provider"
   | "runtime-e2e";
 
+/** Production runtime-e2e 必须由真实执行留下证据的阶段。 */
+export type ProductionRuntimeStage =
+  | "write_observe"
+  | "candidate"
+  | "graph"
+  | "tree"
+  | "context_recall";
+
+interface ProductionStageReceiptBase {
+  executed: true;
+  /** 必须来自 production 响应或持久化 ledger，不接受 fixture 预声明。 */
+  receiptIds: string[];
+  evidenceId: string;
+  activeMemoryId: string;
+}
+
+export interface ProductionWriteObserveReceipt extends ProductionStageReceiptBase {
+  traceId: string;
+  storageKey: string;
+}
+
+export interface ProductionCandidateReceipt extends ProductionStageReceiptBase {
+  jobId: string;
+  effectKey: "extract_candidate.persist.v1";
+  /** 从 active memory 治理镜像回读的原生分类，不允许用 semanticType 代替。 */
+  memoryKind: MemoryKind;
+  semanticType: MemorySemanticType;
+  admissionRoute: "active";
+  lifecycleStatus: "active";
+  contextEligible: true;
+  valueScore: number;
+  importance: number;
+  confidence: number;
+  validatorAudit: Readonly<Record<string, unknown>>;
+  dedupTrace: Readonly<{
+    created: 1;
+    duplicateCount: number;
+    capacityRejectedCount: number;
+    droppedCount: number;
+    candidateIds: string[];
+    memoryIds: string[];
+    activeMemoryIds: string[];
+  }>;
+  /** F0 自动抽取的 pending candidate；与 active 五阶段主链并列，不替代 active receipt。 */
+  pending?: ProductionPendingCandidateReceipt;
+}
+
+export interface ProductionCandidateScopeReceipt {
+  tenantId: string;
+  userId: string;
+  appId: string;
+  projectId: string;
+  agentId: string;
+  namespace: string;
+  visibility: MemoryVisibility;
+  workspaceId: string;
+  sessionId: string;
+}
+
+export interface ProductionCandidateGateReceipt {
+  gateId: `G${"01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10" | "11"}`;
+  status: "passed" | "not_applicable";
+  reasonCode: string;
+  policyVersion: "candidate-validator-v1";
+  before?: Readonly<Record<string, string | number | boolean | null>>;
+  after?: Readonly<Record<string, string | number | boolean | null>>;
+}
+
+export interface ProductionCandidateValidationReceipt {
+  version: 1;
+  policyVersion: "candidate-validator-v1";
+  candidateOrdinal: number;
+  proposalHash: string;
+  evidenceIds: string[];
+  outcome: "accepted";
+  gates: ProductionCandidateGateReceipt[];
+}
+
+export interface ProductionPendingCandidateSnapshot {
+  candidateId: string;
+  scope: ProductionCandidateScopeReceipt;
+  status: "pending";
+  promotedToMemoryId: null;
+  contentHash: string;
+  activeContentHash: string;
+  evidenceIds: string[];
+  memoryKind: MemoryKind;
+  semanticType: "rules";
+  admissionRoute: "candidate" | "candidate_low_priority";
+  valueScore: number;
+  importance: number;
+  confidence: number;
+  validationReceipt: ProductionCandidateValidationReceipt;
+}
+
+export interface ProductionPendingCandidateReceipt {
+  executed: true;
+  receiptIds: string[];
+  jobId: string;
+  effectKey: "extract_candidate.persist.v1";
+  evidenceId: string;
+  candidate: ProductionPendingCandidateSnapshot;
+  effectTrace: Readonly<{
+    created: 1;
+    duplicateCount: 0;
+    capacityRejectedCount: 0;
+    droppedCount: 0;
+    candidateIds: string[];
+    memoryIds: string[];
+    activeMemoryIds: string[];
+  }>;
+  proposalReceipts: ReadonlyArray<Readonly<{
+    version: 1;
+    candidateOrdinal: number;
+    outcome: "accepted";
+    validation: ProductionCandidateValidationReceipt;
+    admission: Readonly<{
+      version: 1;
+      outcome: "accepted";
+      route: "candidate" | "candidate_low_priority";
+      valueScore: number;
+      reason: string;
+      breakdown: Readonly<Record<string, number>>;
+    }>;
+  }>>;
+  derivationCounts: Readonly<{
+    memories: 0;
+    graphJobs: 0;
+    treeJobs: 0;
+    treeBuffers: 0;
+    workMemoryNodes: 0;
+    workMemoryEdges: 0;
+    evidenceLinks: 0;
+  }>;
+  visibility: Readonly<{
+    contextSourceIds: string[];
+    lookupHitIds: string[];
+    recallHitIds: string[];
+  }>;
+}
+
+export interface ProductionEvidenceLinkBinding {
+  linkId: string;
+  targetId: string;
+  evidenceId: string;
+}
+
+export interface ProductionGraphReceipt extends ProductionStageReceiptBase {
+  jobId: string;
+  effectKey: "extract_graph.persist.v1";
+  entityIds: string[];
+  relationIds: string[];
+  memoryEvidenceLinkIds: string[];
+  entityEvidenceLinkIds: string[];
+  relationEvidenceLinkIds: string[];
+  memoryEvidenceBindings: ProductionEvidenceLinkBinding[];
+  entityEvidenceBindings: ProductionEvidenceLinkBinding[];
+  relationEvidenceBindings: ProductionEvidenceLinkBinding[];
+  workMemoryNodeIds: string[];
+  workMemoryActiveNodeId: string;
+  workMemoryEvidenceNodeId: string;
+  workMemoryEdgeIds: string[];
+  workMemoryEdgeBindings: Array<{
+    edgeId: string;
+    predicate: "grounded_by";
+    sourceId: string;
+    targetId: string;
+    evidenceChunkIds: string[];
+  }>;
+}
+
+export interface ProductionTreeBufferBinding {
+  jobId: string;
+  treeType: "source" | "global" | "topic";
+  treeKey: string;
+  bufferId: string;
+  leafId: string;
+}
+
+export interface ProductionTreeReceipt extends ProductionStageReceiptBase {
+  effectKey: "build_tree.persist.v1";
+  expectedTreeTypes: MemoryTreeType[];
+  sourceJobId: string;
+  sourceTreeKey: string;
+  globalJobId: string | null;
+  sourceLeafId: string;
+  globalLeafId: string | null;
+  topicJobIds: string[];
+  topicLeafIds: string[];
+  topicTreeKeys: string[];
+  bufferBindings: ProductionTreeBufferBinding[];
+  coldTopicJobIds: string[];
+  coldTopicBufferIds: string[];
+  hotness: Readonly<{
+    topicEntityId: string;
+    threshold: 6;
+    beforeRecall: ProductionHotnessEvidence;
+    afterRecall: ProductionHotnessEvidence;
+  }>;
+  sealedSummary: ProductionSealedSummaryReceipt;
+}
+
+export interface ProductionSealedLeafEvidenceBinding {
+  leafId: string;
+  evidenceChunkId: string;
+  activeLifecycleStatus: "active";
+  activeAdmissionRoute: "active";
+  evidenceLifecycleStatus: "archived";
+  evidenceAdmissionRoute: "evidence_only";
+  evidenceCommandType: "importEvidence";
+}
+
+/** F0 原生 source tree 的持久化 L1 摘要与 L0 evidence 回溯证据。 */
+export interface ProductionSealedSummaryReceipt {
+  executed: true;
+  jobId: string;
+  effectKey: "build_tree.persist.v1";
+  requestFingerprint: string;
+  leaseGeneration: number;
+  committedAt: number;
+  nodeId: string;
+  treeType: "source";
+  treeKey: string;
+  level: 1;
+  status: "sealed";
+  leafIds: string[];
+  evidenceChunkIds: string[];
+  leafEvidenceBindings: ProductionSealedLeafEvidenceBinding[];
+  summaryCount: 1;
+  leafCount: 20;
+  sourceBufferCount: 0;
+  effectResult: Readonly<{
+    leafId: string;
+    sealed: true;
+    bufferId: null;
+    nodeId: string;
+    foldedNodeIds: string[];
+  }>;
+}
+
+export interface ProductionHotnessEvidence {
+  mentionCount30d: number;
+  distinctSourceCount: number;
+  lastSeenAt: number;
+  recencyDecay: number;
+  graphCentrality: number;
+  queryHits30d: number;
+  score: number;
+}
+
+export interface ProductionContextRecallReceipt extends ProductionStageReceiptBase {
+  contextSourceIds: string[];
+  lookupHitIds: string[];
+  recallHitIds: string[];
+  contextScoreBreakdown: CompleteRecallScoreBreakdown;
+  lookupScoreBreakdown: CompleteRecallScoreBreakdown;
+  recallScoreBreakdown: CompleteRecallScoreBreakdown;
+  slotActiveMemoryIds: Record<MemorySemanticType, string>;
+  slotSourceIds: Record<MemorySemanticType, string[]>;
+  slotScoreBreakdowns: Record<MemorySemanticType, CompleteRecallScoreBreakdown>;
+}
+
+export interface ProductionStageEvidence {
+  write_observe?: ProductionWriteObserveReceipt;
+  candidate?: ProductionCandidateReceipt;
+  graph?: ProductionGraphReceipt;
+  tree?: ProductionTreeReceipt;
+  context_recall?: ProductionContextRecallReceipt;
+}
+
+/** 故障后由第二个 production host 重放，所有 effect/ledger 身份必须保持稳定。 */
+export interface ProductionRestartReplayEvidence {
+  restarted: true;
+  replayedCandidateJobId: string;
+  effectReceiptIdsBeforeRestart: string[];
+  effectReceiptIdsAfterRestart: string[];
+  ledgerIdsBeforeRestart: string[];
+  ledgerIdsAfterRestart: string[];
+  effectReceiptCountBeforeRestart: number;
+  effectReceiptCountAfterRestart: number;
+  ledgerCountBeforeRestart: number;
+  ledgerCountAfterRestart: number;
+  contextSourceIdsBeforeRestart: string[];
+  contextSourceIdsAfterRestart: string[];
+  lookupHitIdsBeforeRestart: string[];
+  lookupHitIdsAfterRestart: string[];
+  recallHitIdsBeforeRestart: string[];
+  recallHitIdsAfterRestart: string[];
+  slotSourceIdsBeforeRestart: Record<MemorySemanticType, string[]>;
+  slotSourceIdsAfterRestart: Record<MemorySemanticType, string[]>;
+  contextScoreBreakdownBeforeRestart: CompleteRecallScoreBreakdown;
+  contextScoreBreakdownAfterRestart: CompleteRecallScoreBreakdown;
+  lookupScoreBreakdownBeforeRestart: CompleteRecallScoreBreakdown;
+  lookupScoreBreakdownAfterRestart: CompleteRecallScoreBreakdown;
+  recallScoreBreakdownBeforeRestart: CompleteRecallScoreBreakdown;
+  recallScoreBreakdownAfterRestart: CompleteRecallScoreBreakdown;
+  pending: Readonly<{
+    replayedCandidateJobId: string;
+    candidateBeforeRestart: ProductionPendingCandidateSnapshot;
+    candidateAfterRestart: ProductionPendingCandidateSnapshot;
+    effectTraceBeforeRestart: ProductionPendingCandidateReceipt["effectTrace"];
+    effectTraceAfterRestart: ProductionPendingCandidateReceipt["effectTrace"];
+    proposalReceiptsBeforeRestart: ProductionPendingCandidateReceipt["proposalReceipts"];
+    proposalReceiptsAfterRestart: ProductionPendingCandidateReceipt["proposalReceipts"];
+    derivationCountsBeforeRestart: ProductionPendingCandidateReceipt["derivationCounts"];
+    derivationCountsAfterRestart: ProductionPendingCandidateReceipt["derivationCounts"];
+    visibilityBeforeRestart: ProductionPendingCandidateReceipt["visibility"];
+    visibilityAfterRestart: ProductionPendingCandidateReceipt["visibility"];
+  }>;
+  sealedSummaryBeforeRestart: ProductionSealedSummaryReceipt;
+  sealedSummaryAfterRestart: ProductionSealedSummaryReceipt;
+  sealedSummaryAttemptsBeforeRestart: number;
+  sealedSummaryAttemptsAfterRestart: number;
+}
+
 /** 单次 suite 的可复现执行元数据。null 表示该离线运行不涉及对应 provider 字段。 */
 export interface EvalExecutionMetadata {
   runMode: EvalRunMode;
@@ -419,6 +738,10 @@ export interface EvalExecutionMetadata {
   version: string;
   fallback: boolean;
   degraded: boolean;
+  /** runtime-e2e runner 实际观察到的阶段证据；fixture 声明不能替代此字段。 */
+  productionStageEvidence?: ProductionStageEvidence;
+  /** production host 故障重启后的真实 replay 与幂等 ledger 证据。 */
+  productionRestartReplayEvidence?: ProductionRestartReplayEvidence;
 }
 
 /** metric gate 的比较方向。 */
@@ -484,6 +807,7 @@ export interface EvalReportManifestSuite {
   fixtureSha256: string;
   metrics: string[];
   gate: Record<string, number> | null;
+  requiredProductionStages: ProductionRuntimeStage[] | null;
   gateIdentity: string;
 }
 

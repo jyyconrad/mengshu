@@ -4,7 +4,7 @@ This file provides guidance to Codex and AI coding assistants when working with 
 
 ## 项目概述
 
-mengshu（梦枢）是面向多产品 Agent Runtime 的本地优先记忆中间件。当前版本 v1.0.6。D-01~D-23 算法规格和模块资产覆盖较广，但真实运行主链尚未全量集成；当前状态与升级顺序见 `.memory-docs/original-docs/03-architecture/mengshu-local-runtime-audit-and-upgrade-plan-2026-07.md`。
+mengshu（梦枢）是面向多产品 Agent Runtime 的本地优先记忆中间件。当前版本 v1.0.7。D-01~D-23 算法规格和模块资产覆盖较广，但真实运行主链尚未全量集成；当前状态与升级顺序见 `.memory-docs/original-docs/03-architecture/mengshu-local-runtime-audit-and-upgrade-plan-2026-07.md`。
 
 核心能力：LLM 结构化提取 → 11 闸门 validator → 4 套评分 → 语义去重 → L0-L3 树摘要 → 6 因子召回 → 5 槽位注入。
 

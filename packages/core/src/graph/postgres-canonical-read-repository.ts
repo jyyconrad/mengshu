@@ -4,7 +4,11 @@ import {
   type CanonicalAuthorityScope,
 } from "../domain/authority-scope-fingerprint.js";
 import type { MemoryScope } from "../domain/types.js";
-import type { EntityFilter, InMemoryGraphRepository, RelationFilter } from "./repository.js";
+import type {
+  EntityFilter,
+  EntityGraphRepository,
+  RelationFilter,
+} from "./repository.js";
 import { ENTITY_TYPES, RELATION_PREDICATES } from "./schema.js";
 import type {
   EntityStatus,
@@ -293,7 +297,7 @@ function singleton<T>(rows: readonly Record<string, unknown>[], decode: (row: un
 
 /** Read-only, scope-bound adapter over the v9 canonical graph tables. */
 export class PostgresCanonicalGraphReadRepository implements Pick<
-  InMemoryGraphRepository,
+  EntityGraphRepository,
   "getEntity" | "findEntities" | "getRelation" | "findRelations"
 > {
   readonly #client: PostgresCanonicalGraphReadQueryClient;
@@ -372,5 +376,53 @@ export class PostgresCanonicalGraphReadRepository implements Pick<
       ...this.#scopeParams(), filter.entityId ?? null, filter.predicate ?? null, limit,
     ]);
     return result.rows.map((row) => decodeRelation(row, this.#scope, this.#fingerprint));
+  }
+}
+
+export type PostgresCanonicalGraphReadRepositoryFactory = (
+  scope: MemoryScope,
+) => Pick<
+  EntityGraphRepository,
+  "getEntity" | "findEntities" | "getRelation" | "findRelations"
+>;
+
+/**
+ * Production Entity Graph adapter over canonical PostgreSQL tables.
+ *
+ * Entity mutations belong to the durable native graph effect because it commits
+ * evidence links, graph rows, job fencing and the receipt in one transaction.
+ */
+export class PostgresCanonicalEntityGraphRepository implements EntityGraphRepository {
+  constructor(
+    private readonly defaultScope: MemoryScope,
+    private readonly readRepository: PostgresCanonicalGraphReadRepositoryFactory,
+  ) {}
+
+  async upsertEntities(): Promise<void> {
+    throw new Error(
+      "Canonical Entity Graph writes require the provider-owned durable graph effect",
+    );
+  }
+
+  async upsertRelations(): Promise<void> {
+    throw new Error(
+      "Canonical Entity Graph writes require the provider-owned durable graph effect",
+    );
+  }
+
+  async getEntity(id: string, scope = this.defaultScope) {
+    return this.readRepository(scope).getEntity(id, scope);
+  }
+
+  async getRelation(id: string, scope = this.defaultScope) {
+    return this.readRepository(scope).getRelation(id, scope);
+  }
+
+  async findEntities(filter: EntityFilter) {
+    return this.readRepository(filter.scope).findEntities(filter);
+  }
+
+  async findRelations(filter: RelationFilter) {
+    return this.readRepository(filter.scope).findRelations(filter);
   }
 }

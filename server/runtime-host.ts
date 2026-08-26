@@ -64,7 +64,8 @@ export interface RuntimeHostIssue {
     | "DEPENDENCIES_NOT_READY"
     | "WORKER_NOT_READY"
     | "WORKER_PROBE_FAILED"
-    | "WORKER_PROBE_TIMEOUT";
+    | "WORKER_PROBE_TIMEOUT"
+    | "WORKER_RUNTIME_DEGRADED";
 }
 
 export interface RuntimeHostSnapshot {
@@ -83,6 +84,7 @@ interface RuntimeHostCycle {
   startPromise: Promise<void>;
   stopPromise?: Promise<void>;
   readonly workerCleanup: RuntimeHostWorkerCleanup;
+  readonly workerHealth: () => { readonly ready: boolean } | undefined;
 }
 
 interface RuntimeHostWorkerCleanup {
@@ -193,11 +195,23 @@ export class RuntimeHost {
   }
 
   snapshot(): RuntimeHostSnapshot {
-    const issues = this.current?.issues;
+    const staticIssues = this.current?.issues ?? [];
+    let workerRuntimeDegraded = false;
+    try {
+      const workerHealth = this.current?.workerHealth();
+      workerRuntimeDegraded = this.state === "ready" && workerHealth !== undefined &&
+        workerHealth.ready !== true;
+    } catch {
+      workerRuntimeDegraded = this.state === "ready";
+    }
+    const issues = workerRuntimeDegraded
+      ? [...staticIssues, { component: "worker", code: "WORKER_RUNTIME_DEGRADED" } as const]
+      : staticIssues;
+    const reportedState = workerRuntimeDegraded ? "degraded" as const : this.state;
     return Object.freeze({
-      state: this.state,
-      ready: this.state === "ready",
-      accepting: this.accepting,
+      state: reportedState,
+      ready: reportedState === "ready",
+      accepting: this.accepting && !workerRuntimeDegraded,
       generation: this.generation,
       ...(issues && issues.length > 0
         ? { issues: Object.freeze(issues.map((issue) => Object.freeze({ ...issue }))) }
@@ -323,6 +337,18 @@ export class RuntimeHost {
       issues,
       startPromise: Promise.resolve(),
       workerCleanup,
+      workerHealth: () => {
+        if (!worker || typeof worker.snapshot !== "function") return undefined;
+        try {
+          const health = worker.snapshot();
+          if (!health || typeof health !== "object" || typeof health.ready !== "boolean") {
+            return { ready: false };
+          }
+          return { ready: health.ready };
+        } catch {
+          return { ready: false };
+        }
+      },
     } satisfies RuntimeHostCycle;
     this.current = cycle;
     cycle.startPromise = lifecycle.start().then(

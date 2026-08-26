@@ -11,6 +11,7 @@ import type {
   TableStats,
   KnowledgeBaseConfig,
 } from "../types.js";
+import { resolveVectorCandidateLimit } from "../types.js";
 import { vectorDimsForModel } from "../../../../../config.js";
 import { assertSafeLegacyDeleteFilter } from "./legacy-delete-filter-guard.js";
 import type { KnownEmbeddingSpace } from "../../domain/embedding-space.js";
@@ -25,12 +26,43 @@ import {
 } from "./postgres-forget-transaction.js";
 import type { ForgetTransactionPort } from "../../domain/service-types.js";
 import type { MemoryRecord, MemoryScope } from "../../domain/types.js";
+import { scopeToKey } from "../../domain/scope.js";
 import { recordToMemoryEntry } from "../../domain/legacy-mapping.js";
 import {
   PostgresAtomicMemoryStorePort,
   type PostgresMemoryWriteClient,
   type ProviderOwnedAtomicMemoryStorePort,
 } from "../../service/write-kernel-transaction.js";
+import {
+  PostgresMemoryWriteKernelTransactionPort,
+  type PostgresMemoryWriteKernelClient,
+  type ProviderOwnedMemoryWriteKernelTransactionPort,
+} from "../../service/write-kernel-postgres-transaction.js";
+import {
+  writeRecordToMemoryRecord,
+  writeRecordToPostgresPendingCandidate,
+} from "../../service/write-kernel-mapping.js";
+import type { WriteMemoryRecord } from "../../service/write-kernel.js";
+import type { CandidateProposalReceiptV1 } from
+  "../../lifecycle/candidate-spec-computation.js";
+import type { SourceKind } from "../../scoring/importance-score.js";
+import {
+  CANDIDATE_GATE_IDS,
+  CANDIDATE_VALIDATION_POLICY_VERSION,
+} from "../../lifecycle/candidate-validation-receipt.js";
+import {
+  PostgresDuplicateEvidenceLinkPort,
+  type PostgresMemoryEvidenceLinkPoolClient,
+  type ProviderOwnedDuplicateEvidenceLinkPort,
+} from "../../service/postgres-memory-evidence-link-port.js";
+import {
+  PostgresCandidateEvidenceReadPort,
+  type CandidateEvidenceReadPort,
+} from "../../lifecycle/postgres-candidate-evidence-read-port.js";
+import {
+  PostgresEvidenceContentReadPort,
+  type PostgresEvidenceContentQueryClient,
+} from "../../graph/postgres-evidence-content-read.js";
 import {
   executePostgresMigrations,
   PostgresSchemaContractError,
@@ -63,26 +95,65 @@ import {
   type PostgresProviderOwnedDomainEffectRunner,
   type PostgresDurableJobV2EffectClient,
   type PostgresDurableJobV2EffectInput,
+  type PostgresDurableJobV2EffectReplayInspection,
   type PostgresDurableJobV2EffectResult,
 } from "../../storage/repositories/postgres-job-v2-effect.js";
 import {
   POSTGRES_EXTRACT_GRAPH_EFFECT_KEY,
   POSTGRES_BUILD_TREE_EFFECT_KEY,
+  authoritativeExtractGraphReplayFingerprint,
   buildTreeSemanticFingerprint,
   extractGraphSemanticFingerprint,
   type PostgresBuildTreeEffectRequest,
   type PostgresBuildTreeEffectSummary,
+  type PostgresLegacyExtractGraphEffectRequest,
+  type PostgresAuthoritativeExtractGraphReplayRequest,
+  type PostgresAuthoritativeExtractGraphEffectRequest,
   type PostgresExtractGraphEffectRequest,
   type PostgresExtractGraphEffectSummary,
 } from "./postgres-job-v2-domain-effects.js";
 import { PostgresGraphRepository } from "../../graph/postgres-repository.js";
 import {
+  PostgresEntityGraphQueryHitsPort,
+} from "../../graph/postgres-entity-query-hits.js";
+import type {
+  EntityGraphQueryHitsInput,
+  EntityGraphQueryHitsResult,
+} from "../../graph/query-hits-tracker.js";
+import {
+  persistAuthoritativeEntityGraphWithClient,
+  snapshotAuthoritativeEntityGraphDerivation,
+} from "../../graph/postgres-authoritative-entity-graph-effect.js";
+import type { AuthoritativeEntityGraphDerivation } from
+  "../../graph/authoritative-entity-graph-derivation.js";
+import {
+  assertActiveEntityGraphEmbeddingSpaceWithClient,
+  canonicalizeAuthoritativeEntityGraphWithClient,
+  persistEntityCanonicalizationPlanWithClient,
+  snapshotEntityGraphEmbeddingBatch,
+} from "../../graph/postgres-entity-canonicalization.js";
+import {
+  PostgresWorkMemoryGraphRepository,
+  type PostgresWorkMemoryPool,
+} from "../../graph/postgres-work-memory-repository.js";
+import {
   POSTGRES_BUILD_TREE_EFFECT_RELATIONS,
   executePostgresBuildTreeDomainEffect,
 } from "../../tree/postgres-build-tree-effect.js";
+import {
+  archiveSupersededPostgresTopicTrees,
+  persistPostgresTopicTreeAliases,
+  type ArchiveSupersededPostgresTopicTreesInput,
+  type PersistPostgresTopicTreeAliasesInput,
+  type PostgresTopicTreeAlias,
+  type PostgresTopicTreeMigrationQueryClient,
+} from "../../tree/postgres-topic-tree-migration.js";
 import { PostgresCanonicalTreeReadRepository } from
   "../../tree/postgres-canonical-read-repository.js";
-import { PostgresCanonicalGraphReadRepository } from
+import {
+  PostgresCanonicalEntityGraphRepository,
+  PostgresCanonicalGraphReadRepository,
+} from
   "../../graph/postgres-canonical-read-repository.js";
 import {
   MENGSHU_CANDIDATE_CONFLICT_COLUMNS,
@@ -94,6 +165,79 @@ import {
   PostgresBoundCandidateReviewRepository,
   type ScopeBoundCandidateReviewRepository,
 } from "../../lifecycle/postgres-candidate-review-repository.js";
+import {
+  PostgresCandidateDedupReadAdapter,
+  type CandidateDedupReadPort,
+} from "../../lifecycle/candidate-dedup-read-port.js";
+import {
+  PostgresCandidatePromotionPort,
+  type PostgresCandidatePromotionClient,
+  type ProviderOwnedCandidatePromotionPort,
+} from "./postgres-candidate-promotion.js";
+import {
+  PostgresActiveMemoryDerivationReadPort,
+  type ActiveMemoryDerivationReadPort,
+} from "../../graph/postgres-active-derivation-read-port.js";
+import {
+  PostgresAuthoritativeEntityGraphReadPort,
+  type AuthoritativeEntityGraphReadPort,
+} from "../../graph/postgres-authoritative-entity-graph-read-port.js";
+import {
+  PostgresCanonicalEntityCentralityRefresh,
+  type CanonicalEntityCentralityRefreshInput,
+  type CanonicalEntityCentralityRefreshResult,
+} from "../../graph/postgres-canonical-entity-centrality-refresh.js";
+import {
+  PostgresCanonicalEntityTopicReadPort,
+  type CanonicalEntityTopicReadFacts,
+  type CanonicalEntityTopicReadInput,
+} from "../../graph/postgres-canonical-entity-topic-read-port.js";
+import {
+  PostgresGovernedRetrievalHydrator,
+  type PostgresGovernedRetrievalHydrationRequest,
+} from "../../retrieval/postgres-governed-retrieval-hydrator.js";
+import type { GovernedRetrievalHydration } from
+  "../../retrieval/governed-retrieval-engine.js";
+import {
+  PostgresGovernedRetrievalCandidateSource,
+  type PostgresGovernedRetrievalCandidateSearchInput,
+} from "../../retrieval/postgres-governed-retrieval-candidate-source.js";
+import type { GovernedRetrievalCandidate } from
+  "../../retrieval/governed-retrieval-engine.js";
+import {
+  PostgresMemoryViewAssetRepository,
+  type PostgresMemoryViewAssetPool,
+} from "../../assets/postgres-repository.js";
+import {
+  PostgresAgentLoadoutRepository,
+  type PostgresAgentLoadoutPool,
+} from "../../loadout/postgres-repository.js";
+import {
+  PostgresSlotInvalidationOutboxRepository,
+  type PostgresSlotInvalidationOutboxQueryClient,
+} from "../../context/postgres-slot-invalidation-outbox.js";
+import {
+  PostgresContextAssemblyReceiptRepository,
+  type PostgresContextAssemblyReceiptQueryClient,
+} from "../../context/postgres-assembly-receipt.js";
+import { KnowledgeResourceCapability } from
+  "../../resources/knowledge-resource-capability.js";
+import {
+  PostgresKnowledgeResourceRepository,
+  type PostgresKnowledgeResourceQueryClient,
+} from "../../resources/postgres-knowledge-resource-repository.js";
+
+export interface PostgresActiveDerivationOutboxPoolClient {
+  query(
+    sql: string,
+    params?: readonly unknown[],
+  ): Promise<{ readonly rows: readonly Record<string, unknown>[]; readonly rowCount?: number | null }>;
+  release(): void;
+}
+
+export interface PostgresActiveDerivationOutboxPool {
+  connect(): Promise<PostgresActiveDerivationOutboxPoolClient>;
+}
 
 const { Pool } = pg;
 
@@ -106,6 +250,7 @@ const EMBEDDING_METADATA_ID = "embeddingSpaceId" as const;
 const EMBEDDING_METADATA_STATE = "embeddingSpaceState" as const;
 const AUTHORITY_DEDUPE_COLUMNS =
   "tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, visibility, content_hash";
+const ACTIVE_MEMORY_DEDUPE_PREDICATE = "lifecycle_status = 'active'";
 const NON_QUARANTINED_ROW_SQL = "legacy_quarantine_reason IS NULL";
 const LOCK_SCHEMA_BOOTSTRAP_SQL =
   "SELECT pg_advisory_lock(hashtext('mengshu_schema_bootstrap'))";
@@ -167,10 +312,25 @@ export interface PostgresDurableJobV2RuntimeBundle {
   readonly executeGraphEffect: (
     request: PostgresExtractGraphEffectRequest,
   ) => Promise<PostgresDurableJobV2EffectResult<PostgresExtractGraphEffectSummary>>;
+  readonly inspectAuthoritativeGraphReplay: (
+    request: PostgresAuthoritativeExtractGraphReplayRequest,
+  ) => Promise<PostgresDurableJobV2EffectReplayInspection<PostgresExtractGraphEffectSummary>>;
   readonly executeBuildTreeEffect: (
     request: PostgresBuildTreeEffectRequest,
     signal: AbortSignal,
   ) => Promise<PostgresDurableJobV2EffectResult<PostgresBuildTreeEffectSummary>>;
+  readonly persistTopicTreeAliases: (
+    input: PersistPostgresTopicTreeAliasesInput,
+  ) => Promise<readonly PostgresTopicTreeAlias[]>;
+  readonly archiveSupersededTopicTrees: (
+    input: ArchiveSupersededPostgresTopicTreesInput,
+  ) => Promise<readonly PostgresTopicTreeAlias[]>;
+  readonly refreshCanonicalEntityCentrality: (
+    input: CanonicalEntityCentralityRefreshInput,
+  ) => Promise<CanonicalEntityCentralityRefreshResult>;
+  readonly readCanonicalEntityTopicFacts: (
+    input: CanonicalEntityTopicReadInput,
+  ) => Promise<CanonicalEntityTopicReadFacts>;
   /** Runtime enqueue gate：只读 readiness，不拥有/关闭运行中 provider。 */
   readonly assertEnqueueReady: () => Promise<PostgresDurableJobV2RuntimeReadiness>;
   readonly assertReady: () => Promise<PostgresDurableJobV2RuntimeReadiness>;
@@ -185,6 +345,31 @@ export interface PostgresDurableJobV2RuntimeBundleDependencies {
 }
 
 const POSTGRES_DURABLE_RUNTIME_BUNDLE_OWNERS = new WeakMap<object, PostgresProvider>();
+const POSTGRES_ENTITY_GRAPH_QUERY_HITS_OWNERS = new WeakMap<object, PostgresProvider>();
+const POSTGRES_GOVERNED_RETRIEVAL_HYDRATOR_OWNERS = new WeakMap<object, PostgresProvider>();
+const POSTGRES_GOVERNED_RETRIEVAL_CANDIDATE_SOURCE_OWNERS =
+  new WeakMap<object, PostgresProvider>();
+
+export interface ProviderOwnedPostgresGovernedRetrievalHydrator {
+  readonly contract: "mengshu.postgres-governed-retrieval-hydrator/v1";
+  readonly hydrate: (
+    input: PostgresGovernedRetrievalHydrationRequest,
+  ) => Promise<GovernedRetrievalHydration | undefined>;
+}
+
+export interface ProviderOwnedPostgresEntityGraphQueryHits {
+  readonly contract: "mengshu.postgres-entity-graph-query-hits/v1";
+  readonly incrementRecallHits: (
+    input: EntityGraphQueryHitsInput,
+  ) => Promise<EntityGraphQueryHitsResult>;
+}
+
+export interface ProviderOwnedPostgresGovernedRetrievalCandidateSource {
+  readonly contract: "mengshu.postgres-governed-retrieval-candidate-source/v1";
+  readonly search: (
+    input: PostgresGovernedRetrievalCandidateSearchInput,
+  ) => Promise<GovernedRetrievalCandidate[]>;
+}
 
 function bundleError(code: PostgresDurableJobV2RuntimeBundleErrorCode): never {
   throw new PostgresDurableJobV2RuntimeBundleError(code);
@@ -219,6 +404,72 @@ export function assertProviderOwnedPostgresEffectRepository(
     throw new Error("Postgres provider-owned effect repository is required");
   }
   return value as PostgresDurableJobV2EffectRepository;
+}
+
+export function assertProviderOwnedPostgresEntityGraphQueryHits(
+  value: unknown,
+): ProviderOwnedPostgresEntityGraphQueryHits {
+  if (!value || typeof value !== "object" ||
+      !POSTGRES_ENTITY_GRAPH_QUERY_HITS_OWNERS.has(value)) {
+    throw new Error("Postgres provider-owned Entity Graph query hits port is required");
+  }
+  return value as ProviderOwnedPostgresEntityGraphQueryHits;
+}
+
+export function assertPostgresProviderOwnsEntityGraphQueryHits(
+  provider: unknown,
+  value: unknown,
+): ProviderOwnedPostgresEntityGraphQueryHits {
+  const port = assertProviderOwnedPostgresEntityGraphQueryHits(value);
+  if (!(provider instanceof PostgresProvider) ||
+      POSTGRES_ENTITY_GRAPH_QUERY_HITS_OWNERS.get(port) !== provider) {
+    throw new Error("Postgres provider-owned Entity Graph query hits port is required");
+  }
+  return port;
+}
+
+export function assertProviderOwnedPostgresGovernedRetrievalHydrator(
+  value: unknown,
+): ProviderOwnedPostgresGovernedRetrievalHydrator {
+  if (!value || typeof value !== "object" ||
+      !POSTGRES_GOVERNED_RETRIEVAL_HYDRATOR_OWNERS.has(value)) {
+    throw new Error("Postgres provider-owned governed retrieval hydrator is required");
+  }
+  return value as ProviderOwnedPostgresGovernedRetrievalHydrator;
+}
+
+export function assertPostgresProviderOwnsGovernedRetrievalHydrator(
+  provider: unknown,
+  value: unknown,
+): ProviderOwnedPostgresGovernedRetrievalHydrator {
+  const hydrator = assertProviderOwnedPostgresGovernedRetrievalHydrator(value);
+  if (!(provider instanceof PostgresProvider) ||
+      POSTGRES_GOVERNED_RETRIEVAL_HYDRATOR_OWNERS.get(hydrator) !== provider) {
+    throw new Error("Postgres provider-owned governed retrieval hydrator is required");
+  }
+  return hydrator;
+}
+
+export function assertProviderOwnedPostgresGovernedRetrievalCandidateSource(
+  value: unknown,
+): ProviderOwnedPostgresGovernedRetrievalCandidateSource {
+  if (!value || typeof value !== "object" ||
+      !POSTGRES_GOVERNED_RETRIEVAL_CANDIDATE_SOURCE_OWNERS.has(value)) {
+    throw new Error("Postgres provider-owned governed retrieval candidate source is required");
+  }
+  return value as ProviderOwnedPostgresGovernedRetrievalCandidateSource;
+}
+
+export function assertPostgresProviderOwnsGovernedRetrievalCandidateSource(
+  provider: unknown,
+  value: unknown,
+): ProviderOwnedPostgresGovernedRetrievalCandidateSource {
+  const source = assertProviderOwnedPostgresGovernedRetrievalCandidateSource(value);
+  if (!(provider instanceof PostgresProvider) ||
+      POSTGRES_GOVERNED_RETRIEVAL_CANDIDATE_SOURCE_OWNERS.get(source) !== provider) {
+    throw new Error("Postgres provider-owned governed retrieval candidate source is required");
+  }
+  return source;
 }
 
 type StoreQuery = (
@@ -295,7 +546,10 @@ export interface PostgresCandidateEffectRequest {
     readonly traceId: string;
     readonly intent: string;
   };
-  readonly candidates: readonly PostgresPendingCandidateInput[];
+  readonly candidates?: readonly PostgresPendingCandidateInput[];
+  readonly records?: readonly WriteMemoryRecord[];
+  /** 脱敏的全 proposal 计算/校验回执；native records 路径随 domain write 原子提交。 */
+  readonly proposalReceipts?: readonly CandidateProposalReceiptV1[];
 }
 
 export interface PostgresCandidateEffectSummary extends Record<string, unknown> {
@@ -303,6 +557,10 @@ export interface PostgresCandidateEffectSummary extends Record<string, unknown> 
   readonly duplicateCount: number;
   readonly capacityRejectedCount: number;
   readonly candidateIds: readonly string[];
+  readonly memoryIds?: readonly string[];
+  readonly activeMemoryIds?: readonly string[];
+  readonly droppedCount?: number;
+  readonly proposalReceipts?: readonly CandidateProposalReceiptV1[];
 }
 
 export interface PostgresScopeBackfillInspection {
@@ -477,7 +735,11 @@ function snapshotDurableRuntimeBundleDependencies(
 }
 
 function snapshotCandidateEffectRequest(value: unknown): PostgresCandidateEffectRequest {
-  const request = exactDataRecord(value, ["effectInput", "context", "semanticRequest", "candidates"]);
+  const request = exactDataRecord(
+    value,
+    ["effectInput", "context", "semanticRequest"],
+    ["candidates", "records", "proposalReceipts"],
+  );
   const effect = exactDataRecord(request.effectInput, [
     "id", "scope", "owner", "leaseToken", "leaseGeneration",
   ]);
@@ -511,6 +773,31 @@ function snapshotCandidateEffectRequest(value: unknown): PostgresCandidateEffect
       !safeId(semantic.traceId) || !safeId(semantic.intent)) {
     throw new Error("Postgres candidate effect input is invalid");
   }
+  const hasCandidates = Object.hasOwn(request, "candidates");
+  const hasRecords = Object.hasOwn(request, "records");
+  if (hasCandidates === hasRecords ||
+      (hasCandidates && !Array.isArray(request.candidates)) ||
+      (hasRecords && !Array.isArray(request.records))) {
+    throw new Error("Postgres candidate effect input is invalid");
+  }
+  const records = hasRecords
+    ? (request.records as readonly WriteMemoryRecord[]).map((record) => {
+        if (!record || typeof record !== "object" || record.mutation !== "content" ||
+            typeof record.importance !== "number" || !Number.isFinite(record.importance) ||
+            record.importance < 0 || record.importance > 1) {
+          throw new Error("Postgres candidate effect write record is invalid");
+        }
+        if (record.route !== "candidate" && record.route !== "candidate_low_priority" &&
+            record.route !== "active" && record.route !== "lookup_only" &&
+            record.route !== "evidence_only" && record.route !== "drop") {
+          throw new Error("Postgres candidate effect write record is invalid");
+        }
+        return Object.freeze({ ...record });
+      })
+    : undefined;
+  const proposalReceipts = Object.hasOwn(request, "proposalReceipts")
+    ? snapshotCandidateProposalReceipts(request.proposalReceipts)
+    : Object.freeze([] as CandidateProposalReceiptV1[]);
   return Object.freeze({
     effectInput: Object.freeze({
       id: effect.id,
@@ -530,8 +817,226 @@ function snapshotCandidateEffectRequest(value: unknown): PostgresCandidateEffect
       traceId: semantic.traceId,
       intent: semantic.intent,
     }),
-    candidates: request.candidates as readonly PostgresPendingCandidateInput[],
+    ...(hasCandidates
+      ? { candidates: request.candidates as readonly PostgresPendingCandidateInput[] }
+      : { records: Object.freeze(records!) }),
+    proposalReceipts,
   }) as PostgresCandidateEffectRequest;
+}
+
+function snapshotCandidateProposalReceipts(
+  value: unknown,
+): readonly CandidateProposalReceiptV1[] {
+  if (!Array.isArray(value) || nodeUtilTypes.isProxy(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new Error("Postgres candidate proposal receipt is invalid");
+  }
+  return Object.freeze(value.map((item, index) => {
+    const receipt = exactDataRecord(
+      item,
+      ["version", "candidateOrdinal", "outcome"],
+      ["validation", "admission", "computationReason"],
+      "Postgres candidate proposal receipt is invalid",
+    );
+    if (receipt.version !== 1 || !Number.isSafeInteger(receipt.candidateOrdinal) ||
+        Number(receipt.candidateOrdinal) < 0 ||
+        (index > 0 && Number(receipt.candidateOrdinal) <= Number(
+          (value[index - 1] as CandidateProposalReceiptV1).candidateOrdinal,
+        )) ||
+        !["accepted", "validator_rejected", "admission_dropped", "computation_dropped"]
+          .includes(String(receipt.outcome))) {
+      throw new Error("Postgres candidate proposal receipt is invalid");
+    }
+    const validation = receipt.validation === undefined
+      ? undefined
+      : snapshotCandidateValidationReceipt(receipt.validation, Number(receipt.candidateOrdinal));
+    const admission = receipt.admission === undefined
+      ? undefined
+      : snapshotCandidateAdmissionReceipt(receipt.admission);
+    if (receipt.computationReason !== undefined &&
+        (typeof receipt.computationReason !== "string" ||
+         !SAFE_CANDIDATE_ID.test(receipt.computationReason))) {
+      throw new Error("Postgres candidate proposal receipt is invalid");
+    }
+    if ((receipt.outcome === "accepted" &&
+         (validation?.outcome !== "accepted" || admission?.outcome !== "accepted" ||
+          admission.route === "drop")) ||
+        (receipt.outcome === "validator_rejected" &&
+         (validation?.outcome !== "rejected" || admission !== undefined)) ||
+        (receipt.outcome === "admission_dropped" &&
+         (validation?.outcome !== "accepted" || admission?.outcome !== "dropped" ||
+          admission.route !== "drop")) ||
+        (receipt.outcome !== "computation_dropped" && receipt.computationReason !== undefined)) {
+      throw new Error("Postgres candidate proposal receipt is invalid");
+    }
+    return Object.freeze({
+      version: 1 as const,
+      candidateOrdinal: Number(receipt.candidateOrdinal),
+      outcome: receipt.outcome as CandidateProposalReceiptV1["outcome"],
+      ...(validation === undefined ? {} : { validation }),
+      ...(admission === undefined ? {} : { admission }),
+      ...(receipt.computationReason === undefined
+        ? {}
+        : { computationReason: receipt.computationReason }),
+    });
+  }));
+}
+
+function snapshotCandidateValidationReceipt(value: unknown, candidateOrdinal: number) {
+  const receipt = exactDataRecord(
+    value,
+    ["version", "policyVersion", "candidateOrdinal", "proposalHash", "evidenceIds", "outcome", "gates"],
+    ["rejectedReason"],
+    "Postgres candidate validation receipt is invalid",
+  );
+  if (receipt.version !== 1 || receipt.policyVersion !== CANDIDATE_VALIDATION_POLICY_VERSION ||
+      receipt.candidateOrdinal !== candidateOrdinal ||
+      typeof receipt.proposalHash !== "string" || !/^[a-f0-9]{64}$/.test(receipt.proposalHash) ||
+      (receipt.outcome !== "accepted" && receipt.outcome !== "rejected") ||
+      !Array.isArray(receipt.evidenceIds) || receipt.evidenceIds.some((id) =>
+        typeof id !== "string" || !SAFE_CANDIDATE_ID.test(id)) ||
+      !Array.isArray(receipt.gates) || receipt.gates.length !== CANDIDATE_GATE_IDS.length ||
+      (receipt.rejectedReason !== undefined &&
+       (typeof receipt.rejectedReason !== "string" || !SAFE_CANDIDATE_ID.test(receipt.rejectedReason))) ||
+      (receipt.outcome === "accepted" && receipt.rejectedReason !== undefined) ||
+      (receipt.outcome === "rejected" && receipt.rejectedReason === undefined)) {
+    throw new Error("Postgres candidate validation receipt is invalid");
+  }
+  const gates = Object.freeze(receipt.gates.map((item, index) => {
+    const gate = exactDataRecord(
+      item,
+      ["gateId", "status", "reasonCode", "policyVersion"],
+      ["before", "after"],
+      "Postgres candidate gate receipt is invalid",
+    );
+    if (gate.gateId !== CANDIDATE_GATE_IDS[index] ||
+        !["passed", "rejected", "not_evaluated", "not_applicable"].includes(String(gate.status)) ||
+        typeof gate.reasonCode !== "string" || !SAFE_CANDIDATE_ID.test(gate.reasonCode) ||
+        gate.policyVersion !== CANDIDATE_VALIDATION_POLICY_VERSION) {
+      throw new Error("Postgres candidate gate receipt is invalid");
+    }
+    const transition = (entry: unknown): Readonly<Record<string, string | number | boolean | null>> | undefined => {
+      if (entry === undefined) return undefined;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry) || nodeUtilTypes.isProxy(entry)) {
+        throw new Error("Postgres candidate gate transition is invalid");
+      }
+      const snapshot = exactDataRecord(entry, [], Reflect.ownKeys(entry as object)
+        .filter((key): key is string => typeof key === "string"),
+      "Postgres candidate gate transition is invalid");
+      for (const [key, itemValue] of Object.entries(snapshot)) {
+        if (!SAFE_CANDIDATE_ID.test(key) ||
+            !(itemValue === null || typeof itemValue === "boolean" ||
+              (typeof itemValue === "number" && Number.isFinite(itemValue)) ||
+              (typeof itemValue === "string" && !UNSAFE_CANDIDATE_STRING.test(itemValue) &&
+               !UNPAIRED_CANDIDATE_SURROGATE.test(itemValue)))) {
+          throw new Error("Postgres candidate gate transition is invalid");
+        }
+      }
+      return Object.freeze({ ...snapshot }) as Readonly<Record<string, string | number | boolean | null>>;
+    };
+    const before = transition(gate.before);
+    const after = transition(gate.after);
+    return Object.freeze({
+      gateId: CANDIDATE_GATE_IDS[index]!,
+      status: gate.status as "passed" | "rejected" | "not_evaluated" | "not_applicable",
+      reasonCode: gate.reasonCode,
+      policyVersion: CANDIDATE_VALIDATION_POLICY_VERSION,
+      ...(before === undefined ? {} : { before }),
+      ...(after === undefined ? {} : { after }),
+    });
+  }));
+  return Object.freeze({
+    version: 1 as const,
+    policyVersion: CANDIDATE_VALIDATION_POLICY_VERSION,
+    candidateOrdinal,
+    proposalHash: receipt.proposalHash as string,
+    evidenceIds: Object.freeze([...(receipt.evidenceIds as string[])]),
+    outcome: receipt.outcome as "accepted" | "rejected",
+    ...(receipt.rejectedReason === undefined ? {} : { rejectedReason: receipt.rejectedReason as never }),
+    gates,
+  });
+}
+
+function snapshotCandidateAdmissionReceipt(value: unknown) {
+  const receipt = exactDataRecord(
+    value,
+    ["version", "outcome", "route", "valueScore", "reason", "breakdown", "valueSignalProvenance"],
+    [],
+    "Postgres candidate admission receipt is invalid",
+  );
+  const routes = new Set(["drop", "candidate_low_priority", "candidate", "active", "lookup_only", "evidence_only"]);
+  const breakdown = exactDataRecord(
+    receipt.breakdown,
+    [],
+    Reflect.ownKeys(receipt.breakdown as object).filter((key): key is string => typeof key === "string"),
+    "Postgres candidate admission receipt is invalid",
+  );
+  const provenance = snapshotCandidateValueSignalProvenance(receipt.valueSignalProvenance);
+  if (receipt.version !== 1 || (receipt.outcome !== "accepted" && receipt.outcome !== "dropped") ||
+      typeof receipt.route !== "string" || !routes.has(receipt.route) ||
+      typeof receipt.valueScore !== "number" || !Number.isFinite(receipt.valueScore) ||
+      receipt.valueScore < 0 || receipt.valueScore > 1 ||
+      typeof receipt.reason !== "string" || !SAFE_CANDIDATE_ID.test(receipt.reason) ||
+      Object.entries(breakdown).some(([key, item]) =>
+        !SAFE_CANDIDATE_ID.test(key) || typeof item !== "number" || !Number.isFinite(item))) {
+    throw new Error("Postgres candidate admission receipt is invalid");
+  }
+  return Object.freeze({
+    version: 1 as const,
+    outcome: receipt.outcome as "accepted" | "dropped",
+    route: receipt.route as NonNullable<CandidateProposalReceiptV1["admission"]>["route"],
+    valueScore: receipt.valueScore,
+    reason: receipt.reason,
+    breakdown: Object.freeze({ ...breakdown }) as Readonly<Record<string, number>>,
+    valueSignalProvenance: provenance,
+  });
+}
+
+function snapshotCandidateValueSignalProvenance(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || nodeUtilTypes.isProxy(value)) {
+    throw new Error("Postgres candidate admission receipt is invalid");
+  }
+  const mode = (value as { mode?: unknown }).mode;
+  if (mode === "legacy_unknown") {
+    const provenance = exactDataRecord(
+      value,
+      ["mode", "evidence", "novelty"],
+      [],
+      "Postgres candidate admission receipt is invalid",
+    );
+    if (provenance.evidence !== "unknown" || provenance.novelty !== "unknown") {
+      throw new Error("Postgres candidate admission receipt is invalid");
+    }
+    return Object.freeze({
+      mode: "legacy_unknown" as const,
+      evidence: "unknown" as const,
+      novelty: "unknown" as const,
+    });
+  }
+  const provenance = exactDataRecord(
+    value,
+    ["mode", "evidence", "novelty", "sourceKind", "maxSimilarity"],
+    [],
+    "Postgres candidate admission receipt is invalid",
+  );
+  const sourceKinds = new Set<SourceKind>([
+    "rule_file", "session_user", "work_log", "document", "tool_result", "agent_output",
+  ]);
+  if (provenance.mode !== "authoritative" || provenance.evidence !== "source_authority" ||
+      provenance.novelty !== "semantic_max_similarity" ||
+      typeof provenance.sourceKind !== "string" ||
+      !sourceKinds.has(provenance.sourceKind as SourceKind) ||
+      typeof provenance.maxSimilarity !== "number" || !Number.isFinite(provenance.maxSimilarity) ||
+      provenance.maxSimilarity < 0 || provenance.maxSimilarity > 1) {
+    throw new Error("Postgres candidate admission receipt is invalid");
+  }
+  return Object.freeze({
+    mode: "authoritative" as const,
+    evidence: "source_authority" as const,
+    novelty: "semantic_max_similarity" as const,
+    sourceKind: provenance.sourceKind as SourceKind,
+    maxSimilarity: provenance.maxSimilarity,
+  });
 }
 
 function candidateEffectInput(
@@ -567,7 +1072,50 @@ function candidateEffectInput(
 function assertCandidateEffectSummary(
   value: unknown,
   candidates?: readonly Readonly<PostgresPendingCandidateInput>[],
+  records?: readonly WriteMemoryRecord[],
+  routeAwareReceipt = records !== undefined,
 ): void {
+  if (routeAwareReceipt) {
+    const summary = exactDataRecord(
+      value,
+      ["created", "duplicateCount", "capacityRejectedCount", "candidateIds",
+        "memoryIds", "activeMemoryIds", "droppedCount"],
+      ["proposalReceipts"],
+      "Postgres candidate effect receipt is invalid",
+    );
+    for (const key of ["created", "duplicateCount", "capacityRejectedCount", "droppedCount"] as const) {
+      if (!Number.isSafeInteger(summary[key]) || Number(summary[key]) < 0) {
+        throw new Error("Postgres candidate effect receipt is invalid");
+      }
+    }
+    for (const key of ["candidateIds", "memoryIds", "activeMemoryIds"] as const) {
+      if (!Array.isArray(summary[key]) ||
+          summary[key].some((id: unknown) => typeof id !== "string" || id.length === 0)) {
+        throw new Error("Postgres candidate effect receipt is invalid");
+      }
+    }
+    const candidateIds = summary.candidateIds as string[];
+    const memoryIds = summary.memoryIds as string[];
+    const activeMemoryIds = summary.activeMemoryIds as string[];
+    const proposalReceipts = summary.proposalReceipts === undefined
+      ? Object.freeze([] as CandidateProposalReceiptV1[])
+      : snapshotCandidateProposalReceipts(summary.proposalReceipts);
+    const uniqueIds = new Set([...candidateIds, ...memoryIds]);
+    const routedCount = records?.filter((record) => record.mutation === "content" &&
+      record.route !== "drop").length;
+    if (uniqueIds.size !== candidateIds.length + memoryIds.length ||
+        Number(summary.created) !== candidateIds.length + memoryIds.length ||
+        activeMemoryIds.some((id) => !memoryIds.includes(id)) ||
+        new Set(activeMemoryIds).size !== activeMemoryIds.length ||
+        (routedCount !== undefined &&
+          (Number(summary.created) + Number(summary.duplicateCount) +
+            Number(summary.capacityRejectedCount) !== routedCount ||
+           Number(summary.droppedCount) !== records!.length - routedCount))) {
+      throw new Error("Postgres candidate effect receipt is invalid");
+    }
+    void proposalReceipts;
+    return;
+  }
   const summary = exactDataRecord(
     value,
     ["created", "duplicateCount", "capacityRejectedCount", "candidateIds"],
@@ -761,6 +1309,10 @@ export class PostgresProvider implements DatabaseProvider {
 
   async close(): Promise<void> {
     await this.#closeProviderPool();
+  }
+
+  hasSlotInvalidationOutboxCapability(): boolean {
+    return this.schemaContractState === "ready" && this.schemaVersion >= 21;
   }
 
   async #closeProviderPool(): Promise<void> {
@@ -1173,6 +1725,103 @@ FROM "${table}"`);
     });
   }
 
+  /** v20 private MemoryView asset overlay, isolated from canonical memory facts. */
+  createMemoryViewAssetRepository(): PostgresMemoryViewAssetRepository {
+    const pool: PostgresMemoryViewAssetPool = {
+      query: async (sql: string, params: readonly unknown[] = []) => {
+        await this.initialize();
+        this.assertSchemaVersion(20, "Memory View asset repository");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+      },
+      connect: async () => {
+        await this.initialize();
+        this.assertSchemaVersion(20, "Memory View asset repository");
+        const client = await this.pool!.connect();
+        return {
+          query: async (sql: string, params: readonly unknown[] = []) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+    return new PostgresMemoryViewAssetRepository(pool);
+  }
+
+  /** v20 versioned private AgentLoadout overlay. */
+  createAgentLoadoutRepository(): PostgresAgentLoadoutRepository {
+    const pool: PostgresAgentLoadoutPool = {
+      query: async (sql: string, params: readonly unknown[] = []) => {
+        await this.initialize();
+        this.assertSchemaVersion(20, "Agent Loadout repository");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+      },
+      connect: async () => {
+        await this.initialize();
+        this.assertSchemaVersion(21, "Agent Loadout repository write");
+        const client = await this.pool!.connect();
+        return {
+          query: async (sql: string, params: readonly unknown[] = []) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+    return new PostgresAgentLoadoutRepository(pool);
+  }
+
+  /** v21 provider-owned Asset/Loadout invalidation outbox boundary. */
+  createSlotInvalidationOutboxRepository(): PostgresSlotInvalidationOutboxRepository {
+    const client: PostgresSlotInvalidationOutboxQueryClient = {
+      query: async (sql: string, params: readonly unknown[] = []) => {
+        await this.initialize();
+        this.assertSchemaVersion(21, "Slot invalidation outbox");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+      },
+    };
+    return new PostgresSlotInvalidationOutboxRepository(client);
+  }
+
+  /** v11 memory.written repair queue; callers receive no raw provider pool. */
+  createActiveDerivationOutboxPool(): PostgresActiveDerivationOutboxPool {
+    return {
+      connect: async () => {
+        await this.initialize();
+        this.assertSchemaVersion(11, "Active derivation outbox");
+        const client = await this.pool!.connect();
+        return {
+          query: async (sql: string, params: readonly unknown[] = []) => {
+            const result = await client.query(sql, [...params]);
+            return {
+              rows: result.rows as Record<string, unknown>[],
+              rowCount: result.rowCount,
+            };
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+  }
+
+  /** v22 append-only receipt boundary for reproducible context assembly. */
+  createContextAssemblyReceiptRepository(): PostgresContextAssemblyReceiptRepository {
+    const client: PostgresContextAssemblyReceiptQueryClient = {
+      query: async (sql: string, params: readonly unknown[] = []) => {
+        await this.initialize();
+        this.assertSchemaVersion(22, "Context assembly receipt repository");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+      },
+    };
+    return new PostgresContextAssemblyReceiptRepository(client);
+  }
+
   /**
    * v11 core write path. The record insert callback is deliberately closed
    * over this provider's private insertEntries implementation, so journal
@@ -1219,6 +1868,179 @@ FROM "${table}"`);
     });
   }
 
+  /**
+   * MemoryWriteKernel 的 provider-owned callback transaction factory。
+   *
+   * route -> 主库/候选区的纯映射由 write-kernel-mapping 负责；两条写入路径
+   * 都使用 transaction port 传入的同一个 dedicated client。
+   */
+  createMemoryWriteKernelTransactionPort(): ProviderOwnedMemoryWriteKernelTransactionPort {
+    return new PostgresMemoryWriteKernelTransactionPort({
+      connect: async (): Promise<PostgresMemoryWriteKernelClient> => {
+        await this.initialize();
+        this.assertSchemaVersion(14, "memory write kernel transaction");
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    }, async (client, record) => {
+      if (record.mutation !== "content") {
+        throw new Error("Postgres memory write kernel lifecycle requires the forget transaction");
+      }
+      if (record.route === "candidate" || record.route === "candidate_low_priority") {
+        const candidate = writeRecordToPostgresPendingCandidate(record);
+        const repository = new PostgresCandidateRepository({
+          assertReady: () => this.assertSchemaVersion(14, "memory write kernel candidate"),
+        });
+        const result = await repository.insertKernelPendingWithClient(
+          client,
+          { ...record.scope, visibility: record.scope.visibility ?? "private" },
+          candidate,
+        );
+        return { memoryId: result.candidateId, stored: result.inserted };
+      }
+
+      const memory = writeRecordToMemoryRecord(record);
+      const entry = recordToMemoryEntry(memory);
+      const tableName = entry.tableName ?? this.getDefaultTableName(entry.dataType);
+      if (!DEFAULT_TABLES.includes(tableName)) {
+        throw new Error(
+          "Postgres memory write kernel only supports canonical memories/knowledge tables",
+        );
+      }
+      this.validateStoreEntry(entry);
+      const records = await this.insertEntries(tableName, [entry], async (sql, params = []) => {
+        const result = await client.query(sql, params);
+        return { rows: result.rows, rowCount: result.rowCount };
+      });
+      const [result] = records;
+      if (!result || records.length !== 1) {
+        throw new Error("Postgres memory write kernel returned an invalid memory result");
+      }
+      return { memoryId: result.persistedId, stored: result.stored };
+    });
+  }
+
+  /** v15 duplicate dedup -> evidence ledger，始终使用 provider-owned dedicated client。 */
+  createDuplicateEvidenceLinkPort(): ProviderOwnedDuplicateEvidenceLinkPort {
+    return new PostgresDuplicateEvidenceLinkPort({
+      connect: async (): Promise<PostgresMemoryEvidenceLinkPoolClient> => {
+        await this.initialize();
+        this.assertSchemaVersion(15, "duplicate evidence link");
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    });
+  }
+
+  /** v13 原生 Work Memory Graph repository，查询与写事务均复用本 provider pool。 */
+  createWorkMemoryGraphRepository(): PostgresWorkMemoryGraphRepository {
+    const pool: PostgresWorkMemoryPool = {
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(13, "Work Memory Graph");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+      connect: async () => {
+        await this.initialize();
+        this.assertSchemaVersion(13, "Work Memory Graph");
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+    return new PostgresWorkMemoryGraphRepository(pool);
+  }
+
+  /** v15 recall feedback；只沿 Entity Graph authoritative evidence ledger 更新。 */
+  createEntityGraphQueryHitsPort(): ProviderOwnedPostgresEntityGraphQueryHits {
+    const delegate = new PostgresEntityGraphQueryHitsPort({
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+    });
+    const port = Object.freeze({
+      contract: "mengshu.postgres-entity-graph-query-hits/v1" as const,
+      incrementRecallHits: async (input: EntityGraphQueryHitsInput) => {
+        await this.initialize();
+        this.assertSchemaVersion(15, "Entity Graph query hits");
+        return delegate.incrementRecallHits(input);
+      },
+    }) satisfies ProviderOwnedPostgresEntityGraphQueryHits;
+    POSTGRES_ENTITY_GRAPH_QUERY_HITS_OWNERS.set(port, this);
+    return port;
+  }
+
+  /** v11 candidate -> active promotion, bound to one server-owned authority scope. */
+  createCandidatePromotionPort(scope: MemoryScope): ProviderOwnedCandidatePromotionPort {
+    return new PostgresCandidatePromotionPort({
+      connect: async (): Promise<PostgresCandidatePromotionClient> => {
+        await this.initialize();
+        this.assertSchemaVersion(11, "candidate promotion");
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    }, async (client, record) => {
+      const entry = recordToMemoryEntry(record);
+      const tableName = entry.tableName ?? this.getDefaultTableName(entry.dataType);
+      if (tableName !== "memories") {
+        throw new Error("Postgres candidate promotion only supports canonical memories");
+      }
+      this.validateStoreEntry(entry);
+      const records = await this.insertEntries("memories", [entry], async (sql, params = []) => {
+        const result = await client.query(sql, params);
+        return { rows: result.rows, rowCount: result.rowCount };
+      });
+      const [result] = records;
+      if (!result || records.length !== 1) {
+        throw new Error("Postgres candidate promotion returned an invalid record result");
+      }
+      return result;
+    }, scope);
+  }
+
   createCanonicalTreeReadRepository(scope: MemoryScope): PostgresCanonicalTreeReadRepository {
     return new PostgresCanonicalTreeReadRepository({
       query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
@@ -1226,7 +2048,7 @@ FROM "${table}"`);
         params: readonly unknown[] = [],
       ) => {
         await this.initialize();
-        this.assertSchemaVersion(9, "canonical tree read");
+        this.assertSchemaVersion(16, "canonical tree read");
         const result = await this.pool!.query(sql, [...params]);
         return { rows: result.rows as Row[], rowCount: result.rowCount };
       },
@@ -1245,6 +2067,155 @@ FROM "${table}"`);
         return { rows: result.rows as Row[], rowCount: result.rowCount };
       },
     }, scope);
+  }
+
+  /** Production Entity Graph facade；读取 canonical 表，写入只允许 durable native effect。 */
+  createCanonicalEntityGraphRepository(
+    defaultScope: MemoryScope,
+  ): PostgresCanonicalEntityGraphRepository {
+    return new PostgresCanonicalEntityGraphRepository(
+      defaultScope,
+      (scope) => this.createCanonicalGraphReadRepository(scope),
+    );
+  }
+
+  /** Provider-owned、scope-at-call candidate dedup read adapter. */
+  createCandidateDedupReadPort(): CandidateDedupReadPort {
+    return new PostgresCandidateDedupReadAdapter({
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(14, "candidate dedup read");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+    });
+  }
+
+  /** Provider-owned persisted evidence facts；候选 confidence 不读取 job/客户端 metadata。 */
+  createCandidateEvidenceReadPort(): CandidateEvidenceReadPort {
+    return new PostgresCandidateEvidenceReadPort({
+      query: async (
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(14, "candidate evidence read");
+        const result = await this.pool!.query(sql, [...params]);
+        return {
+          rows: result.rows as Record<string, unknown>[],
+          ...(result.rowCount === null ? {} : { rowCount: result.rowCount }),
+        };
+      },
+    });
+  }
+
+  /** Provider-owned F1 evidence preview reader; exact-scope and prompt-safe. */
+  createEvidenceContentReadPort(): PostgresEvidenceContentReadPort {
+    const client: PostgresEvidenceContentQueryClient = {
+      query: async (
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(14, "evidence content read");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+      },
+    };
+    return new PostgresEvidenceContentReadPort(client);
+  }
+
+  /** Provider-owned, exact-scope read-only Knowledge resource capability. */
+  createKnowledgeResourceCapability(): KnowledgeResourceCapability {
+    const client: PostgresKnowledgeResourceQueryClient = {
+      query: async (
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(2, "knowledge resource read");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+      },
+    };
+    return new KnowledgeResourceCapability(new PostgresKnowledgeResourceRepository(client));
+  }
+
+  /** Provider-owned committed-active/evidence/tree fact read boundary for F0 derivation. */
+  createActiveMemoryDerivationReadPort(): ActiveMemoryDerivationReadPort {
+    return new PostgresActiveMemoryDerivationReadPort({
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(14, "active derivation read");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+    });
+  }
+
+  /** Provider-owned active/evidence identity hydration for authoritative Entity Graph jobs. */
+  createAuthoritativeEntityGraphReadPort(): AuthoritativeEntityGraphReadPort {
+    return new PostgresAuthoritativeEntityGraphReadPort({
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(15, "authoritative Entity Graph read");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+    });
+  }
+
+  /** v15 governed retrieval hydration；只暴露权威回读，不暴露 provider client/lifecycle。 */
+  createGovernedRetrievalHydrator(): ProviderOwnedPostgresGovernedRetrievalHydrator {
+    const delegate = new PostgresGovernedRetrievalHydrator({
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(15, "governed retrieval hydration");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+    });
+    const port = Object.freeze({
+      contract: "mengshu.postgres-governed-retrieval-hydrator/v1" as const,
+      hydrate: (input: PostgresGovernedRetrievalHydrationRequest) => delegate.hydrate(input),
+    }) satisfies ProviderOwnedPostgresGovernedRetrievalHydrator;
+    POSTGRES_GOVERNED_RETRIEVAL_HYDRATOR_OWNERS.set(port, this);
+    return port;
+  }
+
+  /** v15 multi-route candidate producer; final policy and scoring stay in GovernedRetrievalEngine. */
+  createGovernedRetrievalCandidateSource(): ProviderOwnedPostgresGovernedRetrievalCandidateSource {
+    const delegate = new PostgresGovernedRetrievalCandidateSource({
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+    });
+    const port = Object.freeze({
+      contract: "mengshu.postgres-governed-retrieval-candidate-source/v1" as const,
+      search: async (input: PostgresGovernedRetrievalCandidateSearchInput) => {
+        await this.initialize();
+        this.assertSchemaVersion(15, "governed retrieval candidate source");
+        return delegate.search(input);
+      },
+    }) satisfies ProviderOwnedPostgresGovernedRetrievalCandidateSource;
+    POSTGRES_GOVERNED_RETRIEVAL_CANDIDATE_SOURCE_OWNERS.set(port, this);
+    return port;
   }
 
   /**
@@ -1286,6 +2257,23 @@ FROM "${table}"`);
     const effectDependencies = Object.freeze({
       clock: dependencies.effectClock ?? dependencies.clock,
     });
+    const canonicalGraphClient = Object.freeze({
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(15, "canonical Entity topic projection");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+    });
+    const canonicalEntityCentrality = new PostgresCanonicalEntityCentralityRefresh(
+      canonicalGraphClient,
+    );
+    const canonicalEntityTopicRead = new PostgresCanonicalEntityTopicReadPort(
+      canonicalGraphClient,
+    );
     const bundle = Object.freeze({
       contract: "mengshu.postgres-durable-job-v2/v1" as const,
       repository,
@@ -1294,14 +2282,61 @@ FROM "${table}"`);
         this.#executeCandidateEffect(request, effectDependencies),
       executeGraphEffect: (request: PostgresExtractGraphEffectRequest) =>
         this.#executeGraphEffect(request, effectDependencies),
+      inspectAuthoritativeGraphReplay: (request: PostgresAuthoritativeExtractGraphReplayRequest) =>
+        this.#inspectAuthoritativeGraphReplay(request, effectDependencies),
       executeBuildTreeEffect: (request: PostgresBuildTreeEffectRequest, signal: AbortSignal) =>
         this.#executeBuildTreeEffect(request, signal, effectDependencies),
+      persistTopicTreeAliases: (input: PersistPostgresTopicTreeAliasesInput) =>
+        this.#executeTopicTreeMigration((client) =>
+          persistPostgresTopicTreeAliases(client, input)),
+      archiveSupersededTopicTrees: (input: ArchiveSupersededPostgresTopicTreesInput) =>
+        this.#executeTopicTreeMigration((client) =>
+          archiveSupersededPostgresTopicTrees(client, input)),
+      refreshCanonicalEntityCentrality: (input: CanonicalEntityCentralityRefreshInput) =>
+        canonicalEntityCentrality.refresh(input),
+      readCanonicalEntityTopicFacts: (input: CanonicalEntityTopicReadInput) =>
+        canonicalEntityTopicRead.read(input),
       assertEnqueueReady: () => this.#assertDurableJobV2EnqueueReady(),
       assertReady: () => this.#assertDurableJobV2RuntimeReady(),
       close: () => this.#closeProviderPool(),
     }) satisfies PostgresDurableJobV2RuntimeBundle;
     POSTGRES_DURABLE_RUNTIME_BUNDLE_OWNERS.set(bundle, this);
     return bundle;
+  }
+
+  async #executeTopicTreeMigration<Result>(
+    operation: (client: PostgresTopicTreeMigrationQueryClient) => Promise<Result>,
+  ): Promise<Result> {
+    await this.initialize();
+    this.assertSchemaVersion(16, "D-21 topic tree migration");
+    const client = await this.pool!.connect();
+    const migrationClient: PostgresTopicTreeMigrationQueryClient = Object.freeze({
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        const result = await client.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+    });
+    try {
+      await client.query("BEGIN");
+      const result = await operation(migrationClient);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Postgres topic tree migration and rollback both failed",
+        );
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   /**
@@ -1513,11 +2548,12 @@ FROM "${table}"`);
   #createProviderOwnedDomainEffectRunner(
     allowedRelations: readonly string[],
     executionDependencies: { readonly clock?: () => number },
+    minimumSchemaVersion = 9,
   ): PostgresProviderOwnedDomainEffectRunner {
     const repository = new PostgresDurableJobV2EffectRepository({
       connect: async (): Promise<PostgresDurableJobV2EffectClient> => {
         await this.initialize();
-        this.assertSchemaVersion(9, "durable tree/graph effect");
+        this.assertSchemaVersion(minimumSchemaVersion, "durable provider-owned effect");
         const client = await this.pool!.connect();
         return {
           query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
@@ -1553,6 +2589,7 @@ FROM "${table}"`);
     const runner = this.#createProviderOwnedDomainEffectRunner(
       POSTGRES_BUILD_TREE_EFFECT_RELATIONS,
       executionDependencies,
+      16,
     );
     try {
       return await runner.execute({
@@ -1576,6 +2613,25 @@ FROM "${table}"`);
     rawRequest: PostgresExtractGraphEffectRequest,
     executionDependencies: { readonly clock?: () => number },
   ): Promise<PostgresDurableJobV2EffectResult<PostgresExtractGraphEffectSummary>> {
+    const rawRecord = exactDataRecord(
+      rawRequest,
+      ["effectInput", "context", "semanticRequest"],
+      ["entities", "relations", "graph", "entityEmbeddings"],
+      "Postgres graph effect input is invalid",
+    );
+    const rawSemantic = exactDataRecord(
+      rawRecord.semanticRequest,
+      [],
+      ["chunkId", "text", "sourceId", "context", "graphKind", "activeMemoryId", "evidenceId"],
+      "Postgres graph effect input is invalid",
+    );
+    if (rawSemantic.graphKind === "entity") {
+      return this.#executeAuthoritativeGraphEffect(
+        rawRecord,
+        rawSemantic,
+        executionDependencies,
+      );
+    }
     const requestRecord = exactDataRecord(
       rawRequest,
       ["effectInput", "context", "semanticRequest", "entities", "relations"],
@@ -1616,7 +2672,7 @@ FROM "${table}"`);
       text: semanticRecord.text,
       ...(semanticRecord.sourceId === undefined ? {} : { sourceId: semanticRecord.sourceId }),
       ...(semanticRecord.context === undefined ? {} : { context: semanticRecord.context }),
-    }) as PostgresExtractGraphEffectRequest["semanticRequest"];
+    }) as PostgresLegacyExtractGraphEffectRequest["semanticRequest"];
     const graphRepository = new PostgresGraphRepository({
       assertReady: () => this.assertSchemaVersion(9, "durable graph effect"),
     });
@@ -1629,8 +2685,8 @@ FROM "${table}"`);
     try {
       graph = graphRepository.snapshotGraph(
         fullScope,
-        requestRecord.entities as PostgresExtractGraphEffectRequest["entities"],
-        requestRecord.relations as PostgresExtractGraphEffectRequest["relations"],
+        requestRecord.entities as PostgresLegacyExtractGraphEffectRequest["entities"],
+        requestRecord.relations as PostgresLegacyExtractGraphEffectRequest["relations"],
       );
     } catch {
       throw new PostgresDurableJobV2EffectError(
@@ -1644,7 +2700,7 @@ FROM "${table}"`);
       semanticRequest,
       entities: graph.entities,
       relations: graph.relations,
-    }) satisfies PostgresExtractGraphEffectRequest;
+    }) satisfies PostgresLegacyExtractGraphEffectRequest;
     const runner = this.#createProviderOwnedDomainEffectRunner([
       "mengshu_graph_entities",
       "mengshu_graph_relations",
@@ -1657,8 +2713,8 @@ FROM "${table}"`);
       }, (client) => graphRepository.upsertGraphWithClient(
         client,
         fullScope,
-        graph.entities as PostgresExtractGraphEffectRequest["entities"],
-        graph.relations as PostgresExtractGraphEffectRequest["relations"],
+        graph.entities as PostgresLegacyExtractGraphEffectRequest["entities"],
+        graph.relations as PostgresLegacyExtractGraphEffectRequest["relations"],
       ));
     } catch (error) {
       if (error instanceof PostgresDurableJobV2EffectError) throw error;
@@ -1672,6 +2728,184 @@ FROM "${table}"`);
     }
   }
 
+  async #executeAuthoritativeGraphEffect(
+    requestRecord: Readonly<Record<string, unknown>>,
+    semanticRecord: Readonly<Record<string, unknown>>,
+    executionDependencies: { readonly clock?: () => number },
+  ): Promise<PostgresDurableJobV2EffectResult<PostgresExtractGraphEffectSummary>> {
+    exactDataRecord(
+      requestRecord,
+      ["effectInput", "context", "semanticRequest", "graph", "entityEmbeddings"],
+      [],
+      "Postgres authoritative graph effect input is invalid",
+    );
+    exactDataRecord(
+      semanticRecord,
+      ["graphKind", "activeMemoryId", "evidenceId"],
+      [],
+      "Postgres authoritative graph effect input is invalid",
+    );
+    const effectRecord = exactDataRecord(
+      requestRecord.effectInput,
+      ["id", "scope", "owner", "leaseToken", "leaseGeneration"],
+      [],
+      "Postgres authoritative graph effect input is invalid",
+    );
+    const contextRecord = exactDataRecord(
+      requestRecord.context,
+      [],
+      ["workspaceId", "sessionId"],
+      "Postgres authoritative graph effect input is invalid",
+    );
+    const effectInput = Object.freeze({
+      id: effectRecord.id,
+      scope: effectRecord.scope,
+      owner: effectRecord.owner,
+      leaseToken: effectRecord.leaseToken,
+      leaseGeneration: effectRecord.leaseGeneration,
+    }) as unknown as PostgresExtractGraphEffectRequest["effectInput"];
+    const context = Object.freeze({
+      ...(contextRecord.workspaceId === undefined ? {} : { workspaceId: contextRecord.workspaceId }),
+      ...(contextRecord.sessionId === undefined ? {} : { sessionId: contextRecord.sessionId }),
+    }) as PostgresExtractGraphEffectRequest["context"];
+    if (semanticRecord.graphKind !== "entity" ||
+        typeof semanticRecord.activeMemoryId !== "string" ||
+        semanticRecord.activeMemoryId.length === 0 ||
+        typeof semanticRecord.evidenceId !== "string" ||
+        semanticRecord.evidenceId.length === 0) {
+      throw new PostgresDurableJobV2EffectError(
+        "DURABLE_JOB_EFFECT_INVALID_INPUT",
+        "Postgres authoritative graph domain input is invalid",
+      );
+    }
+    const request = Object.freeze({
+      effectInput,
+      context,
+      semanticRequest: Object.freeze({
+        graphKind: "entity" as const,
+        activeMemoryId: semanticRecord.activeMemoryId,
+        evidenceId: semanticRecord.evidenceId,
+      }),
+      graph: requestRecord.graph as AuthoritativeEntityGraphDerivation,
+      entityEmbeddings: requestRecord.entityEmbeddings as never,
+    }) satisfies PostgresAuthoritativeExtractGraphEffectRequest;
+    const runner = this.#createProviderOwnedDomainEffectRunner([
+      "mengshu_graph_entities",
+      "mengshu_graph_relations",
+      "mengshu_memory_evidence_links",
+      "mengshu_graph_entity_evidence",
+      "mengshu_graph_relation_evidence",
+      "mengshu_graph_entity_aliases",
+      "mengshu_graph_entity_alias_bindings",
+      "mengshu_graph_entity_resolution_ledger",
+      "mengshu_graph_relation_resolution_ledger",
+      "mengshu_graph_entity_embeddings",
+    ], executionDependencies, 17);
+    try {
+      return await runner.execute({
+        ...effectInput,
+        effectKey: POSTGRES_EXTRACT_GRAPH_EFFECT_KEY,
+        requestFingerprint: extractGraphSemanticFingerprint(request),
+      }, async (client) => {
+        let canonicalGraph: AuthoritativeEntityGraphDerivation;
+        let entityEmbeddings: ReturnType<typeof snapshotEntityGraphEmbeddingBatch>;
+        try {
+          const graph = request.graph;
+          const repository = new PostgresGraphRepository();
+          const snapshot = repository.snapshotGraph(
+            { ...effectInput.scope, ...context },
+            graph.entities,
+            graph.relations,
+          );
+          if (request.semanticRequest.activeMemoryId !== graph.memoryId ||
+              request.semanticRequest.evidenceId !== graph.evidenceId ||
+              snapshot.scopeFingerprint !== graph.scopeFingerprint ||
+              graph.entityEvidenceLinks.length !== graph.entities.length ||
+              graph.relationEvidenceLinks.length !== graph.relations.length ||
+              graph.entityEvidenceLinks.some((link) => link.memoryId !== graph.memoryId ||
+                link.evidenceId !== graph.evidenceId || link.targetKind !== "entity") ||
+              graph.relationEvidenceLinks.some((link) => link.memoryId !== graph.memoryId ||
+                link.evidenceId !== graph.evidenceId || link.targetKind !== "relation") ||
+              graph.aliasProjections.some((alias) => alias.evidenceId !== graph.evidenceId)) {
+            throw new Error("identity mismatch");
+          }
+          canonicalGraph = snapshotAuthoritativeEntityGraphDerivation(graph);
+          entityEmbeddings = snapshotEntityGraphEmbeddingBatch(
+            canonicalGraph,
+            request.entityEmbeddings,
+          );
+        } catch {
+          throw new PostgresDurableJobV2EffectError(
+            "DURABLE_JOB_EFFECT_INVALID_INPUT",
+            "Postgres authoritative graph domain input is invalid",
+          );
+        }
+        try {
+          await assertActiveEntityGraphEmbeddingSpaceWithClient(client, entityEmbeddings);
+        } catch (error) {
+          if (error instanceof Error &&
+              error.message === "Postgres entity canonicalization active embedding space is invalid") {
+            throw new PostgresDurableJobV2EffectError(
+              "DURABLE_JOB_EFFECT_INVALID_INPUT",
+              "Postgres authoritative graph embedding space is invalid",
+            );
+          }
+          throw error;
+        }
+        const canonicalization = await canonicalizeAuthoritativeEntityGraphWithClient(client, {
+          jobId: effectInput.id,
+          graph: canonicalGraph,
+          embeddings: entityEmbeddings,
+        });
+        const persisted = await persistAuthoritativeEntityGraphWithClient(
+          client,
+          canonicalization.graph,
+        );
+        const canonicalizationPersisted = await persistEntityCanonicalizationPlanWithClient(
+          client,
+          canonicalization,
+        );
+        return Object.freeze({
+          ...persisted,
+          createdRelations: persisted.createdRelations +
+            canonicalizationPersisted.createdRelations,
+          relationIds: Object.freeze([
+            ...persisted.relationIds,
+            ...canonicalizationPersisted.relationIds,
+          ]),
+          relationEvidenceLinks: persisted.relationEvidenceLinks +
+            canonicalizationPersisted.relationEvidenceLinks,
+          evidenceId: canonicalization.graph.evidenceId,
+        });
+      }) as PostgresDurableJobV2EffectResult<PostgresExtractGraphEffectSummary>;
+    } catch (error) {
+      if (error instanceof PostgresDurableJobV2EffectError) throw error;
+      if (error instanceof Error && /^Postgres (?:authoritative Entity Graph|graph)/.test(error.message)) {
+        throw new PostgresDurableJobV2EffectError(
+          "DURABLE_JOB_EFFECT_INVALID_RESULT",
+          "Postgres authoritative graph domain effect is invalid",
+        );
+      }
+      throw error;
+    }
+  }
+
+  async #inspectAuthoritativeGraphReplay(
+    request: PostgresAuthoritativeExtractGraphReplayRequest,
+    executionDependencies: { readonly clock?: () => number },
+  ) {
+    const runner = this.#createProviderOwnedDomainEffectRunner(
+      ["mengshu_graph_entities"],
+      executionDependencies,
+      17,
+    );
+    return runner.inspectReplay<PostgresExtractGraphEffectSummary>({
+      ...request.effectInput,
+      effectKey: POSTGRES_EXTRACT_GRAPH_EFFECT_KEY,
+      requestFingerprint: authoritativeExtractGraphReplayFingerprint(request),
+    });
+  }
+
   /** Provider-owned atomic batch, reachable only through a minted runtime bundle. */
   async #executeCandidateEffect(
     rawRequest: PostgresCandidateEffectRequest,
@@ -1679,24 +2913,128 @@ FROM "${table}"`);
   ): Promise<PostgresDurableJobV2EffectResult<PostgresCandidateEffectSummary>> {
     const request = snapshotCandidateEffectRequest(rawRequest);
     const repository = new PostgresCandidateRepository({
-      assertReady: () => this.assertSchemaVersion(8, "durable candidate"),
+      assertReady: () => this.assertSchemaVersion(request.records ? 14 : 8, "durable candidate"),
     });
     // Snapshot the entire batch before initialize/connect. A malformed later
     // item therefore cannot cause an earlier item to reach PostgreSQL.
-    const candidates = repository.snapshotPendingCandidates(request.candidates);
+    const candidates = request.candidates === undefined
+      ? undefined
+      : repository.snapshotPendingCandidates(request.candidates);
+    const records = request.records as readonly Extract<
+      WriteMemoryRecord,
+      { mutation: "content" }
+    >[] | undefined;
     const effectInput = candidateEffectInput(request);
+    if (records) {
+      const prepared = Object.freeze(records.map((record) => {
+        if (record.route === "drop") return Object.freeze({ route: "drop" as const });
+        if (record.route === "candidate" || record.route === "candidate_low_priority") {
+          return Object.freeze({
+            route: record.route,
+            scope: Object.freeze({ ...record.scope }),
+            candidate: writeRecordToPostgresPendingCandidate(record),
+          });
+        }
+        return Object.freeze({
+          route: record.route,
+          memory: writeRecordToMemoryRecord(record),
+        });
+      }));
+      const candidateRecords = prepared.filter((record) =>
+        record.route === "candidate" || record.route === "candidate_low_priority");
+      const runner = this.#createProviderOwnedDomainEffectRunner([
+        MENGSHU_CANDIDATE_RELATION,
+        "memories",
+        "knowledge",
+      ], executionDependencies, 14);
+      const effectResult = await runner.executeWithPendingCandidateCapacity(
+        effectInput,
+        { context: request.context, requestedCount: candidateRecords.length },
+        async (client, capacity) => {
+          const candidateIds: string[] = [];
+          const memoryIds: string[] = [];
+          const activeMemoryIds: string[] = [];
+          let duplicateCount = 0;
+          let candidateCursor = 0;
+          let capacityRejectedCount = 0;
+          let droppedCount = 0;
+          for (const record of prepared) {
+            if (record.route === "drop") {
+              droppedCount += 1;
+              continue;
+            }
+            if (record.route === "candidate" || record.route === "candidate_low_priority") {
+              if (candidateCursor >= capacity.remaining) {
+                capacityRejectedCount += 1;
+                candidateCursor += 1;
+                continue;
+              }
+              candidateCursor += 1;
+              const result = await repository.insertPendingWithClient(client, {
+                sourceJobId: effectInput.id,
+                scope: { ...record.scope, visibility: record.scope.visibility ?? "private" },
+              }, record.candidate);
+              if (result.inserted) candidateIds.push(result.candidateId!);
+              else duplicateCount += 1;
+              continue;
+            }
+            if (!("memory" in record)) {
+              throw new Error("Postgres candidate effect prepared record is invalid");
+            }
+            const entry = recordToMemoryEntry(record.memory);
+            const tableName = entry.tableName ?? this.getDefaultTableName(entry.dataType);
+            if (!DEFAULT_TABLES.includes(tableName)) {
+              throw new Error("Postgres candidate effect only supports canonical memories/knowledge tables");
+            }
+            this.validateStoreEntry(entry);
+            const persisted = await this.insertEntries(tableName, [entry], async (sql, params = []) => {
+              const result = await client.query(sql, params);
+              return { rows: [...result.rows], rowCount: result.rowCount };
+            });
+            const [result] = persisted;
+            if (!result || persisted.length !== 1) {
+              throw new Error("Postgres candidate effect returned an invalid memory result");
+            }
+            if (result.stored) {
+              memoryIds.push(result.persistedId);
+              if (record.route === "active") activeMemoryIds.push(result.persistedId);
+            } else {
+              duplicateCount += 1;
+            }
+          }
+          return Object.freeze({
+            created: candidateIds.length + memoryIds.length,
+            duplicateCount,
+            capacityRejectedCount,
+            candidateIds: Object.freeze(candidateIds),
+            memoryIds: Object.freeze(memoryIds),
+            activeMemoryIds: Object.freeze(activeMemoryIds),
+            droppedCount,
+            proposalReceipts: request.proposalReceipts,
+          });
+        },
+      );
+      if (effectResult.status === "applied") {
+        assertCandidateEffectSummary(effectResult.receipt.result, undefined, records);
+      } else if (effectResult.status === "replayed") {
+        // Recomputed LLM/materialization output is not effect identity. The first
+        // committed receipt remains authoritative for the same semantic request.
+        assertCandidateEffectSummary(effectResult.receipt.result, undefined, undefined, true);
+      }
+      return effectResult;
+    }
     const effects = this.#createDurableJobV2EffectRepositoryInternal({
       ...executionDependencies,
       allowedRelations: [MENGSHU_CANDIDATE_RELATION],
     }, true, 8, CANDIDATE_EFFECT_FACTORY_AUTHORITY);
     const effectResult = await effects.executeWithPendingCandidateCapacity<PostgresCandidateEffectSummary>(
       effectInput,
-      { context: request.context, requestedCount: candidates.length },
+      { context: request.context, requestedCount: candidates!.length },
       async (client, capacity) => {
       const candidateIds: string[] = [];
       let duplicateCount = 0;
-      const boundedCandidates = candidates.slice(0, capacity.remaining);
-      const capacityRejectedCount = candidates.length - boundedCandidates.length;
+      const boundedCandidates = candidates!.slice(0, capacity.remaining);
+      const capacityRejectedCount = candidates!.length - boundedCandidates.length;
       const binding = Object.freeze({
         sourceJobId: effectInput.id,
         scope: Object.freeze({
@@ -1800,6 +3138,7 @@ FROM "${table}"`);
       throw new Error("Postgres recall tenant/user authority must be provided together");
     }
     if (options.vector) {
+      resolveVectorCandidateLimit(options);
       this.assertAnnEmbeddingFilter(options.filter);
     }
     await this.initialize();
@@ -1817,14 +3156,17 @@ FROM "${table}"`);
       }
 
       allResults.sort((a, b) => b.score - a.score);
-      if (options.limit) {
-        return allResults.slice(0, options.limit);
-      }
-      return allResults;
+      const candidates = options.vector
+        ? allResults.slice(0, resolveVectorCandidateLimit(options))
+        : allResults;
+      return options.limit === undefined ? candidates : candidates.slice(0, options.limit);
     }
 
     const tableName = options.tableName ?? this.getDefaultTableName(options.dataTypes?.[0]);
-    return this.queryFromTable(tableName, options);
+    const results = await this.queryFromTable(tableName, options);
+    return options.vector && options.limit !== undefined
+      ? results.slice(0, options.limit)
+      : results;
   }
 
   async delete(ids: string[]): Promise<void> {
@@ -2087,13 +3429,16 @@ FROM "${table}"`);
           `INSERT INTO ${escaped} (
            id, text, content_hash, vector, importance, category, data_type, metadata, created_at,
            project_name, app_name, user_id, agent_id, workspace_id,
-           tenant_id, canonical_project_id, product_id, producer_id, namespace, visibility, lifecycle_status,
+           tenant_id, canonical_project_id, product_id, producer_id, namespace, visibility, scope_key,
+           lifecycle_status,
            embedding_space_id, embedding_space_state
          )
          VALUES ($1, $2, $3, $4::vector, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14,
-                 $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                 $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
          ${this.schemaContractState === "ready"
-    ? `ON CONFLICT (${AUTHORITY_DEDUPE_COLUMNS}) DO NOTHING`
+    ? `ON CONFLICT (${AUTHORITY_DEDUPE_COLUMNS})${tableName === "memories"
+      ? ` WHERE ${ACTIVE_MEMORY_DEDUPE_PREDICATE}`
+      : ""} DO NOTHING`
     : "ON CONFLICT DO NOTHING"}
          RETURNING id`,
           [
@@ -2117,6 +3462,14 @@ FROM "${table}"`);
           entry.producerId,
           entry.namespace,
           entry.visibility,
+          scopeToKey({
+            tenantId: entry.tenantId,
+            appId: entry.productId,
+            userId: entry.userId,
+            projectId: entry.canonicalProjectId,
+            agentId: entry.producerId,
+            namespace: entry.namespace,
+          }),
           entry.lifecycleStatus ?? null,
           embeddingStamp.embeddingSpaceId,
           embeddingStamp.embeddingSpaceState,
@@ -2150,6 +3503,7 @@ FROM "${table}"`);
          WHERE tenant_id = $1 AND user_id = $2 AND canonical_project_id = $3
            AND product_id = $4 AND producer_id = $5 AND namespace = $6
            AND visibility = $7 AND content_hash = $8
+           ${tableName === "memories" ? `AND ${ACTIVE_MEMORY_DEDUPE_PREDICATE}` : ""}
            AND ${NON_QUARANTINED_ROW_SQL}
          LIMIT 1`,
         [
@@ -2250,8 +3604,8 @@ FROM "${table}"`);
     paramIdx = this.appendScopeConditions(conditions, params, options, paramIdx);
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-    const limit = options.limit ?? 5;
-    params.push(limit);
+    const candidateLimit = resolveVectorCandidateLimit(options);
+    params.push(candidateLimit);
 
     const { rows } = await this.pool!.query(
       `SELECT *, 1 - (vector <=> $1::vector) AS similarity
@@ -2262,10 +3616,10 @@ FROM "${table}"`);
       params,
     );
 
-    const minScore = options.minScore ?? 0;
-    return rows
-      .map((row) => this.rowToEntry(row, row.similarity))
-      .filter((entry) => entry.score >= minScore);
+    const mapped = rows.map((row) => this.rowToEntry(row, row.similarity));
+    return options.minScore === undefined
+      ? mapped
+      : mapped.filter((entry) => entry.score >= options.minScore!);
   }
 
   /**

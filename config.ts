@@ -36,6 +36,24 @@ export interface KnowledgeBaseConfig {
   customCategories?: string[];
 }
 
+export interface CostModelPricingConfig {
+  /** 每百万 input token 的主币种价格。 */
+  inputTokenPrice?: number;
+  /** 每百万 output token 的主币种价格。 */
+  outputTokenPrice?: number;
+  /** 每百万 embedding token 的主币种价格。 */
+  embeddingPrice?: number;
+}
+
+export interface CostPricingConfig {
+  /** 每次改价必须生成新版本；账本事件固定记录该版本。 */
+  version: string;
+  provider: "openai";
+  currency: string;
+  minorUnitsPerMajor?: number;
+  models: Record<string, CostModelPricingConfig>;
+}
+
 export type MemoryConfig = {
   embedding: {
     provider: "openai";
@@ -49,6 +67,11 @@ export type MemoryConfig = {
    */
   authority?: AuthorityScope;
   /**
+   * 无可信 host context 的 CLI/工具所使用的默认 Agent。
+   * authority 允许多个 agentId 时必须显式配置，且必须属于 allow.agentIds。
+   */
+  defaultAgentId?: string;
+  /**
    * LLM chat completion 配置（可选）。
    * 提供后即可启用摘要 / 抽取等生成式能力；未提供时上层降级到 NullLlmClient。
    *
@@ -57,7 +80,7 @@ export type MemoryConfig = {
    * - summarizationModel: 摘要生成（Memory Tree sealing）
    * - reasoningModel: 推理判断（faithfulness 校验、晋升决策）
    *
-   * temperature 可选配置（0~2），缺省由调用方决定（结构化任务通常用 0.0）。
+   * 所有 LLM 请求均由运行时强制使用 temperature=0.0，不提供可调配置。
    */
   llm?: {
     provider: "openai";
@@ -66,14 +89,14 @@ export type MemoryConfig = {
     baseURL?: string;
     apiKey: string;
     maxTokens?: number;
-    /** 采样温度（0~2），可选 */
-    temperature?: number;
     /** 结构化抽取模型（候选记忆提取） */
     extractionModel?: string;
     /** 摘要生成模型（Memory Tree sealing） */
     summarizationModel?: string;
     /** 推理判断模型（faithfulness 校验、晋升决策） */
     reasoningModel?: string;
+    /** D-22 本地估算价格快照；不配置时事件明确标为 unpriced。 */
+    pricing?: CostPricingConfig;
   };
   mode?: "embedded" | "server" | "remote" | "backend-proxy";
   server?: {
@@ -88,6 +111,8 @@ export type MemoryConfig = {
     graph?: boolean;
     summaryTree?: boolean;
     webConsole?: boolean;
+    /** 显式启用 private Asset/Loadout 对原生 5 槽位的增强注入。 */
+    assetInjection?: boolean;
   };
   dbType?: "lancedb" | "supabase" | "postgres";
   dbPath?: string;
@@ -313,6 +338,9 @@ function parseHostAuthority(value: unknown): AuthorityScope | undefined {
       throw new Error(`authority allowlist ${field} is required`);
     }
   }
+  if ((allow.agentIds as unknown[]).length > 64) {
+    throw new Error("authority.allow.agentIds must contain at most 64 entries");
+  }
 
   const candidate: AuthorityScope = {
     tenantId: authority.tenantId as string,
@@ -418,6 +446,77 @@ function resolveEmbeddingModel(embedding: Record<string, unknown>): string {
   return model;
 }
 
+function parseCostPricing(value: unknown): CostPricingConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("llm.pricing must be an object");
+  }
+  const pricing = value as Record<string, unknown>;
+  assertAllowedKeys(
+    pricing,
+    ["version", "provider", "currency", "minorUnitsPerMajor", "models"],
+    "llm.pricing",
+  );
+  if (typeof pricing.version !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(pricing.version)) {
+    throw new Error("llm.pricing.version is required and must be a safe version label");
+  }
+  if (pricing.provider !== "openai") {
+    throw new Error("llm.pricing.provider must be openai");
+  }
+  if (typeof pricing.currency !== "string" || !/^[A-Z]{3}$/.test(pricing.currency)) {
+    throw new Error("llm.pricing.currency must be an ISO 4217 code");
+  }
+  if (pricing.minorUnitsPerMajor !== undefined &&
+      (typeof pricing.minorUnitsPerMajor !== "number" ||
+       !Number.isInteger(pricing.minorUnitsPerMajor) || pricing.minorUnitsPerMajor < 1)) {
+    throw new Error("llm.pricing.minorUnitsPerMajor must be a positive integer");
+  }
+  if (!pricing.models || typeof pricing.models !== "object" || Array.isArray(pricing.models)) {
+    throw new Error("llm.pricing.models must be a non-empty object");
+  }
+  const rawModels = pricing.models as Record<string, unknown>;
+  if (Object.keys(rawModels).length === 0) {
+    throw new Error("llm.pricing.models must be a non-empty object");
+  }
+  const models: Record<string, CostModelPricingConfig> = {};
+  for (const [model, raw] of Object.entries(rawModels)) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(model) ||
+        !raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`llm.pricing.models.${model} is invalid`);
+    }
+    const row = raw as Record<string, unknown>;
+    assertAllowedKeys(
+      row,
+      ["inputTokenPrice", "outputTokenPrice", "embeddingPrice"],
+      `llm.pricing.models.${model}`,
+    );
+    const result: CostModelPricingConfig = {};
+    for (const key of ["inputTokenPrice", "outputTokenPrice", "embeddingPrice"] as const) {
+      const amount = row[key];
+      if (amount !== undefined) {
+        if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) {
+          throw new Error(`llm.pricing.models.${model}.${key} must be non-negative`);
+        }
+        result[key] = amount;
+      }
+    }
+    if (Object.keys(result).length === 0) {
+      throw new Error(`llm.pricing.models.${model} must define at least one price`);
+    }
+    models[model] = result;
+  }
+  return {
+    version: pricing.version,
+    provider: "openai",
+    currency: pricing.currency,
+    ...(pricing.minorUnitsPerMajor === undefined
+      ? {}
+      : { minorUnitsPerMajor: pricing.minorUnitsPerMajor as number }),
+    models,
+  };
+}
+
 export const memoryConfigSchema = {
   parse(value: unknown): MemoryConfig {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -426,11 +525,32 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "authority", "llm", "mode", "server", "features", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
+      ["embedding", "authority", "defaultAgentId", "llm", "mode", "server", "features", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
       "memory config",
     );
 
     const authority = parseHostAuthority(cfg.authority);
+    if (cfg.defaultAgentId !== undefined &&
+        (typeof cfg.defaultAgentId !== "string" || cfg.defaultAgentId.trim().length === 0)) {
+      throw new Error("defaultAgentId must be a non-empty string");
+    }
+    if (!authority && cfg.defaultAgentId !== undefined) {
+      throw new Error("defaultAgentId requires authority");
+    }
+    let defaultAgentId: string | undefined;
+    if (authority) {
+      if (cfg.defaultAgentId === undefined) {
+        if (authority.allow.agentIds.length !== 1) {
+          throw new Error("defaultAgentId is required when authority allows multiple agentIds");
+        }
+        defaultAgentId = authority.allow.agentIds[0];
+      } else {
+        defaultAgentId = cfg.defaultAgentId as string;
+        if (!authority.allow.agentIds.includes(defaultAgentId)) {
+          throw new Error("defaultAgentId must be an exact member of authority.allow.agentIds allowlist");
+        }
+      }
+    }
     const embedding = cfg.embedding as Record<string, unknown> | undefined;
     if (!embedding || typeof embedding.apiKey !== "string") {
       throw new Error("embedding.apiKey is required");
@@ -447,10 +567,11 @@ export const memoryConfigSchema = {
 
     // Validate llm config if provided
     const llm = cfg.llm as Record<string, unknown> | undefined;
+    let llmPricing: CostPricingConfig | undefined;
     if (llm) {
       assertAllowedKeys(
         llm,
-        ["provider", "model", "baseURL", "apiKey", "maxTokens", "temperature", "extractionModel", "summarizationModel", "reasoningModel"],
+        ["provider", "model", "baseURL", "apiKey", "maxTokens", "extractionModel", "summarizationModel", "reasoningModel", "pricing"],
         "llm config",
       );
       if (typeof llm.apiKey !== "string" || !llm.apiKey) {
@@ -477,12 +598,7 @@ export const memoryConfigSchema = {
       if (llm.reasoningModel !== undefined && typeof llm.reasoningModel !== "string") {
         throw new Error("llm.reasoningModel must be a string");
       }
-      if (
-        llm.temperature !== undefined &&
-        (typeof llm.temperature !== "number" || llm.temperature < 0 || llm.temperature > 2)
-      ) {
-        throw new Error("llm.temperature must be between 0 and 2");
-      }
+      llmPricing = parseCostPricing(llm.pricing);
     }
 
     const mode = typeof cfg.mode === "string" ? cfg.mode : "embedded";
@@ -515,8 +631,12 @@ export const memoryConfigSchema = {
 
     const features = cfg.features as Record<string, unknown> | undefined;
     if (features) {
-      assertAllowedKeys(features, ["bm25", "graph", "summaryTree", "webConsole"], "features config");
-      for (const key of ["bm25", "graph", "summaryTree", "webConsole"]) {
+      assertAllowedKeys(
+        features,
+        ["bm25", "graph", "summaryTree", "webConsole", "assetInjection"],
+        "features config",
+      );
+      for (const key of ["bm25", "graph", "summaryTree", "webConsole", "assetInjection"]) {
         if (features[key] !== undefined && typeof features[key] !== "boolean") {
           throw new Error(`features.${key} must be a boolean`);
         }
@@ -708,6 +828,7 @@ export const memoryConfigSchema = {
 
     return {
       authority,
+      defaultAgentId,
       embedding: {
         provider: "openai",
         model,
@@ -720,10 +841,10 @@ export const memoryConfigSchema = {
         apiKey: resolveEnvVars(String(llm.apiKey), "llm.apiKey"),
         baseURL: typeof llm.baseURL === "string" ? resolveEnvVars(llm.baseURL, "llm.baseURL") : undefined,
         maxTokens: typeof llm.maxTokens === "number" ? llm.maxTokens : undefined,
-        temperature: typeof llm.temperature === "number" ? llm.temperature : undefined,
         extractionModel: typeof llm.extractionModel === "string" ? llm.extractionModel : undefined,
         summarizationModel: typeof llm.summarizationModel === "string" ? llm.summarizationModel : undefined,
         reasoningModel: typeof llm.reasoningModel === "string" ? llm.reasoningModel : undefined,
+        ...(llmPricing ? { pricing: llmPricing } : {}),
       } : undefined,
       mode: mode as MemoryConfig["mode"],
       server: {
@@ -738,6 +859,7 @@ export const memoryConfigSchema = {
         graph: features?.graph === true,
         summaryTree: features?.summaryTree === true,
         webConsole: features?.webConsole === true,
+        assetInjection: features?.assetInjection === true,
       },
       dbType,
       dbPath: dbType === "lancedb"

@@ -57,13 +57,13 @@ afterEach(() => {
 });
 
 describe("eval manifest", () => {
-  test("当前 manifest 明确登记 2 套 baseline 与 6 套 extension", () => {
+  test("当前 manifest 明确登记 2 套 baseline 与 9 套 extension", () => {
     const manifest = loadEvalManifest(manifestPath);
     const suites = Object.values(manifest.suites);
 
-    expect(suites).toHaveLength(8);
+    expect(suites).toHaveLength(11);
     expect(suites.filter((suite) => suite.kind === "baseline")).toHaveLength(2);
-    expect(suites.filter((suite) => suite.kind === "extension")).toHaveLength(6);
+    expect(suites.filter((suite) => suite.kind === "extension")).toHaveLength(9);
   });
 
   test("all 完全由 manifest 展开，不允许硬编码漏跑", () => {
@@ -160,7 +160,7 @@ describe("eval manifest", () => {
 
     expect(plan).toMatchObject({
       manifestSchemaVersion: 1,
-      manifestVersion: "v0.2-P0c",
+      manifestVersion: "v0.3-MG009",
       runner: "slot-context-v1",
       caseCount: 30,
       sha256: "082bd7165c76ab17639cabf00d10ca7280d8bc0696d4717eb03b96e9027278dc",

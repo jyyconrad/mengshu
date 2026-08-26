@@ -11,7 +11,7 @@
 
 import type { MemoryCategory } from "../../../../config.js";
 import type { MemoryEntry, TableName } from "../db/types.js";
-import type { MemoryKind, MemoryRecord, MemoryScopeInput, MemorySemanticType, RecordProvenance } from "../../../../core/types.js";
+import type { MemoryContainer, MemoryKind, MemoryRecord, MemoryScopeInput, MemorySemanticType, RecordProvenance } from "../../../../core/types.js";
 import { normalizeScope } from "../../../../core/scope.js";
 import { kindToSemanticType } from "./semantic-type-mapper.js";
 
@@ -23,8 +23,23 @@ const MEMORY_SEMANTIC_TYPES: readonly MemorySemanticType[] = [
   "resource",
 ];
 
+const MEMORY_CONTAINERS: readonly MemoryContainer[] = [
+  "personal",
+  "project",
+  "session_candidate",
+  "team",
+  "enterprise",
+];
+
 function isMemorySemanticType(value: unknown): value is MemorySemanticType {
   return typeof value === "string" && (MEMORY_SEMANTIC_TYPES as readonly string[]).includes(value);
+}
+
+function resolveMemoryContainer(value: unknown): MemoryContainer | undefined {
+  return typeof value === "string" &&
+    (MEMORY_CONTAINERS as readonly string[]).includes(value)
+    ? value as MemoryContainer
+    : undefined;
 }
 
 /**
@@ -153,6 +168,7 @@ export function memoryEntryToRecord(entry: MemoryEntry, defaults: MemoryScopeInp
     agentId: entry.producerId ?? entry.agentId ?? (typeof metadata.agentName === "string" ? metadata.agentName : defaults.agentId),
     namespace: entry.namespace ?? tableNameToNamespace(entry.tableName),
     workspaceId: entry.workspaceId ?? defaults.workspaceId,
+    sessionId: typeof metadata.sessionId === "string" ? metadata.sessionId : defaults.sessionId,
     visibility: entry.visibility ?? defaults.visibility,
   });
 
@@ -162,6 +178,7 @@ export function memoryEntryToRecord(entry: MemoryEntry, defaults: MemoryScopeInp
     id: entry.id,
     scope,
     kind: recordKind,
+    container: resolveMemoryContainer(metadata.memoryContainer),
     text: entry.text,
     contentHash: entry.contentHash,
     importance: coerceImportance(entry.importance),
@@ -211,6 +228,7 @@ export function recordToMemoryEntry(record: MemoryRecord, vector?: number[]): Me
       ...(record.hotness !== undefined && { hotness: record.hotness }),
       ...(record.sourceNodeIds && { sourceNodeIds: record.sourceNodeIds }),
       ...(record.confidence !== undefined && { confidence: record.confidence }),
+      ...(record.container !== undefined && { memoryContainer: record.container }),
       ...(record.semanticType && { semanticType: record.semanticType }),
       ...(record.updatedAt !== undefined && { updatedAt: record.updatedAt }),
     },

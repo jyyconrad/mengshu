@@ -26,6 +26,15 @@ import OpenAI from "openai";
 import pLimit from "p-limit";
 import retry from "p-retry";
 import type { MemoryConfig } from "../../../../../config.js";
+import {
+  UNSCOPED_RUNTIME_COST_FINGERPRINT,
+  UNPRICED_RUNTIME_PRICING_SNAPSHOT,
+  appendRuntimeCostSafely,
+  createRuntimeCostEvent,
+  type RuntimeCostContext,
+  type RuntimeCostEventSink,
+  type RuntimePricingSnapshot,
+} from "../../cost/runtime-cost.js";
 
 /** 单条 chat 消息。 */
 export interface LlmCompletionMessage {
@@ -71,6 +80,8 @@ export interface LlmCompletionOptions {
    * 未指定时使用默认模型。
    */
   modelType?: "extraction" | "summarization" | "reasoning";
+  /** 可选成本归因；只接受非敏感分类、操作名和不可逆 scope fingerprint。 */
+  costContext?: Partial<RuntimeCostContext>;
 }
 
 /** 统一的 LLM 客户端接口。 */
@@ -113,7 +124,10 @@ export interface ChatCompletionClient {
         temperature?: number;
         response_format?: { type: "json_object" };
         signal?: AbortSignal;
-      }): Promise<{ choices: Array<{ message: { content: string | null } }> }>;
+      }): Promise<{
+        choices: Array<{ message: { content: string | null } }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      }>;
     };
   };
 }
@@ -130,6 +144,14 @@ export interface OpenAiLlmClientOptions {
   minTimeout?: number;
   /** 重试最大退避（毫秒），默认 5000。 */
   maxTimeout?: number;
+  /** append-only 成本账本；不传时不记录。production runtime 会显式注入。 */
+  costLedger?: RuntimeCostEventSink;
+  /** 调用时固定的版本化价格快照；未知模型保持 unpriced。 */
+  pricingSnapshot?: RuntimePricingSnapshot;
+  /** 客户端级默认归因；调用级 costContext 可覆盖 operation/category/fingerprint。 */
+  costContext?: RuntimeCostContext;
+  /** 账本失败的可观测回调；异常会被隔离，绝不触发 provider 重试。 */
+  onCostLedgerError?: (error: unknown) => void;
 }
 
 const DEFAULT_CONCURRENCY = 3;
@@ -162,6 +184,10 @@ export class OpenAiLlmClient implements LlmClient {
   private readonly maxRetries: number;
   private readonly minTimeout: number;
   private readonly maxTimeout: number;
+  private readonly costLedger?: RuntimeCostEventSink;
+  private readonly pricingSnapshot: RuntimePricingSnapshot;
+  private readonly costContext: RuntimeCostContext;
+  private readonly onCostLedgerError?: (error: unknown) => void;
 
   constructor(
     private readonly llmConfig: NonNullable<MemoryConfig["llm"]>,
@@ -183,6 +209,13 @@ export class OpenAiLlmClient implements LlmClient {
     this.minTimeout = options.minTimeout ?? DEFAULT_MIN_TIMEOUT;
     this.maxTimeout = options.maxTimeout ?? DEFAULT_MAX_TIMEOUT;
     this.limit = pLimit(options.concurrency ?? DEFAULT_CONCURRENCY);
+    this.costLedger = options.costLedger;
+    this.pricingSnapshot = options.pricingSnapshot ?? UNPRICED_RUNTIME_PRICING_SNAPSHOT;
+    this.costContext = options.costContext ?? {
+      category: "unknown",
+      scopeFingerprint: UNSCOPED_RUNTIME_COST_FINGERPRINT,
+    };
+    this.onCostLedgerError = options.onCostLedgerError;
   }
 
   /** 默认模型名（用于 eval trace manifest 记录）。 */
@@ -215,6 +248,7 @@ export class OpenAiLlmClient implements LlmClient {
     // temperature 固定为 0.0，不可配置
     const temperature = 0.0;
     const model = this.selectModel(options.modelType);
+    const costContext = this.resolveCostContext(options.costContext, "llm.complete");
 
     // 合并 abort signal：优先使用调用方的 signal，若未显式给出 timeout 则套用默认上限，
     // 防止 fetch 永久挂起导致资源耗尽（安全约束）。
@@ -226,19 +260,27 @@ export class OpenAiLlmClient implements LlmClient {
 
     return this.limit(() =>
       retry(
-        async () => {
-          const response = await this.client.chat.completions.create({
-            model,
-            messages,
-            ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
-            temperature,
-            ...(signal ? { signal } : {}),
-          });
-          const content = response.choices?.[0]?.message?.content;
-          if (typeof content !== "string" || content.length === 0) {
-            throw new Error("LLM completion returned empty content");
+        async (attemptNumber) => {
+          let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+          try {
+            const response = await this.client.chat.completions.create({
+              model,
+              messages,
+              ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+              temperature,
+              ...(signal ? { signal } : {}),
+            });
+            usage = response.usage;
+            const content = response.choices?.[0]?.message?.content;
+            if (typeof content !== "string" || content.length === 0) {
+              throw new Error("LLM completion returned empty content");
+            }
+            await this.recordCostAttempt(model, costContext, "succeeded", attemptNumber, usage);
+            return content;
+          } catch (error) {
+            await this.recordCostAttempt(model, costContext, "failed", attemptNumber, usage);
+            throw error;
           }
-          return content;
         },
         {
           retries: this.maxRetries,
@@ -260,7 +302,50 @@ export class OpenAiLlmClient implements LlmClient {
     return this.complete([
       { role: "system", content: instruction },
       { role: "user", content: text },
-    ], options);
+    ], {
+      ...options,
+      costContext: { ...options?.costContext, operation: options?.costContext?.operation ?? "llm.summarize" },
+    });
+  }
+
+  private resolveCostContext(
+    override: Partial<RuntimeCostContext> | undefined,
+    operation: string,
+  ): RuntimeCostContext {
+    return {
+      category: override?.category ?? this.costContext.category,
+      scopeFingerprint: override?.scopeFingerprint ?? this.costContext.scopeFingerprint,
+      operation: override?.operation ?? this.costContext.operation ?? operation,
+    };
+  }
+
+  private async recordCostAttempt(
+    model: string,
+    context: RuntimeCostContext,
+    status: "succeeded" | "failed",
+    attempt: number,
+    usage?: { prompt_tokens?: number; completion_tokens?: number },
+  ): Promise<void> {
+    const inputTokens = typeof usage?.prompt_tokens === "number" ? usage.prompt_tokens : null;
+    const outputTokens = typeof usage?.completion_tokens === "number" ? usage.completion_tokens : null;
+    await appendRuntimeCostSafely(
+      this.costLedger,
+      createRuntimeCostEvent({
+        operation: context.operation ?? "llm.complete",
+        category: context.category,
+        provider: this.llmConfig.provider,
+        model,
+        inputTokens,
+        outputTokens,
+        embeddingUnits: null,
+        embeddingUnitKind: null,
+        pricingSnapshot: this.pricingSnapshot,
+        status,
+        attempt,
+        scopeFingerprint: context.scopeFingerprint,
+      }),
+      this.onCostLedgerError,
+    );
   }
 
   /**
@@ -511,6 +596,7 @@ export class OpenAiLlmClient implements LlmClient {
     // D-18: temperature 一律 0.0，不受 options/config 覆盖
     const temperature = 0.0;
     const model = this.selectModel(options.modelType);
+    const costContext = this.resolveCostContext(options.costContext, "llm.extract_structured");
 
     // 合并 abort signal：未显式给出 timeout 时套用默认上限（安全约束）。
     const effectiveTimeout =
@@ -520,29 +606,36 @@ export class OpenAiLlmClient implements LlmClient {
     const signal = this.mergeAbortSignals(options.signal, effectiveTimeout);
 
     return retry(
-      async () => {
-        const response = await this.limit(() =>
-          this.client.chat.completions.create({
-            model,
-            messages: augmented,
-            ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
-            temperature, // 显式传递 0.0
-            response_format: { type: "json_object" },
-            ...(signal ? { signal } : {}),
-          }),
-        );
+      async (attemptNumber) => {
+        let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+        try {
+          const response = await this.limit(() =>
+            this.client.chat.completions.create({
+              model,
+              messages: augmented,
+              ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+              temperature, // 显式传递 0.0
+              response_format: { type: "json_object" },
+              ...(signal ? { signal } : {}),
+            }),
+          );
+          usage = response.usage;
 
-        const content = response.choices?.[0]?.message?.content;
-        if (typeof content !== "string" || content.length === 0) {
-          throw new Error("LLM returned empty content");
+          const content = response.choices?.[0]?.message?.content;
+          if (typeof content !== "string" || content.length === 0) {
+            throw new Error("LLM returned empty content");
+          }
+
+          const parsed = JSON.parse(content) as T;
+
+          // D-08 (§2.2): schema 运行时校验 - 递归检查 required 字段
+          this.validateSchema(parsed, schema, "root");
+          await this.recordCostAttempt(model, costContext, "succeeded", attemptNumber, usage);
+          return parsed;
+        } catch (error) {
+          await this.recordCostAttempt(model, costContext, "failed", attemptNumber, usage);
+          throw error;
         }
-
-        const parsed = JSON.parse(content) as T;
-
-        // D-08 (§2.2): schema 运行时校验 - 递归检查 required 字段
-        this.validateSchema(parsed, schema, "root");
-
-        return parsed;
       },
       {
         // §10.4: 最多 3 次重试，指数退避
@@ -589,9 +682,12 @@ export class NullLlmClient implements LlmClient {
  * 根据配置创建 LLM 客户端。
  * 有 llm 配置返回 OpenAiLlmClient，否则返回 NullLlmClient。
  */
-export function createLlmClient(config: MemoryConfig["llm"] | undefined): LlmClient {
+export function createLlmClient(
+  config: MemoryConfig["llm"] | undefined,
+  options: OpenAiLlmClientOptions = {},
+): LlmClient {
   if (!config) {
     return new NullLlmClient();
   }
-  return new OpenAiLlmClient(config);
+  return new OpenAiLlmClient(config, options);
 }

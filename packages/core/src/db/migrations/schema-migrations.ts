@@ -40,6 +40,13 @@ const AUTHORITY_DEDUPE_CONTRACT_STATEMENTS = AUTHORITY_DEDUPE_TABLES.flatMap((ta
     `DROP INDEX IF EXISTS ${table}_content_hash_idx`,
   ]);
 
+const EVIDENCE_FIRST_ACTIVE_MEMORY_DEDUPE_CONTRACT_STATEMENTS = [
+  `CREATE UNIQUE INDEX memories_active_authority_content_hash_uidx ON memories (${AUTHORITY_DEDUPE_COLUMNS})
+WHERE lifecycle_status = 'active'`,
+  "DROP INDEX memories_authority_content_hash_uidx",
+  "ALTER INDEX memories_active_authority_content_hash_uidx RENAME TO memories_authority_content_hash_uidx",
+] as const;
+
 export const DURABLE_JOB_STATE_CONSTRAINT_NAME = "mengshu_jobs_v2_state_check";
 
 /**
@@ -96,6 +103,7 @@ const DURABLE_JOB_STATE_CONTRACT_STATEMENTS = [
 const CONTRACT_STATEMENTS_BY_VERSION = new Map<number, readonly string[]>([
   [6, AUTHORITY_DEDUPE_CONTRACT_STATEMENTS],
   [10, DURABLE_JOB_STATE_CONTRACT_STATEMENTS],
+  [18, EVIDENCE_FIRST_ACTIVE_MEMORY_DEDUPE_CONTRACT_STATEMENTS],
 ]);
 
 export function schemaMigrationChecksum(migration: SchemaMigration): string {
@@ -718,6 +726,911 @@ ON mengshu_embedding_spaces (queryability_state, embedding_space_id)`,
 ON mengshu_embedding_reembed_shadow (table_name, record_id, captured_at DESC)`,
       `CREATE INDEX IF NOT EXISTS mengshu_embedding_reembed_receipts_migration_idx
 ON mengshu_embedding_reembed_receipts (migration_id, operation, table_name, record_id)`,
+    ],
+  },
+  {
+    version: 13,
+    name: "add-durable-work-memory-graph",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_work_memory_nodes (
+  id TEXT NOT NULL,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  node_type TEXT NOT NULL CHECK (node_type IN ('evidence', 'memory', 'summary', 'skill_candidate')),
+  record_id TEXT NOT NULL,
+  label TEXT NOT NULL CHECK (char_length(label) BETWEEN 1 AND 1000 AND btrim(label) <> ''),
+  evidence_kind TEXT CHECK (evidence_kind IN ('chunk', 'observation', 'document', 'message', 'resource')),
+  semantic_type TEXT CHECK (semantic_type IN ('profile', 'task_context', 'rules', 'experience', 'resource')),
+  lifecycle_status TEXT CHECK (lifecycle_status IN ('active', 'archived', 'revoked', 'superseded', 'promoted')),
+  tree_type TEXT CHECK (tree_type IN ('source', 'topic', 'global')),
+  level INTEGER CHECK (level BETWEEN 0 AND 3),
+  skill_candidate_status TEXT CHECK (skill_candidate_status IN ('pending', 'active', 'archived', 'rejected')),
+  evidence_memory_ids JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(evidence_memory_ids) = 'array'),
+  evidence_chunk_ids JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(evidence_chunk_ids) = 'array'),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT CHECK (updated_at IS NULL OR updated_at >= created_at),
+  PRIMARY KEY (scope_fingerprint, id),
+  UNIQUE (scope_fingerprint, node_type, record_id),
+  CHECK (char_length(id) BETWEEN 1 AND 256 AND id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(record_id) BETWEEN 1 AND 256 AND record_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (
+    (node_type = 'evidence' AND evidence_kind IS NOT NULL AND semantic_type IS NULL
+      AND lifecycle_status IS NULL AND tree_type IS NULL AND level IS NULL
+      AND skill_candidate_status IS NULL AND jsonb_array_length(evidence_memory_ids) = 0
+      AND jsonb_array_length(evidence_chunk_ids) = 0)
+    OR
+    (node_type = 'memory' AND evidence_kind IS NULL AND lifecycle_status IS NOT NULL
+      AND tree_type IS NULL AND level IS NULL AND skill_candidate_status IS NULL
+      AND jsonb_array_length(evidence_memory_ids) = 0
+      AND jsonb_array_length(evidence_chunk_ids) >= 1)
+    OR
+    (node_type = 'summary' AND evidence_kind IS NULL AND semantic_type IS NULL
+      AND lifecycle_status IS NULL AND tree_type IS NOT NULL AND level IS NOT NULL
+      AND skill_candidate_status IS NULL AND jsonb_array_length(evidence_memory_ids) = 0
+      AND jsonb_array_length(evidence_chunk_ids) >= 1)
+    OR
+    (node_type = 'skill_candidate' AND evidence_kind IS NULL AND semantic_type IS NULL
+      AND lifecycle_status IS NULL AND tree_type IS NULL AND level IS NULL
+      AND skill_candidate_status IS NOT NULL AND jsonb_array_length(evidence_memory_ids) >= 1
+      AND jsonb_array_length(evidence_chunk_ids) >= 1)
+  )
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_work_memory_nodes_scope_type_idx ON mengshu_work_memory_nodes (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, node_type, record_id, created_at DESC, id
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_work_memory_edges (
+  id TEXT NOT NULL,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  edge_type TEXT NOT NULL CHECK (edge_type = 'memory_relation'),
+  predicate TEXT NOT NULL CHECK (predicate IN ('grounded_by', 'derives_from', 'contradicts', 'supersedes', 'promoted_to')),
+  source_id TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  confidence DOUBLE PRECISION NOT NULL CHECK (confidence > 0 AND confidence <= 1),
+  evidence_chunk_ids JSONB NOT NULL CHECK (
+    jsonb_typeof(evidence_chunk_ids) = 'array' AND jsonb_array_length(evidence_chunk_ids) >= 1
+  ),
+  reason TEXT CHECK (reason IS NULL OR char_length(reason) <= 2000),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT CHECK (updated_at IS NULL OR updated_at >= created_at),
+  PRIMARY KEY (scope_fingerprint, id),
+  FOREIGN KEY (scope_fingerprint, source_id)
+    REFERENCES mengshu_work_memory_nodes (scope_fingerprint, id),
+  FOREIGN KEY (scope_fingerprint, target_id)
+    REFERENCES mengshu_work_memory_nodes (scope_fingerprint, id),
+  CHECK (char_length(id) BETWEEN 1 AND 256 AND id !~ '[[:space:][:cntrl:]]'),
+  CHECK (source_id <> target_id)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_work_memory_edges_scope_source_idx ON mengshu_work_memory_edges (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, source_id, predicate, id
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_work_memory_edges_scope_target_idx ON mengshu_work_memory_edges (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, target_id, predicate, id
+      )`,
+    ],
+  },
+  {
+    version: 14,
+    name: "add-atomic-candidate-write-journal",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_candidate_write_receipts (
+  storage_key TEXT PRIMARY KEY CHECK (storage_key ~ '^[0-9a-f]{64}$'),
+  request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+  candidate_id TEXT NOT NULL REFERENCES mengshu_candidates (id),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  route TEXT NOT NULL CHECK (route IN ('candidate_low_priority', 'candidate')),
+  result JSONB NOT NULL CHECK (jsonb_typeof(result) = 'object'),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_candidate_write_audit (
+  audit_id BIGSERIAL PRIMARY KEY,
+  storage_key TEXT NOT NULL CHECK (storage_key ~ '^[0-9a-f]{64}$'),
+  request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+  candidate_id TEXT NOT NULL REFERENCES mengshu_candidates (id),
+  action TEXT NOT NULL CHECK (action = 'candidate.store'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  route TEXT NOT NULL CHECK (route IN ('candidate_low_priority', 'candidate')),
+  occurred_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (storage_key, candidate_id, action)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_candidate_write_outbox (
+  event_id TEXT PRIMARY KEY CHECK (event_id ~ '^[0-9a-f]{64}$'),
+  storage_key TEXT NOT NULL CHECK (storage_key ~ '^[0-9a-f]{64}$'),
+  request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+  candidate_id TEXT NOT NULL REFERENCES mengshu_candidates (id),
+  topic TEXT NOT NULL CHECK (topic = 'candidate.written'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  route TEXT NOT NULL CHECK (route IN ('candidate_low_priority', 'candidate')),
+  occurred_at TIMESTAMPTZ NOT NULL,
+  published_at TIMESTAMPTZ,
+  UNIQUE (storage_key, topic, candidate_id)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_candidate_write_audit_scope_candidate_idx
+ON mengshu_candidate_write_audit (
+  tenant_id, user_id, app_id, project_id, agent_id, namespace, visibility,
+  workspace_id, session_id, candidate_id, occurred_at DESC
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_candidate_write_outbox_pending_idx
+ON mengshu_candidate_write_outbox (occurred_at, event_id)
+WHERE published_at IS NULL`,
+      `CREATE INDEX IF NOT EXISTS mengshu_candidate_write_receipts_created_idx
+ON mengshu_candidate_write_receipts (created_at DESC, storage_key)`,
+    ],
+  },
+  {
+    version: 15,
+    name: "add-authoritative-evidence-link-ledgers",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_evidence_links (
+  link_id TEXT PRIMARY KEY CHECK (link_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  target_memory_id TEXT NOT NULL,
+  evidence_memory_id TEXT NOT NULL,
+  link_kind TEXT NOT NULL CHECK (link_kind IN (
+    'grounded_by', 'duplicate_evidence', 'supersession_evidence', 'conflict_evidence'
+  )),
+  source TEXT NOT NULL CHECK (char_length(source) BETWEEN 1 AND 256 AND btrim(source) <> ''),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  UNIQUE (
+    scope_fingerprint, target_memory_id, evidence_memory_id, link_kind, source
+  ),
+  CHECK (char_length(target_memory_id) BETWEEN 1 AND 256 AND target_memory_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(evidence_memory_id) BETWEEN 1 AND 256 AND evidence_memory_id !~ '[[:space:][:cntrl:]]')
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_memory_evidence_links_scope_target_idx
+ON mengshu_memory_evidence_links (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, target_memory_id, link_kind, created_at DESC
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_graph_entity_evidence (
+  link_id TEXT PRIMARY KEY CHECK (link_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  entity_id TEXT NOT NULL,
+  evidence_memory_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (char_length(source_kind) BETWEEN 1 AND 256 AND btrim(source_kind) <> ''),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  FOREIGN KEY (scope_fingerprint, entity_id)
+    REFERENCES mengshu_graph_entities (scope_fingerprint, id),
+  UNIQUE (scope_fingerprint, entity_id, evidence_memory_id, source_id, source_kind),
+  CHECK (char_length(evidence_memory_id) BETWEEN 1 AND 256 AND evidence_memory_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(source_id) BETWEEN 1 AND 256 AND source_id !~ '[[:space:][:cntrl:]]')
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_graph_entity_evidence_scope_evidence_idx
+ON mengshu_graph_entity_evidence (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, evidence_memory_id, entity_id, created_at DESC
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_graph_relation_evidence (
+  link_id TEXT PRIMARY KEY CHECK (link_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  relation_id TEXT NOT NULL,
+  evidence_memory_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL CHECK (char_length(source_kind) BETWEEN 1 AND 256 AND btrim(source_kind) <> ''),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  FOREIGN KEY (scope_fingerprint, relation_id)
+    REFERENCES mengshu_graph_relations (scope_fingerprint, id),
+  UNIQUE (scope_fingerprint, relation_id, evidence_memory_id, source_id, source_kind),
+  CHECK (char_length(evidence_memory_id) BETWEEN 1 AND 256 AND evidence_memory_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(source_id) BETWEEN 1 AND 256 AND source_id !~ '[[:space:][:cntrl:]]')
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_graph_relation_evidence_scope_evidence_idx
+ON mengshu_graph_relation_evidence (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, evidence_memory_id, relation_id, created_at DESC
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_graph_entity_aliases (
+  alias_id TEXT PRIMARY KEY CHECK (alias_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  entity_id TEXT NOT NULL,
+  alias TEXT NOT NULL CHECK (char_length(alias) BETWEEN 1 AND 1000 AND btrim(alias) <> ''),
+  normalized_alias TEXT NOT NULL CHECK (char_length(normalized_alias) BETWEEN 1 AND 1000 AND btrim(normalized_alias) <> ''),
+  evidence_memory_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  FOREIGN KEY (scope_fingerprint, entity_id)
+    REFERENCES mengshu_graph_entities (scope_fingerprint, id),
+  UNIQUE (scope_fingerprint, entity_id, normalized_alias),
+  CHECK (char_length(evidence_memory_id) BETWEEN 1 AND 256 AND evidence_memory_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(source_id) BETWEEN 1 AND 256 AND source_id !~ '[[:space:][:cntrl:]]')
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_graph_entity_aliases_scope_alias_idx
+ON mengshu_graph_entity_aliases (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, normalized_alias, entity_id
+)`,
+    ],
+  },
+  {
+    version: 16,
+    name: "add-topic-tree-alias-migration-ledger",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_topic_tree_aliases (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  legacy_tree_key TEXT NOT NULL,
+  canonical_topic_label TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded', 'archived')),
+  merged_from JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(merged_from) = 'array'),
+  sealed_node_id TEXT,
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+  superseded_at BIGINT,
+  archived_at BIGINT,
+  PRIMARY KEY (scope_fingerprint, legacy_tree_key),
+  CHECK (char_length(legacy_tree_key) BETWEEN 1 AND 256 AND legacy_tree_key !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(canonical_topic_label) BETWEEN 1 AND 80 AND canonical_topic_label !~ '[[:space:][:cntrl:]]'),
+  CHECK (merged_from @> jsonb_build_array(legacy_tree_key)),
+  CHECK (sealed_node_id IS NULL OR (char_length(sealed_node_id) BETWEEN 1 AND 256 AND sealed_node_id !~ '[[:space:][:cntrl:]]')),
+  CHECK (superseded_at IS NULL OR superseded_at >= created_at),
+  CHECK (archived_at IS NULL OR (superseded_at IS NOT NULL AND archived_at >= superseded_at)),
+  CHECK (
+    (status = 'active' AND superseded_at IS NULL AND archived_at IS NULL)
+    OR (status = 'superseded' AND superseded_at IS NOT NULL AND archived_at IS NULL)
+    OR (status = 'archived' AND superseded_at IS NOT NULL AND archived_at IS NOT NULL)
+  )
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_topic_tree_aliases_scope_canonical_idx
+ON mengshu_topic_tree_aliases (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, canonical_topic_label, legacy_tree_key
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_topic_tree_aliases_scope_status_idx
+ON mengshu_topic_tree_aliases (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, status, superseded_at, legacy_tree_key
+)`,
+    ],
+  },
+  {
+    version: 17,
+    name: "add-canonical-entity-resolution-journal",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_graph_entity_alias_bindings (
+  alias_binding_id TEXT PRIMARY KEY,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'organization', 'project', 'repo', 'file', 'topic', 'tool', 'task', 'concept', 'user', 'agent', 'chunk', 'document', 'other')),
+  normalized_alias TEXT NOT NULL CHECK (char_length(normalized_alias) BETWEEN 1 AND 1000 AND btrim(normalized_alias) <> ''),
+  canonical_entity_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+  retired_at BIGINT,
+  FOREIGN KEY (scope_fingerprint, canonical_entity_id)
+    REFERENCES mengshu_graph_entities (scope_fingerprint, id),
+  CHECK (char_length(alias_binding_id) BETWEEN 1 AND 256 AND alias_binding_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(canonical_entity_id) BETWEEN 1 AND 256 AND canonical_entity_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (retired_at IS NULL OR retired_at >= created_at),
+  CHECK (
+    (status = 'active' AND retired_at IS NULL)
+    OR (status = 'retired' AND retired_at IS NOT NULL)
+  )
+)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS mengshu_graph_entity_alias_bindings_active_uidx
+ON mengshu_graph_entity_alias_bindings (
+  scope_fingerprint, entity_type, normalized_alias
+)
+WHERE status = 'active'`,
+      `CREATE INDEX IF NOT EXISTS mengshu_graph_entity_alias_bindings_entity_idx
+ON mengshu_graph_entity_alias_bindings (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, canonical_entity_id, status, normalized_alias
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_graph_entity_resolution_ledger (
+  resolution_id TEXT PRIMARY KEY,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  job_id TEXT NOT NULL REFERENCES mengshu_jobs_v2 (id),
+  evidence_memory_id TEXT NOT NULL,
+  raw_entity_id TEXT NOT NULL,
+  canonical_entity_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'organization', 'project', 'repo', 'file', 'topic', 'tool', 'task', 'concept', 'user', 'agent', 'chunk', 'document', 'other')),
+  method TEXT NOT NULL CHECK (method IN ('exact', 'alias', 'semantic', 'create')),
+  similarity DOUBLE PRECISION CHECK (similarity IS NULL OR (similarity >= 0 AND similarity <= 1)),
+  can_rollback BOOLEAN NOT NULL,
+  raw_entity JSONB NOT NULL CHECK (jsonb_typeof(raw_entity) = 'object'),
+  observed_aliases JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(observed_aliases) = 'array'),
+  status TEXT NOT NULL CHECK (status IN ('applied', 'rolled_back')),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  rolled_back_at BIGINT,
+  FOREIGN KEY (scope_fingerprint, canonical_entity_id)
+    REFERENCES mengshu_graph_entities (scope_fingerprint, id),
+  UNIQUE (scope_fingerprint, job_id, evidence_memory_id, raw_entity_id),
+  CHECK (char_length(resolution_id) BETWEEN 1 AND 256 AND resolution_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(evidence_memory_id) BETWEEN 1 AND 256 AND evidence_memory_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(raw_entity_id) BETWEEN 1 AND 256 AND raw_entity_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (
+    (method = 'semantic' AND similarity IS NOT NULL AND can_rollback = TRUE)
+    OR (method <> 'semantic' AND similarity IS NULL AND can_rollback = FALSE)
+  ),
+  CHECK (rolled_back_at IS NULL OR rolled_back_at >= created_at),
+  CHECK (
+    (status = 'applied' AND rolled_back_at IS NULL)
+    OR (status = 'rolled_back' AND can_rollback = TRUE AND rolled_back_at IS NOT NULL)
+  )
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_graph_entity_resolution_scope_evidence_idx
+ON mengshu_graph_entity_resolution_ledger (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, evidence_memory_id, raw_entity_id, created_at
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_graph_entity_resolution_rollback_idx
+ON mengshu_graph_entity_resolution_ledger (
+  scope_fingerprint, canonical_entity_id, created_at, resolution_id
+)
+WHERE status = 'applied' AND can_rollback = TRUE`,
+      `CREATE TABLE IF NOT EXISTS mengshu_graph_relation_resolution_ledger (
+  resolution_id TEXT PRIMARY KEY,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  job_id TEXT NOT NULL REFERENCES mengshu_jobs_v2 (id),
+  evidence_memory_id TEXT NOT NULL,
+  raw_relation_id TEXT NOT NULL,
+  canonical_relation_id TEXT,
+  canonical_subject_id TEXT NOT NULL,
+  canonical_object_id TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('canonicalized', 'dropped_self')),
+  raw_relation JSONB NOT NULL CHECK (jsonb_typeof(raw_relation) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  FOREIGN KEY (scope_fingerprint, canonical_relation_id)
+    REFERENCES mengshu_graph_relations (scope_fingerprint, id),
+  FOREIGN KEY (scope_fingerprint, canonical_subject_id)
+    REFERENCES mengshu_graph_entities (scope_fingerprint, id),
+  FOREIGN KEY (scope_fingerprint, canonical_object_id)
+    REFERENCES mengshu_graph_entities (scope_fingerprint, id),
+  UNIQUE (scope_fingerprint, job_id, evidence_memory_id, raw_relation_id),
+  CHECK (char_length(resolution_id) BETWEEN 1 AND 256 AND resolution_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(evidence_memory_id) BETWEEN 1 AND 256 AND evidence_memory_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(raw_relation_id) BETWEEN 1 AND 256 AND raw_relation_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (
+    (outcome = 'canonicalized' AND canonical_relation_id IS NOT NULL
+      AND canonical_subject_id <> canonical_object_id)
+    OR
+    (outcome = 'dropped_self' AND canonical_relation_id IS NULL
+      AND canonical_subject_id = canonical_object_id)
+  )
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_graph_relation_resolution_scope_evidence_idx
+ON mengshu_graph_relation_resolution_ledger (
+  scope_fingerprint, tenant_id, user_id, app_id, project_id, agent_id, namespace,
+  visibility, workspace_id, session_id, evidence_memory_id, raw_relation_id, created_at
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_graph_entity_embeddings (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  entity_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'organization', 'project', 'repo', 'file', 'topic', 'tool', 'task', 'concept', 'user', 'agent', 'chunk', 'document', 'other')),
+  embedding_space_id TEXT NOT NULL,
+  embedding_space_state TEXT NOT NULL CHECK (embedding_space_state IN ('known-queryable', 'unknown-unqueryable')),
+  vector vector NOT NULL,
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (scope_fingerprint, entity_id, embedding_space_id),
+  FOREIGN KEY (scope_fingerprint, entity_id)
+    REFERENCES mengshu_graph_entities (scope_fingerprint, id),
+  FOREIGN KEY (embedding_space_id)
+    REFERENCES mengshu_embedding_spaces (embedding_space_id)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_graph_entity_embeddings_queryable_idx
+ON mengshu_graph_entity_embeddings (
+  scope_fingerprint, entity_type, embedding_space_id, entity_id
+)
+WHERE embedding_space_state = 'known-queryable'`,
+    ],
+  },
+  {
+    version: 18,
+    name: "evidence-first-active-memory-dedupe",
+    kind: "contract",
+    statements: EVIDENCE_FIRST_ACTIVE_MEMORY_DEDUPE_CONTRACT_STATEMENTS,
+  },
+  {
+    version: 19,
+    name: "add-semantic-type-backfill-ledger",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_semantic_type_backfill_shadow (
+  migration_id TEXT NOT NULL,
+  record_id UUID NOT NULL,
+  original_metadata JSONB NOT NULL CHECK (jsonb_typeof(original_metadata) = 'object'),
+  original_value_hash TEXT NOT NULL CHECK (original_value_hash ~ '^[0-9a-f]{64}$'),
+  captured_at BIGINT NOT NULL CHECK (captured_at >= 0),
+  PRIMARY KEY (migration_id, record_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_semantic_type_backfill_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  migration_id TEXT NOT NULL,
+  record_id UUID NOT NULL,
+  disposition TEXT NOT NULL CHECK (disposition IN ('preserve_explicit', 'backfill', 'lookup_only', 'invalid_explicit')),
+  semantic_type TEXT CHECK (semantic_type IS NULL OR semantic_type IN ('profile', 'task_context', 'rules', 'experience', 'resource')),
+  original_value_hash TEXT NOT NULL CHECK (original_value_hash ~ '^[0-9a-f]{64}$'),
+  resulting_value_hash TEXT CHECK (resulting_value_hash IS NULL OR resulting_value_hash ~ '^[0-9a-f]{64}$'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  UNIQUE (migration_id, record_id),
+  FOREIGN KEY (migration_id, record_id)
+    REFERENCES mengshu_semantic_type_backfill_shadow (migration_id, record_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_semantic_type_backfill_checkpoints (
+  migration_id TEXT PRIMARY KEY,
+  manifest_hash TEXT NOT NULL CHECK (manifest_hash ~ '^[0-9a-f]{64}$'),
+  after_id UUID,
+  counts JSONB NOT NULL CHECK (jsonb_typeof(counts) = 'object'),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_semantic_type_backfill_receipts_disposition_idx
+ON mengshu_semantic_type_backfill_receipts (migration_id, disposition, record_id)`,
+    ],
+  },
+  {
+    version: 20,
+    name: "add-private-asset-loadout-overlay",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_asset_versions (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  asset_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  kind TEXT NOT NULL CHECK (kind IN ('memory_view')),
+  status TEXT NOT NULL CHECK (status IN ('draft', 'review', 'published', 'deprecated', 'revoked')),
+  visibility TEXT NOT NULL CHECK (visibility = 'private'),
+  owner_user_id TEXT NOT NULL,
+  descriptor JSONB NOT NULL CHECK (jsonb_typeof(descriptor) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (scope_fingerprint, asset_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_asset_heads (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  asset_id TEXT NOT NULL,
+  latest_version INTEGER NOT NULL CHECK (latest_version >= 1),
+  changed_at BIGINT NOT NULL CHECK (changed_at >= 0),
+  PRIMARY KEY (scope_fingerprint, asset_id),
+  FOREIGN KEY (scope_fingerprint, asset_id, latest_version)
+    REFERENCES mengshu_asset_versions (scope_fingerprint, asset_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_asset_promotion_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  request_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  asset_id TEXT NOT NULL,
+  asset_version INTEGER NOT NULL CHECK (asset_version >= 1),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  UNIQUE (scope_fingerprint, request_key),
+  FOREIGN KEY (scope_fingerprint, asset_id, asset_version)
+    REFERENCES mengshu_asset_versions (scope_fingerprint, asset_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_asset_audit (
+  audit_id BIGSERIAL PRIMARY KEY,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  asset_id TEXT NOT NULL,
+  asset_version INTEGER NOT NULL CHECK (asset_version >= 1),
+  event_type TEXT NOT NULL CHECK (event_type IN ('version_created', 'status_changed')),
+  receipt_id TEXT NOT NULL REFERENCES mengshu_asset_promotion_receipts (receipt_id),
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  FOREIGN KEY (scope_fingerprint, asset_id, asset_version)
+    REFERENCES mengshu_asset_versions (scope_fingerprint, asset_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_asset_outbox (
+  event_id TEXT PRIMARY KEY,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  asset_id TEXT NOT NULL,
+  asset_version INTEGER NOT NULL CHECK (asset_version >= 1),
+  event_type TEXT NOT NULL CHECK (event_type IN ('asset.version.created', 'asset.status.changed')),
+  payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  published_at BIGINT,
+  FOREIGN KEY (scope_fingerprint, asset_id, asset_version)
+    REFERENCES mengshu_asset_versions (scope_fingerprint, asset_id, version)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_asset_versions_status_idx
+ON mengshu_asset_versions (scope_fingerprint, status, kind, asset_id, version DESC)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_asset_outbox_pending_idx
+ON mengshu_asset_outbox (occurred_at, event_id) WHERE published_at IS NULL`,
+      `CREATE TABLE IF NOT EXISTS mengshu_loadout_versions (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  loadout_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  app_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  project_id TEXT,
+  visibility TEXT NOT NULL CHECK (visibility = 'private'),
+  descriptor JSONB NOT NULL CHECK (jsonb_typeof(descriptor) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (scope_fingerprint, loadout_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_loadout_heads (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  loadout_id TEXT NOT NULL,
+  latest_version INTEGER NOT NULL CHECK (latest_version >= 1),
+  changed_at BIGINT NOT NULL CHECK (changed_at >= 0),
+  PRIMARY KEY (scope_fingerprint, loadout_id),
+  FOREIGN KEY (scope_fingerprint, loadout_id, latest_version)
+    REFERENCES mengshu_loadout_versions (scope_fingerprint, loadout_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_loadout_receipts (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  request_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  loadout_id TEXT NOT NULL,
+  loadout_version INTEGER NOT NULL CHECK (loadout_version >= 1),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (scope_fingerprint, request_key),
+  UNIQUE (scope_fingerprint, request_key),
+  FOREIGN KEY (scope_fingerprint, loadout_id, loadout_version)
+    REFERENCES mengshu_loadout_versions (scope_fingerprint, loadout_id, version)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_loadout_identity_idx
+ON mengshu_loadout_versions (scope_fingerprint, app_id, agent_id, project_id, version DESC)`,
+    ],
+  },
+  {
+    version: 21,
+    name: "add-loadout-audit-invalidation-outbox",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_loadout_audit (
+  audit_id BIGSERIAL PRIMARY KEY,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  loadout_id TEXT NOT NULL,
+  loadout_version INTEGER NOT NULL CHECK (loadout_version >= 1),
+  event_type TEXT NOT NULL CHECK (event_type = 'version_created'),
+  request_key TEXT NOT NULL,
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  FOREIGN KEY (scope_fingerprint, loadout_id, loadout_version)
+    REFERENCES mengshu_loadout_versions (scope_fingerprint, loadout_id, version),
+  FOREIGN KEY (scope_fingerprint, request_key)
+    REFERENCES mengshu_loadout_receipts (scope_fingerprint, request_key)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_loadout_outbox (
+  event_id TEXT PRIMARY KEY CHECK (event_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  loadout_id TEXT NOT NULL,
+  loadout_version INTEGER NOT NULL CHECK (loadout_version >= 1),
+  event_type TEXT NOT NULL CHECK (event_type = 'loadout.version.created'),
+  payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  published_at BIGINT,
+  FOREIGN KEY (scope_fingerprint, loadout_id, loadout_version)
+    REFERENCES mengshu_loadout_versions (scope_fingerprint, loadout_id, version)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_loadout_outbox_pending_idx
+ON mengshu_loadout_outbox (occurred_at, event_id) WHERE published_at IS NULL`,
+    ],
+  },
+  {
+    version: 22,
+    name: "add-context-assembly-receipts",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_context_assembly_receipts (
+  receipt_id TEXT PRIMARY KEY CHECK (receipt_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  session_id TEXT NOT NULL,
+  stable_content_hash TEXT NOT NULL CHECK (stable_content_hash ~ '^[0-9a-f]{64}$'),
+  dynamic_content_hash TEXT NOT NULL CHECK (dynamic_content_hash ~ '^[0-9a-f]{64}$'),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  expires_at BIGINT NOT NULL CHECK (expires_at >= created_at),
+  CHECK (char_length(session_id) BETWEEN 1 AND 256 AND session_id !~ '[[:space:][:cntrl:]]')
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_context_assembly_receipts_session_idx
+ON mengshu_context_assembly_receipts (scope_fingerprint, session_id, created_at DESC, receipt_id DESC)`,
+    ],
+  },
+  {
+    version: 23,
+    name: "add-history-rebuild-ledger",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_runs (
+  run_id TEXT PRIMARY KEY,
+  migration_id TEXT NOT NULL,
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility IN ('private', 'workspace', 'team', 'public')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  manifest_hash TEXT NOT NULL CHECK (manifest_hash ~ '^[0-9a-f]{64}$'),
+  model_fingerprint TEXT NOT NULL CHECK (model_fingerprint ~ '^[0-9a-f]{64}$'),
+  prompt_hash TEXT NOT NULL CHECK (prompt_hash ~ '^[0-9a-f]{64}$'),
+  schema_hash TEXT NOT NULL CHECK (schema_hash ~ '^[0-9a-f]{64}$'),
+  policy_hash TEXT NOT NULL CHECK (policy_hash ~ '^[0-9a-f]{64}$'),
+  attempt_hash TEXT NOT NULL CHECK (attempt_hash ~ '^[0-9a-f]{64}$'),
+  state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'rolled_back', 'drifted', 'failed')),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+  UNIQUE (migration_id, scope_fingerprint, attempt_hash),
+  CHECK (char_length(run_id) BETWEEN 1 AND 256 AND run_id !~ '[[:space:][:cntrl:]]'),
+  CHECK (char_length(migration_id) BETWEEN 1 AND 256 AND migration_id !~ '[[:space:][:cntrl:]]')
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_source_snapshots (
+  run_id TEXT NOT NULL REFERENCES mengshu_history_rebuild_runs (run_id),
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  source_upper_bound UUID,
+  source_count BIGINT NOT NULL CHECK (source_count >= 0),
+  snapshot_hash TEXT NOT NULL CHECK (snapshot_hash ~ '^[0-9a-f]{64}$'),
+  captured_at BIGINT NOT NULL CHECK (captured_at >= 0),
+  PRIMARY KEY (run_id, source_table),
+  CHECK ((source_count = 0 AND source_upper_bound IS NULL) OR
+    (source_count > 0 AND source_upper_bound IS NOT NULL))
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_source_rows (
+  run_id TEXT NOT NULL,
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  record_id UUID NOT NULL,
+  source_hash TEXT NOT NULL CHECK (source_hash ~ '^[0-9a-f]{64}$'),
+  source_row JSONB NOT NULL CHECK (jsonb_typeof(source_row) = 'object'),
+  original_text TEXT NOT NULL,
+  original_metadata JSONB NOT NULL CHECK (jsonb_typeof(original_metadata) = 'object'),
+  original_metadata_hash TEXT NOT NULL CHECK (original_metadata_hash ~ '^[0-9a-f]{64}$'),
+  original_lifecycle_status TEXT CHECK (original_lifecycle_status IS NULL OR
+    original_lifecycle_status IN ('active', 'archived', 'revoked', 'superseded', 'promoted')),
+  captured_at BIGINT NOT NULL CHECK (captured_at >= 0),
+  PRIMARY KEY (run_id, source_table, record_id),
+  UNIQUE (run_id, source_table, source_hash),
+  FOREIGN KEY (run_id, source_table)
+    REFERENCES mengshu_history_rebuild_source_snapshots (run_id, source_table)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_checkpoints (
+  run_id TEXT NOT NULL,
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  after_id UUID,
+  checkpoint_version BIGINT NOT NULL DEFAULT 0 CHECK (checkpoint_version >= 0),
+  counts JSONB NOT NULL CHECK (jsonb_typeof(counts) = 'object'),
+  state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'rolled_back', 'drifted', 'failed')),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (run_id, source_table),
+  FOREIGN KEY (run_id, source_table)
+    REFERENCES mengshu_history_rebuild_source_snapshots (run_id, source_table)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_shadow_plans (
+  run_id TEXT NOT NULL,
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  record_id UUID NOT NULL,
+  source_hash TEXT NOT NULL CHECK (source_hash ~ '^[0-9a-f]{64}$'),
+  disposition TEXT NOT NULL CHECK (disposition IN ('preserve', 'backfill', 'model_classify', 'lookup_only', 'quarantine')),
+  semantic_type TEXT CHECK (semantic_type IS NULL OR semantic_type IN ('profile', 'task_context', 'rules', 'experience', 'resource')),
+  topic_labels JSONB NOT NULL CHECK (jsonb_typeof(topic_labels) = 'array'),
+  context_eligible BOOLEAN NOT NULL,
+  tree_eligibility JSONB NOT NULL CHECK (jsonb_typeof(tree_eligibility) = 'object'),
+  reason TEXT NOT NULL,
+  plan_receipt_hash TEXT NOT NULL CHECK (plan_receipt_hash ~ '^[0-9a-f]{64}$'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (run_id, source_table, record_id),
+  UNIQUE (run_id, plan_receipt_hash),
+  FOREIGN KEY (run_id, source_table)
+    REFERENCES mengshu_history_rebuild_source_snapshots (run_id, source_table),
+  CHECK (source_table <> 'knowledge' OR
+    (semantic_type = 'resource' AND context_eligible = false))
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_model_receipts (
+  receipt_hash TEXT PRIMARY KEY CHECK (receipt_hash ~ '^[0-9a-f]{64}$'),
+  run_id TEXT NOT NULL,
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  record_id UUID NOT NULL,
+  source_hash TEXT NOT NULL CHECK (source_hash ~ '^[0-9a-f]{64}$'),
+  model_fingerprint TEXT NOT NULL CHECK (model_fingerprint ~ '^[0-9a-f]{64}$'),
+  prompt_hash TEXT NOT NULL CHECK (prompt_hash ~ '^[0-9a-f]{64}$'),
+  schema_hash TEXT NOT NULL CHECK (schema_hash ~ '^[0-9a-f]{64}$'),
+  input_hash TEXT NOT NULL CHECK (input_hash ~ '^[0-9a-f]{64}$'),
+  output_hash TEXT NOT NULL CHECK (output_hash ~ '^[0-9a-f]{64}$'),
+  confidence DOUBLE PRECISION NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+  proposal_count INTEGER NOT NULL CHECK (proposal_count >= 0),
+  input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+  output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  UNIQUE (run_id, source_table, record_id),
+  FOREIGN KEY (run_id, source_table, record_id)
+    REFERENCES mengshu_history_rebuild_shadow_plans (run_id, source_table, record_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_operation_receipts (
+  receipt_hash TEXT PRIMARY KEY CHECK (receipt_hash ~ '^[0-9a-f]{64}$'),
+  run_id TEXT NOT NULL REFERENCES mengshu_history_rebuild_runs (run_id),
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  operation TEXT NOT NULL CHECK (operation IN ('plan', 'apply', 'verify', 'rollback')),
+  status TEXT NOT NULL CHECK (status IN ('applied', 'verified', 'rolled_back', 'drifted', 'failed')),
+  counts JSONB NOT NULL CHECK (jsonb_typeof(counts) = 'object'),
+  result_hash TEXT NOT NULL CHECK (result_hash ~ '^[0-9a-f]{64}$'),
+  drift_hash TEXT CHECK (drift_hash IS NULL OR drift_hash ~ '^[0-9a-f]{64}$'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  UNIQUE (run_id, source_table, operation, receipt_hash)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_artifacts (
+  run_id TEXT NOT NULL,
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  record_id UUID NOT NULL,
+  artifact_type TEXT NOT NULL CHECK (artifact_type IN ('evidence_memory', 'evidence_link', 'tree_job')),
+  artifact_id TEXT NOT NULL,
+  artifact_role TEXT NOT NULL CHECK (artifact_role IN ('evidence_mirror', 'grounded_by', 'source_leaf', 'source_finalize', 'topic_leaf', 'topic_finalize')),
+  source_hash TEXT NOT NULL CHECK (source_hash ~ '^[0-9a-f]{64}$'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (run_id, artifact_type, artifact_id),
+  FOREIGN KEY (run_id, source_table, record_id)
+    REFERENCES mengshu_history_rebuild_source_rows (run_id, source_table, record_id),
+  CHECK (char_length(artifact_id) BETWEEN 1 AND 256 AND artifact_id !~ '[[:space:][:cntrl:]]')
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_history_rebuild_shadow_disposition_idx
+ON mengshu_history_rebuild_shadow_plans (run_id, source_table, disposition, record_id)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_history_rebuild_operations_idx
+ON mengshu_history_rebuild_operation_receipts (run_id, source_table, operation, created_at, receipt_hash)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_history_rebuild_artifacts_source_idx
+ON mengshu_history_rebuild_artifacts (run_id, source_table, record_id, artifact_type, artifact_role)`,
+    ],
+  },
+  {
+    version: 24,
+    name: "add-history-rebuild-model-attempt-ledger",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_model_attempts (
+  migration_id TEXT NOT NULL,
+  manifest_hash TEXT NOT NULL CHECK (manifest_hash ~ '^[0-9a-f]{64}$'),
+  run_id TEXT NOT NULL REFERENCES mengshu_history_rebuild_runs (run_id),
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  record_id UUID NOT NULL,
+  source_hash TEXT NOT NULL CHECK (source_hash ~ '^[0-9a-f]{64}$'),
+  attempt INTEGER NOT NULL CHECK (attempt >= 0 AND attempt < 2),
+  model_fingerprint TEXT NOT NULL CHECK (model_fingerprint ~ '^[0-9a-f]{64}$'),
+  prompt_hash TEXT NOT NULL CHECK (prompt_hash ~ '^[0-9a-f]{64}$'),
+  schema_hash TEXT NOT NULL CHECK (schema_hash ~ '^[0-9a-f]{64}$'),
+  input_hash TEXT NOT NULL CHECK (input_hash ~ '^[0-9a-f]{64}$'),
+  state TEXT NOT NULL CHECK (state IN ('reserved', 'completed')),
+  reserved_input_tokens INTEGER NOT NULL CHECK (reserved_input_tokens >= 0),
+  reserved_output_tokens INTEGER NOT NULL CHECK (reserved_output_tokens >= 0),
+  reserved_cost_minor_units BIGINT NOT NULL CHECK (reserved_cost_minor_units >= 0),
+  output JSONB,
+  output_hash TEXT CHECK (output_hash IS NULL OR output_hash ~ '^[0-9a-f]{64}$'),
+  actual_input_tokens INTEGER,
+  actual_output_tokens INTEGER,
+  actual_cost_minor_units BIGINT,
+  reserved_at BIGINT NOT NULL CHECK (reserved_at >= 0),
+  completed_at BIGINT,
+  PRIMARY KEY (run_id, source_table, record_id, attempt),
+  CHECK (char_length(migration_id) BETWEEN 1 AND 256 AND migration_id !~ '[[:space:][:cntrl:]]'),
+  CHECK ((state = 'reserved' AND output IS NULL AND output_hash IS NULL AND
+      actual_input_tokens IS NULL AND actual_output_tokens IS NULL AND
+      actual_cost_minor_units IS NULL AND completed_at IS NULL) OR
+    (state = 'completed' AND jsonb_typeof(output) = 'object' AND output_hash IS NOT NULL AND
+      actual_input_tokens = reserved_input_tokens AND actual_output_tokens >= 0 AND
+      actual_output_tokens <= reserved_output_tokens AND actual_cost_minor_units >= 0 AND
+      actual_cost_minor_units <= reserved_cost_minor_units AND completed_at >= reserved_at))
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_history_rebuild_model_attempts_budget_idx
+ON mengshu_history_rebuild_model_attempts (migration_id, manifest_hash, state)`,
     ],
   },
 ];

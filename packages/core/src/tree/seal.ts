@@ -234,7 +234,7 @@ export async function sealBuffer(
     const evidenceTexts = leaves.map((leaf) => leaf.text ?? "").filter((text) => text.length > 0);
     faithfulnessValidation = await validateFaithfulness({
       node,
-      buffer: input.buffer,
+      leaves,
       evidenceTexts,
       config: input.faithfulnessConfig,
       llmClient: input.llmClient,

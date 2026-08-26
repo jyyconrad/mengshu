@@ -27,7 +27,7 @@
  * 合并会导致英文部分误命中（如 "always" 出现在子串中）。
  */
 export const STABILITY_PATTERNS: readonly RegExp[] = [
-  /总是|从不|必须|禁止|默认|以后都|每次/,
+  /总是|从不|必须|禁止|不得|不可|默认|以后都|每次/,
   /\balways\b|\bnever\b|\bmust\b|\bdo not\b/i,
 ] as const;
 
@@ -150,7 +150,7 @@ const PROFILE_SIGNAL_PATTERNS: ReadonlyArray<
 ] as const;
 
 const RULE_SIGNAL_PATTERNS: readonly RegExp[] = [
-  /禁止|不要|不能|永远不|从不|总是|默认|以后都|必须/,
+  /禁止|不要|不能|不得|不可|永远不|从不|总是|默认|以后都|必须/,
   /\b(?:always|never|must(?:\s+not)?|do\s+not|don't)\b/i,
   /如果.{0,24}(?:就|则).{0,12}(?:禁用|禁止|必须)/,
   /(?:团队|项目).{0,12}(?:编码|提交|开发).{0,8}规范(?:包括|要求)?/,

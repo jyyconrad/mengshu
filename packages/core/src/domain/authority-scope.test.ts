@@ -60,6 +60,42 @@ describe("resolveAuthorityScope", () => {
     });
   });
 
+  test("preserves canonical server-owned workspace/session while clients cannot submit them", () => {
+    const resolved = resolveAuthorityScope({
+      ...AUTHORITY,
+      workspaceId: "workspace-a",
+      sessionId: "session-a",
+    }, CLIENT_SCOPE);
+
+    expect(resolved).toEqual({
+      tenantId: "tenant-a",
+      userId: "user-a",
+      appId: "mengshu",
+      projectId: "project-a",
+      agentId: "agent-a",
+      namespace: "memories",
+      visibility: "private",
+      workspaceId: "workspace-a",
+      sessionId: "session-a",
+    });
+    authorityError(
+      () => resolveAuthorityScope(AUTHORITY, { ...CLIENT_SCOPE, sessionId: "session-a" }),
+      "CLIENT_FIELD_FORBIDDEN",
+      "sessionId",
+    );
+  });
+
+  test.each(["workspaceId", "sessionId"] as const)(
+    "rejects invalid server-owned optional field %s",
+    (field) => {
+      authorityError(
+        () => resolveAuthorityScope({ ...AUTHORITY, [field]: " bad" }, CLIENT_SCOPE),
+        "AUTHORITY_FIELD_INVALID",
+        field,
+      );
+    },
+  );
+
   test("is deterministic and does not mutate frozen authority/client inputs", () => {
     const authority = Object.freeze({
       ...AUTHORITY,

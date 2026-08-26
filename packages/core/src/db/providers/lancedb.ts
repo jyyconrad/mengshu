@@ -20,6 +20,7 @@ import type {
 import {
   DatabaseStoreCleanupError,
   parseDatabaseStoreResult,
+  resolveVectorCandidateLimit,
 } from "../types.js";
 import { vectorDimsForModel } from "../../../../../config.js";
 import { assertSafeLegacyDeleteFilter } from "./legacy-delete-filter-guard.js";
@@ -360,6 +361,7 @@ export class LanceDBProvider implements DatabaseProvider {
   private validateQueryOptions(options: MemoryQueryOptions): void {
     validateAuthorityOptions(options);
     validateDataTypes(options.dataTypes);
+    if (options.vector) resolveVectorCandidateLimit(options);
     if (options.tableName !== undefined) {
       this.assertAllowedTableName(options.tableName);
     }
@@ -1319,15 +1321,18 @@ export class LanceDBProvider implements DatabaseProvider {
 
       // 合并结果并按分数排序
       allResults.sort((a, b) => b.score - a.score);
-      if (options.limit) {
-        return allResults.slice(0, options.limit);
-      }
-      return allResults;
+      const candidates = options.vector
+        ? allResults.slice(0, resolveVectorCandidateLimit(options))
+        : allResults;
+      return options.limit === undefined ? candidates : candidates.slice(0, options.limit);
     }
 
     // 单表查询
     const tableName = options.tableName ?? this.getDefaultTableName(options.dataTypes?.[0]);
-    return this.queryFromTable(tableName, options);
+    const results = await this.queryFromTable(tableName, options);
+    return options.vector && options.limit !== undefined
+      ? results.slice(0, options.limit)
+      : results;
   }
 
   /**
@@ -1381,10 +1386,8 @@ export class LanceDBProvider implements DatabaseProvider {
         vectorQuery = vectorQuery.filter(filters.join(" AND "));
       }
 
-      // 限制结果数量
-      if (options.limit) {
-        vectorQuery = vectorQuery.limit(options.limit);
-      }
+      // ANN 候选池与 core 六因子评分后的最终 limit 是两个独立合同。
+      vectorQuery = vectorQuery.limit(resolveVectorCandidateLimit(options));
 
       results = await this.withDatabaseIdentityCheck(async () => vectorQuery.toArray());
     } else {
@@ -1448,9 +1451,9 @@ export class LanceDBProvider implements DatabaseProvider {
       };
     });
 
-    // 应用最小分数过滤
-    const minScore = options.minScore ?? 0;
-    return mapped.filter((r) => r.score >= minScore);
+    return options.minScore === undefined
+      ? mapped
+      : mapped.filter((row) => row.score >= options.minScore!);
   }
 
   async getTableNames(): Promise<TableName[]> {

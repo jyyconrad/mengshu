@@ -30,7 +30,7 @@ afterEach(() => {
 });
 
 describe("quick-eval CLI fail-closed", () => {
-  test("无参数默认执行完整 8 suite，offline quality 通过 exit 0，但不冒充 production gate", () => {
+  test("无参数默认执行完整 11 suite，offline quality 通过 exit 0，但不冒充 production gate", () => {
     const result = runCli([]);
 
     expect(result.status).toBe(0);
@@ -42,17 +42,17 @@ describe("quick-eval CLI fail-closed", () => {
     expect(result.stdout).toMatch(/production gate reason:.*offline-component/);
   });
 
-  test("all 写出完整 8 suite report，全部 offline quality gate 通过，production gate 仍失败", () => {
+  test("all 写出完整 11 suite report，全部 offline quality gate 通过，production gate 仍失败", () => {
     const out = makeTempDir();
     const result = runCli(["all", "--out", out]);
 
     expect(result.status).toBe(0);
     expect(result.stderr).not.toMatch(/未实现 runner/);
     const report = JSON.parse(readFileSync(path.join(out, "report.json"), "utf8"));
-    expect(report.suites).toHaveLength(8);
+    expect(report.suites).toHaveLength(11);
     expect(report.releaseGatePassed).toBe(true);
     expect(report.productionReleaseGatePassed).toBe(false);
-    expect(report.manifest.suites).toHaveLength(8);
+    expect(report.manifest.suites).toHaveLength(11);
     expect(report.manifest.suites).toEqual(expect.arrayContaining([
       expect.objectContaining({
         name: "mengshu-extraction",
@@ -62,7 +62,7 @@ describe("quick-eval CLI fail-closed", () => {
     ]));
     const extensions = report.suites.filter((suite: { suite: string }) =>
       !suite.suite.startsWith("mengshu-v0.1") && suite.suite !== "mengshu-safety");
-    expect(extensions).toHaveLength(6);
+    expect(extensions).toHaveLength(9);
     expect(extensions.find((suite: { suite: string }) => suite.suite === "mengshu-extraction"))
       .toMatchObject({ gatePassed: true });
     expect(extensions.every((suite: { gatePassed: boolean }) => suite.gatePassed === true))
@@ -101,6 +101,22 @@ describe("quick-eval CLI fail-closed", () => {
       fixtureSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       gateIdentity: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
+  });
+
+  test("--suite 显式选择 deterministic capability suite", () => {
+    const out = makeTempDir();
+    const result = runCli(["--suite", "mengshu-slot-loadout", "--out", out]);
+
+    expect(result.status).toBe(0);
+    const report = JSON.parse(readFileSync(path.join(out, "report.json"), "utf8"));
+    expect(report.suites).toEqual([
+      expect.objectContaining({
+        suite: "mengshu-slot-loadout",
+        total: 6,
+        passed: 6,
+        gatePassed: true,
+      }),
+    ]);
   });
 
   test("未知 suite 非零失败并指出未登记", () => {

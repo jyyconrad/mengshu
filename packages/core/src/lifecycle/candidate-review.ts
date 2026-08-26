@@ -29,7 +29,13 @@ export interface CandidateReviewServiceDeps {
   /** 接受候选时调用，将候选转换为 MemoryRecord 并写入主库 */
   promoteCandidate?(input: {
     candidate: CandidateRecord;
-  }): Promise<{ memoryId: string }>;
+  }): Promise<{
+    memoryId: string;
+    /** Provider transaction 已提交 candidate 状态、audit、outbox 与 receipt。 */
+    governanceCommitted?: true;
+  }>;
+  /** 仅 provider-owned 原子 promotion receipt 可重放 approved 候选的后置派生。 */
+  replayApprovedPromotion?: true;
   /** 拒绝时记录 contentHash 黑名单（可选） */
   recordRejectedHash?(contentHash: string): Promise<void>;
   /** 审计日志 */
@@ -92,7 +98,11 @@ export class CandidateReviewService {
         errors.push(`not_found:${id}`);
         continue;
       }
-      if (record.status !== "pending") {
+      const approvedReplay = record.status === "approved" &&
+        this.deps.replayApprovedPromotion === true &&
+        typeof record.promotedToMemoryId === "string" &&
+        record.promotedToMemoryId.length > 0;
+      if (record.status !== "pending" && !approvedReplay) {
         errors.push(`not_pending:${id}`);
         continue;
       }
@@ -101,15 +111,17 @@ export class CandidateReviewService {
         const result = await this.deps.promoteCandidate({ candidate: record });
         memoryId = result.memoryId;
         promoted.push(memoryId);
-        await this.deps.repository.setStatus(id, "approved", {
-          promotedToMemoryId: memoryId,
-        });
-        await this.deps.audit?.({
-          scope: record.scope,
-          action: "candidate.approve",
-          targetId: id,
-          metadata: { memoryId },
-        });
+        if (result.governanceCommitted !== true) {
+          await this.deps.repository.setStatus(id, "approved", {
+            promotedToMemoryId: memoryId,
+          });
+          await this.deps.audit?.({
+            scope: record.scope,
+            action: "candidate.approve",
+            targetId: id,
+            metadata: { memoryId },
+          });
+        }
         affected++;
       } catch (err) {
         errors.push(`promote_failed:${id}:${(err as Error).message}`);

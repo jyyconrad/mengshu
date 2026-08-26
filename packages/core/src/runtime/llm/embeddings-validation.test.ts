@@ -121,6 +121,21 @@ describe("Embeddings 配置验证", () => {
   });
 
   describe("成功创建实例", () => {
+    it("SDK 请求使用 30s 硬超时且不与外层 p-retry 形成乘法重试", () => {
+      const embeddings = new Embeddings({
+        apiKey: "sk-test-key-123",
+        baseURL: "https://api.openai.com/v1",
+        model: "text-embedding-3-small",
+        provider: "openai" as const,
+      });
+      const client = (embeddings as unknown as {
+        client: { timeout: number; maxRetries: number };
+      }).client;
+
+      expect(client.timeout).toBe(30_000);
+      expect(client.maxRetries).toBe(0);
+    });
+
     it("应该成功创建 Embeddings 实例（有效配置）", () => {
       const config = {
         apiKey: "sk-test-key-123",

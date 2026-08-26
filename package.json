@@ -1,6 +1,6 @@
 {
   "name": "@mengshu/core",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Local-first memory middleware (mengshu) for OpenClaw-type Agent Runtime products with auto-recall/capture",
   "type": "module",
   "license": "MIT",
@@ -55,6 +55,7 @@
   },
   "files": [
     "dist",
+    "openclaw.plugin.json",
     "README.md",
     "docs/README.md",
     "docs/api",
@@ -65,11 +66,14 @@
     "docs/design/schema.md",
     "config.example.json",
     "config/*.example.json",
+    ".agents/plugins/marketplace.json",
     "scripts/sql",
+    "scripts/pack-codex-marketplace.mjs",
     "plugins/codex/.codex-plugin/plugin.json",
     "plugins/codex/.mcp.json",
     "plugins/codex/mcp/server.mjs",
     "plugins/codex/skills",
+    "plugins/codex/sources",
     "plugins/codex/README.md",
     "plugins/openclaw/openclaw.plugin.json",
     "plugins/openclaw/README.md"
@@ -116,6 +120,16 @@
       "optional": true
     }
   },
+  "overrides": {
+    "@hono/node-server@<=1.19.14": "1.19.15",
+    "hono@<=4.12.33": "4.12.34",
+    "brace-expansion@>=2.0.0 <2.1.4": "2.1.4",
+    "fast-uri@>=3.0.0 <3.1.5": "3.1.5",
+    "fast-xml-parser@<5.7.0": "5.7.0",
+    "ip-address@<=10.3.0": "10.5.0",
+    "ws@>=8.0.0 <8.21.0": "8.21.0",
+    "body-parser@>=2.0.0 <2.3.0": "2.3.0"
+  },
   "bin": {
     "ms": "./dist/bin/ms.js",
     "mengshu": "./dist/bin/ms.js"
@@ -126,12 +140,16 @@
     "postbuild": "chmod +x dist/bin/ms.js",
     "prepack": "npm run version:check && npm run build",
     "pack:dry-run": "npm pack --dry-run",
+    "pack:codex": "node scripts/pack-codex-marketplace.mjs",
     "version:check": "node scripts/check-version-consistency.mjs",
     "test": "vitest run",
     "test:live": "MENGSHU_RUN_LIVE_TESTS=1 vitest run index.test.ts hybrid-integration.test.ts",
+    "test:production-gate": "node -e \"if (process.env.MENGSHU_RUN_LIVE_TESTS !== '1') { console.error('test:production-gate requires MENGSHU_RUN_LIVE_TESTS=1'); process.exit(1) }\" && vitest run tests/live/postgres-v9-runtime.e2e.test.ts tests/live/production-rest-runtime-eval.e2e.test.ts tests/live/postgres-authoritative-graph-reuse.e2e.test.ts tests/live/postgres-entity-alias-lifecycle.e2e.test.ts",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "eval:quick": "tsx tests/eval/runners/quick-eval.ts"
+    "eval:quick": "tsx tests/eval/runners/quick-eval.ts",
+    "migrate:topic-tree": "tsx scripts/operator-topic-tree-migrate.ts",
+    "migrate:history": "tsx scripts/operator-history-rebuild.ts"
   },
   "openclaw": {
     "extensions": [

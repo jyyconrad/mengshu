@@ -62,18 +62,46 @@ export interface RegisterMemoryServerCliOptions extends OpenClawCliAuthorityCont
   getTableStats?: () => Promise<TableStats[]>;
   startServer?: typeof startMemoryServer;
   keepAlive?: boolean;
+  /** Runtime 持有的统一 Write Kernel 能力；serve 只负责透传。 */
+  memoryWrite?: StartMemoryServerOptions["memoryWrite"];
   /** Console 聚合 API，注入后 serve 启动的 daemon 暴露 /v1/console/* 与 Candidates 闭环。 */
   console?: StartMemoryServerOptions["console"];
   /** Agent 快路径服务，注入后 daemon 暴露 /v1/agent/*（context/observe/lookup/session）。 */
   agentFastPath?: StartMemoryServerOptions["agentFastPath"];
   /** Production serve 必须显式构造 Durable Job v2 RuntimeHost；缺失时 fail-closed。 */
   runtimeHostFactory?: () => MemoryServerLifecycleHost;
+  serverLogger?: StartMemoryServerOptions["logger"];
+  /** 进程终止信号注册器；测试可注入，生产默认监听 SIGINT/SIGTERM。 */
+  registerShutdownSignal?: StartMemoryServerOptions["registerShutdownSignal"];
   /** Listener 探针；测试可注入，默认执行有超时的 TCP connect。 */
   probeServer?: (target: ServerProbeTarget) => Promise<boolean>;
   /** PostgreSQL-only, provider-owned fixed migration facade plus one-run registry snapshot. */
   schemaCutover?: {
     readonly port: PostgresSchemaCutoverPort;
     readonly getRegistry: () => MemoryAutodbRegistry;
+  };
+}
+
+export function registerNodeShutdownSignals(
+  handler: () => Promise<void>,
+): () => void {
+  let triggered = false;
+  let registered = true;
+  const onSignal = () => {
+    if (triggered) return;
+    triggered = true;
+    void handler().catch(() => {
+      process.exitCode = 1;
+      process.stderr.write("Memory server shutdown failed\n");
+    });
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  return () => {
+    if (!registered) return;
+    registered = false;
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
   };
 }
 
@@ -146,6 +174,7 @@ export function registerMemoryServerCliCommands(
       const runtimeHost = options.runtimeHostFactory();
       const running = await (options.startServer ?? startMemoryServer)({
         service: options.service,
+        memoryWrite: options.memoryWrite,
         console: options.console,
         agentFastPath: options.agentFastPath,
         authority: options.authority,
@@ -156,6 +185,8 @@ export function registerMemoryServerCliCommands(
         port,
         secret: options.config.server?.secret,
         requireHttps: options.config.server?.requireHttps,
+        logger: options.serverLogger,
+        registerShutdownSignal: options.registerShutdownSignal ?? registerNodeShutdownSignals,
       });
       console.log(`Memory server listening at ${running.url}`);
       if (options.keepAlive === false) {
@@ -210,7 +241,6 @@ export function registerMemoryServerCliCommands(
     .command("health")
     .description("Show memory service health as JSON")
     .action(async () => {
-      requireOpenClawCliAuthority(options);
       console.log(JSON.stringify(await options.service.health(), null, 2));
     });
 

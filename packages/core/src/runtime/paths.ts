@@ -35,6 +35,8 @@ export const REGISTRY_FILENAME = "registry.json";
 export const PROJECTS_DIRNAME = "projects";
 export const MEMORY_DIRNAME = "memory";
 export const LANCEDB_DIRNAME = "lancedb";
+export const AUDIT_DIRNAME = "audit";
+export const RUNTIME_COST_LEDGER_FILENAME = "runtime-cost.jsonl";
 /** Agent 历史导入相关目录/文件名（对应方案 §4.2 状态路径）。 */
 export const IMPORTS_DIRNAME = "imports";
 export const AGENT_HISTORY_DIRNAME = "agent-history";
@@ -102,6 +104,16 @@ export function resolveEnvPath(options: HomePathOptions = {}): string {
 /** 全局 registry.json 绝对路径。 */
 export function resolveRegistryPath(options: HomePathOptions = {}): string {
   return join(resolveHomeDir(options), REGISTRY_FILENAME);
+}
+
+/** 全局运行时审计目录：`~/.mengshu/audit/`。 */
+export function resolveRuntimeAuditDir(options: HomePathOptions = {}): string {
+  return join(resolveHomeDir(options), AUDIT_DIRNAME);
+}
+
+/** append-only 运行时成本账本：`~/.mengshu/audit/runtime-cost.jsonl`。 */
+export function resolveRuntimeCostLedgerPath(options: HomePathOptions = {}): string {
+  return join(resolveRuntimeAuditDir(options), RUNTIME_COST_LEDGER_FILENAME);
 }
 
 /** 全局 projects/ 目录绝对路径。 */

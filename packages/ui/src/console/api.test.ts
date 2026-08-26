@@ -10,6 +10,7 @@ import { InMemoryCandidateRepository } from "../../../../lifecycle/candidate-rep
 import { CandidateReviewService } from "../../../../lifecycle/candidate-review.js";
 import type { CandidateRecord } from "../../../../lifecycle/candidate-types.js";
 import { createConsoleApi } from "./api.js";
+import { computeRecallScoreBreakdown } from "../../../../core/recall-scoring.js";
 
 const scope = {
   tenantId: "local",
@@ -48,13 +49,21 @@ class FakeMemoryService implements MemoryService {
     return {
       scope,
       query: input.query,
-      hits: this.hits.map((hit) => ({
-        record: hit,
-        score: hit.score,
-        source: "vector",
-        scoreBreakdown: { vector: hit.score },
-        provenance: hit.provenance,
-      })),
+      hits: this.hits.map((hit) => {
+        const scoreBreakdown = computeRecallScoreBreakdown(
+          hit,
+          { relevance: hit.score, scopeFit: 1 },
+          ["vector"],
+          { vector: hit.score },
+        );
+        return {
+          record: hit,
+          score: scoreBreakdown.score,
+          source: "vector" as const,
+          scoreBreakdown,
+          provenance: hit.provenance,
+        };
+      }),
     };
   }
 
@@ -132,6 +141,64 @@ describe("console API", () => {
       expect.objectContaining({ id: "public", preview: "public memory", raw: "public memory", sourceLabel: "source-public" }),
       expect.objectContaining({ id: "private", preview: "[private]", raw: undefined, sourceLabel: "source-private" }),
     ]);
+    expect(result.results[0].scoreBreakdown).toMatchObject({
+      weights: expect.any(Object),
+      factors: expect.any(Object),
+      contributions: expect.any(Object),
+      matchedBy: ["vector"],
+      sourceSignals: { vector: 0.9 },
+    });
+  });
+
+  test("lookup fails closed when the service omits a complete breakdown", async () => {
+    const service = new FakeMemoryService();
+    service.recall = async () => ({
+      scope,
+      query: "memory",
+      hits: [{ record: record("mem-1", "memory"), score: 0.9, source: "vector" }],
+    });
+    const api = createConsoleApi({ service });
+
+    await expect(api.lookup({ scope, query: "memory" })).rejects.toThrow(
+      "RECALL_SCORE_BREAKDOWN_REQUIRED",
+    );
+  });
+
+  test("lookup returns the exact production breakdown object without adapter recomputation", async () => {
+    const memory = record("mem-1", "memory");
+    const breakdown = computeRecallScoreBreakdown(
+      memory,
+      { relevance: 0.9, scopeFit: 1 },
+      ["vector"],
+      { vector: 0.9 },
+    );
+    const service = new FakeMemoryService();
+    service.recall = async () => ({
+      scope,
+      query: "memory",
+      filtered: [{
+        candidateId: "entity:blocked",
+        authoritativeRecordId: "memory-blocked",
+        source: "entity_graph",
+        filteredReason: "scope_mismatch",
+      }],
+      hits: [{
+        record: memory,
+        score: breakdown.score,
+        source: "vector",
+        scoreBreakdown: breakdown,
+      }],
+    });
+    const api = createConsoleApi({ service });
+
+    const result = await api.lookup({ scope, query: "memory" });
+    expect(result.results[0].scoreBreakdown).toBe(breakdown);
+    expect(result.filtered).toEqual([{
+      candidateId: "entity:blocked",
+      authoritativeRecordId: "memory-blocked",
+      source: "entity_graph",
+      filteredReason: "scope_mismatch",
+    }]);
   });
 });
 

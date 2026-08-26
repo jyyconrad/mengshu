@@ -215,19 +215,23 @@ describe("recall-explain-v1 honest component runner", () => {
     );
   });
 
-  test("salience=0 明确入参但 production 返回 null 时进入分母并使 metric 失败", async () => {
+  test("salience=0 是合法确定性输入并返回完整 production breakdown", async () => {
     const run = await runRecallExplainSuite(writeFixture([
       syntheticCase({ salience_llm: 0, source: "rule_file" }),
     ]));
     const evaluation = run.results[0].memoryEvaluations[0];
 
     expect(evaluation.eligibleForBreakdownMetric).toBe(true);
-    expect(evaluation.actual.breakdown).toBeNull();
-    expect(run.results[0].failures).toContain(
+    expect(evaluation.actual.breakdown).toEqual({
+      salience_llm: 0,
+      sourceAuthority: 0.2,
+      explicitnessBonus: 0,
+      typePrior: 0.15,
+    });
+    expect(run.results[0].failures).not.toContain(
       "importance_breakdown_unavailable:memory-1:production_returned_null",
     );
-    expect(run.metrics[0]).toMatchObject({ numerator: 0, denominator: 1, passed: false });
-    expect(run.gateFailures.join("\n")).toMatch(/value=0.*exact 1/);
+    expect(run.metrics[0]).toMatchObject({ numerator: 1, denominator: 1, passed: true });
   });
 
   test.each([

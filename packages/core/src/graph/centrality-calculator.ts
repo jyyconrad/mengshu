@@ -5,19 +5,23 @@
  * P2 核心功能：按 entity degree 归一化计算 graphCentrality = degree / max(degree_in_scope)
  */
 
-import type { InMemoryGraphRepository } from "./repository.js";
+import type { EntityGraphRepository } from "./repository.js";
 import type { MemoryScope } from "../domain/types.js";
 import { scopeToKey } from "../domain/scope.js";
 
 export interface CentralityCalculatorOptions {
-  graphRepo: InMemoryGraphRepository;
+  graphRepo: EntityGraphRepository;
+  /** Production PostgreSQL refresh keeps centrality inside the canonical provider. */
+  refreshCanonical?: (scope: MemoryScope) => Promise<void>;
 }
 
 export class CentralityCalculator {
-  private readonly graphRepo: InMemoryGraphRepository;
+  private readonly graphRepo: EntityGraphRepository;
+  private readonly refreshCanonical?: (scope: MemoryScope) => Promise<void>;
 
   constructor(options: CentralityCalculatorOptions) {
     this.graphRepo = options.graphRepo;
+    this.refreshCanonical = options.refreshCanonical;
   }
 
   /**
@@ -30,6 +34,10 @@ export class CentralityCalculator {
    * @param scope - 要计算的 scope
    */
   async calculateCentrality(scope: MemoryScope): Promise<void> {
+    if (this.refreshCanonical) {
+      await this.refreshCanonical(scope);
+      return;
+    }
     // 获取 scope 内的所有 entity 和 relation
     const entities = await this.graphRepo.findEntities({ scope, limit: Number.POSITIVE_INFINITY });
     const relations = await this.graphRepo.findRelations({ scope, limit: Number.POSITIVE_INFINITY });

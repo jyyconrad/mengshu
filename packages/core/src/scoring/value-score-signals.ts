@@ -13,6 +13,7 @@
 
 import type { ValueScoreSignals } from "./value-score.js";
 import type { MemorySemanticType } from "../domain/types.js";
+import type { SourceKind } from "./importance-score.js";
 import type {
   ValidatedCandidate,
   ScopeLevel,
@@ -76,19 +77,6 @@ function deriveSpecificity(text: string): number {
 }
 
 /**
- * evidence 维度推导（§4.1 取值来源表："sourceAuthority(evidence) 映射"）
- *
- * 当前上下文：候选来自 LLM 抽取（session_user 来源）或 heuristic（agent_output），
- * 暂无 rule_file/work_log 等高权威来源。统一按 session_user=0.8 给分。
- *
- * TODO(P2)：当接入 rule_file 扫描或 work_log 集成后，从 sourceKind 字段读取真实来源。
- */
-function deriveEvidence(_text: string): number {
-  // 首期固定 session_user 权威度 0.8（来自会话抽取）
-  return SCORING_WEIGHTS_V1.sourceAuthority.session_user;
-}
-
-/**
  * scopeFit 维度推导（§4.1 取值来源表："有明确 scope 归属 → 高"）
  *
  * 判定 targetScope 是否明确且合理（不是过宽的 global/user）。
@@ -109,20 +97,54 @@ function deriveScopeFit(targetScope: ScopeLevel): number {
   return 0.3; // global
 }
 
-/**
- * novelty 维度推导（§4.1 取值来源表："去重阶段 1 - maxSimilarity"）
- *
- * 当前上下文：准入阶段尚未执行 L3 语义去重（embedding 依赖异步），
- * 只经过 L0 exact hash（persistCandidates 内同 scope 同文本去重）。
- * 同批内重复已被拦截，剩余候选视为"初步新颖"，给中性偏高分 0.7。
- *
- * TODO(P2)：当接入异步去重后，从 deduplication 模块获取真实 maxSimilarity，
- * 用 1 - maxSimilarity 作为 novelty 分（完全重复 → 0，完全新颖 → 1.0）。
- */
-function deriveNovelty(_text: string): number {
-  // 首期给中性偏高分 0.7（同批去重通过 = 初步新颖）
-  return 0.7;
+export type ValueScoreSignalInput = Readonly<
+  | {
+      mode: "authoritative";
+      sourceKind: SourceKind;
+      maxSimilarity: number;
+    }
+  | { mode: "legacy_unknown" }
+>;
+
+export type ValueScoreSignalProvenance = Readonly<
+  | {
+      mode: "authoritative";
+      evidence: "source_authority";
+      novelty: "semantic_max_similarity";
+      sourceKind: SourceKind;
+      maxSimilarity: number;
+    }
+  | {
+      mode: "legacy_unknown";
+      evidence: "unknown";
+      novelty: "unknown";
+    }
+>;
+
+export interface ValueScoreSignalContext {
+  readonly intent?: string;
+  readonly valueSignals?: ValueScoreSignalInput;
 }
+
+export interface DerivedValueScoreSignals {
+  readonly signals: ValueScoreSignals;
+  readonly provenance: ValueScoreSignalProvenance;
+}
+
+export class ValueScoreSignalError extends Error {
+  readonly code = "VALUE_SCORE_SIGNAL_INVALID" as const;
+
+  constructor() {
+    super("valueScore signal is invalid");
+    this.name = "ValueScoreSignalError";
+  }
+}
+
+const LEGACY_UNKNOWN_PROVENANCE: ValueScoreSignalProvenance = Object.freeze({
+  mode: "legacy_unknown",
+  evidence: "unknown",
+  novelty: "unknown",
+});
 
 /**
  * riskPenalty 维度推导（§4.1 取值来源表："命中风险词或 riskFlags"）
@@ -153,10 +175,10 @@ function deriveRiskPenalty(riskFlags: readonly string[]): number {
  * @param context 抽取上下文（intent 用于判定 explicitness）
  * @returns 8 维信号，供 computeValueScore 消费
  */
-export function deriveValueScoreSignals(
+export function deriveValueScoreSignalsWithProvenance(
   candidate: ValidatedCandidate,
-  context: { intent?: string },
-): ValueScoreSignals {
+  context: ValueScoreSignalContext = {},
+): DerivedValueScoreSignals {
   // explicitness：用户明确要求记住 → 1.0，否则 0
   // 来源 1：intent=remember（memory_store 工具显式保存）
   // 来源 2：text 命中显式记忆请求模式（"记住"/"以后都"/"remember"/"don't forget"）
@@ -172,19 +194,36 @@ export function deriveValueScoreSignals(
   // specificity：是否含具体指代（文件/工具/命令/数值）
   const specificity = deriveSpecificity(candidate.text);
 
-  // evidence：来源权威度（首期固定 session_user=0.8）
-  const evidence = deriveEvidence(candidate.text);
+  const valueSignals = context.valueSignals;
+  let evidence = 0;
+  let novelty = 0;
+  let provenance = LEGACY_UNKNOWN_PROVENANCE;
+  if (valueSignals?.mode === "authoritative") {
+    if (
+      !Number.isFinite(valueSignals.maxSimilarity) ||
+      valueSignals.maxSimilarity < 0 ||
+      valueSignals.maxSimilarity > 1
+    ) {
+      throw new ValueScoreSignalError();
+    }
+    evidence = SCORING_WEIGHTS_V1.sourceAuthority[valueSignals.sourceKind];
+    novelty = 1 - valueSignals.maxSimilarity;
+    provenance = Object.freeze({
+      mode: "authoritative",
+      evidence: "source_authority",
+      novelty: "semantic_max_similarity",
+      sourceKind: valueSignals.sourceKind,
+      maxSimilarity: valueSignals.maxSimilarity,
+    });
+  }
 
   // scopeFit：scope 归属是否明确（session/project 高，global 低）
   const scopeFit = deriveScopeFit(candidate.targetScope);
 
-  // novelty：是否非重复（首期固定 0.7，待接入异步去重）
-  const novelty = deriveNovelty(candidate.text);
-
   // riskPenalty：风险标记聚合（prompt_injection/sensitive/low_evidence）
   const riskPenalty = deriveRiskPenalty(candidate.riskFlags);
 
-  return {
+  const signals = Object.freeze({
     explicitness,
     durability,
     actionability,
@@ -193,5 +232,14 @@ export function deriveValueScoreSignals(
     scopeFit,
     novelty,
     riskPenalty,
-  };
+  });
+  return Object.freeze({ signals, provenance });
+}
+
+/** 兼容旧调用方；provenance 由新入口单独返回并写入 receipt。 */
+export function deriveValueScoreSignals(
+  candidate: ValidatedCandidate,
+  context: ValueScoreSignalContext = {},
+): ValueScoreSignals {
+  return deriveValueScoreSignalsWithProvenance(candidate, context).signals;
 }

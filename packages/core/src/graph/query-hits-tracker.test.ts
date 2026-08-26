@@ -2,7 +2,7 @@
  * QueryHitsTracker 单元测试
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { QueryHitsTracker } from "./query-hits-tracker.js";
 import { InMemoryGraphRepository } from "./repository.js";
 import type { GraphEntityRecord } from "./types.js";
@@ -282,5 +282,50 @@ describe("QueryHitsTracker", () => {
 
     // 不应该抛出错误
     await expect(tracker.trackRecallHits(hits, scope)).resolves.toBeUndefined();
+  });
+
+  it("production port 只接收权威 memory identity，不信任 metadata entityIds", async () => {
+    const incrementRecallHits = vi.fn(async () => ({
+      updatedEntityIds: ["authoritative-entity"],
+    }));
+    const productionTracker = new QueryHitsTracker({
+      entityGraphQueryHits: { incrementRecallHits },
+    });
+    const hit = {
+      record: {
+        id: "active-memory-1",
+        scope,
+        kind: "fact" as const,
+        text: "PostgreSQL query hit",
+        contentHash: "hash-production",
+        importance: 0.8,
+        category: "other",
+        dataType: "memory",
+        vector: new Array(384).fill(0.1),
+        provenance: {},
+        createdAt: Date.now(),
+        metadata: {
+          entityIds: ["caller-forged-entity"],
+          workMemoryNodeIds: ["must-not-be-treated-as-entity"],
+          codeGraphNodeIds: ["must-not-be-treated-as-entity"],
+        },
+      },
+      score: 0.9,
+      source: "graph" as const,
+      scoreBreakdown: { vector: 0.9 },
+      provenance: {},
+    } satisfies RecallHit;
+
+    await productionTracker.trackRecallHits([hit, hit], scope);
+
+    expect(incrementRecallHits).toHaveBeenCalledOnce();
+    expect(incrementRecallHits).toHaveBeenCalledWith({
+      memoryIds: ["active-memory-1"],
+      scope,
+      occurredAt: expect.any(Number),
+    });
+    expect(JSON.stringify(incrementRecallHits.mock.calls)).not.toContain("caller-forged-entity");
+    expect(JSON.stringify(incrementRecallHits.mock.calls)).not.toContain("workMemoryNodeIds");
+    expect(JSON.stringify(incrementRecallHits.mock.calls)).not.toContain("codeGraphNodeIds");
   });
 });

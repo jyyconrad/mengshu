@@ -105,7 +105,6 @@ export function createConfigFingerprint(config: unknown): string {
           summarizationModel: optionalString(llm.summarizationModel),
           reasoningModel: optionalString(llm.reasoningModel),
           maxTokens: optionalNumber(llm.maxTokens),
-          temperature: optionalNumber(llm.temperature),
           credentialConfigured: credentialConfigured(llm.apiKey),
         }
       : undefined,
@@ -141,6 +140,7 @@ export function createConfigFingerprint(config: unknown): string {
       graph: optionalBoolean(features.graph),
       summaryTree: optionalBoolean(features.summaryTree),
       webConsole: optionalBoolean(features.webConsole),
+      assetInjection: optionalBoolean(features.assetInjection),
     },
     captureRecall: {
       autoCapture: optionalBoolean(root.autoCapture),

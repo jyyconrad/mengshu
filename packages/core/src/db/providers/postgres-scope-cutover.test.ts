@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MemoryAutodbRegistry } from "../../runtime/registry.js";
+import { CURRENT_SCHEMA_VERSION } from "../migrations/schema-migrations.js";
 
 const calls: Array<{ sql: string; params?: unknown[] }> = [];
 let ledger: Array<{ version: number; name: string; checksum: string }> = [];
@@ -142,7 +143,7 @@ describe("PostgresProvider scope cutover facade", () => {
 
     await expect(provider.getSchemaContractStatus()).resolves.toMatchObject({
       currentVersion: 5,
-      targetVersion: 12,
+      targetVersion: CURRENT_SCHEMA_VERSION,
       scopeContentHashDedupe: "pending",
     });
 

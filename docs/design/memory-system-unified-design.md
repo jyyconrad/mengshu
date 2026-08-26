@@ -274,7 +274,6 @@ interface LlmClient {
     schema: JSONSchema;          // 强制 schema
     schemaName: string;          // OpenAI structured outputs 需要 name
     model?: string;              // 可选：覆盖默认模型（见 §11.3 模型分层）
-    temperature?: number;        // 默认 0.0，提取任务必须确定性
     maxTokens?: number;
   }): Promise<T>;
 }
@@ -284,6 +283,8 @@ interface ChatMessage {
   content: string;
 }
 ```
+
+`temperature` 不是调用方或用户配置项；所有 LLM 请求由运行时强制使用 `0.0`。
 
 **为什么必须用 structured outputs**（而非 prompt 里写"输出 JSON"）：
 

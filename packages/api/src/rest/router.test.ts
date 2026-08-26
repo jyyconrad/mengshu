@@ -9,6 +9,11 @@ import { CandidateReviewService } from "../../../../lifecycle/candidate-review.j
 import { createRestApi, createRestRouter } from "./router.js";
 import type { AuthorityScope } from "../../../core/src/domain/authority-scope.js";
 import type { MemoryConfig } from "../../../../config.js";
+import type {
+  MemoryWriteCommand,
+  MemoryWriteKernelResult,
+} from "../../../core/src/service/write-kernel.js";
+import { computeRecallScoreBreakdown } from "../../../../core/recall-scoring.js";
 
 const scope = {
   tenantId: "local",
@@ -33,6 +38,13 @@ const record: MemoryRecord = {
   provenance: {},
   createdAt: 1710000000000,
 };
+
+const scoreBreakdown = computeRecallScoreBreakdown(
+  record,
+  { relevance: 0.9, scopeFit: 1 },
+  ["vector"],
+  { vector: 0.9 },
+);
 
 const transportAuthority: AuthorityScope = {
   tenantId: "server-tenant",
@@ -76,7 +88,7 @@ class FakeMemoryService implements MemoryService {
     return {
       scope,
       query: "concise",
-      hits: [{ record, score: 0.9, source: "vector" }],
+      hits: [{ record, score: scoreBreakdown.score, source: "vector", scoreBreakdown }],
     };
   }
 
@@ -84,7 +96,7 @@ class FakeMemoryService implements MemoryService {
     return {
       scope,
       content: "<retrieved-context>safe</retrieved-context>",
-      hits: [{ record, score: 0.9, source: "vector" }],
+      hits: [{ record, score: scoreBreakdown.score, source: "vector", scoreBreakdown }],
       tokenEstimate: 8,
     };
   }
@@ -99,6 +111,57 @@ class FakeMemoryService implements MemoryService {
 }
 
 describe("REST router", () => {
+  test("server-owned workspace/session are preserved and client overrides are rejected", async () => {
+    const executeMemoryWrite = vi.fn(async (): Promise<MemoryWriteKernelResult> => ({
+      status: "persisted",
+      route: "active",
+      recordType: "memory",
+      memoryId: "memory-1",
+      stored: true,
+    }));
+    const authority: AuthorityScope = {
+      ...transportAuthority,
+      workspaceId: "workspace-server",
+      sessionId: "session-server",
+    };
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      authority,
+      memoryWrite: { executeMemoryWrite },
+    });
+
+    const accepted = await router.handle({
+      method: "POST",
+      path: "/v1/memories",
+      headers: {},
+      body: {
+        idempotencyKey: "scope-fidelity-1",
+        record: { ...record, scope: {} },
+      },
+    });
+    expect(accepted.status).toBe(201);
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      clientScope: expect.objectContaining({
+        workspaceId: "workspace-server",
+        sessionId: "session-server",
+      }),
+    }));
+
+    const rejected = await router.handle({
+      method: "POST",
+      path: "/v1/memories",
+      headers: {},
+      body: {
+        idempotencyKey: "scope-fidelity-2",
+        record: { ...record, scope: { sessionId: "session-client" } },
+      },
+    });
+    expect(rejected).toEqual({
+      status: 400,
+      body: { error: "Invalid scope: CLIENT_FIELD_FORBIDDEN" },
+    });
+  });
+
   test("rejects production router construction without authority", () => {
     expect(() => createRestRouter({ service: new FakeMemoryService() })).toThrow(
       /REST authority is required/,
@@ -156,10 +219,16 @@ describe("REST router", () => {
   test("authority makes attacker tenant/user override zero before save/recall/context/observe/forget", async () => {
     const service = new FakeMemoryService();
     const capturedScopes: unknown[] = [];
-    service.storeMemory = (async (input: { record: { scope: unknown } }) => {
-      capturedScopes.push(input.record.scope);
-      return { id: "mem-1", stored: true };
-    }) as unknown as typeof service.storeMemory;
+    const executeMemoryWrite = vi.fn(async (command: MemoryWriteCommand) => {
+      capturedScopes.push(command.clientScope);
+      return {
+        status: "persisted" as const,
+        route: "active" as const,
+        recordType: "memory" as const,
+        memoryId: "mem-1",
+        stored: true,
+      };
+    });
     service.recall = (async (input: { scope: unknown }) => {
       capturedScopes.push(input.scope);
       return { scope, query: "", hits: [] };
@@ -184,14 +253,23 @@ describe("REST router", () => {
         return { ack: true as const, traceId: "trace-1", queuedJobs: [] };
       },
     } as unknown as NonNullable<Parameters<typeof createRestRouter>[0]["agentFastPath"]>;
-    const router = createRestRouter({ service, forgetService, agentFastPath, authority: transportAuthority });
+    const router = createRestRouter({
+      service,
+      forgetService,
+      agentFastPath,
+      authority: transportAuthority,
+      memoryWrite: { executeMemoryWrite },
+    });
 
     const responses = await Promise.all([
       router.handle({
         method: "POST",
         path: "/v1/memories",
         headers: {},
-        body: { record: { ...record, scope: attackerScope } },
+        body: {
+          idempotencyKey: "rest-save-1",
+          record: { ...record, scope: attackerScope },
+        },
       }),
       router.handle({
         method: "POST",
@@ -225,6 +303,141 @@ describe("REST router", () => {
       expect(captured).toMatchObject({ tenantId: "server-tenant", userId: "server-user" });
       expect(captured).not.toMatchObject({ tenantId: "attacker-tenant" });
     }
+  });
+
+  test("authority save delegates only to the runtime write capability", async () => {
+    const service = new FakeMemoryService();
+    const directStore = vi.spyOn(service, "storeMemory");
+    const executeMemoryWrite = vi.fn(async (_command: MemoryWriteCommand) => ({
+      status: "persisted" as const,
+      route: "candidate" as const,
+      recordType: "candidate" as const,
+      candidateId: "candidate-1",
+      memoryId: "candidate-1",
+      stored: true,
+    }));
+    const router = createRestRouter({
+      service,
+      authority: transportAuthority,
+      memoryWrite: { executeMemoryWrite },
+    });
+
+    const response = await router.handle({
+      method: "POST",
+      path: "/v1/memories",
+      headers: {},
+      body: {
+        idempotencyKey: "rest-save-2",
+        record: { ...record, scope: attackerScope },
+      },
+    });
+
+    expect(response).toEqual({
+      status: 201,
+      body: {
+        id: "candidate-1",
+        stored: true,
+        status: "persisted",
+        route: "candidate",
+        recordType: "candidate",
+      },
+    });
+    expect(directStore).not.toHaveBeenCalled();
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      type: "saveExplicit",
+      idempotencyKey: "rest-save-2",
+      serverAuthority: transportAuthority,
+      clientScope: expect.objectContaining({
+        tenantId: "server-tenant",
+        userId: "server-user",
+      }),
+      text: record.text,
+      kind: record.kind,
+    }));
+  });
+
+  test("authority save owns REST source and rejects provenance/metadata source spoofing", async () => {
+    const executeMemoryWrite = vi.fn(async () => ({
+      status: "persisted" as const,
+      route: "active" as const,
+      recordType: "memory" as const,
+      memoryId: "memory-rest-source",
+      stored: true,
+    }));
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      memoryWrite: { executeMemoryWrite },
+    });
+
+    await router.handle({
+      method: "POST",
+      path: "/v1/memories",
+      headers: {},
+      body: {
+        idempotencyKey: "rest-authoritative-source-1",
+        record: {
+          ...record,
+          scope: attackerScope,
+          metadata: { source: "system", clientLabel: "preserved" },
+          provenance: {
+            source: "scan",
+            sourceId: "message-real-1",
+            messageId: "message-1",
+          },
+        },
+      },
+    });
+
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      type: "saveExplicit",
+      metadata: { source: "user", clientLabel: "preserved" },
+      provenance: {
+        source: "user",
+        sourceId: "message-real-1",
+        messageId: "message-1",
+      },
+    }));
+  });
+
+  test("authority save derives a stable compatibility key for legacy SDK records", async () => {
+    const service = new FakeMemoryService();
+    const directStore = vi.spyOn(service, "storeMemory");
+    const executeMemoryWrite = vi.fn(async (_command: MemoryWriteCommand) => ({
+      status: "persisted" as const,
+      memoryId: "legacy-memory-1",
+      stored: true,
+      recordType: "memory" as const,
+      route: "active" as const,
+    }));
+    const router = createRestRouter({
+      service,
+      authority: transportAuthority,
+      memoryWrite: { executeMemoryWrite },
+    });
+
+    const first = await router.handle({
+      method: "POST",
+      path: "/v1/memories",
+      headers: {},
+      body: { record: { ...record, scope: {} } },
+    });
+    const replay = await router.handle({
+      method: "POST",
+      path: "/v1/memories",
+      headers: {},
+      body: { record: { ...record, scope: {} } },
+    });
+
+    expect(first.status).toBe(201);
+    expect(replay.status).toBe(201);
+    const firstCommand = executeMemoryWrite.mock.calls[0]![0];
+    const replayCommand = executeMemoryWrite.mock.calls[1]![0];
+    expect(firstCommand).toEqual(expect.objectContaining({
+      idempotencyKey: expect.stringMatching(/^legacy-rest-v1:[0-9a-f]{64}$/),
+    }));
+    expect(replayCommand.idempotencyKey).toBe(firstCommand.idempotencyKey);
+    expect(directStore).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -275,6 +488,18 @@ describe("REST router", () => {
     });
   });
 
+  test("returns 503 when the service health snapshot is not ready", async () => {
+    const router = createRestRouter({
+      unsafeLegacyScope: true,
+      service: { health: async () => ({ ok: false, error: "db unavailable" }) } as never,
+    });
+
+    await expect(router.handle({ method: "GET", path: "/v1/health", headers: {} })).resolves.toEqual({
+      status: 503,
+      body: { ok: false, error: "db unavailable" },
+    });
+  });
+
   test("stores memory from JSON body", async () => {
     const router = createRestRouter({ unsafeLegacyScope: true, service: new FakeMemoryService() });
 
@@ -310,9 +535,139 @@ describe("REST router", () => {
     });
 
     expect(recall.status).toBe(200);
-    expect(recall.body).toMatchObject({ query: "concise" });
+    expect(recall.body).toMatchObject({
+      query: "concise",
+      hits: [{ score: scoreBreakdown.score, source: "vector", scoreBreakdown }],
+    });
     expect(context.status).toBe(200);
-    expect(context.body).toMatchObject({ content: "<retrieved-context>safe</retrieved-context>" });
+    expect(context.body).toMatchObject({
+      content: "<retrieved-context>safe</retrieved-context>",
+      hits: [{ score: scoreBreakdown.score, scoreBreakdown }],
+    });
+  });
+
+  test("context returns an explicit error when the service omits the production breakdown", async () => {
+    const service = new FakeMemoryService();
+    service.buildContext = async () => ({
+      scope,
+      content: "unsafe contract",
+      hits: [{ record, score: 0.9, source: "vector" }],
+    });
+    const router = createRestRouter({ unsafeLegacyScope: true, service });
+
+    await expect(router.handle({
+      method: "POST",
+      path: "/v1/context",
+      headers: {},
+      body: { query: "concise" },
+    })).resolves.toEqual({
+      status: 500,
+      body: { error: "RECALL_SCORE_BREAKDOWN_REQUIRED" },
+    });
+  });
+
+  test("recall returns an explicit error when the service omits the production breakdown", async () => {
+    const service = new FakeMemoryService();
+    service.recall = (async () => ({
+      scope,
+      query: "concise",
+      hits: [{ record, score: 0.9, source: "vector" }],
+    })) as typeof service.recall;
+    const router = createRestRouter({ unsafeLegacyScope: true, service });
+
+    await expect(router.handle({
+      method: "POST",
+      path: "/v1/recall",
+      headers: {},
+      body: { query: "concise" },
+    })).resolves.toEqual({
+      status: 500,
+      body: { error: "RECALL_SCORE_BREAKDOWN_REQUIRED" },
+    });
+  });
+
+  test("agent lookup preserves the FastPath complete breakdown", async () => {
+    const lookupHit = {
+      id: record.id,
+      preview: record.text,
+      score: scoreBreakdown.score,
+      scoreBreakdown,
+      source: "vector",
+      evidence: [],
+      actions: ["copy_reference" as const],
+    };
+    const agentFastPath = {
+      async lookup() {
+        return { hits: [lookupHit], telemetry: { latencyMs: 1, mode: "fast" as const } };
+      },
+    } as unknown as NonNullable<Parameters<typeof createRestRouter>[0]["agentFastPath"]>;
+    const router = createRestRouter({ unsafeLegacyScope: true, service: new FakeMemoryService(), agentFastPath });
+
+    const response = await router.handle({
+      method: "POST",
+      path: "/v1/agent/lookup",
+      headers: {},
+      body: { query: "concise" },
+    });
+
+    expect(response.status).toBe(200);
+    expect((response.body as { hits: typeof lookupHit[] }).hits[0].scoreBreakdown).toBe(scoreBreakdown);
+    expect((response.body as { hits: typeof lookupHit[] }).hits[0]).toEqual(lookupHit);
+  });
+
+  test("agent lookup returns an explicit error when FastPath omits the breakdown", async () => {
+    const agentFastPath = {
+      async lookup() {
+        return {
+          hits: [{ id: record.id, preview: record.text, score: 0.9, source: "vector", evidence: [], actions: [] }],
+          telemetry: { latencyMs: 1, mode: "fast" as const },
+        };
+      },
+    } as unknown as NonNullable<Parameters<typeof createRestRouter>[0]["agentFastPath"]>;
+    const router = createRestRouter({ unsafeLegacyScope: true, service: new FakeMemoryService(), agentFastPath });
+
+    await expect(router.handle({
+      method: "POST",
+      path: "/v1/agent/lookup",
+      headers: {},
+      body: { query: "concise" },
+    })).resolves.toEqual({
+      status: 500,
+      body: { error: "RECALL_SCORE_BREAKDOWN_REQUIRED" },
+    });
+  });
+
+  test("agent context rejects slots whose sourceIds and recallReceipts diverge", async () => {
+    const agentFastPath = {
+      async context() {
+        return {
+          scope,
+          slots: {
+            rules: {
+              semanticType: "rules" as const,
+              question: "Q3",
+              content: `- ${record.text}`,
+              sourceIds: [record.id],
+              recallReceipts: [],
+              nodeCount: 1,
+            },
+          },
+          content: record.text,
+          telemetry: { latencyMs: 1, nodesUsed: 1, cacheHit: false },
+        };
+      },
+    } as unknown as NonNullable<Parameters<typeof createRestRouter>[0]["agentFastPath"]>;
+    const router = createRestRouter({ unsafeLegacyScope: true, service: new FakeMemoryService(), agentFastPath });
+
+    await expect(router.handle({
+      method: "POST",
+      path: "/v1/agent/context",
+      headers: {},
+      body: { task: "load context" },
+    })).resolves.toEqual({
+      status: 500,
+      body: { error: "CONTEXT_RECALL_BREAKDOWN_REQUIRED" },
+    });
   });
 
   test("applies auth guard and returns JSON errors", async () => {

@@ -15,6 +15,8 @@ import {
   sortByNodeScore,
   computeImportanceForRecord,
   computeImportanceForRecordWithBreakdown,
+  computeRecallScoreBreakdown,
+  isRecallScoreBreakdown,
   type ImportanceMetadata,
 } from "./recall-scoring.js";
 
@@ -130,6 +132,26 @@ describe("sortByNodeScore", () => {
 });
 
 describe("computeImportanceForRecord (v0.2)", () => {
+  test("salience=0 是合法输入，不得误判为缺失元数据", () => {
+    const meta: ImportanceMetadata = {
+      salience: 0,
+      sourceKind: "rule_file",
+      explicitSave: false,
+      semanticType: "rules",
+    };
+
+    expect(computeImportanceForRecord(meta)).toBeCloseTo(0.35, 6);
+    expect(computeImportanceForRecordWithBreakdown(meta)).toMatchObject({
+      importance: 0.35,
+      breakdown: {
+        salience_llm: 0,
+        sourceAuthority: 0.2,
+        explicitnessBonus: 0,
+        typePrior: 0.15,
+      },
+    });
+  });
+
   test("从元数据正确计算 importance（4 项加权）", () => {
     const meta: ImportanceMetadata = {
       salience: 0.8,
@@ -174,6 +196,50 @@ describe("computeImportanceForRecord (v0.2)", () => {
     expect(scoreWith).toBeGreaterThan(scoreWithout);
     // 差值应为 w3_explicit = 0.2
     expect(scoreWith - scoreWithout).toBeCloseTo(0.2, 6);
+  });
+});
+
+describe("isRecallScoreBreakdown", () => {
+  test("仅接受权重、因子、贡献、总分和 matchedBy 相互一致的完整六因子回执", () => {
+    const complete = computeRecallScoreBreakdown(
+      makeRecord({ semanticType: "rules", importance: 0.7 }),
+      { relevance: 0.8, scopeFit: 1 },
+      ["vector"],
+      { vector: 0.8 },
+    );
+
+    expect(isRecallScoreBreakdown(complete)).toBe(true);
+    expect(isRecallScoreBreakdown({ ...complete, weights: { ...complete.weights, relevance: 0.39 } })).toBe(false);
+    expect(isRecallScoreBreakdown({ ...complete, factors: { ...complete.factors, relevance: 2 } })).toBe(false);
+    expect(isRecallScoreBreakdown({
+      ...complete,
+      contributions: { ...complete.contributions, relevance: complete.contributions.relevance + 0.01 },
+    })).toBe(false);
+    expect(isRecallScoreBreakdown({ ...complete, score: complete.score + 0.01 })).toBe(false);
+    expect(isRecallScoreBreakdown({ ...complete, matchedBy: ["unknown"] })).toBe(false);
+    expect(isRecallScoreBreakdown({ ...complete, matchedBy: [] })).toBe(false);
+  });
+
+  test("完整回执构造器拒绝空/未知 matchedBy 和非有限 source signal", () => {
+    const record = makeRecord({ semanticType: "rules" });
+    expect(() => computeRecallScoreBreakdown(
+      record,
+      { relevance: 0.8, scopeFit: 1 },
+      [],
+      { vector: 0.8 },
+    )).toThrow(/matchedBy/);
+    expect(() => computeRecallScoreBreakdown(
+      record,
+      { relevance: 0.8, scopeFit: 1 },
+      ["unknown" as "vector"],
+      { vector: 0.8 },
+    )).toThrow(/matchedBy/);
+    expect(() => computeRecallScoreBreakdown(
+      record,
+      { relevance: 0.8, scopeFit: 1 },
+      ["vector"],
+      { vector: Number.NaN },
+    )).toThrow(/sourceSignals/);
   });
 });
 

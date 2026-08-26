@@ -15,21 +15,33 @@ import type {
 } from "../runtime/llm/llm-client.js";
 import type { ExtractedCandidate, TypeExtractor } from "./type-extractor.js";
 import {
-  validateCandidate,
+  validateCandidateWithReceipt,
   type CandidateSource,
+  type CandidateValidationReceiptV1,
   type RawCandidate,
   type ScopeLevel,
   type Temporality,
   type ValidatedCandidate,
 } from "./candidate-validator.js";
 import {
-  decideAdmission,
+  decideAdmissionWithBreakdown,
   type AdmissionContext,
+  type AdmissionDecisionResult,
 } from "./admission-decision.js";
 import {
   inferDeterministicCandidateSignals,
   STABILITY_PATTERNS,
 } from "../runtime/llm/extraction-rules.js";
+import {
+  deriveCandidateConfidence,
+  snapshotAuthoritativeCandidateEvidenceFacts,
+  type AuthoritativeCandidateEvidenceFact,
+} from "./candidate-confidence-deriver.js";
+import {
+  ValueScoreSignalError,
+  type ValueScoreSignalProvenance,
+} from "../scoring/value-score-signals.js";
+import type { SourceKind } from "../scoring/importance-score.js";
 
 type JsonPrimitive = string | number | boolean | null;
 export type CandidateJsonValue =
@@ -42,11 +54,32 @@ export interface CandidateComputationInput {
   text: string;
   traceId: string;
   intent?: string;
+  /** 由 server 按真实 persisted evidence 读取并注入；不得来自 LLM 或客户端 metadata。 */
+  evidenceFacts?: readonly AuthoritativeCandidateEvidenceFact[];
 }
+
+export interface RuntimeCandidateSimilarityResolution {
+  readonly authority: "runtime_embedding_resolution";
+  readonly embeddingSpaceId: string;
+  readonly maxSimilarity?: number;
+  readonly vector: readonly number[];
+}
+
+export type CandidateMaximumSimilarityResolution =
+  | number
+  | RuntimeCandidateSimilarityResolution;
 
 export interface CandidateComputationDeps {
   extractor: TypeExtractor;
   llmClient?: LlmClient;
+  /** 从 Runtime 当前 authoritative embedding space 读取 admission novelty。 */
+  resolveMaxSimilarity?(input: {
+    readonly text: string;
+    readonly kind: string;
+    readonly semanticType?: MemorySemanticType;
+    readonly scope: MemoryScope;
+    readonly signal?: AbortSignal;
+  }): Promise<CandidateMaximumSimilarityResolution | undefined>;
 }
 
 export interface ComputedCandidateSpec {
@@ -62,12 +95,36 @@ export interface ComputedCandidateSpec {
   };
   readonly metadata: Readonly<Record<string, CandidateJsonValue>>;
   readonly auditMetadata: Readonly<Record<string, CandidateJsonValue>>;
+  /** 当前调用链内复用的纯计算结果；不进入 metadata、audit 或持久化 receipt。 */
+  readonly similarityResolution?: RuntimeCandidateSimilarityResolution;
+  /** 由 validator 直接生成；可选仅用于兼容旧的手工构造 fixture。 */
+  readonly validationReceipt?: CandidateValidationReceiptV1;
 }
 
 export type CandidateFallbackReason = "llm_extraction_failed";
 
+export interface CandidateAdmissionReceiptV1 {
+  readonly version: 1;
+  readonly outcome: "accepted" | "dropped";
+  readonly route: AdmissionDecisionResult["route"];
+  readonly valueScore: number;
+  readonly reason: string;
+  readonly breakdown: Readonly<Record<string, number>>;
+  readonly valueSignalProvenance: ValueScoreSignalProvenance;
+}
+
+export interface CandidateProposalReceiptV1 {
+  readonly version: 1;
+  readonly candidateOrdinal: number;
+  readonly outcome: "accepted" | "validator_rejected" | "admission_dropped" | "computation_dropped";
+  readonly validation?: CandidateValidationReceiptV1;
+  readonly admission?: CandidateAdmissionReceiptV1;
+  readonly computationReason?: string;
+}
+
 export interface CandidateComputationResult {
   readonly specs: readonly ComputedCandidateSpec[];
+  readonly proposalReceipts: readonly CandidateProposalReceiptV1[];
   readonly fallbackReason: CandidateFallbackReason | null;
 }
 
@@ -343,8 +400,97 @@ function sourceFor(input: CandidateComputationInput): { source: CandidateSource;
   };
 }
 
-function admissionContext(input: CandidateComputationInput, sourceKind: AdmissionContext["sourceKind"]): AdmissionContext {
-  return { intent: input.intent ?? "auto", sourceKind, hasConflict: false };
+function authoritativeSourceKind(
+  verdict: ValidatedCandidate,
+  evidenceFacts: readonly AuthoritativeCandidateEvidenceFact[] | undefined,
+): SourceKind | undefined {
+  const confidence = deriveCandidateConfidence({
+    semanticType: verdict.semanticType,
+    eventIds: verdict.evidence.eventIds ?? [],
+    evidenceFacts,
+  });
+  if (!confidence) return undefined;
+  const sourceKinds = new Set(confidence.evidences.map((evidence) => evidence.sourceKind));
+  return sourceKinds.size === 1 ? confidence.evidences[0]?.sourceKind : undefined;
+}
+
+function legacyAdmissionContext(input: CandidateComputationInput): AdmissionContext {
+  return {
+    intent: input.intent ?? "auto",
+    hasConflict: false,
+    valueSignals: { mode: "legacy_unknown" },
+  };
+}
+
+interface CandidateAdmissionContextResolution {
+  readonly context: AdmissionContext;
+  readonly similarityResolution?: RuntimeCandidateSimilarityResolution;
+}
+
+async function admissionContext(
+  deps: CandidateComputationDeps,
+  input: CandidateComputationInput,
+  verdict: ValidatedCandidate,
+  kind: string,
+  signal?: AbortSignal,
+): Promise<CandidateAdmissionContextResolution> {
+  const sourceKind = authoritativeSourceKind(verdict, input.evidenceFacts);
+  if (!sourceKind || !deps.resolveMaxSimilarity) {
+    return deepFreeze({
+      context: {
+        ...legacyAdmissionContext(input),
+        ...(sourceKind === undefined ? {} : { sourceKind }),
+      },
+    });
+  }
+  const resolved = await deps.resolveMaxSimilarity({
+    text: verdict.text,
+    kind,
+    semanticType: verdict.semanticType,
+    scope: input.scope,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  throwIfAborted(signal);
+  if (resolved === undefined) {
+    return deepFreeze({
+      context: { ...legacyAdmissionContext(input), sourceKind },
+    });
+  }
+  const maxSimilarity = typeof resolved === "number" ? resolved : resolved.maxSimilarity;
+  let similarityResolution: RuntimeCandidateSimilarityResolution | undefined;
+  if (typeof resolved !== "number") {
+    if (
+      resolved.authority !== "runtime_embedding_resolution" ||
+      typeof resolved.embeddingSpaceId !== "string" ||
+      resolved.embeddingSpaceId.length === 0 ||
+      !Array.isArray(resolved.vector) ||
+      resolved.vector.length === 0 ||
+      resolved.vector.some((value) => typeof value !== "number" || !Number.isFinite(value))
+    ) {
+      throw new ValueScoreSignalError();
+    }
+    similarityResolution = deepFreeze({
+      authority: "runtime_embedding_resolution",
+      embeddingSpaceId: resolved.embeddingSpaceId,
+      ...(maxSimilarity === undefined ? {} : { maxSimilarity }),
+      vector: [...resolved.vector],
+    });
+  }
+  if (maxSimilarity === undefined) {
+    return deepFreeze({
+      context: { ...legacyAdmissionContext(input), sourceKind },
+      ...(similarityResolution === undefined ? {} : { similarityResolution }),
+    });
+  }
+  return deepFreeze({
+    context: {
+      intent: input.intent ?? "auto",
+      sourceKind,
+      hasConflict: false,
+      valueSignals: { mode: "authoritative", sourceKind, maxSimilarity },
+    },
+    ...(similarityResolution === undefined ? {} : { similarityResolution }),
+  });
 }
 
 function makeSpec(args: {
@@ -354,10 +500,31 @@ function makeSpec(args: {
   extractor: string;
   intent: string;
   extraMetadata?: Record<string, CandidateJsonValue>;
-  admission: ReturnType<typeof decideAdmission>;
-}): ComputedCandidateSpec {
+  admission: AdmissionDecisionResult;
+  validationReceipt: CandidateValidationReceiptV1;
+  evidenceFacts?: readonly AuthoritativeCandidateEvidenceFact[];
+  similarityResolution?: RuntimeCandidateSimilarityResolution;
+}): ComputedCandidateSpec | undefined {
   const { verdict, admission } = args;
   const eventIds = [...(verdict.evidence.eventIds ?? [])];
+  const confidenceBreakdown = deriveCandidateConfidence({
+    semanticType: verdict.semanticType,
+    eventIds,
+    evidenceFacts: args.evidenceFacts,
+  });
+  if (!confidenceBreakdown) return undefined;
+  const confidenceSnapshot: CandidateJsonValue = {
+    score: confidenceBreakdown.score,
+    baseConfidence: confidenceBreakdown.baseConfidence,
+    evidences: confidenceBreakdown.evidences.map((evidence) => ({
+      evidenceId: evidence.evidenceId,
+      sourceKind: evidence.sourceKind,
+      reliability: evidence.reliability,
+    })),
+  };
+  const sourceKinds = new Set(confidenceBreakdown.evidences.map((evidence) => evidence.sourceKind));
+  if (sourceKinds.size !== 1) return undefined;
+  const sourceKind = confidenceBreakdown.evidences[0]!.sourceKind;
   const metadata: Record<string, CandidateJsonValue> = {
     ...(args.extraMetadata ?? {}),
     intent: args.intent,
@@ -370,6 +537,9 @@ function makeSpec(args: {
     crossContextual: verdict.crossContextual,
     evidenceOnly: verdict.evidenceOnly,
     riskFlags: [...verdict.riskFlags],
+    sourceKind,
+    valueSignalProvenance: admission.valueSignalProvenance,
+    confidenceBreakdown: confidenceSnapshot,
     ...(verdict.profileDimension ? { profileDimension: verdict.profileDimension } : {}),
   };
   const auditMetadata: Record<string, CandidateJsonValue> = {
@@ -379,29 +549,129 @@ function makeSpec(args: {
     valueScore: admission.valueScore,
     riskFlags: [...verdict.riskFlags],
     evidenceOnly: verdict.evidenceOnly,
+    sourceKind,
+    valueSignalProvenance: admission.valueSignalProvenance,
+    confidenceBreakdown: confidenceSnapshot,
   };
   return deepFreeze({
     text: verdict.text,
     semanticType: verdict.semanticType,
     kind: args.kind,
-    confidence: verdict.salience,
+    confidence: confidenceBreakdown.score,
     reason: args.reason,
     extractor: args.extractor,
     evidence: { quote: verdict.evidence.quote, eventIds },
     metadata: deepFreeze(metadata),
     auditMetadata: deepFreeze(auditMetadata),
+    ...(args.similarityResolution === undefined
+      ? {}
+      : { similarityResolution: args.similarityResolution }),
+    validationReceipt: args.validationReceipt,
   });
 }
 
-function validateAndRoute(
+function admissionReceipt(
+  admission: AdmissionDecisionResult,
+): CandidateAdmissionReceiptV1 {
+  return deepFreeze({
+    version: 1,
+    outcome: admission.route === "drop" ? "dropped" : "accepted",
+    route: admission.route,
+    valueScore: admission.valueScore,
+    reason: admission.reason,
+    breakdown: { ...(admission.breakdown ?? {}) },
+    valueSignalProvenance: admission.valueSignalProvenance,
+  });
+}
+
+async function routeValidatedCandidate(
+  deps: CandidateComputationDeps,
+  input: CandidateComputationInput,
+  verdict: ValidatedCandidate,
+  validation: CandidateValidationReceiptV1,
+  kind: string,
+  candidateOrdinal: number,
+  signal?: AbortSignal,
+): Promise<{
+  readonly admission?: AdmissionDecisionResult;
+  readonly similarityResolution?: RuntimeCandidateSimilarityResolution;
+  readonly proposalReceipt: CandidateProposalReceiptV1;
+}> {
+  try {
+    const resolved: CandidateAdmissionContextResolution = verdict.evidenceOnly
+      ? deepFreeze({ context: legacyAdmissionContext(input) })
+      : await admissionContext(deps, input, verdict, kind, signal);
+    const admission = decideAdmissionWithBreakdown(verdict, resolved.context);
+    return {
+      ...(admission.route === "drop" ? {} : { admission }),
+      ...(admission.route === "drop" || resolved.similarityResolution === undefined
+        ? {}
+        : { similarityResolution: resolved.similarityResolution }),
+      proposalReceipt: deepFreeze({
+        version: 1,
+        candidateOrdinal,
+        outcome: admission.route === "drop" ? "admission_dropped" : "accepted",
+        validation,
+        admission: admissionReceipt(admission),
+      }),
+    };
+  } catch (error) {
+    if (!(error instanceof ValueScoreSignalError)) throw error;
+    return {
+      proposalReceipt: deepFreeze({
+        version: 1,
+        candidateOrdinal,
+        outcome: "computation_dropped",
+        validation,
+        computationReason: "value_score_signal_invalid",
+      }),
+    };
+  }
+}
+
+async function validateAndRoute(
+  deps: CandidateComputationDeps,
+  input: CandidateComputationInput,
   raw: RawCandidate,
   source: CandidateSource,
-  context: AdmissionContext,
-): { verdict: ValidatedCandidate; admission: ReturnType<typeof decideAdmission> } | undefined {
-  const verdict = validateCandidate(raw, source);
-  if (verdict.rejected) return undefined;
-  const admission = decideAdmission(verdict, context);
-  return admission.route === "drop" ? undefined : { verdict, admission };
+  kind: string,
+  candidateOrdinal: number,
+  signal?: AbortSignal,
+): Promise<{
+  readonly verdict?: ValidatedCandidate;
+  readonly admission?: AdmissionDecisionResult;
+  readonly similarityResolution?: RuntimeCandidateSimilarityResolution;
+  readonly proposalReceipt: CandidateProposalReceiptV1;
+}> {
+  const validation = validateCandidateWithReceipt(raw, source, { candidateOrdinal });
+  if (validation.verdict.rejected) {
+    return {
+      proposalReceipt: deepFreeze({
+        version: 1,
+        candidateOrdinal,
+        outcome: "validator_rejected",
+        validation: validation.receipt,
+      }),
+    };
+  }
+  const routed = await routeValidatedCandidate(
+    deps,
+    input,
+    validation.verdict,
+    validation.receipt,
+    kind,
+    candidateOrdinal,
+    signal,
+  );
+  return {
+    ...(routed.admission === undefined
+      ? {}
+      : { verdict: validation.verdict, admission: routed.admission }),
+    ...(routed.similarityResolution === undefined
+      ? {}
+      : { similarityResolution: routed.similarityResolution }),
+    proposalReceipt: routed.proposalReceipt,
+  };
 }
 
 async function computeLlm(
@@ -410,9 +680,12 @@ async function computeLlm(
   signal?: AbortSignal,
 ): Promise<{
   specs: ComputedCandidateSpec[] | null;
+  proposalReceipts: CandidateProposalReceiptV1[];
   fallbackReason: CandidateFallbackReason | null;
 }> {
-  if (!deps.llmClient?.available) return { specs: null, fallbackReason: null };
+  if (!deps.llmClient?.available) {
+    return { specs: null, proposalReceipts: [], fallbackReason: null };
+  }
   const { source, eventId } = sourceFor(input);
   const messages: LlmCompletionMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
@@ -442,16 +715,17 @@ async function computeLlm(
     snapshot = snapshotJson(result);
   } catch (error) {
     if (isAbortError(error) || signal?.aborted) throw abortError(signal);
-    return { specs: null, fallbackReason: "llm_extraction_failed" };
+    return { specs: null, proposalReceipts: [], fallbackReason: "llm_extraction_failed" };
   }
 
   const root = recordValue(snapshot);
   const candidates = root?.candidates;
   if (!Array.isArray(candidates)) {
-    return { specs: null, fallbackReason: "llm_extraction_failed" };
+    return { specs: null, proposalReceipts: [], fallbackReason: "llm_extraction_failed" };
   }
   const specs: ComputedCandidateSpec[] = [];
-  for (const candidateValue of candidates) {
+  const proposalReceipts: CandidateProposalReceiptV1[] = [];
+  for (const [candidateOrdinal, candidateValue] of candidates.entries()) {
     const candidate = recordValue(candidateValue);
     if (!candidate) continue;
     const evidence = recordValue(candidate.evidence);
@@ -470,7 +744,15 @@ async function computeLlm(
           : undefined;
     // 缺失/非法 temporality 且没有明确文本/intent 证据时，候选不具备
     // 可解释的时效语义；直接丢弃，绝不把 absence 默认为 persistent。
-    if (!temporality) continue;
+    if (!temporality) {
+      proposalReceipts.push(deepFreeze({
+        version: 1,
+        candidateOrdinal,
+        outcome: "computation_dropped",
+        computationReason: "temporality_not_explainable",
+      }));
+      continue;
+    }
     const raw: RawCandidate = {
       text,
       semanticType: stringValue(candidate.semanticType) as MemorySemanticType | undefined,
@@ -482,24 +764,52 @@ async function computeLlm(
       // Provider 输出中的 eventIds 不属于 authority；纯计算边界只绑定当前真实事件。
       evidence: { quote: stringValue(evidence?.quote) ?? "", eventIds: [eventId] },
     };
-    const routed = validateAndRoute(raw, source, admissionContext(input, "session_user"));
-    if (!routed) continue;
-    specs.push(makeSpec({
-      ...routed,
-      kind: stringValue(candidate.kind) ?? "other",
+    const kind = stringValue(candidate.kind) ?? "other";
+    const routed = await validateAndRoute(
+      deps,
+      input,
+      raw,
+      source,
+      kind,
+      candidateOrdinal,
+      signal,
+    );
+    proposalReceipts.push(routed.proposalReceipt);
+    if (!routed.verdict || !routed.admission) continue;
+    const verdict = routed.verdict;
+    const admission = routed.admission;
+    const spec = makeSpec({
+      verdict,
+      admission,
+      validationReceipt: routed.proposalReceipt.validation!,
+      kind,
       reason: stringValue(candidate.reason) ?? "llm_extracted",
       extractor: "llm",
       intent: input.intent ?? "auto",
-    }));
+      evidenceFacts: input.evidenceFacts,
+      similarityResolution: routed.similarityResolution,
+    });
+    if (spec) {
+      specs.push(spec);
+    } else {
+      proposalReceipts[proposalReceipts.length - 1] = deepFreeze({
+        ...routed.proposalReceipt,
+        outcome: "computation_dropped",
+        computationReason: "authoritative_evidence_unavailable",
+      });
+    }
   }
-  return { specs, fallbackReason: null };
+  return { specs, proposalReceipts, fallbackReason: null };
 }
 
 async function computeHeuristic(
   deps: CandidateComputationDeps,
   input: CandidateComputationInput,
   signal?: AbortSignal,
-): Promise<ComputedCandidateSpec[]> {
+): Promise<{
+  readonly specs: ComputedCandidateSpec[];
+  readonly proposalReceipts: CandidateProposalReceiptV1[];
+}> {
   throwIfAborted(signal);
   const extractorOutput = await deps.extractor.extract({
     text: input.text,
@@ -560,7 +870,8 @@ async function computeHeuristic(
   }
   const { source, eventId } = sourceFor(input);
   const specs: ComputedCandidateSpec[] = [];
-  for (const candidateValue of extracted) {
+  const proposalReceipts: CandidateProposalReceiptV1[] = [];
+  for (const [candidateOrdinal, candidateValue] of extracted.entries()) {
     let candidate: Record<string, CandidateJsonValue>;
     try {
       candidate = recordValue(snapshotJson(candidateValue)) ?? {};
@@ -579,9 +890,8 @@ async function computeHeuristic(
         ? "profile"
         : undefined
     );
-    // TypeExtractor contract 允许 optional semanticType 以承载“无法分类”结果，
-    // 但 governance boundary 不得替它编造 experience 或继续推导持久性。
-    if (!semanticType) continue;
+    // TypeExtractor contract 允许 optional semanticType 以承载“无法分类”结果；
+    // 原样交给 G05 拒绝并留痕，不替它编造 experience 或继续推导持久性。
     const explicitProfileInference = providedSemanticType === undefined && semanticType === "profile";
     const profileDimension = semanticType === "profile"
       ? stringValue(candidate.profileDimension) ?? inferredProfileDimension
@@ -615,8 +925,17 @@ async function computeHeuristic(
       profileDimension,
       evidence: { quote: evidenceQuote, eventIds: [eventId] },
     };
-    const validated = validateCandidate(raw, source);
-    if (validated.rejected) continue;
+    const validation = validateCandidateWithReceipt(raw, source, { candidateOrdinal });
+    if (validation.verdict.rejected) {
+      proposalReceipts.push(deepFreeze({
+        version: 1,
+        candidateOrdinal,
+        outcome: "validator_rejected",
+        validation: validation.receipt,
+      }));
+      continue;
+    }
+    const validated = validation.verdict;
     // 泛化的 profile/resource 只能在有真实 durability/cross 信号时保留为 evidence；
     // task_context 本身允许短期有效，不得把它误套长期门槛。
     if (
@@ -627,6 +946,13 @@ async function computeHeuristic(
       providedCrossContextual !== true &&
       !crossContextEvidence
     ) {
+      proposalReceipts.push(deepFreeze({
+        version: 1,
+        candidateOrdinal,
+        outcome: "computation_dropped",
+        validation: validation.receipt,
+        computationReason: "insufficient_durability_evidence",
+      }));
       continue;
     }
     // 保留 legacy 语义：无因果链的 heuristic experience 只能作为 evidence，
@@ -635,20 +961,44 @@ async function computeHeuristic(
       semanticType === "experience" && !hasWhy
         ? { ...validated, evidenceOnly: true }
         : validated;
-    const admission = decideAdmission(verdict, admissionContext(input, "agent_output"));
-    if (admission.route === "drop") continue;
+    const kind = stringValue(candidate.kind) ?? "other";
+    const routed = await routeValidatedCandidate(
+      deps,
+      input,
+      verdict,
+      validation.receipt,
+      kind,
+      candidateOrdinal,
+      signal,
+    );
+    const proposalReceipt = routed.proposalReceipt;
+    proposalReceipts.push(proposalReceipt);
+    if (!routed.admission) continue;
+    const admission = routed.admission;
     const rawMetadata = recordValue(candidate.metadata);
-    specs.push(makeSpec({
+    const spec = makeSpec({
       verdict,
       admission,
-      kind: stringValue(candidate.kind) ?? "other",
+      kind,
       reason: stringValue(candidate.reason) ?? "heuristic_extracted",
       extractor: deps.extractor.name,
       intent: input.intent ?? "auto",
       extraMetadata: rawMetadata,
-    }));
+      evidenceFacts: input.evidenceFacts,
+      validationReceipt: validation.receipt,
+      similarityResolution: routed.similarityResolution,
+    });
+    if (spec) {
+      specs.push(spec);
+    } else {
+      proposalReceipts[proposalReceipts.length - 1] = deepFreeze({
+        ...proposalReceipt,
+        outcome: "computation_dropped",
+        computationReason: "authoritative_evidence_unavailable",
+      });
+    }
   }
-  return specs;
+  return { specs, proposalReceipts };
 }
 
 /** 计算 immutable 候选规格；成功的 LLM 空结果不触发 heuristic fallback。 */
@@ -662,11 +1012,13 @@ export async function computeCandidateSpecs(
   const scope = input.scope;
   const text = input.text;
   const intent = input.intent;
+  const evidenceFacts = snapshotAuthoritativeCandidateEvidenceFacts(input.evidenceFacts);
   const normalizedInput: CandidateComputationInput = Object.freeze({
     scope,
     text,
     traceId,
     ...(intent === undefined ? {} : { intent }),
+    ...(evidenceFacts === undefined ? {} : { evidenceFacts }),
   });
   throwIfAborted(signal);
   if (
@@ -676,23 +1028,44 @@ export async function computeCandidateSpecs(
   ) {
     return deepFreeze({
       specs: deepFreeze([] as ComputedCandidateSpec[]),
+      proposalReceipts: deepFreeze([] as CandidateProposalReceiptV1[]),
       fallbackReason: null,
     });
   }
   const llm = await computeLlm(deps, normalizedInput, signal);
   throwIfAborted(signal);
-  const computed = llm.specs ?? await computeHeuristic(deps, normalizedInput, signal);
+  const heuristic = llm.specs === null
+    ? await computeHeuristic(deps, normalizedInput, signal)
+    : undefined;
+  const computed = llm.specs ?? heuristic!.specs;
+  const proposalReceipts = [...(llm.specs === null
+    ? heuristic!.proposalReceipts
+    : llm.proposalReceipts)];
   const seen = new Set<string>();
   const deduped = computed.filter((spec) => {
     // 同一原文可以同时承载相互独立的 type（例如技术栈 resource + 组件 rules）；
     // 只去掉同 type 的重复提案，不能按 text 把第二个语义吞掉。
     const key = `${spec.semanticType ?? "unknown"}\u0000${spec.text}`;
-    if (seen.has(key)) return false;
+    if (seen.has(key)) {
+      const receiptIndex = proposalReceipts.findIndex(
+        (receipt) => receipt.validation?.candidateOrdinal ===
+          spec.validationReceipt?.candidateOrdinal,
+      );
+      if (receiptIndex >= 0) {
+        proposalReceipts[receiptIndex] = deepFreeze({
+          ...proposalReceipts[receiptIndex]!,
+          outcome: "computation_dropped",
+          computationReason: "same_batch_semantic_duplicate",
+        });
+      }
+      return false;
+    }
     seen.add(key);
     return true;
   });
   return deepFreeze({
     specs: deepFreeze(deduped),
+    proposalReceipts: deepFreeze(proposalReceipts),
     fallbackReason: llm.fallbackReason,
   });
 }

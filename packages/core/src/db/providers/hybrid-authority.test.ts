@@ -97,7 +97,7 @@ describe("HybridProvider recall authority", () => {
     const result = await provider.query({ ...authority, vector: [0.1], limit: 5, filter: { category: "fact" } });
 
     expect(result.map(({ id }) => id)).toEqual(["id-0", "id-1", "id-2", "id-3", "id-4"]);
-    expect(lance.queryCalls[0]).toMatchObject(authority);
+    expect(lance.queryCalls[0]).toMatchObject({ ...authority, limit: undefined });
     expect(supabase.queryCalls[0]).toMatchObject({ ...authority, vector: undefined, limit: undefined });
     expect(supabase.queryCalls[0]?.filter).toEqual({
       category: "fact",

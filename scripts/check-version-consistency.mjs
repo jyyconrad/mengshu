@@ -41,6 +41,10 @@ function extractVersion(projectRoot, relativePath, pattern) {
 
 const VERSION_CONSUMERS = [
   {
+    source: "openclaw.plugin.json",
+    read: (root) => readJsonVersion(root, "openclaw.plugin.json"),
+  },
+  {
     source: "plugins/openclaw/package.json",
     read: (root) => readJsonVersion(root, "plugins/openclaw/package.json"),
   },

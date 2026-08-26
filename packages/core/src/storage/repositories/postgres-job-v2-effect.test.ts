@@ -85,11 +85,13 @@ class TransactionalFakeClient implements PostgresDurableJobV2EffectClient {
       this.inTransaction = false;
       return { rows: [], rowCount: 0 };
     }
-    if (!this.inTransaction) throw new Error("query escaped transaction");
+    if (!this.inTransaction && !/^SELECT\b/.test(normalized)) {
+      throw new Error("query escaped transaction");
+    }
 
     if (/SELECT job_id, effect_key/.test(normalized)) {
       const key = `${String(params[0])}:${String(params[1])}`;
-      const row = this.txReceipts.get(key);
+      const row = (this.inTransaction ? this.txReceipts : this.receipts).get(key);
       return { rows: row ? [row as unknown as Row] : [], rowCount: row ? 1 : 0 };
     }
 
@@ -275,6 +277,37 @@ describe("PostgresDurableJobV2EffectRepository", () => {
 
     expect(result).toMatchObject({ status: "replayed", receipt: { leaseGeneration: 1 } });
     expect(work).not.toHaveBeenCalled();
+  });
+
+  test("provider-owned replay preflight 只读命中 receipt，不开启第二个事务裁决点", async () => {
+    const h = harness([200]);
+    h.job.owner = "worker-2";
+    h.job.token = "u".repeat(32);
+    h.job.generation = 2;
+    h.receipts.set("job-1:extract_candidate.persist", {
+      job_id: "job-1",
+      effect_key: "extract_candidate.persist",
+      request_fingerprint: fingerprint,
+      lease_generation: 1,
+      result: { candidateIds: ["candidate-1"] },
+      committed_at: 110,
+    });
+    const runner = createPostgresProviderOwnedDomainEffectRunner(h.repository);
+
+    const result = await runner.inspectReplay(input({
+      owner: "worker-2",
+      leaseToken: "u".repeat(32),
+      leaseGeneration: 2,
+    }));
+
+    expect(result).toMatchObject({ status: "replayed", receipt: { leaseGeneration: 1 } });
+    expect(h.clients[0]?.calls.map(({ sql }) => sql)).toEqual([
+      expect.stringMatching(/^SELECT id FROM mengshu_jobs_v2/),
+      expect.stringMatching(/^SELECT job_id, effect_key/),
+    ]);
+    expect(h.clients[0]?.calls.some(({ sql }) => /BEGIN|COMMIT|ROLLBACK|FOR UPDATE/.test(sql)))
+      .toBe(false);
+    expect(h.clients[0]?.released).toBe(true);
   });
 
   test("claim 后 effect 抛错会整体回滚，下一 generation 能安全重试且只提交一次", async () => {

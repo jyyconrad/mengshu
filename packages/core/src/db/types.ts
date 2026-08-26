@@ -19,6 +19,14 @@ export type DataType = "memory" | "document" | "knowledge";
 export type TableName = "memories" | "knowledge" | "documents" | `knowledge_${string}`;
 
 /**
+ * 向量 provider 在 core 六因子评分前最多返回的候选数。
+ *
+ * 这是检索成本护栏，不是用户可见的最终 recall limit。最终 minScore/limit
+ * 必须在治理硬过滤与六因子评分之后由 core 应用。
+ */
+export const DEFAULT_VECTOR_CANDIDATE_LIMIT = 100;
+
+/**
  * 知识条目（用于独立的知识库表）
  */
 export interface KnowledgeEntry {
@@ -147,10 +155,20 @@ export interface MemoryQueryOptions {
   query?: string;
   /** 查询向量（可选，提供则不重新计算） */
   vector?: number[];
-  /** 最大返回结果数 */
+  /**
+   * 最大返回结果数（legacy provider 调用兼容项）。
+   * 向量查询只在候选取回后应用，不得作为 ANN 候选池上限。
+   */
   limit?: number;
-  /** 最小相似度阈值 (0-1) */
+  /**
+   * legacy provider 相似度阈值 (0-1)。core 六因子最终阈值不得下推到这里。
+   */
   minScore?: number;
+  /**
+   * core 评分前的 ANN 候选池上限；与最终 limit 独立，缺省为
+   * DEFAULT_VECTOR_CANDIDATE_LIMIT。
+   */
+  candidateLimit?: number;
   /** 包含的数据类型 */
   dataTypes?: DataType[];
   /** 元数据过滤条件 */
@@ -174,6 +192,17 @@ export interface MemoryQueryOptions {
   appName?: string;
   /** 项目相似检索 LIKE pattern（如 "openclaw%"） */
   projectPattern?: string;
+}
+
+/** 解析并校验 provider-owned ANN 候选池上限。 */
+export function resolveVectorCandidateLimit(
+  options: Pick<MemoryQueryOptions, "candidateLimit">,
+): number {
+  const limit = options.candidateLimit ?? DEFAULT_VECTOR_CANDIDATE_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error("vector candidateLimit must be a positive safe integer");
+  }
+  return limit;
 }
 
 /**

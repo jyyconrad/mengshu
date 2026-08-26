@@ -25,6 +25,7 @@ import type {
   TableStats,
   KnowledgeBaseConfig,
 } from "../types.js";
+import { resolveVectorCandidateLimit } from "../types.js";
 import { vectorDimsForModel } from "../../../../../config.js";
 import { assertSafeLegacyDeleteFilter } from "./legacy-delete-filter-guard.js";
 
@@ -385,6 +386,7 @@ export class SupabaseProvider implements DatabaseProvider {
   async query(options: MemoryQueryOptions): Promise<(MemoryEntry & { score: number })[]> {
     // 纯合同验证必须在 initialize/network 之前完成。
     recallAuthority(options);
+    if (options.vector) resolveVectorCandidateLimit(options);
     await this.initialize();
 
     // 跨所有表搜索
@@ -402,15 +404,18 @@ export class SupabaseProvider implements DatabaseProvider {
 
       // 合并结果并按分数排序
       allResults.sort((a, b) => b.score - a.score);
-      if (options.limit) {
-        return allResults.slice(0, options.limit);
-      }
-      return allResults;
+      const candidates = options.vector
+        ? allResults.slice(0, resolveVectorCandidateLimit(options))
+        : allResults;
+      return options.limit === undefined ? candidates : candidates.slice(0, options.limit);
     }
 
     // 单表查询
     const tableName = options.tableName ?? this.getDefaultTableName(options.dataTypes?.[0]);
-    return this.queryFromTable(tableName, options);
+    const results = await this.queryFromTable(tableName, options);
+    return options.vector && options.limit !== undefined
+      ? results.slice(0, options.limit)
+      : results;
   }
 
   /**
@@ -502,8 +507,9 @@ export class SupabaseProvider implements DatabaseProvider {
     // 使用 Supabase 的 rpc 方法进行向量搜索，避免 URL 过长
     const { data, error } = await this.client!.rpc(`match_${tableName}`, {
       query_embedding: options.vector,
-      match_count: options.limit ?? 5,
-      min_similarity: options.minScore ?? 0.1,
+      match_count: resolveVectorCandidateLimit(options),
+      // core 拥有最终六因子 minScore 时，用余弦下界 -1 禁用 provider 预筛选。
+      min_similarity: -1,
       filter_data_type: options.dataTypes && options.dataTypes.length > 0 ? options.dataTypes : null,
       // scope 维度过滤参数（D-25）：NULL 时不过滤，保持跨项目软召回
       filter_project_name: options.projectName ?? null,
@@ -543,7 +549,11 @@ export class SupabaseProvider implements DatabaseProvider {
       visibility: row.visibility ?? undefined,
       lifecycleStatus: row.lifecycle_status ?? undefined,
     }));
-    return exactAuthorityRows(rows, authority, options.limit);
+    const authorized = exactAuthorityRows(rows, authority)
+      .slice(0, resolveVectorCandidateLimit(options));
+    return options.minScore === undefined
+      ? authorized
+      : authorized.filter((row) => row.score >= options.minScore!);
   }
 
   /**
@@ -594,8 +604,6 @@ export class SupabaseProvider implements DatabaseProvider {
         query = query.eq('app_name', options.appName);
       }
 
-      query = query.limit(options.limit ?? 5);
-
       // @ts-ignore - Supabase TypeScript limitation for computed fields
       const { data, error } = await query;
 
@@ -628,7 +636,12 @@ export class SupabaseProvider implements DatabaseProvider {
         visibility: row.visibility ?? undefined,
         lifecycleStatus: row.lifecycle_status ?? undefined,
       }));
-      return exactAuthorityRows(rows, authority, options.limit);
+      rows.sort((left, right) => right.score - left.score);
+      const authorized = exactAuthorityRows(rows, authority)
+        .slice(0, resolveVectorCandidateLimit(options));
+      return options.minScore === undefined
+        ? authorized
+        : authorized.filter((row) => row.score >= options.minScore!);
     } catch (err: any) {
       // 如果还是 URL 太长，尝试先获取候选 ID 再计算相似度
       console.warn('Fallback query also failed URL too long, trying alternative approach:', err.message);
@@ -718,8 +731,11 @@ export class SupabaseProvider implements DatabaseProvider {
 
     // 按相似度排序并返回前 N 条
     resultsWithScore.sort((a, b) => b.score - a.score);
-    const limit = options.limit ?? 5;
-    return exactAuthorityRows(resultsWithScore, authority, limit);
+    const authorized = exactAuthorityRows(resultsWithScore, authority)
+      .slice(0, resolveVectorCandidateLimit(options));
+    return options.minScore === undefined
+      ? authorized
+      : authorized.filter((row) => row.score >= options.minScore!);
   }
 
   /**

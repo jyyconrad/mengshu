@@ -1,11 +1,27 @@
 import { describe, expect, test } from "vitest";
 import {
+  DEFAULT_VECTOR_CANDIDATE_LIMIT,
   DatabaseStoreCleanupError,
   isDatabaseStoreCleanupError,
   isDatabaseStoreResult,
   parseDatabaseStoreCleanupError,
   parseDatabaseStoreResult,
+  resolveVectorCandidateLimit,
 } from "./types.js";
+
+describe("vector candidate pool contract", () => {
+  test("uses an explicit default independent from the final result limit", () => {
+    expect(resolveVectorCandidateLimit({})).toBe(DEFAULT_VECTOR_CANDIDATE_LIMIT);
+    expect(resolveVectorCandidateLimit({ candidateLimit: 37 })).toBe(37);
+  });
+
+  test.each([0, -1, 1.5, Number.POSITIVE_INFINITY])(
+    "rejects invalid candidate limit %s",
+    (candidateLimit) => {
+      expect(() => resolveVectorCandidateLimit({ candidateLimit })).toThrow(/candidateLimit/);
+    },
+  );
+});
 
 const validReceipt = () => ({
   inserted: 1,

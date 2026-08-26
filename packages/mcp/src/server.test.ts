@@ -62,19 +62,107 @@ describe("MCP memory server adapter", () => {
     await expect(server.callTool("missing", {})).rejects.toThrow("Unknown MCP tool: missing");
   });
 
+  test("negotiates memory_asset_search and fails stably without its capability", async () => {
+    const without = createMcpMemoryServer({
+      service,
+      authority,
+      defaultScope: authorityConfig.defaultScope,
+      memoryAssets: {
+        list: async () => [],
+        read: async () => ({
+          asset: { id: "asset-1", version: 1, status: "published" },
+          contentValidity: "current",
+          staleReasons: [],
+          explanation: { assetId: "asset-1", version: 1, evidenceIds: [] },
+        }),
+      } as never,
+    });
+    expect(without.listTools().map((tool) => tool.name)).not.toContain("memory_asset_search");
+    await expect(without.callTool("memory_asset_search", { query: "rules" }))
+      .rejects.toThrow("Unknown MCP tool: memory_asset_search");
+
+    const search = vi.fn(async () => ({ query: "rules", assets: [], filtered: [] }));
+    const withSearch = createMcpMemoryServer({
+      service,
+      authority,
+      defaultScope: authorityConfig.defaultScope,
+      memoryAssets: {
+        list: async () => [],
+        read: async () => ({
+          asset: { id: "asset-1", version: 1, status: "published" },
+          contentValidity: "current",
+          staleReasons: [],
+          explanation: { assetId: "asset-1", version: 1, evidenceIds: [] },
+        }),
+        search,
+      } as never,
+    });
+    const descriptor = withSearch.listTools()
+      .find((tool) => tool.name === "memory_asset_search");
+    expect(descriptor?.inputSchema).toMatchObject({
+      required: ["query"],
+      additionalProperties: false,
+    });
+    await expect(withSearch.callTool("memory_asset_search", { query: "rules" }))
+      .resolves.toEqual({ query: "rules", assets: [], filtered: [] });
+    expect(search).toHaveBeenCalledWith(authorityConfig.defaultScope, { query: "rules" });
+
+    for (const forbidden of ["scope", "sql", "path", "url"]) {
+      await expect(withSearch.callTool("memory_asset_search", {
+        query: "rules",
+        [forbidden]: "attacker-value",
+      })).rejects.toThrow(/INVALID_REQUEST/);
+    }
+    expect(search).toHaveBeenCalledTimes(1);
+  });
+
+  test("negotiates persisted memory_session_explain only with its capability", async () => {
+    const without = createMcpMemoryServer({
+      service,
+      authority,
+      defaultScope: authorityConfig.defaultScope,
+    });
+    expect(without.listTools().map((tool) => tool.name)).not.toContain("memory_session_explain");
+    await expect(without.callTool("memory_session_explain", { sessionId: "session-1" }))
+      .rejects.toThrow("Unknown MCP tool: memory_session_explain");
+
+    const receipt = { id: "receipt-1", sessionId: "session-1", bindings: [] };
+    const getLatest = vi.fn(async () => receipt);
+    const withExplain = createMcpMemoryServer({
+      service,
+      authority,
+      defaultScope: authorityConfig.defaultScope,
+      sessionReceipts: { getLatest } as never,
+    });
+    const descriptor = withExplain.listTools()
+      .find((tool) => tool.name === "memory_session_explain");
+    expect(descriptor?.inputSchema).toMatchObject({
+      required: ["sessionId"],
+      additionalProperties: false,
+    });
+    await expect(withExplain.callTool("memory_session_explain", { sessionId: "session-1" }))
+      .resolves.toBe(receipt);
+    expect(getLatest).toHaveBeenCalledWith(
+      { ...authorityConfig.defaultScope, sessionId: "session-1" },
+      "session-1",
+    );
+  });
+
   test("transport-agnostic calls do not expose raw service errors", async () => {
     const secret = "postgres://user:raw-secret@host/db";
-    const throwingService = {
-      ...service,
-      async storeMemory() { throw new Error(secret); },
-    } satisfies MemoryService;
     const server = createMcpMemoryServer({
-      service: throwingService,
+      service,
+      memoryWrite: {
+        async executeMemoryWrite() { throw new Error(secret); },
+      },
       authority,
       defaultScope: authorityConfig.defaultScope,
     });
 
-    const failure = await server.callTool("memory_save", { text: "safe" })
+    const failure = await server.callTool("memory_save", {
+      text: "safe",
+      idempotencyKey: "server-save-1",
+    })
       .catch((error) => error);
 
     expect(failure).toBeInstanceOf(Error);
@@ -83,23 +171,25 @@ describe("MCP memory server adapter", () => {
   });
 
   test("transport-agnostic calls preserve safe typed error codes", async () => {
-    const throwingService = {
-      ...service,
-      async storeMemory() {
+    const server = createMcpMemoryServer({
+      service,
+      memoryWrite: {
+        async executeMemoryWrite() {
         throw new AuthorityScopeError(
           "CLIENT_VALUE_NOT_ALLOWED",
           "secret allowlist value is not allowed",
           "appId",
         );
+        },
       },
-    } satisfies MemoryService;
-    const server = createMcpMemoryServer({
-      service: throwingService,
       authority,
       defaultScope: authorityConfig.defaultScope,
     });
 
-    const failure = await server.callTool("memory_save", { text: "safe" })
+    const failure = await server.callTool("memory_save", {
+      text: "safe",
+      idempotencyKey: "server-save-2",
+    })
       .catch((error) => error);
 
     expect(failure).toBeInstanceOf(Error);

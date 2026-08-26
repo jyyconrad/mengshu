@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pg from "pg";
 import { describe, expect, test, vi } from "vitest";
 
 import { PostgresProvider } from "../packages/core/src/db/providers/postgres.js";
+import {
+  loadGlobalMengshuConfig,
+  provisionGlobalPostgresTestSchema,
+} from "../tests/live/global-postgres-config.js";
 
 import {
   OPERATOR_EMBEDDING_APPLY_TOKEN,
@@ -153,7 +157,10 @@ class FakeClient implements OperatorEmbeddingClient {
     return qwenCentroid && bgeCentroid ? { qwen: qwenCentroid, bge: bgeCentroid } : null;
   }
 
-  private classified(table: "memories" | "knowledge"): Array<{
+  private classified(
+    table: "memories" | "knowledge",
+    target?: { model: string; embeddingSpaceId: string },
+  ): Array<{
     row: StoredRow;
     operation: "validated" | "reembed";
     receipt: "validated" | "applied" | null;
@@ -162,7 +169,12 @@ class FakeClient implements OperatorEmbeddingClient {
     return this.rows.filter((row) => row.table === table).map((row) => {
       const source = this.source(row);
       const receipt = this.receipts.get(`${table}:${row.id}`) ?? row.receiptOperation;
-      const classification = classifyEmbeddingRow({ ...source, receiptOperation: receipt }, centroids, 0.1);
+      const classification = classifyEmbeddingRow(
+        { ...source, receiptOperation: receipt },
+        centroids,
+        0.1,
+        target,
+      );
       return { row, operation: classification.operation, receipt };
     });
   }
@@ -176,8 +188,12 @@ class FakeClient implements OperatorEmbeddingClient {
     if (sql === "COMMIT" || sql === "ROLLBACK") this.transactionOpen = false;
     if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql)) return { rows: [], rowCount: 0 };
     if (sql.includes("embedding-migrate:classify")) {
+      const target = {
+        model: params[2] as string,
+        embeddingSpaceId: params[3] as string,
+      };
       const rows = (["memories", "knowledge"] as const).map((table) => {
-        const classified = this.classified(table);
+        const classified = this.classified(table, target);
         return {
           table_name: table,
           total_count: classified.length,
@@ -192,7 +208,10 @@ class FakeClient implements OperatorEmbeddingClient {
     if (sql.includes("embedding-migrate:validated-bulk")) {
       const table = sql.includes('UPDATE "memories"') ? "memories" : "knowledge";
       const target = params[2] as string;
-      const eligible = this.classified(table).filter((item) =>
+      const eligible = this.classified(table, {
+        model: params[4] as string,
+        embeddingSpaceId: target,
+      }).filter((item) =>
         item.receipt === null && item.operation === "validated");
       const appliedEligible = this.validatedBulkDrift ? eligible.slice(0, -1) : eligible;
       for (const { row } of appliedEligible) {
@@ -214,10 +233,21 @@ class FakeClient implements OperatorEmbeddingClient {
       }] as unknown as Row[], rowCount: 1 };
     }
     if (sql.includes("embedding-migrate:reembed-scan")) {
-      const table = sql.includes('JOIN "memories" record') ? "memories" : "knowledge";
-      const afterId = params[2] as string | null;
-      const limit = params[3] as number;
-      const selected = this.classified(table)
+      const table = sql.includes('"memories" record') ? "memories" : "knowledge";
+      const fastScan = sql.includes("NOT EXISTS");
+      const afterId = params[fastScan ? 1 : 2] as string | null;
+      const limit = params[fastScan ? 2 : 3] as number;
+      const candidates = fastScan
+        ? this.rows.filter((row) => row.table === table).map((row) => ({
+            row,
+            operation: "reembed" as const,
+            receipt: this.receipts.get(`${table}:${row.id}`) ?? row.receiptOperation,
+          }))
+        : this.classified(table, {
+            model: params[4] as string,
+            embeddingSpaceId: params[5] as string,
+          });
+      const selected = candidates
         .filter((item) => item.receipt === null && item.operation === "reembed")
         .map(({ row }) => this.source(row))
         .filter((row) => !afterId || row.id > afterId)
@@ -379,17 +409,25 @@ function fixtureRows(): StoredRow[] {
 }
 
 describe("operator embedding migration", () => {
-  test("manifest 固定目标 Qwen 1024，并以原始文件 SHA 作为 apply 权限边界", () => {
+  test("manifest 仅允许受支持的 Qwen/BGE 1024 目标，并以原始文件 SHA 作为 apply 权限边界", () => {
     const loaded = loadOperatorEmbeddingManifest(manifestText());
     expect(loaded.manifest).toEqual(manifest);
     expect(loaded.sha256).toBe(createHash("sha256").update(manifestText()).digest("hex"));
+    expect(loadOperatorEmbeddingManifest(manifestText({
+      ...manifest,
+      target: { ...manifest.target, model: "BAAI/bge-m3" },
+    })).manifest.target.model).toBe("BAAI/bge-m3");
+    expect(loadOperatorEmbeddingManifest(manifestText({
+      ...manifest,
+      apiBatchSize: 128,
+    })).manifest.apiBatchSize).toBe(128);
 
     for (const invalid of [
       { ...manifest, target: { ...manifest.target, model: "other" } },
       { ...manifest, target: { ...manifest.target, dim: 768 } },
       { ...manifest, centroidMargin: 0.09 },
       { ...manifest, expected: { ...manifest.expected, total: 5 } },
-      { ...manifest, apiBatchSize: 21 },
+      { ...manifest, apiBatchSize: 129 },
       { ...manifest, scanBatchSize: 1001 },
       { ...manifest, expectedCurrentSpaceId: "embedding-space:v1:invalid" },
       { ...manifest, target: { ...manifest.target, provider: "INVALID PROVIDER" } },
@@ -421,6 +459,29 @@ describe("operator embedding migration", () => {
     expect(classifyEmbeddingRow(record("knowledge", 6, {
       metadata: { embeddingModel: "text-embedding-3-small" },
     }), null, 0.1).operation).toBe("reembed");
+  });
+
+  test("BGE 目标只复用已经带 canonical target space 的向量", () => {
+    const target = {
+      model: "BAAI/bge-m3",
+      embeddingSpaceId: `embedding-space:v1:${"b".repeat(64)}`,
+    };
+    const staleMetadata = record("memories", 7, {
+      metadata: { embeddingModel: "BAAI/bge-m3" },
+      embeddingSpaceId: `embedding-space:v1:${"c".repeat(64)}`,
+      embeddingSpaceState: "known-queryable",
+    });
+    expect(classifyEmbeddingRow(staleMetadata, null, 0.1, target)).toMatchObject({
+      operation: "reembed",
+      reason: "target-space-reembed",
+    });
+    expect(classifyEmbeddingRow({
+      ...staleMetadata,
+      embeddingSpaceId: target.embeddingSpaceId,
+    }, null, 0.1, target)).toMatchObject({
+      operation: "validated",
+      reason: "target-space-match",
+    });
   });
 
   test("默认 dry-run 只读取并核验真实期望数，不输出正文、metadata 或连接信息", async () => {
@@ -519,6 +580,8 @@ describe("operator embedding migration", () => {
     const classifySql = client.calls.find(({ sql }) => sql.includes("embedding-migrate:classify"))?.sql ?? "";
     expect(classifySql).toMatch(/AVG\(source_vector\)[\s\S]+embeddingModel[\s\S]+embedding_model[\s\S]+modelName/);
     expect(classifySql).toContain("<=>");
+    expect(classifySql).toContain("source_embedding_space_id");
+    expect(classifySql).toContain("BAAI/bge-m3");
     const validatedSql = client.calls.find(({ sql }) =>
       sql.includes("embedding-migrate:validated-bulk"))?.sql ?? "";
     expect(validatedSql).toMatch(/sha256[\s\S]+record\.vector::text/);
@@ -555,8 +618,15 @@ describe("operator embedding migration", () => {
         metadata: { embeddingModel: "BAAI/bge-m3" },
       })),
     ]);
-    const embedBatch = vi.fn(async (texts: readonly string[]) =>
-      texts.map(() => Array(1024).fill(0.01)));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const embedBatch = vi.fn(async (texts: readonly string[]) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      inFlight -= 1;
+      return texts.map(() => Array(1024).fill(0.01));
+    });
     await runOperatorEmbeddingMigration(client, apiManifest, "7".repeat(64), {
       mode: "apply",
       maintenance: true,
@@ -566,7 +636,44 @@ describe("operator embedding migration", () => {
       embedder: { target: manifest.target, embedBatch },
     });
     expect(embedBatch.mock.calls.map(([texts]) => texts.length)).toEqual([2, 1]);
+    expect(maxInFlight).toBe(2);
+    expect(maxInFlight).toBeLessThanOrEqual(3);
     expect(client.calls.filter(({ sql }) => sql.includes("embedding-migrate:update"))).toHaveLength(1);
+  });
+
+  test("validated=0 的 BGE 全量迁移使用 receipt keyset 快速扫描", async () => {
+    const bgeTarget = {
+      ...manifest.target,
+      model: "BAAI/bge-m3",
+    };
+    const bgeManifest: OperatorEmbeddingManifest = {
+      ...manifest,
+      target: bgeTarget,
+      expected: { total: 4, validated: 0, reembed: 4, memories: 4, knowledge: 0 },
+      scanBatchSize: 4,
+      apiBatchSize: 2,
+    };
+    const client = new FakeClient([1, 2, 3, 4].map((index) => record("memories", index)));
+    await runOperatorEmbeddingMigration(client, bgeManifest, "8".repeat(64), {
+      mode: "apply",
+      maintenance: true,
+      quiescenceConfirmed: true,
+      confirmationToken: OPERATOR_EMBEDDING_APPLY_TOKEN,
+      expectedManifestSha256: "8".repeat(64),
+      embedder: {
+        target: bgeTarget,
+        embedBatch: async (texts) => texts.map(() => Array(1024).fill(0.02)),
+      },
+    });
+
+    const scanCall = client.calls.find(({ sql }) =>
+      sql.includes("embedding-migrate:reembed-scan"));
+    const scanSql = scanCall?.sql ?? "";
+    expect(scanSql).toContain("NOT EXISTS");
+    expect(scanSql).not.toContain("centroids AS");
+    expect(scanCall?.params).toHaveLength(3);
+    expect(client.calls.some(({ sql }) => sql.includes("embedding-migrate:validated-bulk")))
+      .toBe(false);
   });
 
   test("reembed 事务内发现 content_hash/vector 漂移即回滚，不写 receipt", async () => {
@@ -599,6 +706,29 @@ describe("operator embedding migration", () => {
       embedder,
     })).rejects.toThrow(/drift/i);
     expect(metadataDrift.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true);
+  });
+
+  test("远端 embedding 失败只暴露安全分类，不泄漏服务商原始信息", async () => {
+    const client = new FakeClient(fixtureRows());
+    const failure = runOperatorEmbeddingMigration(client, manifest, "9".repeat(64), {
+      mode: "apply",
+      maintenance: true,
+      quiescenceConfirmed: true,
+      confirmationToken: OPERATOR_EMBEDDING_APPLY_TOKEN,
+      expectedManifestSha256: "9".repeat(64),
+      embedder: {
+        target: manifest.target,
+        embedBatch: async () => {
+          throw new Error("Embedding 服务返回 429（限流）：provider-secret-detail");
+        },
+      },
+    });
+
+    await expect(failure).rejects.toMatchObject({
+      code: "EMBEDDING_PROVIDER_FAILED",
+      message: "embedding provider failed after retries",
+    });
+    await expect(failure).rejects.not.toThrow(/provider-secret-detail/);
   });
 
   test("相同 manifest 可重跑；已有 receipt 维持原分类且不再调用模型", async () => {
@@ -868,53 +998,66 @@ describe("operator embedding migration", () => {
       },
     })).rejects.toMatchObject({ code: "INVALID_ROW" });
   });
+
+  test("operator live gate 复用全局配置和隔离 schema，不保留专用凭据或 public reset", () => {
+    const source = readFileSync(new URL(import.meta.url), "utf8");
+    const liveSource = source.slice(source.lastIndexOf("const operatorLiveEnabled ="));
+    const legacyPgPrefix = ["MENGSHU", "LIVE", "PG"].join("_");
+    const legacyOperatorGate = ["MENGSHU", "RUN", "OPERATOR", "EMBEDDING", "LIVE"].join("_");
+    const sharedLiveGate = ["MENGSHU", "RUN", "LIVE", "TESTS"].join("_");
+    const publicSchemaReset = new RegExp(
+      `(?:DROP|CREATE)\\s+SCHEMA\\s+${"pub" + "lic"}`,
+      "i",
+    );
+
+    expect(liveSource).not.toContain(legacyPgPrefix);
+    expect(liveSource).not.toContain(legacyOperatorGate);
+    expect(liveSource).not.toMatch(publicSchemaReset);
+    expect(liveSource).toContain(`process.env.${sharedLiveGate} === "1"`);
+    expect(liveSource).toContain("loadGlobalMengshuConfig()");
+    expect(liveSource).toContain("provisionGlobalPostgresTestSchema(");
+    expect(liveSource).toContain("const config = isolated.postgres");
+    expect(liveSource).toContain(
+      "createOperatorEmbeddingBatchProvider(global.config, loaded.manifest)",
+    );
+    expect(liveSource).toMatch(/finally\s*\{[\s\S]*await isolated\.dispose\(\)/);
+  });
 });
 
-const operatorLiveEnabled = process.env.MENGSHU_RUN_OPERATOR_EMBEDDING_LIVE === "1";
+const operatorLiveEnabled = process.env.MENGSHU_RUN_LIVE_TESTS === "1";
 
 describe.skipIf(!operatorLiveEnabled)("operator embedding migration PostgreSQL live", () => {
   test("server classification + validated bulk + reembed-only network path", async () => {
-    const database = process.env.MENGSHU_LIVE_PG_DATABASE ?? "";
-    const port = Number(process.env.MENGSHU_LIVE_PG_PORT);
-    if (
-      !/^mengshu_live_[a-z0-9_]+$/.test(database) ||
-      process.env.MENGSHU_LIVE_PG_ALLOW_RESET !== "1" ||
-      !Number.isSafeInteger(port)
-    ) {
-      throw new Error("operator live test requires an explicitly resettable mengshu_live_* database");
+    const global = loadGlobalMengshuConfig();
+    const targetModel = global.config.embedding.model;
+    const targetBaseURL = global.config.embedding.baseURL;
+    if (!targetModel || !targetBaseURL) {
+      throw new Error("operator live test requires global Mengshu embedding model and baseURL");
     }
-    const config = {
-      host: process.env.MENGSHU_LIVE_PG_HOST ?? "",
-      port,
-      database,
-      user: process.env.MENGSHU_LIVE_PG_USER ?? "",
-      password: process.env.MENGSHU_LIVE_PG_PASSWORD ?? "",
-      ssl: false as const,
-    };
-    const reset = new pg.Client(config);
-    await reset.connect();
-    await reset.query("DROP SCHEMA public CASCADE");
-    await reset.query("CREATE SCHEMA public AUTHORIZATION CURRENT_USER");
-    await reset.end();
-
-    const provider = new PostgresProvider(config, "BAAI/bge-m3");
-    await provider.initialize();
-    await provider.applyScopeContentHashDedupeContract({
-      maintenance: true,
-      quiescenceConfirmed: true,
-    });
-    await provider.close();
-
-    const client = new pg.Client(config);
-    await client.connect();
+    const isolated = await provisionGlobalPostgresTestSchema("operator_embedding");
     try {
-      const insert = async (
-        table: "memories" | "knowledge",
-        id: string,
-        contentHash: string,
-        model: string,
-        value: readonly number[],
-      ) => client.query(`INSERT INTO "${table}" (
+      const config = isolated.postgres;
+      const provider = new PostgresProvider(config, targetModel);
+      try {
+        await provider.initialize();
+        await provider.applyScopeContentHashDedupeContract({
+          maintenance: true,
+          quiescenceConfirmed: true,
+        });
+      } finally {
+        await provider.close();
+      }
+
+      const client = new pg.Client(config);
+      await client.connect();
+      try {
+        const insert = async (
+          table: "memories" | "knowledge",
+          id: string,
+          contentHash: string,
+          model: string,
+          value: readonly number[],
+        ) => client.query(`INSERT INTO "${table}" (
         id, text, content_hash, vector, metadata,
         tenant_id, user_id, canonical_project_id, product_id, producer_id,
         namespace, visibility, lifecycle_status, scope_key
@@ -923,70 +1066,89 @@ describe.skipIf(!operatorLiveEnabled)("operator embedding migration PostgreSQL l
         'tenant-live', 'user-live', 'project-live', 'mengshu', 'operator-live',
         'working-context', 'private', 'active', $6
       )`, [id, `live-row-${id}`, contentHash, JSON.stringify(value), JSON.stringify({
-        embeddingModel: model,
-      }), `scope-${id}`]);
-      await insert("memories", "00000000-0000-4000-8000-000000000001", "a".repeat(32),
-        "Qwen/Qwen3-Embedding-0.6B", qwen);
-      await insert("memories", "00000000-0000-4000-8000-000000000002",
-        "123e4567-e89b-12d3-a456-426614174000", "BAAI/bge-m3", bge);
-      await insert("knowledge", "00000000-0000-8000-8000-000000000003", "c".repeat(32),
-        "Qwen/Qwen3-Embedding-0.6B", vector(0.99, 0.01));
-      await insert("knowledge", "00000000-0000-4000-8000-000000000004", "d".repeat(32),
-        "openai", vector(0.01, 0.99));
-      await client.query(
-        "UPDATE knowledge SET text = '' WHERE id = '00000000-0000-4000-8000-000000000004'::uuid",
-      );
+          embeddingModel: model,
+        }), `scope-${id}`]);
+        await insert("memories", "00000000-0000-4000-8000-000000000001", "a".repeat(32),
+          "Qwen/Qwen3-Embedding-0.6B", qwen);
+        await insert("memories", "00000000-0000-4000-8000-000000000002",
+          "123e4567-e89b-12d3-a456-426614174000", "BAAI/bge-m3", bge);
+        await insert("knowledge", "00000000-0000-8000-8000-000000000003", "c".repeat(32),
+          "Qwen/Qwen3-Embedding-0.6B", vector(0.99, 0.01));
+        await insert("knowledge", "00000000-0000-4000-8000-000000000004", "d".repeat(32),
+          "openai", vector(0.01, 0.99));
+        await client.query(
+          "UPDATE knowledge SET text = '' WHERE id = '00000000-0000-4000-8000-000000000004'::uuid",
+        );
 
-      const liveManifest: OperatorEmbeddingManifest = {
-        ...manifest,
-        expected: { total: 4, validated: 2, reembed: 2, memories: 2, knowledge: 2 },
-        scanBatchSize: 2,
-        apiBatchSize: 2,
-      };
-      const loaded = loadOperatorEmbeddingManifest(`${JSON.stringify(liveManifest)}\n`);
-      let embeddedTexts = 0;
-      let liveFailure = "";
-      const liveClient: OperatorEmbeddingClient = {
-        query: async (sql, params = []) => {
-          try {
-            return await client.query(sql, [...params]);
-          } catch (error) {
-            const marker = sql.match(/embedding-migrate:[a-z-]+/)?.[0] ?? "transaction";
-            liveFailure = `${marker}: ${error instanceof Error ? error.message : "database error"}`;
-            throw error;
-          }
-        },
-      };
-      const migration = runOperatorEmbeddingMigration(liveClient, loaded.manifest, loaded.sha256, {
-        mode: "apply",
-        maintenance: true,
-        quiescenceConfirmed: true,
-        confirmationToken: OPERATOR_EMBEDDING_APPLY_TOKEN,
-        expectedManifestSha256: loaded.sha256,
-        embedder: {
-          target: liveManifest.target,
-          embedBatch: async (texts) => {
-            embeddedTexts += texts.length;
-            return texts.map(() => Array(1024).fill(0.01));
+        const liveManifest: OperatorEmbeddingManifest = {
+          ...manifest,
+          expected: targetModel === "BAAI/bge-m3"
+            ? { total: 4, validated: 0, reembed: 4, memories: 2, knowledge: 2 }
+            : { total: 4, validated: 2, reembed: 2, memories: 2, knowledge: 2 },
+          target: {
+            provider: global.config.embedding.provider,
+            baseURL: targetBaseURL,
+            model: targetModel,
+            dim: 1024,
+            normalization: "none",
           },
-        },
-      });
-      const report = await migration.catch((error) => {
-        throw new Error(liveFailure || "operator live migration failed", { cause: error });
-      });
-      expect(report).toMatchObject({ validated: 2, reembed: 2, updated: 4 });
-      expect(embeddedTexts).toBe(2);
-      const receipts = await client.query<{ operation: string; count: number }>(
-        `SELECT operation, COUNT(*)::integer AS count
+          scanBatchSize: 2,
+          apiBatchSize: 2,
+        };
+        const loaded = loadOperatorEmbeddingManifest(`${JSON.stringify(liveManifest)}\n`);
+        const embedder = createOperatorEmbeddingBatchProvider(global.config, loaded.manifest);
+        let embeddedTexts = 0;
+        let liveFailure = "";
+        const liveClient: OperatorEmbeddingClient = {
+          query: async (sql, params = []) => {
+            try {
+              return await client.query(sql, [...params]);
+            } catch (error) {
+              const marker = sql.match(/embedding-migrate:[a-z-]+/)?.[0] ?? "transaction";
+              liveFailure = `${marker}: ${error instanceof Error ? error.message : "database error"}`;
+              throw error;
+            }
+          },
+        };
+        const migration = runOperatorEmbeddingMigration(liveClient, loaded.manifest, loaded.sha256, {
+          mode: "apply",
+          maintenance: true,
+          quiescenceConfirmed: true,
+          confirmationToken: OPERATOR_EMBEDDING_APPLY_TOKEN,
+          expectedManifestSha256: loaded.sha256,
+          embedder: {
+            target: embedder.target,
+            embedBatch: async (texts) => {
+              embeddedTexts += texts.length;
+              return embedder.embedBatch(texts);
+            },
+          },
+        });
+        const report = await migration.catch((error) => {
+          throw new Error(liveFailure || "operator live migration failed", { cause: error });
+        });
+        expect(report).toMatchObject({
+          validated: liveManifest.expected.validated,
+          reembed: liveManifest.expected.reembed,
+          updated: 4,
+        });
+        expect(embeddedTexts).toBe(liveManifest.expected.reembed);
+        const receipts = await client.query<{ operation: string; count: number }>(
+          `SELECT operation, COUNT(*)::integer AS count
          FROM mengshu_embedding_reembed_receipts
          GROUP BY operation ORDER BY operation`,
-      );
-      expect(receipts.rows).toEqual([
-        { operation: "applied", count: 2 },
-        { operation: "validated", count: 2 },
-      ]);
+        );
+        expect(receipts.rows).toEqual(targetModel === "BAAI/bge-m3"
+          ? [{ operation: "applied", count: 4 }]
+          : [
+              { operation: "applied", count: 2 },
+              { operation: "validated", count: 2 },
+            ]);
+      } finally {
+        await client.end();
+      }
     } finally {
-      await client.end();
+      await isolated.dispose();
     }
   }, 60_000);
 });

@@ -7,7 +7,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { memoryConfigSchema } from "../../../config.js";
 import { registerOpenClawAdapter } from "./register.js";
-import { defaultScopeFromExactOpenClawAuthority } from "./authority.js";
+import { defaultScopeFromOpenClawAuthority } from "./authority.js";
 import {
   OPENCLAW_LEGACY_MEMORY_PLUGIN_IDS,
   OPENCLAW_MEMORY_PLUGIN_ID,
@@ -41,7 +41,10 @@ const memoryPlugin = {
         "in the local operator-owned plugin config",
       );
     }
-    const defaultScope = defaultScopeFromExactOpenClawAuthority(config.authority);
+    const defaultScope = defaultScopeFromOpenClawAuthority(
+      config.authority,
+      config.defaultAgentId,
+    );
     return registerOpenClawAdapter(api, config, {
       authority: config.authority,
       defaultScope,

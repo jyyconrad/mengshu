@@ -13,13 +13,19 @@ import {
 import type { DataType } from "../../../db/types.js";
 import type { MemoryService } from "../../../core/service-types.js";
 import type { MemoryRecord, MemoryScope } from "../../../core/types.js";
-import type { AuthorityScope } from "../../../packages/core/src/domain/authority-scope.js";
-import { computeContentHash } from "../../../processing/hash-utils.js";
 import {
-  formatRelevantMemoriesContext,
-  looksLikePromptInjection,
-} from "../../../retrieval/prompt-safety.js";
-import { resolveOpenClawAuthorityScope } from "./authority.js";
+  AuthorityScopeError,
+  type AuthorityScope,
+} from "../../../packages/core/src/domain/authority-scope.js";
+import type { AgentFastPathService } from
+  "../../../packages/api/src/agent-fast-path/index.js";
+import type { MemoryWriteCommandExecutor } from "./memory-write.js";
+import { computeContentHash } from "../../../processing/hash-utils.js";
+import { looksLikePromptInjection } from "../../../retrieval/prompt-safety.js";
+import {
+  resolveOpenClawAuthorityScope,
+  resolveOpenClawHostScope,
+} from "./authority.js";
 
 export interface HookLogger {
   info?(message: string): void;
@@ -35,10 +41,25 @@ export interface AgentEndEvent extends Record<string, unknown> {
   messages?: unknown[];
 }
 
+export interface OpenClawAgentHookContext {
+  agentId?: string;
+  sessionKey?: string;
+  sessionId?: string;
+  workspaceDir?: string;
+  messageProvider?: string;
+}
+
+export interface OpenClawRecallTurnGuard {
+  claim(prompt: string, context?: OpenClawAgentHookContext): boolean;
+  clear(context?: OpenClawAgentHookContext): void;
+}
+
 export interface AutoRecallContext {
-  service: MemoryService;
+  agentFastPath: Pick<AgentFastPathService, "context">;
   authority: AuthorityScope;
   defaultScope: MemoryScope;
+  hostContext?: OpenClawAgentHookContext;
+  turnGuard?: OpenClawRecallTurnGuard;
   recallIncludeDocuments?: boolean;
   logger?: HookLogger;
 }
@@ -47,8 +68,12 @@ export interface AutoCaptureContext {
   service: MemoryService;
   authority: AuthorityScope;
   defaultScope: MemoryScope;
-  embedBatch(texts: string[]): Promise<number[][]>;
-  existsByContentHash(contentHashes: string[]): Promise<string[]>;
+  hostContext?: OpenClawAgentHookContext;
+  memoryWrite?: MemoryWriteCommandExecutor;
+  /** @deprecated Explicit test-only compatibility path. */
+  unsafeLegacyWrite?: true;
+  embedBatch?(texts: string[]): Promise<number[][]>;
+  existsByContentHash?(contentHashes: string[]): Promise<string[]>;
   shouldCapture?: (text: string, options?: { maxChars?: number }) => boolean;
   detectCategory?: (text: string) => MemoryCategory;
   captureMaxChars?: number;
@@ -57,6 +82,104 @@ export interface AutoCaptureContext {
   now?: () => number;
   logger?: HookLogger;
   enqueueGraphExtraction?: (chunkId: string, text: string, scope: import("../../../core/types.js").MemoryScope) => Promise<void>;
+}
+
+interface RecallTurnGuardEntry {
+  readonly agentId: string;
+  readonly session: string;
+  readonly expiresAt: number;
+}
+
+const DEFAULT_RECALL_TURN_TTL_MS = 5 * 60 * 1_000;
+const DEFAULT_RECALL_TURN_MAX_ENTRIES = 512;
+
+function hookCoordinates(context?: OpenClawAgentHookContext): {
+  agentId: string;
+  session: string;
+} {
+  return {
+    agentId: typeof context?.agentId === "string" ? context.agentId : "",
+    session: typeof context?.sessionId === "string"
+      ? context.sessionId
+      : typeof context?.sessionKey === "string"
+        ? context.sessionKey
+        : "",
+  };
+}
+
+export function createOpenClawRecallTurnGuard(options: {
+  ttlMs?: number;
+  maxEntries?: number;
+  now?: () => number;
+} = {}): OpenClawRecallTurnGuard {
+  const ttlMs = options.ttlMs ?? DEFAULT_RECALL_TURN_TTL_MS;
+  const maxEntries = options.maxEntries ?? DEFAULT_RECALL_TURN_MAX_ENTRIES;
+  const now = options.now ?? Date.now;
+  if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0 ||
+      !Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+    throw new Error("OpenClaw recall turn guard requires positive integer limits");
+  }
+  const entries = new Map<string, RecallTurnGuardEntry>();
+
+  const pruneExpired = (timestamp: number) => {
+    for (const [key, entry] of entries) {
+      if (entry.expiresAt <= timestamp) entries.delete(key);
+    }
+  };
+
+  return {
+    claim(prompt, context) {
+      const timestamp = now();
+      pruneExpired(timestamp);
+      const coordinates = hookCoordinates(context);
+      const key = JSON.stringify([
+        coordinates.agentId,
+        coordinates.session,
+        computeContentHash(prompt),
+      ]);
+      if (entries.has(key)) return false;
+      while (entries.size >= maxEntries) {
+        const oldest = entries.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        entries.delete(oldest);
+      }
+      entries.set(key, { ...coordinates, expiresAt: timestamp + ttlMs });
+      return true;
+    },
+    clear(context) {
+      const coordinates = hookCoordinates(context);
+      for (const [key, entry] of entries) {
+        if (entry.agentId === coordinates.agentId && entry.session === coordinates.session) {
+          entries.delete(key);
+        }
+      }
+    },
+  };
+}
+
+function resolveHookBoundary(
+  authority: AuthorityScope,
+  defaultScope: MemoryScope,
+  event: BeforeAgentStartEvent | AgentEndEvent,
+  hostContext?: OpenClawAgentHookContext,
+): { authority: AuthorityScope; scope: MemoryScope } {
+  const hostBoundary = resolveOpenClawHostScope(authority, defaultScope, hostContext);
+  const eventScope = resolveOpenClawAuthorityScope(
+    hostBoundary.authority,
+    hostBoundary.scope,
+    event,
+  );
+  if (hostContext?.agentId !== undefined && eventScope.agentId !== hostBoundary.scope.agentId) {
+    throw new AuthorityScopeError(
+      "CLIENT_VALUE_AMBIGUOUS",
+      "OpenClaw hook event agentId conflicts with trusted host agentId",
+      "agentId",
+    );
+  }
+  return {
+    authority: hostBoundary.authority,
+    scope: eventScope,
+  };
 }
 
 const MEMORY_TRIGGERS = [
@@ -150,35 +273,28 @@ export async function handleBeforeAgentStartRecall(
   if (!event.prompt || event.prompt.length < 5) {
     return undefined;
   }
-  const scope = resolveOpenClawAuthorityScope(context.authority, context.defaultScope, event);
+  const { scope } = resolveHookBoundary(
+    context.authority,
+    context.defaultScope,
+    event,
+    context.hostContext,
+  );
+  if (context.turnGuard && !context.turnGuard.claim(event.prompt, context.hostContext)) {
+    return undefined;
+  }
 
   try {
-    const result = await context.service.recall({
-      query: event.prompt,
-      limit: 3,
-      minScore: 0.3,
-      dataTypes: context.recallIncludeDocuments ? ["memory", "document"] : ["memory"],
+    const result = await context.agentFastPath.context({
       scope,
+      task: event.prompt,
     });
-
-    const memoryHits = result.hits.filter((hit) => "text" in hit.record && "category" in hit.record);
-    if (memoryHits.length === 0) {
+    if (result.telemetry.nodesUsed === 0) {
       return undefined;
     }
 
-    context.logger?.info?.(`mengshu: injecting ${memoryHits.length} memories into context`);
+    context.logger?.info?.(`mengshu: injecting ${result.telemetry.nodesUsed} memories into context`);
     return {
-      prependContext: formatRelevantMemoriesContext(
-        memoryHits.map((hit) => {
-          const record = hit.record as MemoryRecord;
-          return {
-            category: record.category,
-            text: record.text,
-            dataType: record.dataType,
-            metadata: record.metadata,
-          };
-        }),
-      ),
+      prependContext: result.content,
     };
   } catch {
     context.logger?.warn("mengshu: recall failed [RECALL_FAILED]");
@@ -195,7 +311,12 @@ export async function handleAgentEndCapture(
   }
   // Resolve before capture/embedding. Authority violations are not swallowed by
   // the legacy capture error handler and therefore fail the host event closed.
-  const scope = resolveOpenClawAuthorityScope(context.authority, context.defaultScope, event);
+  const { authority, scope } = resolveHookBoundary(
+    context.authority,
+    context.defaultScope,
+    event,
+    context.hostContext,
+  );
 
   try {
     const shouldCaptureFn = context.shouldCapture ?? shouldCapture;
@@ -208,9 +329,60 @@ export async function handleAgentEndCapture(
       return;
     }
 
-    // existsByContentHash is a legacy global port. Calling it would expose a
-    // cross-authority existence oracle, so only request-local duplicates are
-    // removed here; persistent dedupe belongs to the authority-scoped kernel.
+    if (context.unsafeLegacyWrite !== true) {
+      if (!context.memoryWrite) {
+        throw new Error("OpenClaw memory write capability is unavailable");
+      }
+      const eventKey = typeof event.messageId === "string" && event.messageId.trim().length > 0
+        ? event.messageId
+        : randomUUID();
+      const hostSessionId = context.hostContext?.sessionId;
+      const hostAgentId = context.hostContext?.agentId;
+      for (const [index, text] of toCapture.entries()) {
+        const category = detectCategoryFn(text);
+        await context.memoryWrite.executeMemoryWrite({
+          type: "observeAuto",
+          intent: "auto",
+          idempotencyKey: `openclaw-capture:${eventKey}:${index}`,
+          serverAuthority: authority,
+          clientScope: scope,
+          text,
+          kind: category === "core" || category === "other"
+            ? "other"
+            : category,
+          category,
+          dataType: "memory",
+          tableName: "memories",
+          metadata: {
+            source: "user",
+            sessionId: hostSessionId ?? event.sessionId,
+            conversationId: event.conversationId,
+            messageId: event.messageId,
+            projectPath: event.projectPath,
+            workspacePath: event.workspacePath,
+            agentId: hostAgentId ?? event.agentId,
+            agentName: event.agentName,
+            groupId: event.groupId,
+            groupName: event.groupName,
+            userName: event.userName,
+            userEmail: event.userEmail,
+          },
+          provenance: {
+            source: "user",
+            sessionId: hostSessionId ??
+              (typeof event.sessionId === "string" ? event.sessionId : undefined),
+            conversationId: typeof event.conversationId === "string"
+              ? event.conversationId
+              : undefined,
+            messageId: typeof event.messageId === "string" ? event.messageId : undefined,
+          },
+        });
+      }
+      context.logger?.info?.(`mengshu: auto-captured ${toCapture.length} new memories`);
+      return;
+    }
+
+    // Legacy-only request-local dedupe. Production dedupe belongs to the Kernel.
     const seenHashes = new Set<string>();
     const newEntries = toCapture.flatMap((text) => {
       const contentHash = computeContentHash(text);
@@ -228,6 +400,9 @@ export async function handleAgentEndCapture(
       return;
     }
 
+    if (!context.embedBatch) {
+      throw new Error("OpenClaw legacy embedding capability is unavailable");
+    }
     const vectors = await context.embedBatch(newEntries.map((entry) => entry.text));
     const now = context.now ?? Date.now;
     for (const [index, entry] of newEntries.entries()) {
@@ -236,12 +411,12 @@ export async function handleAgentEndCapture(
         createdAt: now(),
         updatedAt: now(),
         embeddingModel: context.embeddingModel,
-        sessionId: event.sessionId as string | undefined,
+        sessionId: context.hostContext?.sessionId ?? event.sessionId as string | undefined,
         conversationId: event.conversationId as string | undefined,
         messageId: event.messageId as string | undefined,
         projectPath: event.projectPath as string | undefined,
         workspacePath: event.workspacePath as string | undefined,
-        agentId: event.agentId as string | undefined,
+        agentId: context.hostContext?.agentId ?? event.agentId as string | undefined,
         agentName: event.agentName as string | undefined,
         groupId: event.groupId as string | undefined,
         groupName: event.groupName as string | undefined,

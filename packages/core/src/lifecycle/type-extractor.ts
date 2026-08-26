@@ -86,7 +86,7 @@ const RULES: Array<{
   {
     semanticType: "rules",
     patterns: [
-      /禁止|不要|不能|永远不|从不/,
+      /禁止|不要|不能|不得|不可|永远不|从不/,
       /^所有.+必须/,
       /must not|never|do not|don't/i,
       /合规|compliance|policy|约束/i,

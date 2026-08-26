@@ -22,6 +22,7 @@ import {
   resolveTarget,
 } from "./why.js";
 import type { MemoryRecord, MemoryScope } from "../../../../core/types.js";
+import { computeRecallScoreBreakdown } from "../../../../core/recall-scoring.js";
 
 const baseScope: MemoryScope = {
   tenantId: "local",
@@ -184,11 +185,17 @@ describe("why action", () => {
   test("命中记录时打印报告", async () => {
     const ms = new FakeCommand("ms");
     const record = makeRecord({ id: "rec-1", metadata: { riskFlags: ["sensitive"] } });
+    const breakdown = computeRecallScoreBreakdown(
+      record,
+      { relevance: 0.8, scopeFit: 1 },
+      ["vector"],
+      { vector: 0.8 },
+    );
     const service = {
       recall: vi.fn().mockResolvedValue({
         scope: baseScope,
         query: "rec-1",
-        hits: [{ record, score: 0.8, source: "vector" }],
+        hits: [{ record, score: breakdown.score, source: "vector", scoreBreakdown: breakdown }],
       }),
     };
     registerWhyCliCommands(ms as never, {
@@ -204,6 +211,32 @@ describe("why action", () => {
     expect(service.recall).toHaveBeenCalled();
     expect(logs.join("\n")).toContain("用户偏好使用中文交流");
     expect(logs.join("\n")).toContain("sensitive");
+    expect(logs.join("\n")).toContain("召回评分 (6 factors)");
+    expect(logs.join("\n")).toContain("relevance");
+  });
+
+  test("命中缺少完整回执时明确失败，不静默省略六因子", async () => {
+    const ms = new FakeCommand("ms");
+    const record = makeRecord({ id: "rec-invalid" });
+    const service = {
+      recall: vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: record.id,
+        hits: [{ record, score: 0.9, source: "vector" }],
+      }),
+    };
+    registerWhyCliCommands(ms as never, { service: service as never, scope: baseScope });
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((message?: unknown) => {
+      logs.push(String(message));
+    });
+
+    await expect(ms.find("why")?.actionHandler?.(record.id, {}))
+      .rejects.toThrow("RECALL_SCORE_BREAKDOWN_REQUIRED");
+    spy.mockRestore();
+
+    expect(logs.join("\n")).toBe("");
+    expect(logs.join("\n")).not.toContain("召回评分 (6 factors)");
   });
 
   test("未命中时提示无结果", async () => {
@@ -219,5 +252,31 @@ describe("why action", () => {
     await ms.find("why")?.actionHandler?.("不存在的内容", {});
     spy.mockRestore();
     expect(logs.join("\n")).toContain("未找到");
+  });
+
+  test("目标被治理过滤时展示真实 filteredReason", async () => {
+    const ms = new FakeCommand("ms");
+    const service = {
+      recall: vi.fn().mockResolvedValue({
+        scope: baseScope,
+        query: "memory-blocked",
+        hits: [],
+        filtered: [{
+          candidateId: "tree:memory-blocked",
+          authoritativeRecordId: "memory-blocked",
+          source: "tree",
+          filteredReason: "risk_blocked",
+        }],
+      }),
+    };
+    registerWhyCliCommands(ms as never, { service: service as never, scope: baseScope });
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((message?: unknown) => {
+      logs.push(String(message));
+    });
+    await ms.find("why")?.actionHandler?.("memory-blocked", {});
+    spy.mockRestore();
+
+    expect(logs.join("\n")).toContain("[tree] filteredReason: risk_blocked");
   });
 });

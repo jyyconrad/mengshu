@@ -107,7 +107,12 @@ export class HybridProvider implements DatabaseProvider {
     // 先使用 LanceDB 进行快速向量搜索，获取 ID 和分数
     let lanceResults: Array<MemoryEntry & { score: number }>;
     try {
-      lanceResults = await this.lanceDbProvider.query({ ...options, ...authority });
+      lanceResults = await this.lanceDbProvider.query({
+        ...options,
+        ...authority,
+        // 向量候选必须等 Hybrid 完成双后端 authority 交集后才应用 legacy final limit。
+        limit: options.vector ? undefined : options.limit,
+      });
     } catch {
       throw new HybridRecallAuthorityError("Hybrid recall backend unavailable");
     }

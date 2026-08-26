@@ -68,9 +68,10 @@ describe("RetrievalOrchestrator", () => {
     expect(result.scope).toEqual(scope);
     expect(result.hits.map((item) => item.record.id)).toEqual(["same", "text-only"]);
     expect(result.hits[0].scoreBreakdown).toMatchObject({
-      vector: 0.8,
-      text: 2.4,
-      rrf: expect.any(Number),
+      score: result.hits[0].score,
+      matchedBy: ["vector", "text"],
+      sourceSignals: { vector: 0.8, text: 2.4, rrf: expect.any(Number) },
+      factors: { relevance: 1, scopeFit: 1 },
     });
   });
 });

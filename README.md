@@ -4,7 +4,7 @@
 
 mengshu 用于在 OpenClaw、Codex、Claude Code、MCP 客户端、REST 服务和本地 CLI 之间共享长期工作记忆。它可以保存用户偏好、项目约束、架构决策、可复用经验和资源线索，并在后续任务中按需召回。
 
-当前版本：**v1.0.6**
+当前版本：**v1.0.7**
 
 ## 核心能力
 
@@ -74,7 +74,7 @@ openclaw plugin add ./plugins/openclaw
 ms mcp
 ```
 
-MCP Server 暴露 `memory_recall`、`memory_lookup`、`memory_context_fast`、`memory_save`、`memory_observe_light`、`memory_forget` 等工具。
+MCP Server 暴露 `memory_recall`、`memory_lookup`、`memory_context_fast`、`memory_navigate`、`memory_evidence_read`、`memory_asset_search`、`memory_session_explain`、`memory_save`、`memory_observe_light`、`memory_forget` 等工具。Asset 与 session receipt 工具只在对应 PostgreSQL capability 就绪时注册。
 
 ### REST API 与 Web Console
 
@@ -90,6 +90,13 @@ REST 接口见 [Memory API](docs/api/memory-api.md)。
 ms doctor
 ms recall "deployment notes" --explain
 ms project ingest-history --from codex --dry-run
+ms migrate-topic-tree --migration-id topic-tree-v1
+ms asset list
+ms asset explain <asset-id>
+ms session explain <session-id>
+ms loadout current
+ms loadout unbind <loadout-id> <asset-id> --slot rules --expected-version 1 --idempotency-key <key>
+ms loadout pause <loadout-id> --expected-version 2 --idempotency-key <key>
 ms mcp
 ms serve
 ```

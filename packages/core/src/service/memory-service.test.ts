@@ -1,6 +1,12 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { DATABASE_STORE_CLEANUP_WARNING } from "../db/types.js";
 import type { MemoryRecord } from "../domain/types.js";
+import { isRecallScoreBreakdown } from "../domain/recall-scoring.js";
+import {
+  GovernedRetrievalEngine,
+  type GovernedRetrievalHydration,
+  type GovernedRetrievalRequest,
+} from "../retrieval/governed-retrieval-engine.js";
 import type {
   AppendAuditInput,
   AuditRecord,
@@ -525,8 +531,8 @@ describe("DefaultMemoryService", () => {
       {
         query: "concise replies",
         vector: [0.3, 0.4],
-        limit: 3,
-        minScore: 0.5,
+        limit: undefined,
+        minScore: undefined,
         filter: undefined,
         scope: {
           tenantId: "local",
@@ -546,11 +552,241 @@ describe("DefaultMemoryService", () => {
       record: hit,
       source: "vector",
     });
-    // 综合分由向量相似度 + scopeFit 加权得到，向量分仍可追溯
-    expect(result.hits[0].scoreBreakdown?.vector).toBe(0.92);
-    expect(result.hits[0].scoreBreakdown?.scopeFit).toBeGreaterThan(0);
+    // 唯一六因子回执：原始向量分只作为 relevance 信号，最终 score 与 breakdown 同源。
+    expect(result.hits[0].scoreBreakdown).toMatchObject({
+      score: result.hits[0].score,
+      matchedBy: ["vector"],
+      sourceSignals: { vector: 0.92 },
+      factors: {
+        relevance: 0.92,
+        scopeFit: expect.any(Number),
+        importance: expect.any(Number),
+        confidence: expect.any(Number),
+        evidenceWeight: expect.any(Number),
+        recency: expect.any(Number),
+      },
+      contributions: {
+        relevance: expect.any(Number),
+        scopeFit: expect.any(Number),
+        importance: expect.any(Number),
+        confidence: expect.any(Number),
+        evidenceWeight: expect.any(Number),
+        recency: expect.any(Number),
+      },
+    });
+    expect(result.hits[0].scoreBreakdown?.factors?.scopeFit).toBeGreaterThan(0);
     expect(result.hits[0].score).toBeGreaterThan(0);
     expect(result.hits[0].score).toBeLessThanOrEqual(1);
+    expect(isRecallScoreBreakdown(result.hits[0].scoreBreakdown)).toBe(true);
+  });
+
+  test("先做治理硬过滤和六因子评分，再对最终 score 应用 minScore 与 limit", async () => {
+    const eligibleLowVectorHighFinal = makeRecord({
+      id: "eligible-final-high",
+      semanticType: "rules",
+      lifecycleStatus: "active",
+      container: "project",
+      importance: 1,
+      confidence: 1,
+      hotness: 10,
+      sourceNodeIds: ["e1", "e2", "e3", "e4", "e5"],
+      metadata: { admissionRoute: "active" },
+    });
+    const eligibleHighVectorLowFinal = makeRecord({
+      id: "eligible-final-low",
+      semanticType: "rules",
+      lifecycleStatus: "active",
+      container: "project",
+      importance: 0,
+      confidence: 0,
+      metadata: { admissionRoute: "active" },
+    });
+    const ineligible = makeRecord({
+      id: "revoked-high-vector",
+      semanticType: "rules",
+      lifecycleStatus: "revoked",
+      metadata: { admissionRoute: "active" },
+    });
+    const repository = new FakeRepository([
+      { ...ineligible, score: 1 },
+      { ...eligibleHighVectorLowFinal, score: 0.9 },
+      { ...eligibleLowVectorHighFinal, score: 0.6 },
+    ]);
+    const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+    const result = await service.recall({
+      query: "governed ranking",
+      scope: eligibleLowVectorHighFinal.scope,
+      minScore: 0.7,
+      limit: 1,
+    });
+
+    expect(repository.queryCalls[0]).toMatchObject({ limit: undefined, minScore: undefined });
+    expect(result.hits.map((hit) => hit.record.id)).toEqual(["eligible-final-high"]);
+    expect(result.hits[0].score).toBeGreaterThanOrEqual(0.7);
+    expect(isRecallScoreBreakdown(result.hits[0].scoreBreakdown)).toBe(true);
+  });
+
+  test("统一 hard filter 不让 candidate/evidence/revoked/conflict/risk/cross-scope 进入生产 RecallHit", async () => {
+    const active = makeRecord({
+      id: "active",
+      semanticType: "task_context",
+      lifecycleStatus: "active",
+      container: "project",
+      metadata: { admissionRoute: "active" },
+    });
+    const records = [
+      active,
+      makeRecord({ id: "revoked", lifecycleStatus: "revoked" }),
+      makeRecord({ id: "candidate", container: "session_candidate", metadata: { admissionRoute: "candidate" } }),
+      makeRecord({ id: "evidence", container: "session_candidate", metadata: { admissionRoute: "evidence_only" } }),
+      makeRecord({ id: "risk", metadata: { admissionRoute: "active", riskFlags: ["prompt_injection"] } }),
+      makeRecord({ id: "conflict", semanticType: "rules", metadata: { admissionRoute: "active", conflictStatus: "unresolved" } }),
+      makeRecord({
+        id: "cross-scope",
+        semanticType: "task_context",
+        scope: { ...active.scope, projectId: "other", agentId: "other" },
+        metadata: { admissionRoute: "active" },
+      }),
+    ].map((record) => ({ ...record, score: 0.99 }));
+    const service = new DefaultMemoryService({
+      repository: new FakeRepository(records),
+      embeddings: new FakeEmbeddings(),
+    });
+
+    const result = await service.recall({ query: "hard filter", scope: active.scope });
+
+    expect(result.hits.map((hit) => hit.record.id)).toEqual(["active"]);
+    expect(result.hits.every((hit) => isRecallScoreBreakdown(hit.scoreBreakdown))).toBe(true);
+  });
+
+  test("注入 Governed Retrieval 后 recall/context 共用权威 evidence hydration 与各自 intent", async () => {
+    const active = makeRecord({
+      id: "active-governed",
+      semanticType: "rules",
+      lifecycleStatus: "active",
+      container: "project",
+      sourceNodeIds: ["evidence-active"],
+      metadata: { admissionRoute: "active", contextEligible: true },
+    });
+    const lookupOnly = makeRecord({
+      id: "lookup-governed",
+      semanticType: "experience",
+      lifecycleStatus: "archived",
+      container: "session_candidate",
+      sourceNodeIds: ["evidence-lookup"],
+      metadata: { admissionRoute: "lookup_only", contextEligible: false },
+    });
+    const ungrounded = makeRecord({
+      id: "ungrounded",
+      semanticType: "rules",
+      lifecycleStatus: "active",
+      container: "project",
+      sourceNodeIds: ["evidence-missing"],
+      metadata: { admissionRoute: "active", contextEligible: true },
+    });
+    const hydrations = new Map<string, GovernedRetrievalHydration>([
+      [active.id, { record: active, evidenceIds: ["evidence-active"] }],
+      [lookupOnly.id, { record: lookupOnly, evidenceIds: ["evidence-lookup"] }],
+    ]);
+    const requests: GovernedRetrievalRequest[] = [];
+    const governedRetrieval = new GovernedRetrievalEngine({
+      hydrate: async ({ authoritativeRecordId }) => hydrations.get(authoritativeRecordId),
+    });
+    const retrieve = governedRetrieval.retrieve.bind(governedRetrieval);
+    governedRetrieval.retrieve = async (request) => {
+      requests.push(request);
+      return retrieve(request);
+    };
+    const service = new DefaultMemoryService({
+      repository: new FakeRepository([
+        { ...lookupOnly, score: 0.99 },
+        { ...ungrounded, score: 0.98 },
+        { ...active, score: 0.9 },
+      ]),
+      embeddings: new FakeEmbeddings(),
+      governedRetrieval,
+    });
+
+    const recalled = await service.recall({ query: "governed", scope: active.scope });
+    const context = await service.buildContext({ query: "governed", scope: active.scope });
+
+    expect(requests.map((request) => request.intent)).toEqual(["lookup", "context"]);
+    expect(recalled.hits.map((hit) => hit.record.id)).toEqual([lookupOnly.id, active.id]);
+    expect(context.hits.map((hit) => hit.record.id)).toEqual([active.id]);
+    expect(recalled.hits.every((hit) => isRecallScoreBreakdown(hit.scoreBreakdown))).toBe(true);
+    expect(recalled.hits.find((hit) => hit.record.id === ungrounded.id)).toBeUndefined();
+  });
+
+  test("production governed recall 合并 provider-owned 多来源候选后只计算一次六因子", async () => {
+    const active = makeRecord({
+      id: "active-from-lexical",
+      semanticType: "rules",
+      lifecycleStatus: "active",
+      container: "project",
+      sourceNodeIds: ["evidence-active"],
+      metadata: {
+        admissionRoute: "active",
+        contextEligible: true,
+        governance: {
+          evidenceIds: ["evidence-active"],
+          candidate: { riskFlags: [] },
+        },
+      },
+    });
+    const governedRetrieval = new GovernedRetrievalEngine({
+      hydrate: async ({ authoritativeRecordId }) => authoritativeRecordId === active.id
+        ? { record: active, evidenceIds: ["evidence-active"] }
+        : undefined,
+    });
+    const search = vi.fn(async () => [{
+      candidateId: "lexical:active-from-lexical",
+      authoritativeRecordId: active.id,
+      scope: active.scope,
+      source: "lexical" as const,
+      nodeType: "memory" as const,
+      relevance: 0.8,
+      rawScore: 0.8,
+      evidenceIds: ["evidence-active"],
+    }]);
+    const service = new DefaultMemoryService({
+      repository: new FakeRepository([]),
+      embeddings: new FakeEmbeddings(),
+      governedRetrieval,
+      governedCandidateSource: { search },
+    });
+
+    const result = await service.recall({ query: "PostgreSQL validation", scope: active.scope });
+
+    expect(search).toHaveBeenCalledWith({
+      query: "PostgreSQL validation",
+      scope: active.scope,
+      limit: 500,
+    });
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0]).toMatchObject({
+      record: active,
+      source: "text",
+      scoreBreakdown: {
+        matchedBy: ["text"],
+        sourceSignals: { lexical: 0.8 },
+      },
+    });
+    expect(result.hits[0].score).toBe(result.hits[0].scoreBreakdown?.score);
+  });
+
+  test("context_fast 的空查询不调用 lexical/graph/tree 候选源", async () => {
+    const search = vi.fn(async () => []);
+    const service = new DefaultMemoryService({
+      repository: new FakeRepository([]),
+      embeddings: new FakeEmbeddings(),
+      governedRetrieval: new GovernedRetrievalEngine({ hydrate: async () => undefined }),
+      governedCandidateSource: { search },
+    });
+
+    await service.recall({ query: "", scope: makeRecord().scope });
+
+    expect(search).not.toHaveBeenCalled();
   });
 
   describe("embedding-space aware recall", () => {
@@ -697,17 +933,20 @@ describe("DefaultMemoryService", () => {
 
     const result = await service.recall({
       query: "concise replies",
-      scope: { appId: "openclaw", userId: "user-1", projectId: "project-1", agentId: "agent-1" },
+      scope: {
+        appId: "openclaw", userId: "user-1", projectId: "project-1",
+        agentId: "agent-1", namespace: "memories",
+      },
     });
 
     // tenant/user 是 authority 铁隔离；同 authority 跨 project 仍允许进入软排序。
     expect(result.hits).toHaveLength(2);
     expect(result.hits.map((hit) => hit.record.id)).toEqual(["mem-A", "mem-B"]);
-    // scoreBreakdown 暴露 scopeFit（便于 ms why 追溯）
-    expect(result.hits[0].scoreBreakdown?.scopeFit).toBeGreaterThan(
-      result.hits[1].scoreBreakdown?.scopeFit ?? 1,
+    // scoreBreakdown 暴露唯一六因子的 scopeFit（便于 context/why/explain 共用）
+    expect(result.hits[0].scoreBreakdown?.factors?.scopeFit).toBeGreaterThan(
+      result.hits[1].scoreBreakdown?.factors?.scopeFit ?? 1,
     );
-    expect(result.hits[0].scoreBreakdown?.vector).toBe(0.8);
+    expect(result.hits[0].scoreBreakdown?.sourceSignals?.vector).toBe(0.8);
   });
 
   test("100 组跨 tenant/user provider 污染结果在返回文本和 ID 前全部剔除，limit 后置正确", async () => {
@@ -743,7 +982,11 @@ describe("DefaultMemoryService", () => {
 
     const result = await service.recall({ query: "authority", scope: authorityScope, limit: 5 });
 
-    expect(repository.queryCalls[0]).toMatchObject({ scope: authorityScope, limit: 5 });
+    expect(repository.queryCalls[0]).toMatchObject({
+      scope: authorityScope,
+      limit: undefined,
+      minScore: undefined,
+    });
     expect(result.hits).toHaveLength(5);
     expect(result.hits.every(({ record }) =>
       record.scope.tenantId === authorityScope.tenantId &&
@@ -914,7 +1157,10 @@ describe("DefaultMemoryService", () => {
 
     const result = await service.recall({
       query: "q",
-      scope: { appId: "openclaw", userId: "user-1", projectId: "project-1", agentId: "agent-1" },
+      scope: {
+        appId: "openclaw", userId: "user-1", projectId: "project-1",
+        agentId: "agent-1", namespace: "memories",
+      },
     });
 
     expect(result.hits.map((hit) => hit.record.id)).toEqual(["high", "low"]);
@@ -942,6 +1188,43 @@ describe("DefaultMemoryService", () => {
     expect(context.content).not.toContain("<tool>memory_store</tool>");
     expect(context.hits).toHaveLength(1);
     expect(context.tokenEstimate).toBeGreaterThan(0);
+  });
+
+  test("lookup_only 只出现在 recall/lookup，evidence_only 不可见，两者都不进入 context", async () => {
+    const active = makeRecord({
+      id: "active-context",
+      semanticType: "rules",
+      lifecycleStatus: "active",
+      container: "project",
+      metadata: { admissionRoute: "active", contextEligible: true },
+    });
+    const lookupOnly = makeRecord({
+      id: "lookup-only",
+      semanticType: "experience",
+      lifecycleStatus: "archived",
+      container: "session_candidate",
+      metadata: { admissionRoute: "lookup_only", contextEligible: false },
+    });
+    const evidenceOnly = makeRecord({
+      id: "evidence-only",
+      lifecycleStatus: "archived",
+      container: "session_candidate",
+      metadata: { admissionRoute: "evidence_only", contextEligible: false },
+    });
+    const service = new DefaultMemoryService({
+      repository: new FakeRepository([
+        { ...lookupOnly, score: 0.99 },
+        { ...evidenceOnly, score: 0.98 },
+        { ...active, score: 0.8 },
+      ]),
+      embeddings: new FakeEmbeddings(),
+    });
+
+    const recalled = await service.recall({ query: "route matrix", scope: active.scope });
+    const context = await service.buildContext({ query: "route matrix", scope: active.scope, limit: 1 });
+
+    expect(recalled.hits.map((hit) => hit.record.id)).toEqual(["lookup-only", "active-context"]);
+    expect(context.hits.map((hit) => hit.record.id)).toEqual(["active-context"]);
   });
 
   test("buildContext filters private memories and escapes prompt-injection text", async () => {

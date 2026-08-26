@@ -1,0 +1,5 @@
+{"id":"pd-001","suite":"mengshu-progressive-disclosure","scenario":"must_read_escaped_body"}
+{"id":"pd-002","suite":"mengshu-progressive-disclosure","scenario":"navigation_reference_only"}
+{"id":"pd-003","suite":"mengshu-progressive-disclosure","scenario":"tool_only_reference_only"}
+{"id":"pd-004","suite":"mengshu-progressive-disclosure","scenario":"asset_off_native_fallback"}
+{"id":"pd-005","suite":"mengshu-progressive-disclosure","scenario":"denied_asset_not_injected"}

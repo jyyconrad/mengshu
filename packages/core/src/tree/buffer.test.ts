@@ -27,6 +27,23 @@ function leaf(id: string, text = "memory tree event"): TreeLeaf {
 }
 
 describe("appendLeafToBuffer", () => {
+  test("replaying the same leaf is idempotent for leaf ids and token count", async () => {
+    const repository = new InMemoryTreeRepository();
+    const input = {
+      scope,
+      treeType: "source" as const,
+      treeKey: "source-1",
+      leaf: leaf("leaf-1"),
+      now: 1710000000000,
+    };
+
+    await appendLeafToBuffer(repository, input);
+    const replay = await appendLeafToBuffer(repository, input);
+
+    expect(replay.buffer.leafIds).toEqual(["leaf-1"]);
+    expect(replay.buffer.tokenCount).toBe(input.leaf.tokenCount);
+  });
+
   test("appends leaves to deterministic source buffer and detects seal threshold", async () => {
     const repository = new InMemoryTreeRepository();
     const first = await appendLeafToBuffer(repository, {

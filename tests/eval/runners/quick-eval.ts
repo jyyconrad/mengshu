@@ -53,7 +53,9 @@ import type { EvalSuitePlan } from "./eval-manifest.js";
 import {
   createBaselineMetrics,
   evaluateSuiteGate,
+  findMissingProductionStageEvidence,
   findUnsupportedExpectedFields,
+  hasValidProductionRestartReplayEvidence,
   isProductionReleaseEligible,
   offlineSlotContextExecution,
 } from "./eval-metrics.js";
@@ -245,6 +247,12 @@ export function describeProductionGateFailures(report: EvalReport): string[] {
     if (!execution.version) failures.push(`${suite.suite}: missing version`);
     if (execution.fallback) failures.push(`${suite.suite}: fallback=true`);
     if (execution.degraded) failures.push(`${suite.suite}: degraded=true`);
+    for (const stage of findMissingProductionStageEvidence(execution.productionStageEvidence)) {
+      failures.push(`${suite.suite}: missing production stage evidence '${stage}'`);
+    }
+    if (!hasValidProductionRestartReplayEvidence(suite)) {
+      failures.push(`${suite.suite}: invalid production restart replay evidence`);
+    }
   }
   for (const [runMode, suites] of nonRuntimeSuites) {
     failures.push(`runMode=${runMode} suites=${suites.join(",")}`);
@@ -375,6 +383,7 @@ export function buildReport(
       | "sha256"
       | "metrics"
       | "gate"
+      | "requiredProductionStages"
       | "manifestSchemaVersion"
       | "manifestVersion"
     >
@@ -441,10 +450,12 @@ export function buildReport(
   const manifestSuites = summaries.map((summary) => {
     const plan = planByName.get(summary.suite)!;
     const gate = plan.gate ?? null;
+    const requiredProductionStages = plan.requiredProductionStages ?? null;
     const gateIdentity = createHash("sha256").update(JSON.stringify({
       kind: plan.kind,
       metrics: plan.metrics,
       gate,
+      requiredProductionStages,
     })).digest("hex");
     return {
       name: plan.name,
@@ -454,6 +465,7 @@ export function buildReport(
       fixtureSha256: plan.sha256,
       metrics: [...plan.metrics],
       gate,
+      requiredProductionStages,
       gateIdentity,
     };
   });
@@ -525,7 +537,13 @@ async function main(argv: string[]): Promise<void> {
   let outDir = path.join(resultsDir, timestampDir());
   let manifestPath = path.join(goldensDir, "manifest.json");
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--out") {
+    if (args[i] === "--suite") {
+      if (!args[i + 1]) throw new Error("[quick-eval] --suite 缺少名称");
+      if (suiteWasSet) throw new Error("[quick-eval] suite 只能指定一次");
+      suiteName = args[i + 1];
+      suiteWasSet = true;
+      i++;
+    } else if (args[i] === "--out") {
       if (!args[i + 1]) throw new Error("[quick-eval] --out 缺少路径");
       outDir = path.resolve(args[i + 1]);
       i++;

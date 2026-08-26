@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 
+import type { AuthorityScope } from "../packages/core/src/domain/authority-scope.js";
 import {
   completeDurableJobV2,
   createDurableJobHandlerRegistry,
@@ -15,7 +16,9 @@ import {
   DurableJobV2HandlerFailure,
   createAuthoritativeDurableJobV2WorkerHandlerRegistry,
   runNextDurableJobV2,
+  startBroadAuthorityDurableJobV2Supervisor,
   startDurableJobV2WorkerLoop,
+  type BroadAuthorityDurableJobV2RepositoryPort,
   type DurableJobV2RepositoryPort,
   type DurableJobV2Scheduler,
 } from "./workers-v2.js";
@@ -41,6 +44,23 @@ function runningJob(type = "work", maxAttempts = 3): DurableJobV2 {
     maxAttempts,
   }, { registry, now: 100 });
   return leaseDurableJobV2(queued, {
+    owner: "worker-a",
+    now: 100,
+    leaseMs: 1_000,
+    tokenFactory: () => "a".repeat(32),
+  }).job;
+}
+
+function runningJobFor(jobScope: DurableJobV2Scope, id: string): DurableJobV2 {
+  const registry = createDurableJobHandlerRegistry(["work"]);
+  return leaseDurableJobV2(createDurableJobV2({
+    id,
+    type: "work",
+    payload: { value: 1 },
+    dedupeKey: `work:${id}`,
+    scope: jobScope,
+    maxAttempts: 3,
+  }, { registry, now: 100 }), {
     owner: "worker-a",
     now: 100,
     leaseMs: 1_000,
@@ -93,6 +113,13 @@ class FakeRepository implements DurableJobV2RepositoryPort {
   fail = vi.fn<DurableJobV2RepositoryPort["fail"]>(async () => ({ applied: 0 }));
 }
 
+class FakeBroadAuthorityRepository extends FakeRepository
+  implements BroadAuthorityDurableJobV2RepositoryPort {
+  listRunnableScopes = vi.fn<BroadAuthorityDurableJobV2RepositoryPort["listRunnableScopes"]>(
+    async () => [],
+  );
+}
+
 class ManualScheduler implements DurableJobV2Scheduler {
   #now = 0;
   #nextId = 1;
@@ -122,6 +149,10 @@ class ManualScheduler implements DurableJobV2Scheduler {
   get pending(): number {
     return this.#tasks.size;
   }
+
+  get now(): number {
+    return this.#now;
+  }
 }
 
 function options(
@@ -144,6 +175,18 @@ async function flush(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+const broadAuthority: AuthorityScope = Object.freeze({
+  tenantId: scope.tenantId,
+  userId: scope.userId,
+  allow: Object.freeze({
+    appIds: Object.freeze([scope.appId, "codex"]),
+    projectIds: Object.freeze([scope.projectId, "project-b"]),
+    agentIds: Object.freeze([scope.agentId, "agent-b"]),
+    namespaces: Object.freeze([scope.namespace, "preferences"]),
+    visibilities: Object.freeze(["private", "workspace"] as const),
+  }),
+});
 
 describe("Durable Job v2 worker runNext", () => {
   test("handler registry 与 worker options 非法时 fail-closed", async () => {
@@ -170,6 +213,106 @@ describe("Durable Job v2 worker runNext", () => {
       registry: { authoritative: true, types: [], get: () => undefined },
     })).resolves.toMatchObject({ status: "error", code: "INVALID_WORKER_OPTIONS" });
     expect(repository.quarantineUnknown).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["非数组", "job-work"],
+    ["空数组", []],
+    ["重复 ID", ["job-work", "job-work"]],
+    ["不安全 ID", ["job work"]],
+  ])("idAllowlist %s 时在 repository 调用前 fail-closed", async (_case, idAllowlist) => {
+    const repository = new FakeRepository();
+
+    await expect(runNextDurableJobV2(repository, {
+      ...options(),
+      idAllowlist: idAllowlist as never,
+    })).resolves.toEqual({
+      status: "error",
+      operation: "protocol",
+      code: "INVALID_WORKER_OPTIONS",
+    });
+    expect(repository.reap).not.toHaveBeenCalled();
+    expect(repository.quarantineUnknown).not.toHaveBeenCalled();
+    expect(repository.lease).not.toHaveBeenCalled();
+  });
+
+  test("exact idAllowlist 原样透传给 reap、quarantineUnknown 和 lease", async () => {
+    const repository = new FakeRepository();
+    const idAllowlist = Object.freeze(["job-work", "history-job:batch-1"]);
+
+    await expect(runNextDurableJobV2(repository, {
+      ...options(),
+      idAllowlist,
+    })).resolves.toEqual({ status: "idle" });
+
+    const canonical = repository.reap.mock.calls[0]?.[0].idAllowlist;
+    expect(canonical).toEqual(idAllowlist);
+    expect(Object.isFrozen(canonical)).toBe(true);
+    expect(repository.quarantineUnknown.mock.calls[0]?.[0].idAllowlist).toBe(canonical);
+    expect(repository.lease.mock.calls[0]?.[0].idAllowlist).toBe(canonical);
+  });
+
+  test("reap 返回 idAllowlist 外 job 时 fail-closed", async () => {
+    const repository = new FakeRepository();
+    const outside = failed(
+      runningJobFor(scope, "job-outside"),
+      false,
+      "LEASE_EXPIRED",
+    );
+    repository.reap.mockResolvedValue({ applied: 1, job: outside });
+
+    await expect(runNextDurableJobV2(repository, {
+      ...options(),
+      idAllowlist: ["job-allowed"],
+    })).resolves.toEqual({
+      status: "error",
+      operation: "reap",
+      code: "INVALID_REPOSITORY_RESULT",
+    });
+    expect(repository.quarantineUnknown).not.toHaveBeenCalled();
+    expect(repository.lease).not.toHaveBeenCalled();
+  });
+
+  test("quarantineUnknown 返回 idAllowlist 外 job 时 fail-closed", async () => {
+    const repository = new FakeRepository();
+    const outside = failed(
+      runningJob("unknown"),
+      false,
+      "HANDLER_NOT_REGISTERED",
+    );
+    repository.quarantineUnknown.mockResolvedValue({ applied: 1, job: outside });
+
+    await expect(runNextDurableJobV2(repository, {
+      ...options(),
+      idAllowlist: ["job-allowed"],
+    })).resolves.toEqual({
+      status: "error",
+      operation: "quarantineUnknown",
+      code: "INVALID_REPOSITORY_RESULT",
+    });
+    expect(repository.lease).not.toHaveBeenCalled();
+  });
+
+  test("lease 返回 idAllowlist 外 job 时不执行 handler 或 fenced transition", async () => {
+    const repository = new FakeRepository();
+    const handler = vi.fn(async () => undefined);
+    repository.lease.mockResolvedValue({
+      applied: 1,
+      job: runningJobFor(scope, "job-outside"),
+    });
+
+    await expect(runNextDurableJobV2(repository, {
+      ...options(createAuthoritativeDurableJobV2WorkerHandlerRegistry({ work: handler })),
+      idAllowlist: ["job-allowed"],
+    })).resolves.toEqual({
+      status: "error",
+      operation: "lease",
+      code: "INVALID_REPOSITORY_RESULT",
+    });
+    expect(handler).not.toHaveBeenCalled();
+    expect(repository.renew).not.toHaveBeenCalled();
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.fail).not.toHaveBeenCalled();
   });
 
   test("先 reap、再按完整 authoritative registry quarantine、最后 lease", async () => {
@@ -995,5 +1138,397 @@ describe("Durable Job v2 worker loop", () => {
     });
 
     await expect(loop.stop()).resolves.toEqual({ status: "stopped" });
+  });
+});
+
+describe("Broad-authority Durable Job v2 supervisor", () => {
+  function supervisorOptions(scheduler: DurableJobV2Scheduler = new ManualScheduler()) {
+    return {
+      authority: broadAuthority,
+      workerId: "worker-a",
+      leaseMs: 1_000,
+      heartbeatIntervalMs: 100,
+      registry: createAuthoritativeDurableJobV2WorkerHandlerRegistry({
+        work: async () => undefined,
+      }),
+      scheduler,
+      intervalMs: 1_000,
+      maxScopesPerTick: 3,
+      maxJobsPerTick: 2,
+      stopTimeoutMs: 200,
+    };
+  }
+
+  test("只消费 provider 发现的 exact scopes，不展开 allowlist 笛卡尔积，并限制 scopes/jobs", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const second: DurableJobV2Scope = {
+      ...scope,
+      appId: "codex",
+      projectId: "project-b",
+      agentId: "agent-b",
+      namespace: "preferences",
+      visibility: "workspace",
+    };
+    const third: DurableJobV2Scope = { ...scope, projectId: "project-b" };
+    repository.listRunnableScopes.mockResolvedValue([scope, second, third]);
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(
+      repository,
+      supervisorOptions(),
+    );
+
+    const result = await supervisor.tick();
+
+    expect(result).toEqual([{ status: "idle" }, { status: "idle" }]);
+    expect(repository.listRunnableScopes).toHaveBeenCalledTimes(1);
+    expect(repository.listRunnableScopes).toHaveBeenCalledWith(
+      expect.objectContaining({ tenantId: scope.tenantId, userId: scope.userId }),
+      3,
+    );
+    expect(repository.reap.mock.calls.map(([input]) => input.scope)).toEqual([scope, second]);
+    expect(repository.lease).toHaveBeenCalledTimes(2);
+    expect(repository.lease.mock.calls.map(([input]) => input.scope)).toEqual([scope, second]);
+    expect(repository.reap.mock.calls.every(
+      ([input]) => input.excludeIdPrefix === "history-job:",
+    )).toBe(true);
+    expect(repository.quarantineUnknown.mock.calls.every(
+      ([input]) => input.excludeIdPrefix === "history-job:",
+    )).toBe(true);
+    expect(repository.lease.mock.calls.every(
+      ([input]) => input.excludeIdPrefix === "history-job:",
+    )).toBe(true);
+    await supervisor.stop();
+  });
+
+  test("completed scope 以 round-robin 重入且总 job 数受限；并发 tick 复用同一执行", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const second: DurableJobV2Scope = { ...scope, projectId: "project-b" };
+    repository.listRunnableScopes.mockResolvedValue([scope, second]);
+    const first = runningJobFor(scope, "job-work-1");
+    const secondJob = runningJobFor(second, "job-work-2");
+    repository.lease
+      .mockResolvedValueOnce({ applied: 1, job: first })
+      .mockResolvedValueOnce({ applied: 1, job: secondJob })
+      .mockResolvedValue({ applied: 0 });
+    repository.complete.mockImplementation(async (input) => ({
+      applied: 1,
+      job: completed(input.scope.projectId === scope.projectId ? first : secondJob),
+    }));
+    let releaseDiscovery!: () => void;
+    repository.listRunnableScopes.mockImplementationOnce(() =>
+      new Promise((resolve) => {
+        releaseDiscovery = () => resolve([scope, second]);
+      }));
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(),
+      maxJobsPerTick: 3,
+    });
+
+    const one = supervisor.tick();
+    const same = supervisor.tick();
+    expect(one).toBe(same);
+    releaseDiscovery();
+    const result = await one;
+
+    expect(result).toHaveLength(3);
+    expect(repository.listRunnableScopes).toHaveBeenCalledTimes(1);
+    expect(repository.lease.mock.calls.map(([input]) => input.scope)).toEqual([
+      scope,
+      second,
+      scope,
+    ]);
+    await supervisor.stop();
+  });
+
+  test("provider throw、越权/重复/超限 scope 列表均 fail-closed，不能进入 exact-scope worker", async () => {
+    const cases: readonly (Error | readonly DurableJobV2Scope[])[] = [
+      new Error("provider-secret"),
+      [{ ...scope, tenantId: "tenant-other" }],
+      [scope, scope],
+      [scope, { ...scope, projectId: "project-b" }, { ...scope, appId: "codex" }, scope],
+    ];
+    for (const value of cases) {
+      const repository = new FakeBroadAuthorityRepository();
+      if (value instanceof Error) repository.listRunnableScopes.mockRejectedValue(value);
+      else repository.listRunnableScopes.mockResolvedValue(value);
+      const supervisor = startBroadAuthorityDurableJobV2Supervisor(
+        repository,
+        supervisorOptions(),
+      );
+
+      const result = await supervisor.tick();
+
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        status: value instanceof Error ? "uncertain" : "error",
+        operation: "listRunnableScopes",
+      });
+      expect(repository.reap).not.toHaveBeenCalled();
+      expect(JSON.stringify(result)).not.toContain("provider-secret");
+      await supervisor.stop();
+    }
+  });
+
+  test("stop 使用内部 AbortController 终止 handler；阻塞 discovery 时按 timeout 有界返回", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    repository.listRunnableScopes.mockResolvedValue([scope]);
+    repository.lease.mockResolvedValue({ applied: 1, job: runningJob() });
+    const scheduler = new ManualScheduler();
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(scheduler),
+      registry: createAuthoritativeDurableJobV2WorkerHandlerRegistry({
+        work: () => new Promise<void>(() => undefined),
+      }),
+    });
+    void supervisor.tick();
+    await flush();
+
+    await expect(supervisor.stop()).resolves.toEqual({ status: "stopped" });
+    expect(repository.complete).not.toHaveBeenCalled();
+    expect(repository.fail).not.toHaveBeenCalled();
+
+    const blockedRepository = new FakeBroadAuthorityRepository();
+    blockedRepository.listRunnableScopes.mockImplementation(() => new Promise(() => undefined));
+    const blockedScheduler = new ManualScheduler();
+    const blocked = startBroadAuthorityDurableJobV2Supervisor(
+      blockedRepository,
+      supervisorOptions(blockedScheduler),
+    );
+    void blocked.tick();
+    await flush();
+    const stopping = blocked.stop();
+    blockedScheduler.advanceBy(200);
+    await expect(stopping).resolves.toEqual({ status: "timeout" });
+  });
+
+  test("非法 authority 与预算在启动、连接或 schedule 前同步拒绝", () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const scheduler = new ManualScheduler();
+    expect(() => startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(scheduler),
+      authority: { tenantId: scope.tenantId, userId: scope.userId } as AuthorityScope,
+    })).toThrow(/supervisor options.*invalid/i);
+    expect(() => startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(scheduler),
+      maxJobsPerTick: 0,
+    })).toThrow(/supervisor options.*invalid/i);
+    expect(repository.listRunnableScopes).not.toHaveBeenCalled();
+    expect(scheduler.pending).toBe(0);
+  });
+
+  test("repository 连续失败会指数退避并打开熔断，恢复探测成功后重置 readiness", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const scheduler = new ManualScheduler();
+    repository.listRunnableScopes
+      .mockRejectedValueOnce(new Error("provider-secret-1"))
+      .mockRejectedValueOnce(new Error("provider-secret-2"))
+      .mockResolvedValue([]);
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(scheduler),
+      clock: () => scheduler.now,
+      failureBackoffBaseMs: 100,
+      failureBackoffMaxMs: 1_000,
+      circuitFailureThreshold: 2,
+      circuitResetMs: 500,
+      jitterRatio: 0,
+    });
+
+    await expect(supervisor.tick()).resolves.toEqual([{
+      status: "uncertain",
+      operation: "listRunnableScopes",
+      code: "REPOSITORY_OUTCOME_UNCERTAIN",
+    }]);
+    expect(supervisor.snapshot()).toMatchObject({
+      state: "backoff",
+      ready: false,
+      consecutiveFailures: 1,
+      nextRetryAt: 100,
+    });
+
+    await expect(supervisor.tick()).resolves.toEqual([]);
+    expect(repository.listRunnableScopes).toHaveBeenCalledTimes(1);
+
+    scheduler.advanceBy(100);
+    await expect(supervisor.tick()).resolves.toMatchObject([{ status: "uncertain" }]);
+    expect(supervisor.snapshot()).toMatchObject({
+      state: "open",
+      ready: false,
+      consecutiveFailures: 2,
+      nextRetryAt: 600,
+    });
+
+    scheduler.advanceBy(499);
+    await expect(supervisor.tick()).resolves.toEqual([]);
+    expect(repository.listRunnableScopes).toHaveBeenCalledTimes(2);
+
+    scheduler.advanceBy(1);
+    expect(supervisor.snapshot()).toMatchObject({ state: "half_open", ready: false });
+    await expect(supervisor.tick()).resolves.toEqual([]);
+    expect(repository.listRunnableScopes).toHaveBeenCalledTimes(3);
+    expect(supervisor.snapshot()).toMatchObject({
+      state: "healthy",
+      ready: true,
+      consecutiveFailures: 0,
+      failingScopes: 0,
+      providerState: "healthy",
+      providerConsecutiveFailures: 0,
+    });
+    expect(JSON.stringify(supervisor.snapshot())).not.toContain("provider-secret");
+    await supervisor.stop();
+  });
+
+  test("exact scope 故障独立熔断，健康 scope 继续运行且 half-open 成功后恢复", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const scheduler = new ManualScheduler();
+    const healthyScope = { ...scope, projectId: "project-b" };
+    repository.listRunnableScopes.mockResolvedValue([scope, healthyScope]);
+    let failedOnce = false;
+    repository.reap.mockImplementation(async ({ scope: requestedScope }) => {
+      if (requestedScope.projectId === scope.projectId && !failedOnce) {
+        failedOnce = true;
+        throw new Error("database-password-secret");
+      }
+      return { applied: 0 };
+    });
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(scheduler),
+      clock: () => scheduler.now,
+      failureBackoffBaseMs: 250,
+      failureBackoffMaxMs: 1_000,
+      circuitFailureThreshold: 1,
+      circuitResetMs: 1_000,
+      jitterRatio: 0,
+    });
+
+    await expect(supervisor.tick()).resolves.toMatchObject([
+      { status: "uncertain", operation: "reap" },
+      { status: "idle" },
+    ]);
+    expect(supervisor.snapshot()).toMatchObject({
+      state: "open",
+      ready: false,
+      consecutiveFailures: 1,
+      failingScopes: 1,
+      nextRetryAt: 1_000,
+      providerState: "healthy",
+      providerConsecutiveFailures: 0,
+      scopeOpenCount: 1,
+    });
+    scheduler.advanceBy(999);
+    await expect(supervisor.tick()).resolves.toEqual([{ status: "idle" }]);
+    expect(repository.listRunnableScopes).toHaveBeenCalledTimes(2);
+    expect(repository.reap.mock.calls.filter(
+      ([input]) => input.scope.projectId === scope.projectId,
+    )).toHaveLength(1);
+    expect(repository.reap.mock.calls.filter(
+      ([input]) => input.scope.projectId === healthyScope.projectId,
+    )).toHaveLength(2);
+
+    scheduler.advanceBy(1);
+    expect(supervisor.snapshot()).toMatchObject({
+      state: "half_open",
+      providerState: "healthy",
+      scopeHalfOpenCount: 1,
+    });
+    await expect(supervisor.tick()).resolves.toEqual([
+      { status: "idle" },
+      { status: "idle" },
+    ]);
+    expect(supervisor.snapshot()).toMatchObject({
+      state: "healthy",
+      ready: true,
+      failingScopes: 0,
+      providerState: "healthy",
+    });
+    expect(JSON.stringify(supervisor.snapshot())).not.toContain("database-password-secret");
+    await supervisor.stop();
+  });
+
+  test("half-open 使用已验证 exact scope 探测，job 消失后自动恢复 readiness", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const scheduler = new ManualScheduler();
+    const healthyScope = { ...scope, projectId: "project-b" };
+    repository.listRunnableScopes
+      .mockResolvedValueOnce([scope])
+      .mockResolvedValue([healthyScope]);
+    repository.reap
+      .mockRejectedValueOnce(new Error("transient-scope-failure"))
+      .mockResolvedValue({ applied: 0 });
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(scheduler),
+      clock: () => scheduler.now,
+      maxJobsPerTick: 1,
+      failureBackoffBaseMs: 100,
+      failureBackoffMaxMs: 1_000,
+      circuitFailureThreshold: 1,
+      circuitResetMs: 500,
+      jitterRatio: 0,
+    });
+
+    await expect(supervisor.tick()).resolves.toMatchObject([
+      { status: "uncertain", operation: "reap" },
+    ]);
+    expect(supervisor.snapshot()).toMatchObject({
+      state: "open",
+      ready: false,
+      failingScopes: 1,
+      nextRetryAt: 500,
+    });
+
+    scheduler.advanceBy(500);
+    await expect(supervisor.tick()).resolves.toEqual([{ status: "idle" }]);
+    expect(repository.listRunnableScopes).toHaveBeenCalledTimes(2);
+    expect(repository.reap.mock.calls.map(([input]) => input.scope)).toEqual([scope, scope]);
+    expect(supervisor.snapshot()).toMatchObject({
+      state: "healthy",
+      ready: true,
+      failingScopes: 0,
+      scopeOpenCount: 0,
+      scopeHalfOpenCount: 0,
+    });
+    await supervisor.stop();
+  });
+
+  test("scope discovery cursor 跨 tick 环形轮转，超过单轮上限的 backlog 不饥饿", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const scopes: DurableJobV2Scope[] = [
+      scope,
+      { ...scope, appId: "codex" },
+      { ...scope, projectId: "project-b" },
+      { ...scope, agentId: "agent-b" },
+      { ...scope, namespace: "preferences" },
+    ];
+    const key = (value: DurableJobV2Scope) => [
+      value.appId,
+      value.projectId,
+      value.agentId,
+      value.namespace,
+      value.visibility,
+    ].join("\u0000");
+    repository.listRunnableScopes.mockImplementation(async (_authority, limit, after) => {
+      const afterIndex = after ? scopes.findIndex((candidate) => key(candidate) === key(after)) : -1;
+      const start = (afterIndex + 1) % scopes.length;
+      return Array.from(
+        { length: Math.min(limit, scopes.length) },
+        (_, index) => scopes[(start + index) % scopes.length]!,
+      );
+    });
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(),
+      maxScopesPerTick: 2,
+      maxJobsPerTick: 2,
+    });
+
+    await supervisor.tick();
+    await supervisor.tick();
+    await supervisor.tick();
+
+    expect(repository.reap.mock.calls.map(([input]) => key(input.scope))).toEqual([
+      key(scopes[0]!), key(scopes[1]!),
+      key(scopes[2]!), key(scopes[3]!),
+      key(scopes[4]!), key(scopes[0]!),
+    ]);
+    expect(repository.listRunnableScopes.mock.calls[1]?.[2]).toEqual(scopes[1]);
+    expect(repository.listRunnableScopes.mock.calls[2]?.[2]).toEqual(scopes[3]);
+    await supervisor.stop();
   });
 });

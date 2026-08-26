@@ -1,9 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
 import type { DatabaseProvider, MemoryEntry, MemoryQueryOptions } from "./db/types.js";
-import {
-  DATABASE_STORE_CLEANUP_WARNING,
-  DatabaseStoreCleanupError,
-} from "./db/types.js";
 import { createMengshuRuntime, toFriendlyMengshuError } from "./runtime.js";
 import type { MemoryConfig } from "./config.js";
 import { PostgresTreeRepository } from "./tree/postgres-repository.js";
@@ -39,6 +35,25 @@ import {
   PostgresAtomicMemoryStorePort,
   type PostgresMemoryWriteClient,
 } from "./packages/core/src/service/write-kernel-transaction.js";
+import {
+  PostgresMemoryWriteKernelTransactionPort,
+  type PostgresMemoryWriteKernelClient,
+} from "./packages/core/src/service/write-kernel-postgres-transaction.js";
+import type {
+  MemoryWriteCommand,
+  MemoryWriteKernelResult,
+  WriteMemoryRecord,
+} from "./packages/core/src/service/write-kernel.js";
+import type { CandidateDedupComparable } from
+  "./packages/core/src/lifecycle/candidate-dedup-policy.js";
+import type { CandidateRecord } from
+  "./packages/core/src/lifecycle/candidate-types.js";
+import { planTreeFanOut } from "./packages/core/src/tree/tree-fan-out.js";
+import { computeConfidenceWithBreakdown } from
+  "./packages/core/src/scoring/confidence-score.js";
+import { PostgresDuplicateEvidenceLinkPort } from
+  "./packages/core/src/service/postgres-memory-evidence-link-port.js";
+import { DatabaseFactory } from "./db/factory.js";
 
 function rejectingPostgresForgetPort(message: string): PostgresForgetTransactionPort {
   return new PostgresForgetTransactionPort({
@@ -109,6 +124,69 @@ function runtimePostgresProvider(): RuntimePostgresProvider {
   }) as RuntimePostgresProvider;
 }
 
+function installRuntimeKernelTransaction(provider: RuntimePostgresProvider) {
+  const calls: Array<{ sql: string; params: readonly unknown[] }> = [];
+  const receipts = new Map<string, Record<string, unknown>>();
+  const writes: WriteMemoryRecord[] = [];
+  const client: PostgresMemoryWriteKernelClient = {
+    query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+      sql: string,
+      params: readonly unknown[] = [],
+    ) => {
+      calls.push({ sql, params });
+      if (/FROM mengshu_write_receipts/.test(sql)) {
+        const row = receipts.get(String(params[0]));
+        const rows = row ? [row as Row] : [];
+        return { rows, rowCount: rows.length };
+      }
+      if (/FROM mengshu_candidate_write_receipts/.test(sql)) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (/INSERT INTO mengshu_write_receipts/.test(sql)) {
+        receipts.set(String(params[0]), {
+          storage_key: params[0],
+          tenant_id: params[1],
+          user_id: params[2],
+          request_fingerprint: params[3],
+          result: JSON.parse(String(params[4])),
+        });
+      }
+      return { rows: [], rowCount: 1 };
+    },
+    release: () => undefined,
+  };
+  const port = new PostgresMemoryWriteKernelTransactionPort(
+    { connect: async () => client },
+    async (_client, record) => {
+      writes.push(record);
+      return { memoryId: record.id, stored: true };
+    },
+  );
+  Object.assign(provider, {
+    createMemoryWriteKernelTransactionPort: vi.fn(() => port),
+  });
+  return { calls, receipts, writes, port };
+}
+
+function installRuntimeCandidateDedup(
+  provider: RuntimePostgresProvider,
+  records: readonly CandidateDedupComparable[] = [],
+) {
+  const findExisting = vi.fn(async () => records);
+  vi.spyOn(provider, "createCandidateDedupReadPort").mockReturnValue({ findExisting });
+  return { findExisting };
+}
+
+function runtimeWriteExecutor(runtime: unknown): (
+  command: MemoryWriteCommand,
+) => Promise<MemoryWriteKernelResult> {
+  const candidate = runtime as { executeMemoryWrite?: unknown };
+  expect(candidate.executeMemoryWrite).toBeTypeOf("function");
+  return (candidate.executeMemoryWrite as (
+    command: MemoryWriteCommand,
+  ) => Promise<MemoryWriteKernelResult>).bind(runtime);
+}
+
 function trustedDurableComposition(
   scope: MemoryScope & { visibility: "private" },
   failOnceTypes: readonly string[] = [],
@@ -125,13 +203,14 @@ function trustedDurableComposition(
     backoffMs: () => 100,
   };
   const provider = runtimePostgresProvider();
+  const kernel = installRuntimeKernelTransaction(provider);
   const runtimeBundle = provider.createDurableJobV2RuntimeBundle({
     clock: dependencies.clock,
     tokenFactory: dependencies.tokenFactory,
     backoffMs: dependencies.backoffMs,
   });
   Object.assign(provider as unknown as Record<string, unknown>, {
-    schemaVersion: 11,
+    schemaVersion: 15,
     schemaContractState: "ready",
   });
   const repository = runtimeBundle.repository as PostgresDurableJobV2Repository & {
@@ -158,6 +237,7 @@ function trustedDurableComposition(
   };
   return {
     provider,
+    kernel,
     repository,
     runtimeBundle,
     capability: createNativeDurableJobV2ServeCapability({
@@ -165,6 +245,26 @@ function trustedDurableComposition(
       registry,
       scope: { ...scope },
     }),
+  };
+}
+
+function governedCandidate(
+  scope: MemoryScope,
+  metadata: Record<string, unknown>,
+) {
+  return {
+    id: "candidate-tree-1",
+    scope,
+    text: "所有部署都必须先完成测试验证。",
+    semanticType: "rules" as const,
+    kind: "fact",
+    confidence: 0.9,
+    contentHash: "a".repeat(64),
+    evidenceIds: ["evidence-1"],
+    status: "pending" as const,
+    hitCount: 0,
+    metadata,
+    createdAt: 90,
   };
 }
 
@@ -247,6 +347,40 @@ function directMemoryRecord(
 }
 
 describe("createMengshuRuntime", () => {
+  test("default Postgres runtime starts and stops the provider-owned active derivation repair loop", async () => {
+    const db = runtimePostgresProvider();
+    db.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
+    const drain = deferred();
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("SELECT outbox.event_id")) await drain.promise;
+        return { rows: [], rowCount: 0 };
+      }),
+      release: vi.fn(),
+    };
+    const createPool = vi.spyOn(db, "createActiveDerivationOutboxPool")
+      .mockReturnValue({ connect: async () => client });
+    vi.spyOn(DatabaseFactory, "createProvider").mockReturnValueOnce(db);
+
+    const runtime = createMengshuRuntime({
+      config: postgresGuardConfig,
+      resolvedDbPath: "",
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+    });
+    await runtime.start();
+    await vi.waitFor(() => expect(client.query).toHaveBeenCalledWith("BEGIN"));
+
+    const stopping = runtime.stop();
+    expect(db.close).not.toHaveBeenCalled();
+    drain.resolve();
+    await stopping;
+
+    expect(createPool).toHaveBeenCalledOnce();
+    expect(client.release).toHaveBeenCalledOnce();
+    expect(db.close).toHaveBeenCalledOnce();
+  });
+
   test("10 个并发 runtime.start 只初始化 DB/registry/tree 一次，完成后才 ready", async () => {
     const db = new RegistryFakeDb();
     db.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
@@ -1115,7 +1249,7 @@ describe("createMengshuRuntime", () => {
     expect(runtime.treeRepository).toBeInstanceOf(PostgresTreeRepository);
   });
 
-  test("agent observeLight persists observations through shared memory service", async () => {
+  test("non-Postgres observeLight 保留 evidence 兼容写入且只尝试候选抽取", async () => {
     const db = new FakeDb();
     const embeddings = {
       embed: vi.fn(async () => Array.from({ length: 1536 }, () => 0.01)),
@@ -1146,6 +1280,9 @@ describe("createMengshuRuntime", () => {
       runtime.embeddingSpace.embeddingSpaceId,
     );
     expect(stored?.metadata?.embeddingSpaceState).toBe("known-queryable");
+    expect(stored?.metadata?.memoryContainer).toBe("session_candidate");
+    expect(stored?.metadata?.semanticType).toBeUndefined();
+    expect(stored?.metadata?.admissionRoute).toBe("evidence_only");
     expect(JSON.stringify(stored?.metadata)).not.toContain("test-key");
     expect(response).toMatchObject({
       stored: true,
@@ -1156,10 +1293,39 @@ describe("createMengshuRuntime", () => {
     expect(response.queuedJobs).toEqual([]);
     expect(response.warnings).toEqual([
       expect.stringMatching(/^enqueue_failed: Durable job v2 runtime operation failed$/),
-      expect.stringMatching(/^tree_enqueue_failed: Durable job v2 runtime operation failed$/),
-      expect.stringMatching(/^graph_enqueue_failed: Durable job v2 runtime operation failed$/),
     ]);
     await expect(runtime.ingestionStore.jobs.list()).resolves.toEqual([]);
+  });
+
+  test("observeLight 原始 evidence 不进入 context_fast 五槽位", async () => {
+    const db = new FakeDb();
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: "/tmp/mengshu-test",
+      appId: "test-app",
+      db,
+      embeddings: fakeEmbeddings(),
+    });
+
+    await runtime.agentFastPath.observeLight({
+      scope: runtime.defaultScope,
+      eventType: "user_input",
+      text: "这只是待治理的原始观察，不能直接进入 R0。",
+      intent: "auto",
+    });
+
+    const stored = db.store.mock.calls[0]?.[0]?.[0];
+    db.query.mockResolvedValue(stored ? [{ ...stored, score: 1 } as never] : []);
+
+    const context = await runtime.agentFastPath.context({
+      scope: runtime.defaultScope,
+      task: "检查上下文",
+    });
+
+    expect(context.content).not.toContain("待治理的原始观察");
+    // Non-Postgres runtime recall is fail-closed before records reach the builder.
+    // The builder-level test separately proves raw_evidence filteredReason.
+    expect(context.telemetry.nodesUsed).toBe(0);
   });
 
   test("Postgres runtime 默认不把 legacy handlers 适配成 v2 capability，serve 保持 fail-closed", () => {
@@ -1193,7 +1359,16 @@ describe("createMengshuRuntime", () => {
       namespace: "working-context",
       visibility: "private" as const,
     };
-    const db = runtimePostgresProvider();
+    const trusted = trustedDurableComposition(defaultScope);
+    const db = trusted.provider;
+    const createActiveMemoryDerivationReadPort = vi.spyOn(
+      db,
+      "createActiveMemoryDerivationReadPort",
+    );
+    const createWorkMemoryGraphRepository = vi.spyOn(
+      db,
+      "createWorkMemoryGraphRepository",
+    );
     const runtime = createMengshuRuntime({
       config: postgresGuardConfig,
       resolvedDbPath: "",
@@ -1202,6 +1377,8 @@ describe("createMengshuRuntime", () => {
       db,
       embeddings: fakeEmbeddings(),
       treeRepository: fakeTreeRepository(),
+      durableJobV2ServeCapability: trusted.capability,
+      durableJobV2RuntimeBundle: trusted.runtimeBundle,
     });
 
     expect(runtime.durableJobV2RuntimeBundle).toBeDefined();
@@ -1213,9 +1390,175 @@ describe("createMengshuRuntime", () => {
     ]);
     expect(runtime.durableJobV2ServeCapability?.repository)
       .toBe(runtime.durableJobV2RuntimeBundle?.repository);
+    expect(createActiveMemoryDerivationReadPort).toHaveBeenCalledTimes(1);
+    expect(createWorkMemoryGraphRepository).toHaveBeenCalledTimes(1);
   });
 
-  test("Postgres Console 使用持久 candidate review，approve 在缺少原子 promotion 时 fail-closed", async () => {
+  test("Asset/Loadout 自动注入默认关闭，仅显式开关注册快路径增强", () => {
+    const defaultScope = {
+      tenantId: "tenant-a", userId: "user-a", appId: "mengshu",
+      projectId: "project-a", agentId: "agent-a", namespace: "working-context",
+      visibility: "private" as const,
+    };
+    const create = (assetInjection: boolean | undefined) => createMengshuRuntime({
+      config: {
+        ...postgresGuardConfig,
+        ...(assetInjection === undefined ? {} : { features: { assetInjection } }),
+      },
+      resolvedDbPath: "",
+      appId: "mengshu",
+      defaultScope,
+      db: runtimePostgresProvider(),
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+    });
+
+    const defaultRuntime = create(undefined);
+    expect(defaultRuntime.agentFastPath.assetEnhancementConfigured).toBe(false);
+    expect(defaultRuntime.knowledgeResources).toBeDefined();
+    expect(create(false).agentFastPath.assetEnhancementConfigured).toBe(false);
+    expect(create(true).agentFastPath.assetEnhancementConfigured).toBe(true);
+  });
+
+  test("Postgres runtime 将 recall queryHits 回流到 provider-owned 权威 Entity Graph", async () => {
+    const defaultScope = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      appId: "mengshu",
+      projectId: "project-a",
+      agentId: "agent-a",
+      namespace: "working-context",
+      visibility: "private" as const,
+      workspaceId: "workspace-a",
+      sessionId: "session-a",
+    };
+    const db = runtimePostgresProvider();
+    const query = vi.fn(async (
+      _sql: string,
+      _params: readonly unknown[] = [],
+    ) => ({ rows: [], rowCount: 0 }));
+    Object.assign(db as unknown as Record<string, unknown>, {
+      pool: { query, connect: vi.fn(), end: vi.fn() },
+      schemaVersion: 15,
+      schemaContractState: "ready",
+    });
+    const createEntityGraphQueryHitsPort = vi.spyOn(db, "createEntityGraphQueryHitsPort");
+    const runtime = createMengshuRuntime({
+      config: postgresGuardConfig,
+      resolvedDbPath: "",
+      appId: "mengshu",
+      defaultScope,
+      db,
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+    });
+
+    await runtime.queryHitsTracker.trackRecallHits([{
+      record: {
+        id: "active-memory-a",
+        metadata: { entityIds: ["untrusted-metadata-entity"] },
+      },
+    } as never], defaultScope);
+
+    expect(createEntityGraphQueryHitsPort).toHaveBeenCalledTimes(1);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0]?.[1]?.[10]).toEqual(["active-memory-a"]);
+    expect(String(query.mock.calls[0]?.[0])).toContain("mengshu_graph_entity_evidence");
+  });
+
+  test("runtime build_tree payload 严格保留 routing 与 target identity，domain dedupe 按 target 隔离", async () => {
+    const defaultScope = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      appId: "mengshu",
+      projectId: "project-a",
+      agentId: "agent-a",
+      namespace: "working-context",
+      visibility: "private" as const,
+      workspaceId: "workspace-a",
+      sessionId: "session-a",
+    };
+    const trusted = trustedDurableComposition(defaultScope);
+    const runtime = createMengshuRuntime({
+      config: postgresGuardConfig,
+      resolvedDbPath: "",
+      appId: "mengshu",
+      defaultScope,
+      db: trusted.provider,
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+      durableJobV2ServeCapability: trusted.capability,
+      durableJobV2RuntimeBundle: trusted.runtimeBundle,
+    });
+    const routing = {
+      valueScore: 0.9,
+      importance: 0.9,
+      semanticType: "rules" as const,
+      scopeVisibility: "workspace" as const,
+      riskFlags: [] as string[],
+      topicLabels: ["Deploy Rules"],
+      topicHotnessEligible: true,
+      isWorkspaceRule: true,
+    };
+    const leaf = {
+      id: "active-memory-1",
+      scope: defaultScope,
+      chunkId: "active-memory-1",
+      sourceId: "session-a",
+      entityIds: [],
+      importance: routing.importance,
+      eventAt: 90,
+      createdAt: 90,
+      text: "所有部署都必须先完成测试验证。",
+      tokenCount: 9,
+    };
+    const targets = planTreeFanOut({ scope: defaultScope, leaf, routing }).targets;
+
+    for (const target of targets) {
+      await (runtime.agentFastPath as unknown as {
+        deps: { enqueueJob(input: { type: string; payload: Record<string, unknown> }): Promise<string> };
+      }).deps.enqueueJob({
+        type: "build_tree",
+        payload: {
+          scope: defaultScope,
+          traceId: leaf.id,
+          treeType: target.treeType,
+          treeKey: target.treeKey,
+          targetIdempotencyKey: target.idempotencyKey,
+          routing,
+          leaf: {
+            id: leaf.id,
+            chunkId: leaf.chunkId,
+            sourceId: leaf.sourceId,
+            text: leaf.text,
+            eventAt: leaf.eventAt,
+          },
+        },
+      });
+    }
+
+    const inputs = trusted.repository.enqueueInputs.filter((input) => input.type === "build_tree" &&
+      String(input.dedupeKey).startsWith("build_tree:"));
+    expect(inputs).toHaveLength(3);
+    expect(inputs.map((input) => input.payload)).toEqual(targets.map((target) => ({
+      scope: defaultScope,
+      traceId: leaf.id,
+      treeType: target.treeType,
+      treeKey: target.treeKey,
+      targetIdempotencyKey: target.idempotencyKey,
+      routing,
+      leaf: {
+        id: leaf.id,
+        chunkId: leaf.chunkId,
+        sourceId: leaf.sourceId,
+        text: leaf.text,
+        eventAt: leaf.eventAt,
+      },
+    })));
+    expect(new Set(inputs.map((input) => input.dedupeKey)).size).toBe(3);
+  });
+
+  test("Postgres Console 使用 scope-bound 原子 promotion，approve 不执行二次状态写入", async () => {
     const defaultScope = {
       tenantId: "tenant-a",
       userId: "user-a",
@@ -1252,9 +1595,64 @@ describe("createMengshuRuntime", () => {
       archiveByIds: vi.fn(async () => 0),
       runEvictionScan,
     };
-    const db = runtimePostgresProvider();
+    const trusted = trustedDurableComposition(defaultScope);
+    const db = trusted.provider;
     const createCandidateReviewRepository = vi.spyOn(db, "createCandidateReviewRepository")
       .mockReturnValue(persistentReviewRepository);
+    const promotionPort = db.createCandidatePromotionPort(defaultScope);
+    const promote = vi.spyOn(promotionPort, "promote").mockResolvedValue({
+      status: "applied" as const,
+      candidateId: candidate.id,
+      memoryId: "11111111-1111-4111-8111-111111111111",
+      stored: true as const,
+    });
+    const createCandidatePromotionPort = vi.spyOn(db, "createCandidatePromotionPort")
+      .mockReturnValue(promotionPort);
+    vi.spyOn(db, "createWorkMemoryGraphRepository").mockReturnValue({
+      upsertWorkMemoryGraph: vi.fn(async () => undefined),
+    } as unknown as ReturnType<typeof db.createWorkMemoryGraphRepository>);
+    vi.spyOn(db, "createActiveMemoryDerivationReadPort").mockReturnValue({
+      readCommittedActiveRecords: vi.fn(async ({ activeMemoryIds }) => [{
+        id: activeMemoryIds[0]!,
+        commandType: "observeAuto" as const,
+        mutation: "content" as const,
+        scope: defaultScope,
+        text: candidate.text,
+        metadata: {},
+        vector: [0.1, 0.2],
+        route: "active" as const,
+        valueScore: 0.9,
+        importance: candidate.confidence,
+        kind: "fact" as const,
+        semanticType: "rules" as const,
+        confidence: candidate.confidence,
+        provenance: { source: "agent", sourceId: candidate.id, createdAt: candidate.createdAt },
+        evidenceIds: candidate.evidenceIds,
+        governance: { candidate: {}, admissionReason: "reviewed_candidate" },
+        createdAt: candidate.createdAt,
+      }]),
+      readEvidenceFacts: vi.fn(async () => [{
+        evidenceId: candidate.evidenceIds[0]!,
+        scope: defaultScope,
+        evidenceKind: "observation" as const,
+        label: "candidate evidence",
+        metadata: {},
+        createdAt: candidate.createdAt,
+      }]),
+      readTreeFacts: vi.fn(async () => [{
+        memoryId: "11111111-1111-4111-8111-111111111111",
+        scope: defaultScope,
+        evidenceId: candidate.evidenceIds[0]!,
+        sourceId: candidate.evidenceIds[0]!,
+        entityIds: [],
+        scopeVisibility: "project" as const,
+        riskFlags: [],
+        topicLabels: [],
+        topicHotnessEligible: false,
+        explicitGlobal: false,
+        isWorkspaceRule: false,
+      }]),
+    });
     const runtime = createMengshuRuntime({
       config: postgresGuardConfig,
       resolvedDbPath: "",
@@ -1263,9 +1661,12 @@ describe("createMengshuRuntime", () => {
       db,
       embeddings: fakeEmbeddings(),
       treeRepository: fakeTreeRepository(),
+      durableJobV2ServeCapability: trusted.capability,
+      durableJobV2RuntimeBundle: trusted.runtimeBundle,
     });
 
     expect(createCandidateReviewRepository).toHaveBeenCalledWith(defaultScope);
+    expect(createCandidatePromotionPort).toHaveBeenCalledWith(defaultScope);
     await expect(runtime.consoleApi.candidates({ scope: defaultScope }))
       .resolves.toMatchObject({ total: 1, candidates: [{ id: candidate.id }] });
     await expect(runtime.consoleApi.candidateCount(defaultScope, { status: "pending" }))
@@ -1289,17 +1690,193 @@ describe("createMengshuRuntime", () => {
 
     setStatus.mockClear();
     db.store.mockClear();
+    db.getActiveEmbeddingSpace.mockResolvedValue(runtime.embeddingSpace);
+    await runtime.start();
+    await expect(runtime.consoleApi.reviewCandidates({
+      action: { action: "approve", ids: [candidate.id] },
+    })).resolves.toEqual({
+      affected: 1,
+      promoted: ["11111111-1111-4111-8111-111111111111"],
+      errors: [],
+    });
+    expect(promote).toHaveBeenCalledWith({
+      candidateId: candidate.id,
+      material: expect.objectContaining({
+        id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        importance: candidate.confidence,
+        category: "other",
+        container: "personal",
+        metadata: expect.objectContaining({
+          embeddingSpaceId: runtime.embeddingSpace.embeddingSpaceId,
+          embeddingSpaceState: "known-queryable",
+        }),
+        vector: expect.any(Array),
+      }),
+    });
+    expect(setStatus).not.toHaveBeenCalled();
+    expect(db.store).not.toHaveBeenCalled();
+    await runtime.stop();
+  });
+
+  test("Postgres approve 提交后统一派生失败不报成功，approved receipt replay 修补 graph 与三棵树", async () => {
+    const defaultScope = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      appId: "mengshu",
+      projectId: "project-a",
+      agentId: "agent-a",
+      namespace: "working-context",
+      visibility: "private" as const,
+      workspaceId: "workspace-a",
+      sessionId: "session-a",
+    };
+    const trusted = trustedDurableComposition(defaultScope, ["build_tree"]);
+    const db = trusted.provider;
+    const memoryId = "11111111-1111-4111-8111-111111111111";
+    let candidate: CandidateRecord = governedCandidate(defaultScope, {
+      targetScope: "workspace",
+      riskFlags: [],
+    });
+    const get = vi.fn(async (id: string) => id === candidate.id ? candidate : undefined);
+    vi.spyOn(db, "createCandidateReviewRepository").mockReturnValue({
+      get,
+      list: vi.fn(async () => [candidate]),
+      setStatus: vi.fn(async () => undefined),
+      count: vi.fn(async () => 1),
+      deleteByIds: vi.fn(async () => 0),
+      archiveByIds: vi.fn(async () => 0),
+      runEvictionScan: vi.fn(async () => ({ evicted: 0, archived: 0 })),
+    });
+    const promotionPort = db.createCandidatePromotionPort(defaultScope);
+    const promote = vi.spyOn(promotionPort, "promote").mockImplementation(async () => {
+      const status = candidate.status === "pending" ? "applied" as const : "replayed" as const;
+      candidate = Object.freeze({
+        ...candidate,
+        status: "approved" as const,
+        promotedToMemoryId: memoryId,
+      });
+      return {
+        status,
+        candidateId: candidate.id,
+        memoryId,
+        stored: true as const,
+      };
+    });
+    vi.spyOn(db, "createCandidatePromotionPort").mockReturnValue(promotionPort);
+    const upsertWorkMemoryGraph = vi.fn(async () => undefined);
+    vi.spyOn(db, "createWorkMemoryGraphRepository").mockReturnValue({
+      upsertWorkMemoryGraph,
+    } as unknown as ReturnType<typeof db.createWorkMemoryGraphRepository>);
+    const readCommittedActiveRecords = vi.fn(async ({ activeMemoryIds }: {
+      activeMemoryIds: readonly string[];
+    }) => [{
+      id: activeMemoryIds[0]!,
+      commandType: "observeAuto" as const,
+      mutation: "content" as const,
+      scope: defaultScope,
+      text: candidate.text,
+      metadata: {},
+      vector: [0.1, 0.2],
+      route: "active" as const,
+      valueScore: 0.92,
+      importance: 0.9,
+      kind: "fact" as const,
+      semanticType: "rules" as const,
+      confidence: candidate.confidence,
+      provenance: { source: "agent", sourceId: candidate.evidenceIds[0]!, createdAt: 90 },
+      evidenceIds: candidate.evidenceIds,
+      governance: { candidate: {}, admissionReason: "reviewed_candidate" },
+      createdAt: 90,
+    }]);
+    vi.spyOn(db, "createActiveMemoryDerivationReadPort").mockReturnValue({
+      readCommittedActiveRecords,
+      readEvidenceFacts: vi.fn(async () => [{
+        evidenceId: candidate.evidenceIds[0]!,
+        scope: defaultScope,
+        evidenceKind: "observation" as const,
+        label: "candidate evidence",
+        metadata: {},
+        createdAt: 80,
+      }]),
+      readTreeFacts: vi.fn(async () => [{
+        memoryId,
+        scope: defaultScope,
+        evidenceId: candidate.evidenceIds[0]!,
+        sourceId: defaultScope.sessionId,
+        entityIds: [],
+        scopeVisibility: "workspace" as const,
+        riskFlags: [],
+        topicLabels: ["Release Safety"],
+        topicHotnessEligible: true,
+        explicitGlobal: false,
+        isWorkspaceRule: true,
+      }]),
+    });
+    db.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
+    const runtime = createMengshuRuntime({
+      config: postgresGuardConfig,
+      resolvedDbPath: "",
+      appId: defaultScope.appId,
+      defaultScope,
+      db,
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+      durableJobV2ServeCapability: trusted.capability,
+      durableJobV2RuntimeBundle: trusted.runtimeBundle,
+    });
+    await runtime.start();
+
     await expect(runtime.consoleApi.reviewCandidates({
       action: { action: "approve", ids: [candidate.id] },
     })).resolves.toEqual({
       affected: 0,
       promoted: [],
-      errors: [
-        `promote_failed:${candidate.id}:candidate_approval_requires_atomic_promotion`,
-      ],
+      errors: [expect.stringContaining("injected build_tree enqueue failure")],
     });
-    expect(setStatus).not.toHaveBeenCalled();
-    expect(db.store).not.toHaveBeenCalled();
+    expect(candidate).toMatchObject({ status: "approved", promotedToMemoryId: memoryId });
+
+    await expect(runtime.consoleApi.reviewCandidates({
+      action: { action: "approve", ids: [candidate.id] },
+    })).resolves.toEqual({ affected: 1, promoted: [memoryId], errors: [] });
+
+    expect(promote.mock.results.map((result) => result.type)).toEqual(["return", "return"]);
+    expect(promote).toHaveBeenCalledTimes(2);
+    expect(readCommittedActiveRecords).toHaveBeenCalledTimes(2);
+    expect(upsertWorkMemoryGraph).toHaveBeenCalledTimes(2);
+    const enqueueInputs = trusted.repository.enqueueInputs;
+    expect(enqueueInputs.filter((input) => input.type === "extract_graph")).toHaveLength(2);
+    expect(new Set(enqueueInputs
+      .filter((input) => input.type === "extract_graph")
+      .map((input) => input.dedupeKey))).toHaveLength(1);
+    expect(enqueueInputs.filter((input) => input.type === "build_tree")
+      .map((input) => input.payload.treeType)).toEqual(["source", "source", "topic", "global"]);
+    expect(trusted.repository.createdJobs).toHaveLength(4);
+    await runtime.stop();
+  });
+
+  test("Postgres runtime 拒绝未品牌化的外部 candidate promotion capability", () => {
+    const db = runtimePostgresProvider();
+    vi.spyOn(db, "createCandidatePromotionPort").mockReturnValue({
+      promote: vi.fn(),
+    });
+
+    expect(() => createMengshuRuntime({
+      config: postgresGuardConfig,
+      resolvedDbPath: "",
+      appId: "mengshu",
+      defaultScope: {
+        tenantId: "tenant-a",
+        userId: "user-a",
+        appId: "mengshu",
+        projectId: "project-a",
+        agentId: "agent-a",
+        namespace: "working-context",
+        visibility: "private",
+      },
+      db,
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+    })).toThrow("provider-owned candidate promotion capability is required");
   });
 
   test("schema v11 ready 时 deep lookup 与 console graph 读取 canonical tree/graph", async () => {
@@ -1384,10 +1961,89 @@ describe("createMengshuRuntime", () => {
     });
 
     expect(listSummaries).toHaveBeenCalledWith({ scope: defaultScope });
-    expect(lookup.hits.some((hit) => hit.id === "summary-1")).toBe(true);
+    expect(lookup.hits.some((hit) => hit.id === "summary-1")).toBe(false);
+    expect(lookup.warnings).toContain("tree_recall_breakdown_unavailable");
     expect(findEntities).toHaveBeenCalled();
     expect(findRelations).toHaveBeenCalled();
     expect(graph.entities.map((entity) => entity.id)).toEqual(["entity-1"]);
+  });
+
+  test("Postgres production 通过单一 GraphRepository facade 读取 canonical Entity 与 Work Memory Graph", async () => {
+    const defaultScope = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      appId: "mengshu",
+      projectId: "project-a",
+      agentId: "agent-a",
+      namespace: "working-context",
+      visibility: "private" as const,
+    };
+    const trusted = trustedDurableComposition(defaultScope);
+    const db = trusted.provider;
+    const canonicalEntity = {
+      id: "entity-1",
+      scope: defaultScope,
+      canonicalName: "mengshu",
+      displayName: "Mengshu",
+      type: "project" as const,
+      aliases: ["Mengshu"],
+      mentionCount: 1,
+      mentionCount30d: 1,
+      distinctSourceCount: 1,
+      hotness: 0.5,
+      queryHits30d: 0,
+      status: "active" as const,
+      createdAt: 1,
+      updatedAt: 1,
+      metadata: {},
+    };
+    const findEntities = vi.fn(async () => [canonicalEntity]);
+    const findRelations = vi.fn(async () => []);
+    const getEntity = vi.fn(async () => canonicalEntity);
+    const getRelation = vi.fn(async () => undefined);
+    const createCanonicalGraphReadRepository = vi.spyOn(
+      db,
+      "createCanonicalGraphReadRepository",
+    ).mockImplementation(() => ({
+      findEntities,
+      findRelations,
+      getEntity,
+      getRelation,
+    }) as never);
+    const findWorkMemoryNodes = vi.fn(async () => []);
+    const workMemoryGraph = {
+      upsertWorkMemoryGraph: vi.fn(async () => undefined),
+      getWorkMemoryNode: vi.fn(async () => undefined),
+      getWorkMemoryEdge: vi.fn(async () => undefined),
+      findWorkMemoryNodes,
+      findWorkMemoryEdges: vi.fn(async () => []),
+    };
+    vi.spyOn(db, "createWorkMemoryGraphRepository").mockReturnValue(workMemoryGraph as never);
+
+    const runtime = createMengshuRuntime({
+      config: postgresGuardConfig,
+      resolvedDbPath: "",
+      appId: "mengshu",
+      defaultScope,
+      db,
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+      durableJobV2ServeCapability: trusted.capability,
+      durableJobV2RuntimeBundle: trusted.runtimeBundle,
+    });
+
+    await expect(runtime.graphRepository.findEntities({ scope: defaultScope }))
+      .resolves.toEqual([canonicalEntity]);
+    await expect(runtime.graphRepository.findWorkMemoryNodes({ scope: defaultScope }))
+      .resolves.toEqual([]);
+    await expect(runtime.consoleApi.graph({ scope: defaultScope, query: "mengshu" }))
+      .resolves.toMatchObject({ entities: [{ id: "entity-1" }] });
+    await expect(runtime.graphRepository.upsertEntities([canonicalEntity]))
+      .rejects.toThrow(/canonical Entity Graph writes require.*durable/i);
+
+    expect(createCanonicalGraphReadRepository).toHaveBeenCalledWith(defaultScope);
+    expect(findEntities).toHaveBeenCalledTimes(2);
+    expect(findWorkMemoryNodes).toHaveBeenCalledOnce();
   });
 
   test("显式 trusted native v2 capability 注入后，observeLight 只写 v2 且 dedupe 绑定 persisted ID", async () => {
@@ -1430,27 +2086,135 @@ describe("createMengshuRuntime", () => {
       eventType: "user_input",
       text: "persist and enqueue through durable v2",
       intent: "remember",
+      idempotencyKey: "runtime-evidence-1",
     });
 
-    expect(response).toMatchObject({ ack: true, stored: true, duplicate: false });
-    expect(response.queuedJobs).toHaveLength(3);
+    expect(response).toMatchObject({
+      ack: true,
+      stored: true,
+      duplicate: false,
+      recordType: "memory",
+      admissionRoute: "evidence_only",
+    });
+    expect(response.queuedJobs).toHaveLength(1);
     expect(trusted.repository.enqueueInputs.map((input) => input.type)).toEqual([
       "extract_candidate",
-      "build_tree",
-      "extract_graph",
     ]);
     expect(trusted.repository.enqueueInputs.map((input) => input.dedupeKey)).toEqual([
       deriveDurableJobV2DomainDedupeKey("extract_candidate", response.persistedId!, {}),
-      deriveDurableJobV2DomainDedupeKey("build_tree", response.persistedId!, {}),
-      deriveDurableJobV2DomainDedupeKey("extract_graph", response.persistedId!, {}),
     ]);
+    expect(trusted.kernel.writes).toHaveLength(1);
+    expect(trusted.kernel.receipts).toHaveLength(1);
+    expect(db.store).not.toHaveBeenCalled();
     expect(trusted.repository.enqueueInputs.every((input) =>
       JSON.stringify(input.scope) === JSON.stringify(capability?.scope))).toBe(true);
     await expect(runtime.ingestionStore.jobs.list()).resolves.toEqual([]);
     await runtime.stop();
   });
 
-  test("release-fail receipt reaches FastPath, audits once, and native duplicate retry re-ensures jobs", async () => {
+  test("Agent Fast Path 只接受 Runtime server-owned workspace/session", async () => {
+    const defaultScope = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      appId: "mengshu",
+      projectId: "project-a",
+      agentId: "agent-a",
+      namespace: "working-context",
+      workspaceId: "workspace-server",
+      sessionId: "session-server",
+      visibility: "private" as const,
+    };
+    const trusted = trustedDurableComposition(defaultScope);
+    trusted.provider.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
+    const runtime = createMengshuRuntime({
+      config: postgresGuardConfig,
+      resolvedDbPath: "",
+      appId: "mengshu",
+      defaultScope,
+      db: trusted.provider,
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+      durableJobV2ServeCapability: trusted.capability,
+      durableJobV2RuntimeBundle: trusted.runtimeBundle,
+    });
+    await runtime.start();
+
+    const response = await runtime.agentFastPath.observeLight({
+      scope: { ...defaultScope, workspaceId: "workspace-client", sessionId: "session-client" },
+      eventType: "user_input",
+      text: "client scope must not override Runtime authority",
+      intent: "remember",
+      idempotencyKey: "runtime-authority-reject",
+    });
+
+    expect(response).toMatchObject({
+      ack: true,
+      queuedJobs: [],
+      warnings: [expect.stringMatching(/observation_store_failed:.*authority/i)],
+    });
+    expect(response.persistedId).toBeUndefined();
+    expect(trusted.kernel.writes).toEqual([]);
+    expect(trusted.repository.enqueueInputs).toEqual([]);
+    await runtime.stop();
+  });
+
+  test("Agent Fast Path evidence source 固定且 metadata 身份字段不能覆盖治理事实", async () => {
+    const defaultScope = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      appId: "mengshu",
+      projectId: "project-a",
+      agentId: "agent-a",
+      namespace: "working-context",
+      workspaceId: "workspace-server",
+      sessionId: "session-server",
+      visibility: "private" as const,
+    };
+    const trusted = trustedDurableComposition(defaultScope);
+    trusted.provider.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
+    const runtime = createMengshuRuntime({
+      config: postgresGuardConfig,
+      resolvedDbPath: "",
+      appId: "mengshu",
+      defaultScope,
+      db: trusted.provider,
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+      durableJobV2ServeCapability: trusted.capability,
+      durableJobV2RuntimeBundle: trusted.runtimeBundle,
+    });
+    await runtime.start();
+
+    await runtime.agentFastPath.observeLight({
+      scope: defaultScope,
+      eventType: "user_input",
+      text: "source identity is owned by the Agent Fast Path adapter",
+      intent: "remember",
+      idempotencyKey: "runtime-fixed-source",
+      metadata: {
+        source: "attacker-source",
+        tenantId: "attacker-tenant",
+        sessionId: "attacker-session",
+      },
+    });
+
+    expect(trusted.kernel.writes).toHaveLength(1);
+    expect(trusted.kernel.writes[0]).toMatchObject({
+      scope: defaultScope,
+      metadata: expect.objectContaining({
+        source: "agent-fast-path",
+        sessionId: defaultScope.sessionId,
+      }),
+      provenance: expect.objectContaining({
+        source: "agent-fast-path",
+        sessionId: defaultScope.sessionId,
+      }),
+    });
+    expect(trusted.kernel.writes[0]?.metadata).not.toHaveProperty("tenantId");
+    await runtime.stop();
+  });
+
+  test("kernel receipt replay keeps one evidence write and re-ensures only candidate extraction", async () => {
     const defaultScope = {
       tenantId: "tenant-a",
       userId: "user-a",
@@ -1463,25 +2227,6 @@ describe("createMengshuRuntime", () => {
     const trusted = trustedDurableComposition(defaultScope);
     const db = trusted.provider;
     db.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
-    let persistedId: string | undefined;
-    let durableRows = 0;
-    db.store.mockImplementation(async (entries) => {
-      const requestedId = entries[0]!.id;
-      if (!persistedId) {
-        persistedId = requestedId;
-        durableRows += 1;
-        throw new DatabaseStoreCleanupError({
-          inserted: 1,
-          duplicates: 0,
-          records: [{ requestedId, persistedId, stored: true }],
-        }, "completed");
-      }
-      return {
-        inserted: 0,
-        duplicates: 1,
-        records: [{ requestedId, persistedId, stored: false }],
-      };
-    });
     const runtime = createMengshuRuntime({
       config: postgresGuardConfig,
       resolvedDbPath: "",
@@ -1493,7 +2238,6 @@ describe("createMengshuRuntime", () => {
       durableJobV2ServeCapability: trusted.capability,
       durableJobV2RuntimeBundle: trusted.runtimeBundle,
     });
-    const audit = vi.spyOn(runtime.ingestionStore.audit, "append");
     await runtime.start();
 
     const first = await runtime.agentFastPath.observeLight({
@@ -1501,39 +2245,43 @@ describe("createMengshuRuntime", () => {
       eventType: "user_input",
       text: "persisted although lock release failed",
       intent: "remember",
+      idempotencyKey: "runtime-evidence-replay",
     });
     const retry = await runtime.agentFastPath.observeLight({
       scope: defaultScope,
       eventType: "user_input",
       text: "persisted although lock release failed",
       intent: "remember",
+      idempotencyKey: "runtime-evidence-replay",
     });
 
-    expect(durableRows).toBe(1);
     expect(first).toMatchObject({
-      persistedId,
       stored: true,
       duplicate: false,
-      warnings: [DATABASE_STORE_CLEANUP_WARNING],
+      recordType: "memory",
+      admissionRoute: "evidence_only",
     });
-    expect(first.queuedJobs).toHaveLength(3);
+    expect(first.queuedJobs).toHaveLength(1);
     expect(retry).toMatchObject({
-      persistedId,
-      stored: false,
-      duplicate: true,
+      persistedId: first.persistedId,
+      stored: true,
+      duplicate: false,
+      recordType: "memory",
+      admissionRoute: "evidence_only",
     });
-    expect(retry.queuedJobs).toHaveLength(3);
-    expect(trusted.repository.enqueueInputs).toHaveLength(6);
-    expect(trusted.repository.createdJobs).toHaveLength(3);
-    expect(audit).toHaveBeenCalledTimes(1);
-    expect(audit).toHaveBeenCalledWith(expect.objectContaining({
-      action: "memory.store",
-      targetId: persistedId,
-    }));
+    expect(retry.queuedJobs).toHaveLength(1);
+    expect(trusted.repository.enqueueInputs.map((input) => input.type)).toEqual([
+      "extract_candidate",
+      "extract_candidate",
+    ]);
+    expect(trusted.repository.createdJobs).toHaveLength(1);
+    expect(trusted.kernel.writes).toHaveLength(1);
+    expect(trusted.kernel.receipts).toHaveLength(1);
+    expect(db.store).not.toHaveBeenCalled();
     await runtime.stop();
   });
 
-  test("native duplicate retry repairs a partially enqueued derived-job pair idempotently", async () => {
+  test("kernel receipt replay repairs a failed candidate extraction enqueue idempotently", async () => {
     const defaultScope = {
       tenantId: "tenant-a",
       userId: "user-a",
@@ -1543,26 +2291,9 @@ describe("createMengshuRuntime", () => {
       namespace: "working-context",
       visibility: "private" as const,
     };
-    const trusted = trustedDurableComposition(defaultScope, ["build_tree"]);
+    const trusted = trustedDurableComposition(defaultScope, ["extract_candidate"]);
     const db = trusted.provider;
     db.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
-    let persistedId: string | undefined;
-    db.store.mockImplementation(async (entries) => {
-      const requestedId = entries[0]!.id;
-      if (!persistedId) {
-        persistedId = requestedId;
-        return {
-          inserted: 1,
-          duplicates: 0,
-          records: [{ requestedId, persistedId, stored: true }],
-        };
-      }
-      return {
-        inserted: 0,
-        duplicates: 1,
-        records: [{ requestedId, persistedId, stored: false }],
-      };
-    });
     const runtime = createMengshuRuntime({
       config: postgresGuardConfig,
       resolvedDbPath: "",
@@ -1581,40 +2312,39 @@ describe("createMengshuRuntime", () => {
       eventType: "user_input",
       text: "repair a partially enqueued pair",
       intent: "remember",
+      idempotencyKey: "runtime-evidence-repair",
     });
     expect(first).toMatchObject({ stored: true, duplicate: false });
-    expect(first.queuedJobs).toHaveLength(2);
-    expect(first.warnings?.some((warning) => warning.includes("tree_enqueue_failed"))).toBe(true);
+    expect(first.queuedJobs).toEqual([]);
+    expect(first.warnings?.some((warning) => warning.includes("enqueue_failed"))).toBe(true);
 
     const retry = await runtime.agentFastPath.observeLight({
       scope: defaultScope,
       eventType: "user_input",
       text: "repair a partially enqueued pair",
       intent: "remember",
+      idempotencyKey: "runtime-evidence-repair",
     });
-    expect(retry).toMatchObject({ persistedId, stored: false, duplicate: true });
-    expect(retry.queuedJobs).toHaveLength(3);
+    expect(retry).toMatchObject({
+      persistedId: first.persistedId,
+      stored: true,
+      duplicate: false,
+    });
+    expect(retry.queuedJobs).toHaveLength(1);
     expect(trusted.repository.createdJobs.map((job) => job.type)).toEqual([
       "extract_candidate",
-      "extract_graph",
-      "build_tree",
     ]);
     expect(trusted.repository.enqueueInputs.map((input) => input.type)).toEqual([
       "extract_candidate",
-      "build_tree",
-      "extract_graph",
       "extract_candidate",
-      "build_tree",
-      "extract_graph",
     ]);
     expect(trusted.repository.enqueueInputs.map((input) => input.dedupeKey)).toEqual([
-      deriveDurableJobV2DomainDedupeKey("extract_candidate", persistedId!, {}),
-      deriveDurableJobV2DomainDedupeKey("build_tree", persistedId!, {}),
-      deriveDurableJobV2DomainDedupeKey("extract_graph", persistedId!, {}),
-      deriveDurableJobV2DomainDedupeKey("extract_candidate", persistedId!, {}),
-      deriveDurableJobV2DomainDedupeKey("build_tree", persistedId!, {}),
-      deriveDurableJobV2DomainDedupeKey("extract_graph", persistedId!, {}),
+      deriveDurableJobV2DomainDedupeKey("extract_candidate", first.persistedId!, {}),
+      deriveDurableJobV2DomainDedupeKey("extract_candidate", first.persistedId!, {}),
     ]);
+    expect(trusted.kernel.writes).toHaveLength(1);
+    expect(trusted.kernel.receipts).toHaveLength(1);
+    expect(db.store).not.toHaveBeenCalled();
     await runtime.stop();
   });
 
@@ -1650,6 +2380,7 @@ describe("createMengshuRuntime", () => {
       eventType: "user_input",
       text: "must not enqueue across runtime authority",
       intent: "remember",
+      idempotencyKey: "runtime-cross-scope",
     });
     const session = await runtime.agentFastPath.sessionCommit({
       scope: runtime.defaultScope,
@@ -1658,16 +2389,16 @@ describe("createMengshuRuntime", () => {
 
     expect(observe.queuedJobs).toEqual([]);
     expect(observe.warnings).toEqual([
-      expect.stringMatching(/^enqueue_failed: Durable job v2 runtime operation failed$/),
-      expect.stringMatching(/^tree_enqueue_failed: Durable job v2 runtime operation failed$/),
-      expect.stringMatching(/^graph_enqueue_failed: Durable job v2 runtime operation failed$/),
+      expect.stringMatching(/^observation_store_failed: runtime write authority does not own/),
     ]);
     expect(session.jobs).toEqual([]);
     expect(warnings).toEqual([
-      expect.stringMatching(/^session_commit job refresh_slot_snapshot failed:/),
       expect.stringMatching(/^session_commit job extract_candidate failed:/),
     ]);
     expect(trusted.repository.enqueueInputs).toEqual([]);
+    expect(trusted.kernel.writes).toEqual([]);
+    expect(trusted.kernel.receipts).toHaveLength(0);
+    expect(db.store).not.toHaveBeenCalled();
     await expect(runtime.ingestionStore.jobs.list()).resolves.toEqual([]);
     await runtime.stop();
   });
@@ -2021,5 +2752,600 @@ describe("createMengshuRuntime", () => {
       expect(entry.metadata.embeddingSpaceState).toBe("known-queryable");
       expect(JSON.stringify(entry.metadata)).not.toContain("test-key");
     }
+  });
+
+  describe("F0 Runtime memory write capability", () => {
+    const scope = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      appId: "mengshu",
+      projectId: "project-a",
+      agentId: "agent-a",
+      namespace: "working-context",
+      visibility: "private" as const,
+    };
+    const authority = { tenantId: scope.tenantId, userId: scope.userId };
+
+    function createWriteRuntime(
+      records: readonly CandidateDedupComparable[] = [],
+      options: {
+        logger?: { warn(message: string): void };
+        upsertWorkMemoryGraph?: ReturnType<typeof vi.fn>;
+      } = {},
+    ) {
+      const trusted = trustedDurableComposition(scope);
+      const db = trusted.provider;
+      const kernel = trusted.kernel;
+      const dedup = installRuntimeCandidateDedup(db, records);
+      const upsertWorkMemoryGraph = options.upsertWorkMemoryGraph ??
+        vi.fn(async () => undefined);
+      vi.spyOn(db, "createWorkMemoryGraphRepository").mockReturnValue({
+        upsertWorkMemoryGraph,
+      } as unknown as ReturnType<typeof db.createWorkMemoryGraphRepository>);
+      vi.spyOn(db, "createActiveMemoryDerivationReadPort").mockReturnValue({
+        readCommittedActiveRecords: async ({ activeMemoryIds }) => kernel.writes.filter(
+          (record) => record.mutation === "content" && record.route === "active" &&
+            activeMemoryIds.includes(record.id),
+        ) as Extract<WriteMemoryRecord, { mutation: "content" }>[],
+        readEvidenceFacts: async ({ records: activeRecords }) => activeRecords.flatMap(
+          (record) => record.evidenceIds.map((evidenceId) => ({
+            evidenceId,
+            scope: record.scope,
+            evidenceKind: "observation" as const,
+            label: kernel.writes.find((item): item is Extract<WriteMemoryRecord, {
+              mutation: "content";
+            }> => item.id === evidenceId && item.mutation === "content")?.text ??
+              "persisted evidence",
+            metadata: {},
+            createdAt: record.createdAt,
+          })),
+        ),
+        readTreeFacts: async ({ records: activeRecords }) => activeRecords.map((record) => ({
+          memoryId: record.id,
+          scope: record.scope,
+          evidenceId: record.evidenceIds[0]!,
+          sourceId: record.provenance.sourceId ?? record.evidenceIds[0]!,
+          entityIds: [],
+          scopeVisibility: "project" as const,
+          riskFlags: [],
+          topicLabels: ["Runtime Write"],
+          topicHotnessEligible: true,
+          explicitGlobal: false,
+          isWorkspaceRule: record.semanticType === "rules",
+        })),
+      });
+      const duplicateLinkPort = new PostgresDuplicateEvidenceLinkPort({
+        connect: async () => ({
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => ({
+            rows: (sql.includes("RETURNING link_id")
+              ? [{ link_id: params[0] }]
+              : []) as unknown as Row[],
+            rowCount: sql.includes("RETURNING link_id") ? 1 : 0,
+          }),
+          release: () => undefined,
+        }),
+      });
+      const linkDuplicateEvidence = vi.spyOn(duplicateLinkPort, "linkDuplicateEvidence");
+      const createDuplicateEvidenceLinkPort = vi.spyOn(db, "createDuplicateEvidenceLinkPort")
+        .mockReturnValue(duplicateLinkPort);
+      db.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
+      const runtime = createMengshuRuntime({
+        config: postgresGuardConfig,
+        resolvedDbPath: "",
+        appId: scope.appId,
+        defaultScope: scope,
+        db,
+        embeddings: fakeEmbeddings(),
+        treeRepository: fakeTreeRepository(),
+        durableJobV2ServeCapability: trusted.capability,
+        durableJobV2RuntimeBundle: trusted.runtimeBundle,
+        ...(options.logger === undefined ? {} : { logger: options.logger }),
+      });
+      return {
+        db,
+        kernel,
+        dedup,
+        upsertWorkMemoryGraph,
+        linkDuplicateEvidence,
+        createDuplicateEvidenceLinkPort,
+        runtime,
+      };
+    }
+
+    test("only a provider-owned PostgreSQL kernel is exposed as executeMemoryWrite", () => {
+      const postgres = createWriteRuntime();
+      expect(postgres.runtime.memoryWriteKernel).toBeDefined();
+      expect(postgres.runtime.executeMemoryWrite).toBeTypeOf("function");
+
+      const legacy = createMengshuRuntime({
+        config,
+        resolvedDbPath: "/tmp/mengshu-test",
+        db: new FakeDb(),
+        embeddings: fakeEmbeddings(),
+        treeRepository: fakeTreeRepository(),
+      });
+      expect(legacy.memoryWriteKernel).toBeUndefined();
+      expect("executeMemoryWrite" in legacy).toBe(false);
+    });
+
+    test("Postgres Runtime composition 注入 provider-owned governed retrieval", () => {
+      const trusted = trustedDurableComposition(scope);
+      const createHydrator = vi.spyOn(
+        trusted.provider,
+        "createGovernedRetrievalHydrator",
+      );
+      trusted.provider.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
+
+      createMengshuRuntime({
+        config: postgresGuardConfig,
+        resolvedDbPath: "",
+        appId: scope.appId,
+        defaultScope: scope,
+        db: trusted.provider,
+        embeddings: fakeEmbeddings(),
+        treeRepository: fakeTreeRepository(),
+        durableJobV2ServeCapability: trusted.capability,
+        durableJobV2RuntimeBundle: trusted.runtimeBundle,
+      });
+
+      expect(createHydrator).toHaveBeenCalledOnce();
+
+      const legacyDb = new FakeDb();
+      const legacy = createMengshuRuntime({
+        config,
+        resolvedDbPath: "/tmp/mengshu-test",
+        db: legacyDb,
+        embeddings: fakeEmbeddings(),
+        treeRepository: fakeTreeRepository(),
+      });
+      expect(legacy.memoryService).toBeDefined();
+      expect("createGovernedRetrievalHydrator" in legacyDb).toBe(false);
+    });
+
+    test("importEvidence remains raw evidence-only and bypasses candidate governance dedup", async () => {
+      const { kernel, dedup, runtime } = createWriteRuntime();
+      await runtime.start();
+
+      const result = await runtimeWriteExecutor(runtime)({
+        type: "importEvidence",
+        idempotencyKey: "runtime-import-evidence-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "用户原话必须作为 immutable evidence 保留。",
+        kind: "observation",
+        sourceId: "event-1",
+        evidenceIds: ["event-1"],
+        metadata: { source: "user" },
+        provenance: { source: "user", sourceId: "event-1" },
+      });
+
+      expect(result).toMatchObject({
+        status: "persisted",
+        route: "evidence_only",
+        recordType: "memory",
+      });
+      expect(kernel.writes).toHaveLength(1);
+      expect(kernel.writes[0]).toMatchObject({
+        commandType: "importEvidence",
+        route: "evidence_only",
+        kind: "observation",
+        governance: {
+          candidate: {
+            phase: "raw_evidence",
+            evidenceOnly: true,
+            quote: "用户原话必须作为 immutable evidence 保留。",
+            sourceId: "event-1",
+          },
+          admissionReason: "raw_evidence_before_candidate_admission",
+        },
+      });
+      expect(dedup.findExisting).not.toHaveBeenCalled();
+      await runtime.stop();
+    });
+
+    test("saveExplicit 先保留 evidence，再跨 validator、admission、importance 和 scoped dedup", async () => {
+      const { kernel, dedup, runtime } = createWriteRuntime();
+      await runtime.start();
+
+      const result = await runtimeWriteExecutor(runtime)({
+        type: "saveExplicit",
+        idempotencyKey: "runtime-explicit-rule-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "所有 deployment 都必须先运行 npm test 再发布。",
+        kind: "fact",
+        semanticType: "rules",
+        evidenceIds: ["event-rule-1"],
+        metadata: { source: "user", salience: 0.9 },
+        provenance: { source: "user", sourceId: "event-rule-1" },
+      });
+
+      expect(result).toMatchObject({
+        status: "persisted",
+        route: "active",
+        recordType: "memory",
+      });
+      expect(kernel.writes).toHaveLength(2);
+      expect(kernel.writes[0]).toMatchObject({
+        commandType: "importEvidence",
+        route: "evidence_only",
+      });
+      expect(kernel.writes[0]?.mutation === "content" &&
+        "confidence" in kernel.writes[0]).toBe(false);
+      const write = kernel.writes[1];
+      const evidenceMemoryId = kernel.writes[0]!.id;
+      const confidence = computeConfidenceWithBreakdown("rules", [
+        { sourceKind: "session_user" },
+      ]);
+      expect(write).toMatchObject({
+        commandType: "saveExplicit",
+        route: "active",
+        kind: "fact",
+        semanticType: "rules",
+        confidence: confidence.score,
+        governance: {
+          candidate: {
+            rejected: false,
+            semanticType: "rules",
+            evidence: {
+              quote: "所有 deployment 都必须先运行 npm test 再发布。",
+              eventIds: [evidenceMemoryId],
+            },
+            riskFlags: [],
+            confidence: confidence.score,
+            confidenceBreakdown: {
+              score: confidence.score,
+              baseConfidence: confidence.baseConfidence,
+              evidences: [{
+                evidenceId: evidenceMemoryId,
+                sourceKind: "session_user",
+                reliability: confidence.evidenceReliabilities[0],
+              }],
+            },
+            treeRouting: {
+              version: 1,
+              evidenceId: evidenceMemoryId,
+              sourceId: evidenceMemoryId,
+              entityIds: [],
+              scopeVisibility: "project",
+              riskFlags: [],
+              topicLabels: [],
+              topicHotnessEligible: false,
+              explicitGlobal: false,
+              isWorkspaceRule: false,
+            },
+          },
+          admissionReason: "explicit_save_fast_track",
+          admissionBreakdown: expect.objectContaining({
+            explicitness: expect.any(Number),
+            evidence: expect.closeTo(0.096, 12),
+            novelty: expect.closeTo(0.07, 12),
+            riskPenalty: expect.any(Number),
+          }),
+          valueSignalProvenance: {
+            mode: "authoritative",
+            evidence: "source_authority",
+            novelty: "semantic_max_similarity",
+            sourceKind: "session_user",
+            maxSimilarity: 0,
+          },
+        },
+      });
+      expect(write.mutation === "content" ? write.importance : undefined).toBeGreaterThan(0.5);
+      expect(write.mutation === "content" ? write.importance : undefined).not.toBe(
+        write.mutation === "content" ? write.valueScore : undefined,
+      );
+      expect(dedup.findExisting).toHaveBeenCalledOnce();
+      expect(dedup.findExisting).toHaveBeenCalledWith(expect.objectContaining({
+        scope: { ...scope, visibility: "private" },
+        kind: "fact",
+        semanticType: "rules",
+        embeddingSpaceId: runtime.embeddingSpace.embeddingSpaceId,
+        embeddingSpaceState: "known-queryable",
+      }));
+      await runtime.stop();
+    });
+
+    test("direct WriteKernel 非法向量在 dedup read 前 fail-closed", async () => {
+      const { kernel, dedup, runtime } = createWriteRuntime();
+      await runtime.start();
+
+      await expect(runtimeWriteExecutor(runtime)({
+        type: "observeAuto",
+        intent: "remember",
+        idempotencyKey: "runtime-invalid-admission-vector-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "所有 deployment 都必须先运行 npm test 再发布。",
+        kind: "fact",
+        semanticType: "rules",
+        confidence: 0.9,
+        vector: Array.from({ length: 1536 }, () => 0),
+        evidenceIds: ["event-invalid-vector-1"],
+        metadata: { source: "user", salience: 0.9 },
+        provenance: { source: "user", sourceId: "event-invalid-vector-1" },
+      })).resolves.toEqual({
+        status: "rejected",
+        reason: "value_score_signal_invalid",
+      });
+      expect(dedup.findExisting).not.toHaveBeenCalled();
+      expect(kernel.writes).toEqual([]);
+      await runtime.stop();
+    });
+
+    test("direct WriteKernel 不把存量坏向量伪装成零相似度", async () => {
+      const existing: CandidateDedupComparable = {
+        id: "invalid-existing-vector",
+        text: "另一条 production 发布规则。",
+        vector: Array.from({ length: 1536 }, () => 0),
+        kind: "fact",
+        semanticType: "rules",
+      };
+      const { kernel, dedup, runtime } = createWriteRuntime([existing]);
+      await runtime.start();
+
+      await expect(runtimeWriteExecutor(runtime)({
+        type: "observeAuto",
+        intent: "remember",
+        idempotencyKey: "runtime-invalid-existing-vector-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "所有 deployment 都必须先运行 npm test 再发布。",
+        kind: "fact",
+        semanticType: "rules",
+        confidence: 0.9,
+        evidenceIds: ["event-invalid-existing-vector-1"],
+        metadata: { source: "user", salience: 0.9 },
+        provenance: { source: "user", sourceId: "event-invalid-existing-vector-1" },
+      })).resolves.toEqual({
+        status: "rejected",
+        reason: "value_score_signal_invalid",
+      });
+      expect(dedup.findExisting).toHaveBeenCalledOnce();
+      expect(kernel.writes).toEqual([]);
+      await runtime.stop();
+    });
+
+    test("active receipt 已提交后 warm derivation 失败不掩盖写入 ack", async () => {
+      const warn = vi.fn();
+      const upsertWorkMemoryGraph = vi.fn(async () => {
+        throw new Error("warm graph unavailable with secret-like detail");
+      });
+      const { kernel, runtime } = createWriteRuntime([], {
+        logger: { warn },
+        upsertWorkMemoryGraph,
+      });
+      await runtime.start();
+
+      const result = await runtimeWriteExecutor(runtime)({
+        type: "saveExplicit",
+        idempotencyKey: "runtime-explicit-warm-failure-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "所有 deployment 都必须先运行 npm test 再发布。",
+        kind: "fact",
+        semanticType: "rules",
+        evidenceIds: ["event-warm-failure-1"],
+        metadata: { source: "user", salience: 0.9 },
+        provenance: { source: "user", sourceId: "event-warm-failure-1" },
+      });
+
+      expect(result).toMatchObject({
+        status: "persisted",
+        route: "active",
+        recordType: "memory",
+      });
+      expect(kernel.writes).toHaveLength(2);
+      expect(kernel.writes[0]).toMatchObject({ route: "evidence_only" });
+      expect(kernel.writes[1]).toMatchObject({ route: "active" });
+      expect(kernel.receipts.size).toBe(2);
+      expect(upsertWorkMemoryGraph).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(
+        "Committed active memory warm derivation failed after durable write receipt",
+      );
+      expect(warn.mock.calls.flat().join(" ")).not.toContain("secret-like detail");
+      await runtime.stop();
+    });
+
+    test("active receipt 已提交后 logger 失败也不掩盖写入 ack", async () => {
+      const warn = vi.fn(() => {
+        throw new Error("logger sink unavailable");
+      });
+      const { kernel, runtime } = createWriteRuntime([], {
+        logger: { warn },
+        upsertWorkMemoryGraph: vi.fn(async () => {
+          throw new Error("warm graph unavailable");
+        }),
+      });
+      await runtime.start();
+
+      await expect(runtimeWriteExecutor(runtime)({
+        type: "saveExplicit",
+        idempotencyKey: "runtime-explicit-warn-failure-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "所有 deployment 都必须先运行 npm test 再发布。",
+        kind: "fact",
+        semanticType: "rules",
+        evidenceIds: ["event-warn-failure-1"],
+        metadata: { source: "user", salience: 0.9 },
+        provenance: { source: "user", sourceId: "event-warn-failure-1" },
+      })).resolves.toMatchObject({
+        status: "persisted",
+        route: "active",
+        recordType: "memory",
+      });
+      expect(kernel.receipts.size).toBe(2);
+      expect(warn).toHaveBeenCalledOnce();
+      await runtime.stop();
+    });
+
+    test("kind-only explicit save is lookup-only and never fabricates a five-slot type", async () => {
+      const { kernel, dedup, runtime } = createWriteRuntime();
+      await runtime.start();
+
+      const result = await runtimeWriteExecutor(runtime)({
+        type: "saveExplicit",
+        idempotencyKey: "runtime-kind-only-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "保留 vendor-specific artifact ZX-42 的原始事实。",
+        kind: "fact",
+        evidenceIds: ["event-kind-1"],
+        metadata: { source: "user", salience: 0.8 },
+        provenance: { source: "user", sourceId: "event-kind-1" },
+      });
+
+      expect(result).toMatchObject({
+        status: "persisted",
+        route: "lookup_only",
+        recordType: "memory",
+      });
+      expect(kernel.writes).toHaveLength(2);
+      expect(kernel.writes[0]).toMatchObject({
+        commandType: "importEvidence",
+        route: "evidence_only",
+      });
+      const write = kernel.writes[1];
+      expect(write).toMatchObject({
+        commandType: "saveExplicit",
+        route: "lookup_only",
+        kind: "fact",
+        confidence: 1,
+        importance: 0.5,
+        governance: {
+          candidate: expect.objectContaining({
+            compatibility: "kind_only_explicit",
+            evidenceOnly: false,
+          }),
+          admissionReason: "kind_only_explicit_lookup",
+        },
+      });
+      expect(write.mutation === "content" ? write.semanticType : undefined).toBeUndefined();
+      expect(dedup.findExisting).toHaveBeenCalledWith(expect.not.objectContaining({
+        semanticType: expect.anything(),
+      }));
+      await runtime.stop();
+    });
+
+    test("observeAuto cannot become active and exact native duplicates do not mutate", async () => {
+      const existing: CandidateDedupComparable = {
+        id: "existing-rule-1",
+        text: "所有 deployment 都必须先运行 npm test 再发布。",
+        vector: Array.from({ length: 1536 }, () => 0.01),
+        kind: "fact",
+        semanticType: "rules",
+      };
+      const duplicateRuntime = createWriteRuntime([existing]);
+      await duplicateRuntime.runtime.start();
+      const duplicateCommand: MemoryWriteCommand = {
+        type: "saveExplicit",
+        idempotencyKey: "runtime-exact-duplicate-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: existing.text,
+        kind: existing.kind,
+        semanticType: existing.semanticType,
+        confidence: 0.9,
+        evidenceIds: ["event-rule-2"],
+        metadata: {
+          source: "user",
+          salience: 0.9,
+          tenantId: "metadata-attacker",
+          sessionId: "metadata-session",
+        },
+      };
+      await expect(runtimeWriteExecutor(duplicateRuntime.runtime)(duplicateCommand)).resolves.toEqual({
+        status: "duplicate",
+        kind: "exact",
+        duplicateOf: existing.id,
+      });
+      expect(duplicateRuntime.kernel.writes).toHaveLength(1);
+      expect(duplicateRuntime.kernel.writes[0]).toMatchObject({
+        commandType: "importEvidence",
+        route: "evidence_only",
+      });
+      expect(duplicateRuntime.createDuplicateEvidenceLinkPort).toHaveBeenCalledOnce();
+      expect(duplicateRuntime.linkDuplicateEvidence).toHaveBeenCalledOnce();
+      expect(duplicateRuntime.linkDuplicateEvidence).toHaveBeenCalledWith({
+        scope,
+        targetMemoryId: existing.id,
+        evidenceMemoryId: duplicateRuntime.kernel.writes[0]!.id,
+        createdAt: expect.any(Number),
+      });
+      await duplicateRuntime.runtime.stop();
+
+      const observed = createWriteRuntime();
+      await observed.runtime.start();
+      const result = await runtimeWriteExecutor(observed.runtime)({
+        type: "observeAuto",
+        intent: "remember",
+        idempotencyKey: "runtime-observe-auto-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "每次 deployment 都必须先运行 npm test 再发布。",
+        kind: "fact",
+        semanticType: "rules",
+        confidence: 0.95,
+        evidenceIds: ["event-observe-1"],
+        metadata: { source: "user", salience: 0.95 },
+      });
+      expect(result).toMatchObject({
+        status: "persisted",
+        route: "candidate",
+        recordType: "candidate",
+      });
+      expect(observed.kernel.writes[0]).toMatchObject({
+        commandType: "observeAuto",
+        route: "candidate",
+      });
+      await observed.runtime.stop();
+    });
+
+    test("duplicate ledger 失败不返回公共成功，重试复用 phase E receipt 后完成", async () => {
+      const existing: CandidateDedupComparable = {
+        id: "existing-rule-retry",
+        text: "所有 production migration 必须先通过真实 PostgreSQL 验证。",
+        vector: Array.from({ length: 1536 }, () => 0.01),
+        kind: "fact",
+        semanticType: "rules",
+      };
+      const subject = createWriteRuntime([existing]);
+      subject.linkDuplicateEvidence.mockRejectedValueOnce(new Error("ledger unavailable"));
+      await subject.runtime.start();
+      const command: MemoryWriteCommand = {
+        type: "saveExplicit",
+        idempotencyKey: "runtime-duplicate-link-retry-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: existing.text,
+        kind: existing.kind,
+        semanticType: existing.semanticType,
+        confidence: 0.9,
+        provenance: { source: "user", sourceId: "event-retry-1" },
+      };
+
+      await expect(runtimeWriteExecutor(subject.runtime)(command)).rejects.toThrow(
+        "ledger unavailable",
+      );
+      await expect(runtimeWriteExecutor(subject.runtime)(command)).resolves.toEqual({
+        status: "duplicate",
+        kind: "exact",
+        duplicateOf: existing.id,
+      });
+
+      expect(subject.linkDuplicateEvidence).toHaveBeenCalledTimes(2);
+      expect(subject.kernel.writes).toHaveLength(1);
+      expect(subject.kernel.receipts).toHaveLength(1);
+      expect(subject.kernel.writes[0]).toMatchObject({
+        commandType: "importEvidence",
+        route: "evidence_only",
+      });
+      await subject.runtime.stop();
+    });
   });
 });

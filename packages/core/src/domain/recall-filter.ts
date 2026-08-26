@@ -29,6 +29,113 @@ import {
   DEFAULT_RECALL_WEIGHTS,
   type RecallWeights,
 } from "../../../../core/recall-scoring.js";
+import { kindToSemanticType } from "./semantic-type-mapper.js";
+import { matchesReuseScope } from "./scope-policy.js";
+
+const RECALLABLE_ROUTES = new Set(["active", "lookup_only"]);
+
+function stringArray(value: unknown): readonly string[] | undefined {
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? value
+    : undefined;
+}
+
+interface GovernanceSignals {
+  riskFlags: readonly string[];
+  targetScope?: string;
+}
+
+function governanceSignals(record: MemoryRecord): GovernanceSignals | undefined {
+  const governance = record.metadata?.governance;
+  if (governance === undefined) return { riskFlags: [] };
+  if (!governance || typeof governance !== "object" || Array.isArray(governance)) return undefined;
+  const candidate = (governance as Record<string, unknown>).candidate;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+  const snapshot = candidate as Record<string, unknown>;
+  const riskFlags = snapshot.riskFlags === undefined ? [] : stringArray(snapshot.riskFlags);
+  if (!riskFlags || (snapshot.targetScope !== undefined && typeof snapshot.targetScope !== "string")) {
+    return undefined;
+  }
+  return {
+    riskFlags,
+    ...(typeof snapshot.targetScope === "string" ? { targetScope: snapshot.targetScope } : {}),
+  };
+}
+
+function recallScopeEligible(
+  record: MemoryRecord,
+  requestScope: MemoryScope,
+  policy: SlotReusePolicy,
+): boolean {
+  const semanticType = record.semanticType ?? kindToSemanticType(record.kind, record).semanticType;
+  if (semanticType) return matchesReuseScope(record.scope, requestScope, semanticType, policy);
+  return applyScopeReusePolicy([record], requestScope, policy).reusable.length === 1;
+}
+
+/** F0 生产召回硬过滤：只返回受治理、可检索且未扩大 scope 的 MemoryRecord。 */
+export function filterRecallEligibleRecords<T extends MemoryRecord>(
+  records: readonly T[],
+  requestScope: MemoryScope,
+  policy: SlotReusePolicy = DEFAULT_SLOT_REUSE_POLICY,
+): T[] {
+  return records.filter((record) => {
+    const route = record.metadata?.admissionRoute;
+    if (route !== undefined &&
+        (typeof route !== "string" || !RECALLABLE_ROUTES.has(route))) return false;
+
+    const lookupOnly = route === "lookup_only";
+    const contextEligible = record.metadata?.contextEligible;
+    if (contextEligible !== undefined && typeof contextEligible !== "boolean") return false;
+    if (route === "active" && contextEligible === false) return false;
+    if (lookupOnly && contextEligible === true) return false;
+    const lifecycle = record.lifecycleStatus ?? "active";
+    if (lookupOnly) {
+      if (lifecycle !== "archived" || record.container !== "session_candidate") return false;
+    } else if (lifecycle !== "active" || record.container === "session_candidate") {
+      return false;
+    }
+
+    const metadataRiskFlags = record.metadata?.riskFlags === undefined
+      ? []
+      : stringArray(record.metadata.riskFlags);
+    const governance = governanceSignals(record);
+    if (!metadataRiskFlags || !governance) return false;
+    const riskFlags = Array.from(new Set([
+      ...metadataRiskFlags,
+      ...governance.riskFlags,
+    ]));
+    if (riskFlags.includes("prompt_injection")) return false;
+    const visibility = record.scope.visibility ?? "private";
+    const expandedSensitiveScope = visibility !== "private" ||
+      governance.targetScope === "workspace" || governance.targetScope === "global";
+    if (riskFlags.includes("sensitive") && expandedSensitiveScope) return false;
+
+    const conflictStatus = record.metadata?.conflictStatus;
+    const conflictUnresolved = record.metadata?.conflictUnresolved ??
+      record.metadata?.conflict_unresolved;
+    if (conflictUnresolved !== undefined && typeof conflictUnresolved !== "boolean") return false;
+    const unresolvedConflict =
+      (conflictStatus !== undefined && conflictStatus !== "resolved" && conflictStatus !== "none") ||
+      conflictUnresolved === true ||
+      riskFlags.includes("conflict_possible");
+    if (unresolvedConflict && !lookupOnly) return false;
+
+    return recallScopeEligible(record, requestScope, policy);
+  });
+}
+
+/** 五槽位/Context 只允许 active 路由，lookup-only 只能通过显式检索访问。 */
+export function filterContextEligibleRecords<T extends MemoryRecord>(
+  records: readonly T[],
+  requestScope: MemoryScope,
+  policy: SlotReusePolicy = DEFAULT_SLOT_REUSE_POLICY,
+): T[] {
+  return filterRecallEligibleRecords(records, requestScope, policy).filter((record) => {
+    const route = record.metadata?.admissionRoute;
+    if (route === "lookup_only") return false;
+    return route === undefined || route === "active";
+  });
+}
 
 /**
  * 默认 salience 注入阈值。

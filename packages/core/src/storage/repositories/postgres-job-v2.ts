@@ -1,5 +1,10 @@
 import { isDeepStrictEqual } from "node:util";
 
+import {
+  resolveAuthorityScope,
+  type AuthorityScope,
+  type ClientAuthorityScopeRequest,
+} from "../../domain/authority-scope.js";
 import type {
   DurableJobHandlerRegistry,
   DurableJobV2,
@@ -14,6 +19,7 @@ import {
   createDurableJobV2,
   deriveDurableJobV2ScopedDedupeKey,
   failDurableJobV2,
+  isDurableJobV2SafeIdentifier,
   leaseDurableJobV2,
   quarantineUnknownDurableJobV2,
   reapExpiredDurableJobV2,
@@ -64,12 +70,25 @@ export interface PostgresDurableJobV2LeaseInput {
   readonly scope: DurableJobV2Scope;
   readonly owner: string;
   readonly leaseMs: number;
+  readonly idPrefix?: string;
+  readonly excludeIdPrefix?: string;
+  readonly idAllowlist?: readonly string[];
+}
+
+export interface PostgresDurableJobV2ReapInput {
+  readonly scope: DurableJobV2Scope;
+  readonly idPrefix?: string;
+  readonly excludeIdPrefix?: string;
+  readonly idAllowlist?: readonly string[];
 }
 
 export interface PostgresDurableJobV2QuarantineUnknownInput {
   readonly scope: DurableJobV2Scope;
   /** 当前 runtime 的完整 handler 集合；必须与 repository 启动配置完全一致。 */
   readonly authoritativeHandlerTypes: readonly string[];
+  readonly idPrefix?: string;
+  readonly excludeIdPrefix?: string;
+  readonly idAllowlist?: readonly string[];
 }
 
 export interface PostgresDurableJobV2FencedInput {
@@ -95,6 +114,8 @@ export interface PostgresDurableJobV2FailInput extends PostgresDurableJobV2Fence
 // 表名是 migration v5 的内部常量；不接受调用方 tableName，杜绝 identifier 注入。
 const JOB_TABLE = "mengshu_jobs_v2";
 const SCOPE_VALIDATION_KEY = "scope-validation";
+const HISTORY_JOB_ID_PREFIX = "history-job:";
+const MAX_RUNNABLE_SCOPE_DISCOVERY_LIMIT = 1_000;
 const CANONICAL_NON_NEGATIVE_INTEGER = /^(0|[1-9][0-9]*)$/;
 
 const RETURNING_COLUMNS = `id, type, payload, dedupe_key, scoped_dedupe_key,
@@ -106,6 +127,61 @@ created_at, updated_at`;
 
 function invalidJob(message: string): never {
   throw new JobV2ContractError("INVALID_JOB", message);
+}
+
+function idPrefixFilter(
+  idPrefix: string | undefined,
+  excludeIdPrefix: string | undefined,
+): string {
+  if (idPrefix !== undefined && excludeIdPrefix !== undefined) {
+    invalidJob("Postgres durable job id prefix filters are mutually exclusive");
+  }
+  const prefix = idPrefix ?? excludeIdPrefix;
+  if (prefix === undefined) return "";
+  if (prefix !== HISTORY_JOB_ID_PREFIX) {
+    invalidJob("Postgres durable job id prefix is invalid");
+  }
+  return excludeIdPrefix === undefined
+    ? "  AND id LIKE 'history-job:%'\n"
+    : "  AND id NOT LIKE 'history-job:%'\n";
+}
+
+function canonicalIdAllowlist(
+  value: readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    invalidJob("Postgres durable job id allowlist must be a non-empty array");
+  }
+  const ids = [...value];
+  if (ids.some((id) => !isDurableJobV2SafeIdentifier(id))) {
+    invalidJob("Postgres durable job id allowlist contains an unsafe identifier");
+  }
+  if (new Set(ids).size !== ids.length) {
+    invalidJob("Postgres durable job id allowlist contains duplicate identifiers");
+  }
+  return Object.freeze(ids);
+}
+
+function idAllowlistFilter(
+  idAllowlist: readonly string[] | undefined,
+  parameter: number,
+  column = "id",
+): string {
+  return idAllowlist === undefined ? "" : `  AND ${column} = ANY($${parameter}::text[])\n`;
+}
+
+function withIdAllowlist(
+  params: readonly unknown[],
+  idAllowlist: readonly string[] | undefined,
+): readonly unknown[] {
+  return idAllowlist === undefined ? params : [...params, idAllowlist];
+}
+
+function assertIdAllowed(id: string, idAllowlist: readonly string[] | undefined): void {
+  if (idAllowlist !== undefined && !idAllowlist.includes(id)) {
+    invalidJob("Postgres durable job candidate escaped id allowlist");
+  }
 }
 
 function canonicalScope(scope: DurableJobV2Scope): DurableJobV2Scope {
@@ -120,6 +196,106 @@ function canonicalScope(scope: DurableJobV2Scope): DurableJobV2Scope {
     namespace: scope.namespace,
     visibility: scope.visibility,
   });
+}
+
+function authorityRequestSeed(authority: AuthorityScope): ClientAuthorityScopeRequest {
+  const allow = authority && typeof authority === "object" && !Array.isArray(authority)
+    ? (authority as { readonly allow?: unknown }).allow
+    : undefined;
+  const candidate = allow && typeof allow === "object" && !Array.isArray(allow)
+    ? allow as Record<string, unknown>
+    : {};
+  const first = (field: string): unknown => {
+    const values = candidate[field];
+    return Array.isArray(values) ? values[0] : undefined;
+  };
+  return {
+    appId: first("appIds") as string,
+    projectId: first("projectIds") as string,
+    agentId: first("agentIds") as string,
+    namespace: first("namespaces") as string,
+    visibility: first("visibilities") as DurableJobV2Scope["visibility"],
+  };
+}
+
+function canonicalDiscoveryAuthority(authority: AuthorityScope): AuthorityScope {
+  const seed = authorityRequestSeed(authority);
+  const resolved = resolveAuthorityScope(authority, seed);
+  return Object.freeze({
+    tenantId: resolved.tenantId,
+    userId: resolved.userId,
+    ...(resolved.workspaceId === undefined ? {} : { workspaceId: resolved.workspaceId }),
+    ...(resolved.sessionId === undefined ? {} : { sessionId: resolved.sessionId }),
+    allow: Object.freeze({
+      appIds: Object.freeze([...authority.allow.appIds]),
+      projectIds: Object.freeze([...authority.allow.projectIds]),
+      agentIds: Object.freeze([...authority.allow.agentIds]),
+      namespaces: Object.freeze([...authority.allow.namespaces]),
+      visibilities: Object.freeze([...authority.allow.visibilities]),
+    }),
+  });
+}
+
+function decodeRunnableScope(
+  row: Record<string, unknown>,
+  authority: AuthorityScope,
+): DurableJobV2Scope {
+  const candidate = canonicalScope({
+    tenantId: requiredString(row, "tenant_id"),
+    userId: requiredString(row, "user_id"),
+    appId: requiredString(row, "app_id"),
+    projectId: requiredString(row, "project_id"),
+    agentId: requiredString(row, "agent_id"),
+    namespace: requiredString(row, "namespace"),
+    visibility: requiredString(row, "visibility") as DurableJobV2Scope["visibility"],
+  });
+  const resolved = resolveAuthorityScope(authority, {
+    appId: candidate.appId,
+    projectId: candidate.projectId,
+    agentId: candidate.agentId,
+    namespace: candidate.namespace,
+    visibility: candidate.visibility,
+  });
+  const exact = canonicalScope({
+    tenantId: resolved.tenantId,
+    userId: resolved.userId,
+    appId: resolved.appId,
+    projectId: resolved.projectId,
+    agentId: resolved.agentId,
+    namespace: resolved.namespace,
+    visibility: resolved.visibility!,
+  });
+  if (!sameScope(candidate, exact)) {
+    invalidJob("Postgres durable job runnable scope escaped authority");
+  }
+  return exact;
+}
+
+function canonicalDiscoveryCursor(
+  rawCursor: DurableJobV2Scope,
+  authority: AuthorityScope,
+): DurableJobV2Scope {
+  const cursor = canonicalScope(rawCursor);
+  const resolved = resolveAuthorityScope(authority, {
+    appId: cursor.appId,
+    projectId: cursor.projectId,
+    agentId: cursor.agentId,
+    namespace: cursor.namespace,
+    visibility: cursor.visibility,
+  });
+  const exact = canonicalScope({
+    tenantId: resolved.tenantId,
+    userId: resolved.userId,
+    appId: resolved.appId,
+    projectId: resolved.projectId,
+    agentId: resolved.agentId,
+    namespace: resolved.namespace,
+    visibility: resolved.visibility!,
+  });
+  if (!sameScope(cursor, exact)) {
+    invalidJob("Postgres durable job runnable scope cursor escaped authority");
+  }
+  return exact;
 }
 
 function nowFrom(clock: () => number): number {
@@ -350,6 +526,107 @@ export class PostgresDurableJobV2Repository {
     this.#dependencies = dependencies;
   }
 
+  async listRunnableScopes(
+    rawAuthority: AuthorityScope,
+    limit: number,
+    after?: DurableJobV2Scope,
+  ): Promise<readonly DurableJobV2Scope[]> {
+    const authority = canonicalDiscoveryAuthority(rawAuthority);
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_RUNNABLE_SCOPE_DISCOVERY_LIMIT) {
+      invalidJob("Postgres durable job runnable scope limit is invalid");
+    }
+    const cursor = after === undefined ? undefined : canonicalDiscoveryCursor(after, authority);
+    const now = nowFrom(this.#dependencies.clock);
+    const client = await this.#pool.connect();
+    let queryResult: PostgresDurableJobV2QueryResult | undefined;
+    let failure: unknown;
+    try {
+      queryResult = await client.query(
+        `SELECT tenant_id, user_id, app_id, project_id, agent_id, namespace, visibility
+FROM (
+  SELECT tenant_id, user_id, app_id, project_id, agent_id, namespace, visibility,
+    MIN(CASE
+      WHEN status = 'queued' THEN created_at
+      WHEN status = 'retry_wait' THEN next_attempt_at
+      ELSE lease_until
+    END) AS runnable_at
+  FROM ${JOB_TABLE}
+  WHERE tenant_id = $1 AND user_id = $2
+    AND app_id = ANY($3::text[])
+    AND project_id = ANY($4::text[])
+    AND agent_id = ANY($5::text[])
+    AND namespace = ANY($6::text[])
+    AND visibility = ANY($7::text[])
+    AND id NOT LIKE $8
+    AND (
+      (status = 'queued' AND attempts < max_attempts)
+      OR (status = 'retry_wait' AND attempts < max_attempts AND next_attempt_at <= $9)
+      OR (status = 'running' AND lease_until <= $9)
+    )
+  GROUP BY tenant_id, user_id, app_id, project_id, agent_id, namespace, visibility
+) AS runnable_scopes
+ORDER BY CASE WHEN $10::text IS NULL OR
+    ROW(app_id, project_id, agent_id, namespace, visibility) >
+    ROW($10::text, $11::text, $12::text, $13::text, $14::text)
+  THEN 0 ELSE 1 END,
+  app_id ASC, project_id ASC, agent_id ASC, namespace ASC, visibility ASC
+LIMIT $15`,
+        [
+          authority.tenantId,
+          authority.userId,
+          [...authority.allow.appIds],
+          [...authority.allow.projectIds],
+          [...authority.allow.agentIds],
+          [...authority.allow.namespaces],
+          [...authority.allow.visibilities],
+          `${HISTORY_JOB_ID_PREFIX}%`,
+          now,
+          cursor?.appId ?? null,
+          cursor?.projectId ?? null,
+          cursor?.agentId ?? null,
+          cursor?.namespace ?? null,
+          cursor?.visibility ?? null,
+          limit,
+        ],
+      );
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      client.release();
+    } catch (releaseFailure) {
+      failure = failure
+        ? new AggregateError(
+            [failure, releaseFailure],
+            "Postgres durable job runnable scope query and release both failed",
+          )
+        : releaseFailure;
+    }
+    if (failure) throw failure;
+    if (!queryResult || !Array.isArray(queryResult.rows)) {
+      invalidJob("Postgres durable job runnable scope query returned invalid rows");
+    }
+    const rowCount = queryResult.rowCount ?? queryResult.rows.length;
+    if (!Number.isSafeInteger(rowCount) || rowCount !== queryResult.rows.length || rowCount > limit) {
+      invalidJob("Postgres durable job runnable scope query returned invalid row count");
+    }
+    const scopes: DurableJobV2Scope[] = [];
+    const seen = new Set<string>();
+    for (const row of queryResult.rows) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) {
+        invalidJob("Postgres durable job runnable scope row is invalid");
+      }
+      const exact = decodeRunnableScope(row, authority);
+      const key = deriveDurableJobV2ScopedDedupeKey(exact, SCOPE_VALIDATION_KEY);
+      if (seen.has(key)) {
+        invalidJob("Postgres durable job runnable scope query returned duplicate scopes");
+      }
+      seen.add(key);
+      scopes.push(exact);
+    }
+    return Object.freeze(scopes);
+  }
+
   async enqueue(input: PostgresDurableJobV2EnqueueInput): Promise<DurableJobV2> {
     // 完整纯合同验证必须先于 connect，未注册 handler 不得触碰数据库。
     const expected = createDurableJobV2(input, {
@@ -408,6 +685,9 @@ FOR SHARE`,
   async quarantineUnknown(
     input: PostgresDurableJobV2QuarantineUnknownInput,
   ): Promise<PostgresDurableJobV2OperationResult> {
+    const cohortFilter = idPrefixFilter(input.idPrefix, input.excludeIdPrefix);
+    const idAllowlist = canonicalIdAllowlist(input.idAllowlist);
+    const allowlistFilter = idAllowlistFilter(idAllowlist, 10);
     const scope = canonicalScope(input.scope);
     // 在 connect 前验证“完整且与 repository 一致”，partial worker pool 子集不得触碰 DB。
     const authoritativeRegistry = authoritativeRegistryFor(
@@ -421,7 +701,7 @@ FOR SHARE`,
 FROM ${JOB_TABLE}
 WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3 AND project_id = $4
   AND agent_id = $5 AND namespace = $6 AND visibility = $7
-  AND status IN ('queued', 'retry_wait')
+${cohortFilter}${allowlistFilter}  AND status IN ('queued', 'retry_wait')
   AND (status = 'queued' OR next_attempt_at <= $9)
   AND NOT (type = ANY($8::text[]))
   AND attempts < max_attempts
@@ -429,7 +709,10 @@ ORDER BY CASE WHEN status = 'queued' THEN created_at ELSE next_attempt_at END AS
   created_at ASC, id ASC
 FOR UPDATE SKIP LOCKED
 LIMIT 1`,
-        [...scopeParams(scope), [...authoritativeRegistry.types], now],
+        withIdAllowlist(
+          [...scopeParams(scope), [...authoritativeRegistry.types], now],
+          idAllowlist,
+        ),
       );
       const selectedRow = oneRow(
         selected,
@@ -437,6 +720,7 @@ LIMIT 1`,
       );
       if (!selectedRow) return { applied: 0 };
       const previous = decodeRow(selectedRow);
+      assertIdAllowed(previous.id, idAllowlist);
       const due = previous.status === "queued" ||
         (previous.status === "retry_wait" && previous.nextAttemptAt! <= now);
       if (!sameScope(previous.scope, scope) || !due ||
@@ -454,17 +738,81 @@ LIMIT 1`,
     });
   }
 
-  async lease(input: PostgresDurableJobV2LeaseInput): Promise<PostgresDurableJobV2OperationResult> {
-    const scope = canonicalScope(input.scope);
-    const now = nowFrom(this.#dependencies.clock);
-    return this.transaction(async (client) => {
-      const selected = await client.query(
-        `SELECT ${RETURNING_COLUMNS}
+  lease(input: PostgresDurableJobV2LeaseInput): Promise<PostgresDurableJobV2OperationResult> {
+    const cohortFilter = idPrefixFilter(input.idPrefix, input.excludeIdPrefix);
+    const idAllowlist = canonicalIdAllowlist(input.idAllowlist);
+    const allowlistFilter = idAllowlistFilter(idAllowlist, 10);
+    const historyLeafAllowlistFilter = idAllowlistFilter(
+      idAllowlist,
+      10,
+      "history_leaf.id",
+    );
+    return Promise.resolve().then(() => {
+      const scope = canonicalScope(input.scope);
+      const now = nowFrom(this.#dependencies.clock);
+      return this.transaction(async (client) => {
+        const ordinaryLeaseSql = `SELECT ${RETURNING_COLUMNS}
 FROM ${JOB_TABLE}
 WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3 AND project_id = $4
   AND agent_id = $5 AND namespace = $6 AND visibility = $7
-  AND type = ANY($8::text[])
+${cohortFilter}${allowlistFilter}  AND type = ANY($8::text[])
   AND attempts < max_attempts
+  AND (
+    status = 'queued'
+    OR (status = 'retry_wait' AND next_attempt_at <= $9)
+    OR (status = 'running' AND lease_until <= $9)
+  )
+  AND NOT (
+    type = 'build_tree'
+    AND id LIKE 'history-job:%'
+    AND payload#>>'{finalize,mode}' = 'history_rebuild'
+    AND EXISTS (
+      SELECT 1 FROM mengshu_jobs_v2 AS history_leaf
+      WHERE history_leaf.tenant_id = mengshu_jobs_v2.tenant_id
+        AND history_leaf.user_id = mengshu_jobs_v2.user_id
+        AND history_leaf.app_id = mengshu_jobs_v2.app_id
+        AND history_leaf.project_id = mengshu_jobs_v2.project_id
+        AND history_leaf.agent_id = mengshu_jobs_v2.agent_id
+        AND history_leaf.namespace = mengshu_jobs_v2.namespace
+        AND history_leaf.visibility = mengshu_jobs_v2.visibility
+        AND history_leaf.id <> mengshu_jobs_v2.id
+        AND history_leaf.id LIKE 'history-job:%'
+${historyLeafAllowlistFilter}        AND history_leaf.type = 'build_tree'
+        AND history_leaf.payload ? 'leaf'
+        AND history_leaf.payload->>'treeType' = mengshu_jobs_v2.payload->>'treeType'
+        AND history_leaf.payload->>'treeKey' = mengshu_jobs_v2.payload->>'treeKey'
+        AND COALESCE(history_leaf.payload#>>'{scope,workspaceId}', '') =
+          COALESCE(mengshu_jobs_v2.payload#>>'{scope,workspaceId}', '')
+        AND COALESCE(history_leaf.payload#>>'{scope,sessionId}', '') =
+          COALESCE(mengshu_jobs_v2.payload#>>'{scope,sessionId}', '')
+        AND (history_leaf.status <> 'completed' OR NOT EXISTS (
+          SELECT 1 FROM mengshu_job_v2_effect_receipts AS leaf_receipt
+          WHERE leaf_receipt.job_id = history_leaf.id
+            AND leaf_receipt.effect_key = 'build_tree.persist.v1'
+        ))
+    )
+  )
+ORDER BY CASE
+  WHEN status = 'queued' THEN created_at
+  WHEN status = 'retry_wait' THEN next_attempt_at
+  ELSE lease_until
+END ASC, created_at ASC, id ASC
+FOR UPDATE SKIP LOCKED
+LIMIT 1`;
+        const params = withIdAllowlist(
+          [...scopeParams(scope), [...this.#dependencies.registry.types], now],
+          idAllowlist,
+        );
+        let selected;
+        if (input.idPrefix === HISTORY_JOB_ID_PREFIX) {
+          selected = await client.query(
+            `SELECT ${RETURNING_COLUMNS}
+FROM ${JOB_TABLE}
+WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3 AND project_id = $4
+  AND agent_id = $5 AND namespace = $6 AND visibility = $7
+  AND id LIKE 'history-job:%'
+${allowlistFilter}  AND type = ANY($8::text[])
+  AND attempts < max_attempts AND payload ? 'leaf'
   AND (
     status = 'queued'
     OR (status = 'retry_wait' AND next_attempt_at <= $9)
@@ -477,23 +825,78 @@ ORDER BY CASE
 END ASC, created_at ASC, id ASC
 FOR UPDATE SKIP LOCKED
 LIMIT 1`,
-        [...scopeParams(scope), [...this.#dependencies.registry.types], now],
-      );
-      const selectedRow = oneRow(selected, "Postgres durable job lease selection returned invalid rows");
-      if (!selectedRow) return { applied: 0 };
-      const previous = decodeRow(selectedRow);
-      if (!sameScope(previous.scope, scope) ||
-          !this.#dependencies.registry.isRegistered(previous.type)) {
-        invalidJob("Postgres durable job lease candidate escaped scope or handler registry");
-      }
-      const transition = leaseDurableJobV2(previous, {
-        owner: input.owner,
-        now,
-        leaseMs: input.leaseMs,
-        tokenFactory: this.#dependencies.tokenFactory,
+            params,
+          );
+          let selectedRow = oneRow(
+            selected,
+            "Postgres durable job history leaf lease selection returned invalid rows",
+          );
+          if (!selectedRow) {
+            selected = await client.query(
+              `SELECT ${RETURNING_COLUMNS}
+FROM ${JOB_TABLE}
+WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3 AND project_id = $4
+  AND agent_id = $5 AND namespace = $6 AND visibility = $7
+  AND id LIKE 'history-job:%'
+${allowlistFilter}  AND type = ANY($8::text[])
+  AND attempts < max_attempts
+  AND payload#>>'{finalize,mode}' = 'history_rebuild'
+  AND (
+    status = 'queued'
+    OR (status = 'retry_wait' AND next_attempt_at <= $9)
+    OR (status = 'running' AND lease_until <= $9)
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM mengshu_jobs_v2 AS history_leaf
+    WHERE history_leaf.tenant_id = $1 AND history_leaf.user_id = $2
+      AND history_leaf.app_id = $3 AND history_leaf.project_id = $4
+      AND history_leaf.agent_id = $5 AND history_leaf.namespace = $6
+      AND history_leaf.visibility = $7 AND history_leaf.id LIKE 'history-job:%'
+${historyLeafAllowlistFilter}      AND history_leaf.type = 'build_tree' AND history_leaf.payload ? 'leaf'
+      AND (history_leaf.status <> 'completed' OR NOT EXISTS (
+        SELECT 1 FROM mengshu_job_v2_effect_receipts AS leaf_receipt
+        WHERE leaf_receipt.job_id = history_leaf.id
+          AND leaf_receipt.effect_key = 'build_tree.persist.v1'
+      ))
+  )
+ORDER BY CASE
+  WHEN status = 'queued' THEN created_at
+  WHEN status = 'retry_wait' THEN next_attempt_at
+  ELSE lease_until
+END ASC, created_at ASC, id ASC
+FOR UPDATE SKIP LOCKED
+LIMIT 1`,
+              params,
+            );
+            selectedRow = oneRow(
+              selected,
+              "Postgres durable job history finalize lease selection returned invalid rows",
+            );
+          }
+          if (!selectedRow) return { applied: 0 };
+        } else {
+          selected = await client.query(ordinaryLeaseSql, params);
+        }
+        const selectedRow = oneRow(
+          selected,
+          "Postgres durable job lease selection returned invalid rows",
+        );
+        if (!selectedRow) return { applied: 0 };
+        const previous = decodeRow(selectedRow);
+        assertIdAllowed(previous.id, idAllowlist);
+        if (!sameScope(previous.scope, scope) ||
+            !this.#dependencies.registry.isRegistered(previous.type)) {
+          invalidJob("Postgres durable job lease candidate escaped scope or handler registry");
+        }
+        const transition = leaseDurableJobV2(previous, {
+          owner: input.owner,
+          now,
+          leaseMs: input.leaseMs,
+          tokenFactory: this.#dependencies.tokenFactory,
+        });
+        if (transition.applied === 0) return { applied: 0, job: previous };
+        return this.applyLeaseCas(client, previous, transition.job, now);
       });
-      if (transition.applied === 0) return { applied: 0, job: previous };
-      return this.applyLeaseCas(client, previous, transition.job, now);
     });
   }
 
@@ -527,24 +930,29 @@ LIMIT 1`,
     }));
   }
 
-  async reap(input: { readonly scope: DurableJobV2Scope }): Promise<PostgresDurableJobV2OperationResult> {
-    const scope = canonicalScope(input.scope);
-    const now = nowFrom(this.#dependencies.clock);
-    return this.transaction(async (client) => {
+  reap(input: PostgresDurableJobV2ReapInput): Promise<PostgresDurableJobV2OperationResult> {
+    const cohortFilter = idPrefixFilter(input.idPrefix, input.excludeIdPrefix);
+    const idAllowlist = canonicalIdAllowlist(input.idAllowlist);
+    const allowlistFilter = idAllowlistFilter(idAllowlist, 9);
+    return Promise.resolve().then(() => {
+      const scope = canonicalScope(input.scope);
+      const now = nowFrom(this.#dependencies.clock);
+      return this.transaction(async (client) => {
       const selected = await client.query(
         `SELECT ${RETURNING_COLUMNS}
 FROM ${JOB_TABLE}
 WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3 AND project_id = $4
   AND agent_id = $5 AND namespace = $6 AND visibility = $7
-  AND status = 'running' AND lease_until <= $8 AND attempts >= max_attempts
+${cohortFilter}${allowlistFilter}  AND status = 'running' AND lease_until <= $8 AND attempts >= max_attempts
 ORDER BY lease_until ASC, created_at ASC, id ASC
 FOR UPDATE SKIP LOCKED
 LIMIT 1`,
-        [...scopeParams(scope), now],
+        withIdAllowlist([...scopeParams(scope), now], idAllowlist),
       );
       const selectedRow = oneRow(selected, "Postgres durable job reap selection returned invalid rows");
       if (!selectedRow) return { applied: 0 };
       const previous = decodeRow(selectedRow);
+      assertIdAllowed(previous.id, idAllowlist);
       if (!sameScope(previous.scope, scope)) {
         invalidJob("Postgres durable job reap candidate escaped scope");
       }
@@ -566,6 +974,7 @@ LIMIT 1`,
         ],
       );
       return this.decodeCasResult(updated, previous, transition.job);
+      });
     });
   }
 

@@ -369,6 +369,7 @@ async function runDoctor(dir: string, deps: DoctorCliDeps): Promise<void> {
   );
   if (counts.fatal > 0) {
     console.log("FATAL：存在致命问题，接入前必须修复。");
+    process.exitCode = 1;
   }
 }
 

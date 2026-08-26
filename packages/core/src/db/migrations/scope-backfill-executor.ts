@@ -79,7 +79,26 @@ interface BackfillRow {
   readonly id: string;
   readonly metadata: unknown;
   readonly provenance?: unknown;
+  readonly canonicalScope?: CanonicalScopeColumns;
 }
+
+interface CanonicalScopeColumns {
+  readonly tenantId: string;
+  readonly userId: string;
+  readonly projectId: string;
+  readonly appId: string;
+  readonly agentId: string;
+  readonly namespace: string;
+  readonly visibility: "private" | "workspace" | "team" | "public";
+}
+
+interface CanonicalScopeKeyPlan {
+  readonly status: "resolved";
+  readonly strategy: "canonical-scope-key";
+  readonly scope: CanonicalScopeColumns;
+}
+
+type ExecutableScopeBackfillPlan = ScopeBackfillPlan | CanonicalScopeKeyPlan;
 
 interface MutableStats {
   scanned: number;
@@ -95,6 +114,8 @@ const DEFAULT_BATCH_SIZE = 100;
 const MAX_BATCH_SIZE = 1_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const JSONB_TYPES = new Set(["object", "array", "string", "number", "boolean", "null"]);
+const MEMORY_VISIBILITIES = new Set(["private", "workspace", "team", "public"]);
+const CANONICAL_VALUE = /^[^\u0000-\u001f\u007f]{1,256}$/u;
 
 function executorError(code: ScopeBackfillExecutorErrorCode): never {
   throw new ScopeBackfillExecutorError(code);
@@ -159,10 +180,39 @@ function validateRows(result: PostgresScopeBackfillQueryResult): BackfillRow[] {
     } else if (row.provenance_type !== null || row.provenance !== null) {
       executorError("SCOPE_BACKFILL_INVALID_DB_RESULT");
     }
+    const canonicalValues = [
+      row.tenant_id,
+      row.user_id,
+      row.canonical_project_id,
+      row.product_id,
+      row.producer_id,
+      row.namespace,
+      row.visibility,
+    ];
+    if (canonicalValues.some((value) =>
+      value !== undefined && value !== null && typeof value !== "string")) {
+      executorError("SCOPE_BACKFILL_INVALID_DB_RESULT");
+    }
+    const completeCanonical = canonicalValues.every((value) =>
+      typeof value === "string" && value === value.trim() && CANONICAL_VALUE.test(value));
+    const visibility = row.visibility;
+    const canonicalScope = completeCanonical && typeof visibility === "string" &&
+        MEMORY_VISIBILITIES.has(visibility)
+      ? {
+          tenantId: row.tenant_id as string,
+          userId: row.user_id as string,
+          projectId: row.canonical_project_id as string,
+          appId: row.product_id as string,
+          agentId: row.producer_id as string,
+          namespace: row.namespace as string,
+          visibility: visibility as CanonicalScopeColumns["visibility"],
+        }
+      : undefined;
     rows.push({
       id: row.id,
       metadata: row.metadata,
       provenance: row.provenance_present ? row.provenance : undefined,
+      ...(canonicalScope === undefined ? {} : { canonicalScope }),
     });
   }
   return rows;
@@ -178,7 +228,7 @@ function assertStrictlyIncreasingRows(rows: readonly BackfillRow[], cursor: stri
   }
 }
 
-function countPlan(stats: MutableStats, plan: ScopeBackfillPlan): void {
+function countPlan(stats: MutableStats, plan: ExecutableScopeBackfillPlan): void {
   stats.scanned += 1;
   if (plan.status === "resolved") stats.resolved += 1;
   else if (plan.status === "conflict") stats.conflict += 1;
@@ -215,7 +265,7 @@ function json(value: unknown): string {
 }
 
 function pendingSelectSql(table: ScopeBackfillTable, mode: ScopeBackfillMode): string {
-  const base = `SELECT id::text AS id, metadata, jsonb_typeof(metadata) AS metadata_type, (jsonb_typeof(metadata) = 'object' AND metadata ? 'provenance') AS provenance_present, metadata->'provenance' AS provenance, jsonb_typeof(metadata->'provenance') AS provenance_type FROM "${table}" WHERE scope_key IS NULL AND legacy_quarantine_reason IS NULL`;
+  const base = `SELECT id::text AS id, metadata, jsonb_typeof(metadata) AS metadata_type, (jsonb_typeof(metadata) = 'object' AND metadata ? 'provenance') AS provenance_present, metadata->'provenance' AS provenance, jsonb_typeof(metadata->'provenance') AS provenance_type, tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, visibility FROM "${table}" WHERE scope_key IS NULL AND legacy_quarantine_reason IS NULL`;
   return mode === "dry-run"
     ? `${base} AND ($1::uuid IS NULL OR id > $1::uuid) ORDER BY id ASC LIMIT $2`
     : `${base} ORDER BY id ASC LIMIT $1 FOR UPDATE NOWAIT`;
@@ -227,6 +277,10 @@ function remainingCountSql(table: ScopeBackfillTable): string {
 
 function resolvedUpdateSql(table: ScopeBackfillTable): string {
   return `UPDATE "${table}" AS target SET tenant_id = staged.tenant_id, user_id = staged.user_id, canonical_project_id = staged.canonical_project_id, product_id = staged.product_id, producer_id = staged.producer_id, namespace = staged.namespace, visibility = staged.visibility, app_name = staged.app_name, agent_id = staged.agent_id, workspace_id = staged.workspace_id, scope_key = staged.scope_key, metadata = target.metadata || staged.audit_patch FROM jsonb_to_recordset($1::jsonb) AS staged(id uuid, tenant_id text, user_id text, canonical_project_id text, product_id text, producer_id text, namespace text, visibility text, app_name text, agent_id text, workspace_id text, scope_key text, audit_patch jsonb, old_metadata jsonb) WHERE target.id = staged.id AND target.metadata IS NOT DISTINCT FROM staged.old_metadata AND target.scope_key IS NULL AND target.legacy_quarantine_reason IS NULL RETURNING target.id::text AS id`;
+}
+
+function canonicalScopeKeyUpdateSql(table: ScopeBackfillTable): string {
+  return `UPDATE "${table}" AS target SET scope_key = staged.scope_key FROM jsonb_to_recordset($1::jsonb) AS staged(id uuid, tenant_id text, user_id text, canonical_project_id text, product_id text, producer_id text, namespace text, visibility text, scope_key text) WHERE target.id = staged.id AND target.tenant_id = staged.tenant_id AND target.user_id = staged.user_id AND target.canonical_project_id = staged.canonical_project_id AND target.product_id = staged.product_id AND target.producer_id = staged.producer_id AND target.namespace = staged.namespace AND target.visibility = staged.visibility AND target.scope_key IS NULL AND target.legacy_quarantine_reason IS NULL RETURNING target.id::text AS id`;
 }
 
 function quarantineUpdateSql(table: ScopeBackfillTable): string {
@@ -279,7 +333,26 @@ async function assertNoRemainingRows(
 
 interface PlannedBackfillRow {
   readonly row: BackfillRow;
-  readonly plan: ScopeBackfillPlan;
+  readonly plan: ExecutableScopeBackfillPlan;
+}
+
+function planRow(
+  row: BackfillRow,
+  registry: MemoryAutodbRegistry,
+): ExecutableScopeBackfillPlan {
+  return row.canonicalScope === undefined
+    ? planLegacyScopeBackfill(row, registry)
+    : {
+        status: "resolved",
+        strategy: "canonical-scope-key",
+        scope: row.canonicalScope,
+      };
+}
+
+function isCanonicalScopeKeyPlan(
+  plan: ExecutableScopeBackfillPlan,
+): plan is CanonicalScopeKeyPlan {
+  return "strategy" in plan && plan.strategy === "canonical-scope-key";
 }
 
 async function updateBatch(
@@ -287,15 +360,38 @@ async function updateBatch(
   table: ScopeBackfillTable,
   planned: readonly PlannedBackfillRow[],
 ): Promise<void> {
-  const resolved = planned.filter((item) => item.plan.status === "resolved");
+  const canonical = planned.filter((item) => isCanonicalScopeKeyPlan(item.plan));
+  const resolved = planned.filter((item) =>
+    item.plan.status === "resolved" && !isCanonicalScopeKeyPlan(item.plan));
   const malformed = planned.filter((item) =>
     item.plan.status !== "resolved" && item.plan.reasonCodes.includes("invalid-metadata-shape"));
   const quarantined = planned.filter((item) =>
     item.plan.status !== "resolved" && !item.plan.reasonCodes.includes("invalid-metadata-shape"));
 
+  if (canonical.length > 0) {
+    const payload = canonical.map(({ row, plan }) => {
+      if (!isCanonicalScopeKeyPlan(plan)) executorError("SCOPE_BACKFILL_INVALID_DB_RESULT");
+      return {
+        id: row.id,
+        tenant_id: plan.scope.tenantId,
+        user_id: plan.scope.userId,
+        canonical_project_id: plan.scope.projectId,
+        product_id: plan.scope.appId,
+        producer_id: plan.scope.agentId,
+        namespace: plan.scope.namespace,
+        visibility: plan.scope.visibility,
+        scope_key: scopeToKey(plan.scope),
+      };
+    });
+    const result = await client.query(canonicalScopeKeyUpdateSql(table), [json(payload)]);
+    assertBulkUpdatedRows(result, canonical.map(({ row }) => row.id));
+  }
+
   if (resolved.length > 0) {
     const payload = resolved.map(({ row, plan }) => {
-      if (plan.status !== "resolved") executorError("SCOPE_BACKFILL_INVALID_DB_RESULT");
+      if (plan.status !== "resolved" || isCanonicalScopeKeyPlan(plan)) {
+        executorError("SCOPE_BACKFILL_INVALID_DB_RESULT");
+      }
       return {
         id: row.id,
         tenant_id: plan.scope.tenantId,
@@ -368,7 +464,7 @@ async function executeDryRun(
       if (rows.length === 0) return;
       stats.batches += 1;
       for (const row of rows) {
-        countPlan(stats, planLegacyScopeBackfill(row, registry));
+        countPlan(stats, planRow(row, registry));
       }
       cursor = rows.at(-1)!.id;
     } catch (error) {
@@ -394,7 +490,7 @@ async function executeApply(
       if (rows.length > 0) stats.batches += 1;
       const planned = rows.map((row) => ({
         row,
-        plan: planLegacyScopeBackfill(row, registry),
+        plan: planRow(row, registry),
       }));
       if (planned.length > 0) await updateBatch(client, table, planned);
       for (const { plan } of planned) {

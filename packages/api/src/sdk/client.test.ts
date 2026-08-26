@@ -33,7 +33,10 @@ describe("MemoryClient", () => {
       .mockResolvedValueOnce(jsonResponse(200, { content: "safe", hits: [] }));
     const client = new MemoryClient({ baseUrl: "http://localhost:3847/", fetch: fetchImpl });
 
-    await expect(client.storeMemory({ record: { id: "mem-1" } as never })).resolves.toEqual({
+    await expect(client.storeMemory({
+      record: { id: "mem-1" } as never,
+      idempotencyKey: "sdk-store-1",
+    })).resolves.toEqual({
       id: "mem-1",
       stored: true,
     });
@@ -48,7 +51,7 @@ describe("MemoryClient", () => {
     expect(fetchImpl.mock.calls[0][1]).toMatchObject({
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ record: { id: "mem-1" } }),
+      body: JSON.stringify({ record: { id: "mem-1" }, idempotencyKey: "sdk-store-1" }),
     });
   });
 

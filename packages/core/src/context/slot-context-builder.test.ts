@@ -7,6 +7,8 @@ import { SlotContextBuilder } from "./slot-context-builder.js";
 import { SlotSnapshotCache } from "./slot-snapshot.js";
 import type { MemoryScope } from "../domain/semantic-types.js";
 import type { MemoryRecord } from "../domain/types.js";
+import { computeRecallScoreBreakdown } from "../domain/recall-scoring.js";
+import type { TreeSummaryNode } from "../tree/types.js";
 
 const mockScope: MemoryScope = {
   tenantId: "test-tenant",
@@ -60,6 +62,182 @@ describe("SlotContextBuilder", () => {
   });
 
   describe("buildSlotContext", () => {
+    it("把 evidence/leaf 命中的 sealed tree 按 source R1、topic/global R2 接入对应槽位", async () => {
+      const record = {
+        ...mockRecords[0],
+        id: "memory-tree-1",
+        sourceNodeIds: ["evidence-tree-1"],
+        lifecycleStatus: "active",
+      } as MemoryRecord;
+      const tree = (treeType: TreeSummaryNode["treeType"], id: string): TreeSummaryNode => ({
+        id, scope: mockScope, treeType, treeKey: `${treeType}-key`,
+        level: treeType === "global" ? 3 : treeType === "topic" ? 2 : 1,
+        title: `${treeType} summary`, summary: "bounded summary", childNodeIds: [],
+        leafIds: [record.id], evidenceChunkIds: ["evidence-tree-1"], entityIds: [],
+        relationIds: [], tokenCount: 20, timeRange: { startAt: 1, endAt: 2 },
+        status: "sealed", createdAt: 1, sealedAt: 2, metadata: { summaryMode: "extractive" },
+      });
+
+      const response = await builder.buildSlotContext(mockScope, [record], {
+        useCache: false,
+        treeDepth: "topic",
+        treeSummaries: [tree("source", "source-tree-1"), tree("topic", "topic-tree-1"),
+          tree("global", "global-tree-1"), { ...tree("topic", "invalid-tree"), tokenCount: 501 }],
+      });
+
+      expect(response.assemblyPlan?.slots.task_context?.navigation).toEqual(expect.arrayContaining([
+        expect.objectContaining({ ref: "source-tree-1", kind: "source_tree", level: "R1" }),
+        expect.objectContaining({ ref: "topic-tree-1", kind: "topic_tree", level: "R2" }),
+      ]));
+      expect(response.assemblyPlan?.slots.task_context?.navigation)
+        .not.toEqual(expect.arrayContaining([
+          expect.objectContaining({ ref: "global-tree-1" }),
+          expect.objectContaining({ ref: "invalid-tree" }),
+        ]));
+    });
+
+    it("生产 RecallHit 按唯一六因子总分排序并把完整回执保留到槽位", async () => {
+      const highImportance = {
+        ...mockRecords[0],
+        id: "high-importance",
+        text: "importance 高但任务相关性低",
+        importance: 0.95,
+        confidence: 1,
+      } as MemoryRecord;
+      const highRelevance = {
+        ...mockRecords[0],
+        id: "high-relevance",
+        text: "importance 低但任务相关性高",
+        importance: 0.2,
+        confidence: 1,
+      } as MemoryRecord;
+      const lowScoreBreakdown = computeRecallScoreBreakdown(
+        highImportance,
+        { relevance: 0.05, scopeFit: 1 },
+        ["vector"],
+        { vector: 0.05 },
+      );
+      const highScoreBreakdown = computeRecallScoreBreakdown(
+        highRelevance,
+        { relevance: 1, scopeFit: 1 },
+        ["vector"],
+        { vector: 1 },
+      );
+
+      const result = await builder.buildSlotContextFromRecallHits(
+        mockScope,
+        [
+          { record: highImportance, score: lowScoreBreakdown.score, source: "vector", scoreBreakdown: lowScoreBreakdown },
+          { record: highRelevance, score: highScoreBreakdown.score, source: "vector", scoreBreakdown: highScoreBreakdown },
+        ],
+        { useCache: false },
+      );
+
+      expect(result.slots.task_context?.sourceIds).toEqual([
+        "high-relevance",
+        "high-importance",
+      ]);
+      expect(result.slots.task_context?.recallReceipts).toEqual([
+        expect.objectContaining({
+          sourceId: "high-relevance",
+          score: highScoreBreakdown.score,
+          scoreBreakdown: highScoreBreakdown,
+        }),
+        expect.objectContaining({
+          sourceId: "high-importance",
+          score: lowScoreBreakdown.score,
+          scoreBreakdown: lowScoreBreakdown,
+        }),
+      ]);
+      expect(result.slots.task_context?.evidenceRefs).toEqual([
+        ...(highRelevance.sourceNodeIds ?? []),
+        ...(highImportance.sourceNodeIds ?? []),
+      ]);
+      expect(result.assemblyPlan?.slots.task_context?.mustRead[0]).toMatchObject({
+        ref: "high-relevance",
+        semanticType: "task_context",
+      });
+      expect(result.assemblyPlan?.versions.slotSnapshot).toBe(2);
+      expect(result.assemblyPlan?.stableContentHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(result.assemblyPlan?.dynamicContentHash).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it("任务变化只改变动态 hash，不改变稳定 profile/rules hash", async () => {
+      const record = {
+        ...mockRecords[0],
+        id: "stable-rule",
+        semanticType: "rules",
+        sourceNodeIds: ["evidence-rule"],
+      } as MemoryRecord;
+      const breakdown = computeRecallScoreBreakdown(
+        record,
+        { relevance: 1, scopeFit: 1 },
+        ["vector"],
+        { vector: 1 },
+      );
+      const hits = [{ record, score: breakdown.score, source: "vector" as const, scoreBreakdown: breakdown }];
+
+      const first = await builder.buildSlotContextFromRecallHits(
+        mockScope,
+        hits,
+        { useCache: false, task: "first task" },
+      );
+      const second = await builder.buildSlotContextFromRecallHits(
+        mockScope,
+        hits,
+        { useCache: false, task: "second task" },
+      );
+
+      expect(first.assemblyPlan?.stableContentHash).toBe(second.assemblyPlan?.stableContentHash);
+      expect(first.assemblyPlan?.dynamicContentHash).not.toBe(second.assemblyPlan?.dynamicContentHash);
+      expect(first.slots.rules?.evidenceRefs).toEqual(["evidence-rule"]);
+    });
+
+    it("生产 RecallHit 缺少完整六因子回执时 fail-closed", async () => {
+      const record = mockRecords[0] as MemoryRecord;
+
+      await expect(builder.buildSlotContextFromRecallHits(
+        mockScope,
+        [{ record, score: 0.9, source: "vector" }],
+        { useCache: false },
+      )).rejects.toThrow("CONTEXT_RECALL_BREAKDOWN_REQUIRED");
+    });
+
+    it("缓存输入发生 revoke 后不会继续注入旧节点", async () => {
+      const active = {
+        ...mockRecords[0],
+        id: "cache-revoke",
+        text: "随后会被撤回的规则",
+        semanticType: "rules",
+        lifecycleStatus: "active",
+      } as MemoryRecord;
+      const breakdown = computeRecallScoreBreakdown(
+        active,
+        { relevance: 1, scopeFit: 1 },
+        ["vector"],
+        { vector: 1 },
+      );
+
+      const first = await builder.buildSlotContextFromRecallHits(
+        mockScope,
+        [{ record: active, score: breakdown.score, source: "vector", scoreBreakdown: breakdown }],
+        { useCache: true },
+      );
+      const revoked = { ...active, lifecycleStatus: "revoked" as const };
+      const second = await builder.buildSlotContextFromRecallHits(
+        mockScope,
+        [{ record: revoked, score: breakdown.score, source: "vector", scoreBreakdown: breakdown }],
+        { useCache: true },
+      );
+
+      expect(first.content).toContain("随后会被撤回的规则");
+      expect(second.content).not.toContain("随后会被撤回的规则");
+      expect(second.filtered).toContainEqual(expect.objectContaining({
+        recordId: "cache-revoke",
+        reason: "lifecycle_revoked",
+      }));
+    });
+
     it("应该构建 5 槽位上下文", async () => {
       const result = await builder.buildSlotContext(
         mockScope,
@@ -189,6 +367,30 @@ describe("SlotContextBuilder", () => {
   });
 
   describe("filtered 收集", () => {
+    it("session_candidate evidence 不进入原生 5 槽位/context_fast，reason=raw_evidence", async () => {
+      const records: Partial<MemoryRecord>[] = [{
+        id: "evidence-1",
+        kind: "observation",
+        container: "session_candidate",
+        text: "尚未经过候选审核的原始观察",
+        importance: 0.9,
+        lifecycleStatus: "active",
+        metadata: { admissionRoute: "evidence_only" },
+        scope: mockScope,
+      }];
+
+      const result = await builder.buildSlotContext(
+        mockScope,
+        records as MemoryRecord[],
+        { useCache: false },
+      );
+
+      expect(result.content).not.toContain("原始观察");
+      expect(result.filtered).toEqual([
+        expect.objectContaining({ recordId: "evidence-1", reason: "raw_evidence" }),
+      ]);
+    });
+
     it("revoked 记忆进入 filtered，reason=lifecycle_revoked", async () => {
       const records: Partial<MemoryRecord>[] = [
         { id: "active-1", kind: "goal", semanticType: "task_context", text: "活跃任务", importance: 0.9, scope: mockScope },

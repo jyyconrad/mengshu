@@ -22,6 +22,11 @@
 import type { CommanderLike } from "./index.js";
 import type { MemoryService } from "../../../../core/service-types.js";
 import type { MemoryRecord, MemoryScope, RecallHit } from "../../../../core/types.js";
+import type { CompleteRecallScoreBreakdown } from "../../../../core/recall-scoring.js";
+import {
+  RECALL_SCORE_BREAKDOWN_REQUIRED,
+  requireRecallHitReceipt,
+} from "../../../../packages/core/src/domain/recall-receipt-validation.js";
 
 /** why 命令依赖注入。service/scope 缺省时降级。 */
 export interface WhyCliDeps {
@@ -125,13 +130,28 @@ function line(label: string, value: string | undefined): string {
 }
 
 /** 将 WhyDetails 渲染为人类可读报告（纯函数）。 */
-export function formatWhyReport(record: MemoryRecord): string {
+export function formatWhyReport(
+  record: MemoryRecord,
+  recallBreakdown?: CompleteRecallScoreBreakdown,
+): string {
   const d = extractWhyDetails(record);
   const lines: string[] = [];
 
   lines.push(`记忆 ${d.id}`);
   lines.push(`  ${d.text}`);
   lines.push(`  kind=${d.kind} | importance=${d.importance.toFixed(2)}`);
+
+  if (recallBreakdown) {
+    lines.push("");
+    lines.push("召回评分 (6 factors):");
+    for (const name of [
+      "relevance", "scopeFit", "importance", "confidence", "evidenceWeight", "recency",
+    ] as const) {
+      lines.push(`  - ${name}: value=${recallBreakdown.factors[name].toFixed(3)} ` +
+        `contribution=${recallBreakdown.contributions[name].toFixed(3)}`);
+    }
+    lines.push(`  - total: ${recallBreakdown.score.toFixed(3)}`);
+  }
 
   lines.push("");
   lines.push("来源 (provenance):");
@@ -216,12 +236,28 @@ async function handleWhy(target: unknown, options: WhyOptions, deps: WhyCliDeps)
 
     const record = resolveTarget(text, result.hits);
     if (!record) {
+      const governedFiltered = result.filtered?.filter((item) =>
+        item.authoritativeRecordId === text || item.candidateId === text,
+      ) ?? [];
+      if (governedFiltered.length > 0) {
+        console.log(`记忆未进入召回结果（target=${text}）：`);
+        for (const item of governedFiltered) {
+          console.log(`- [${item.source}] filteredReason: ${item.filteredReason}`);
+        }
+        return;
+      }
       console.log(`未找到匹配的记忆（target=${text}）。`);
       return;
     }
 
-    console.log(formatWhyReport(record));
+    const hit = result.hits.find((candidate) => candidate.record.id === record.id);
+    if (!hit) throw new Error(RECALL_SCORE_BREAKDOWN_REQUIRED);
+    const breakdown = requireRecallHitReceipt(hit);
+    console.log(formatWhyReport(record, breakdown));
   } catch (error) {
+    if (error instanceof Error && error.message === RECALL_SCORE_BREAKDOWN_REQUIRED) {
+      throw error;
+    }
     console.log(`解析失败（已降级）：${(error as Error).message}`);
     console.log("提示：why 需要可用的 embedding 配置以执行召回。");
   }

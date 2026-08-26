@@ -13,6 +13,13 @@ import type {
   MemoryScope,
   RecallResult,
 } from "../../../../core/types.js";
+import { computeRecallScoreBreakdown } from "../../../core/src/domain/recall-scoring.js";
+import type {
+  AgentLoadout,
+  LoadoutAssetCandidate,
+} from "../../../core/src/loadout/types.js";
+import type { ContextAssemblyReceiptRepository } from
+  "../../../core/src/context/assembly-receipt.js";
 
 const baseScope: MemoryScope = {
   tenantId: "local",
@@ -101,7 +108,20 @@ describe("AgentFastPathService", () => {
         query,
         hits: records
           .filter((r) => r.text.includes(query))
-          .map((r) => ({ record: r, score: 0.9, source: "text" as const })),
+          .map((record) => {
+            const scoreBreakdown = computeRecallScoreBreakdown(
+              record,
+              { relevance: 0.9, scopeFit: 1 },
+              ["text"],
+              { text: 0.9 },
+            );
+            return {
+              record,
+              score: scoreBreakdown.score,
+              source: "text" as const,
+              scoreBreakdown,
+            };
+          }),
       })),
       storeObservation: vi.fn().mockResolvedValue({ id: "obs-1", stored: true }),
       enqueueJob: vi.fn().mockResolvedValue("job-1"),
@@ -109,6 +129,321 @@ describe("AgentFastPathService", () => {
   });
 
   describe("context()", () => {
+    it("把当前 task 原样传给 production governed recall loader", async () => {
+      const loadRecallHitsForScope = vi.fn(async () => []);
+      const governedService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecallHitsForScope,
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+      });
+
+      await governedService.context({
+        scope: baseScope,
+        task: "PostgreSQL 验证 Mengshu 运行态升级发布规则",
+      });
+
+      expect(loadRecallHitsForScope).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tenantId: baseScope.tenantId,
+          userId: baseScope.userId,
+        }),
+        "PostgreSQL 验证 Mengshu 运行态升级发布规则",
+      );
+    });
+
+    it("F3: Loadout native policy filters R0 types, applies slot budgets, and caps tree depth", async () => {
+      const scope = { ...baseScope, visibility: "private" as const, sessionId: "policy-session" };
+      const rule = { ...records.find((record) => record.id === "rule-1")!, scope,
+        sourceNodeIds: ["evidence-policy"] };
+      const experience = makeRecord({ id: "experience-policy", scope, semanticType: "experience",
+        text: "experience must remain lookup-only under this Loadout", sourceNodeIds: ["evidence-exp"] });
+      const hit = (record: MemoryRecord) => {
+        const scoreBreakdown = computeRecallScoreBreakdown(
+          record, { relevance: 1, scopeFit: 1 }, ["vector"], { vector: 1 },
+        );
+        return { record, score: scoreBreakdown.score, source: "vector" as const, scoreBreakdown };
+      };
+      const tree = (treeType: "source" | "topic") => ({
+        id: `${treeType}-policy`, scope, treeType, treeKey: `${treeType}-key`,
+        level: treeType === "source" ? 1 : 2, title: `${treeType} policy`, summary: "summary",
+        childNodeIds: [], leafIds: [rule.id], evidenceChunkIds: ["evidence-policy"],
+        entityIds: [], relationIds: [], tokenCount: 10,
+        timeRange: { startAt: 1, endAt: 2 }, status: "sealed" as const,
+        createdAt: 1, sealedAt: 2, metadata: { summaryMode: "extractive" },
+      });
+      const loadout: AgentLoadout = {
+        id: "loadout-policy", scope, appId: scope.appId, agentId: scope.agentId,
+        projectId: scope.projectId, version: 1, visibility: "private", slotBindings: [],
+        nativeMemoryPolicy: {
+          semanticTypes: ["rules"], scopeReuse: "project_only", treeDepth: "source",
+          tokenBudgets: { profile: 100, task_context: 100, rules: 100,
+            experience: 100, resource: 100 },
+        },
+        createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z",
+      };
+      const service = new AgentFastPathService({
+        defaultScope: scope,
+        loadRecallHitsForScope: async () => [hit(rule), hit(experience)],
+        recall: async () => ({ scope, query: "", hits: [] }),
+        resolveLoadout: async () => loadout,
+        resolveLoadoutAssetCandidates: async () => [],
+        loadTreeSummaries: async () => [tree("source"), tree("topic")],
+        contextAssemblyReceipts: { append: async (_scope, receipt) => receipt, getLatest: vi.fn() },
+      });
+
+      const response = await service.context({ scope, task: "policy" });
+
+      expect(response.slots.rules).toBeDefined();
+      expect(response.slots.experience).toBeUndefined();
+      expect(response.filtered).toContainEqual(expect.objectContaining({
+        recordId: "experience-policy", reason: "loadout_policy_excluded",
+      }));
+      expect(response.assemblyPlan?.slots.rules?.tokenBudget).toBe(100);
+      expect(response.assemblyPlan?.slots.rules?.navigation).toContainEqual(
+        expect.objectContaining({ ref: "source-policy", kind: "source_tree", level: "R1" }),
+      );
+      expect(response.assemblyPlan?.slots.rules?.navigation).not.toContainEqual(
+        expect.objectContaining({ ref: "topic-policy" }),
+      );
+    });
+
+    it("F1: persists the final governed assembly receipt after actions and Loadout assembly", async () => {
+      const scope = {
+        ...baseScope,
+        visibility: "private",
+        sessionId: "session-receipt-1",
+      } satisfies MemoryScope & { readonly visibility: "private" };
+      const ruleRecord = {
+        ...records.find((record) => record.id === "rule-1")!,
+        scope,
+        sourceNodeIds: ["evidence-receipt-1"],
+      };
+      const scoreBreakdown = computeRecallScoreBreakdown(
+        ruleRecord,
+        { relevance: 1, scopeFit: 1 },
+        ["vector"],
+        { vector: 1 },
+      );
+      const loadout: AgentLoadout = {
+        id: "loadout-receipt", scope,
+        appId: scope.appId, agentId: scope.agentId, projectId: scope.projectId,
+        version: 3, visibility: "private",
+        slotBindings: [{ assetId: "asset-receipt", slot: "rules", disclosureMode: "must_read",
+          priority: 20, required: true }],
+        nativeMemoryPolicy: {
+          semanticTypes: ["rules"], scopeReuse: "project_only", treeDepth: "topic",
+          tokenBudgets: { profile: 500, task_context: 500, rules: 500,
+            experience: 500, resource: 500 },
+        },
+        createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z",
+      };
+      const append = vi.fn<ContextAssemblyReceiptRepository["append"]>(async (_scope, receipt) =>
+        receipt);
+      const governed = new AgentFastPathService({
+        defaultScope: scope,
+        loadRecallHitsForScope: async () => [{
+          record: ruleRecord, score: scoreBreakdown.score,
+          source: "vector", scoreBreakdown,
+        }],
+        recall: async () => ({ scope, query: "", hits: [] }),
+        resolveLoadout: async () => loadout,
+        resolveLoadoutAssetCandidates: async () => [{
+          assetId: "asset-receipt", assetVersion: 7, assetKind: "memory_view",
+          status: "published", contentValidity: "current", scope,
+          semanticTypes: ["rules"], recordId: ruleRecord.id, content: "receipt rule",
+          evidenceRefs: ["evidence-receipt-1"], lifecycleEligible: true,
+          riskBlocked: false, conflictUnresolved: false, score: scoreBreakdown.score,
+          scoreBreakdown, recallSource: "vector", tokenEstimate: 10,
+        }],
+        contextAssemblyReceipts: { append, getLatest: vi.fn() },
+      });
+
+      const response = await governed.context({ scope, task: "upgrade" });
+
+      expect(append).toHaveBeenCalledOnce();
+      const [persistedScope, receipt] = append.mock.calls[0]!;
+      expect(persistedScope).toEqual(scope);
+      expect(receipt.sessionId).toBe("session-receipt-1");
+      expect(receipt.loadout).toEqual({ id: "loadout-receipt", version: 3 });
+      expect(receipt.assetRefs).toContainEqual({ assetId: "asset-receipt", version: 7 });
+      expect(receipt.evidenceRefs).toContain("evidence-receipt-1");
+      expect(receipt.plan).toEqual(response.assemblyPlan);
+      expect(response.actions?.length).toBeGreaterThan(0);
+      expect(response.warnings ?? []).not.toContain("context_receipt_unavailable");
+    });
+
+    it.each(["missing", "failed"])(
+      "F1: %s receipt capability preserves native context and returns a stable warning",
+      async (mode) => {
+        const scope: MemoryScope = {
+          ...baseScope,
+          visibility: "private",
+          sessionId: `session-receipt-${mode}`,
+        };
+        const governed = new AgentFastPathService({
+          defaultScope: scope,
+          loadRecallHitsForScope: async () => [],
+          recall: async () => ({ scope, query: "", hits: [] }),
+          ...(mode === "failed"
+            ? {
+                contextAssemblyReceipts: {
+                  append: vi.fn(async () => { throw new Error("schema unavailable"); }),
+                  getLatest: vi.fn(),
+                } satisfies ContextAssemblyReceiptRepository,
+              }
+            : {}),
+        });
+
+        const response = await governed.context({ scope, task: "upgrade" });
+
+        expect(response.content).toContain("<relevant-memories>");
+        expect(response.assemblyPlan?.sessionId).toBe(scope.sessionId);
+        expect(response.warnings).toContain("context_receipt_unavailable");
+      },
+    );
+
+    it("F3: optional Loadout assembly augments governed slots after native context", async () => {
+      const ruleRecord = { ...records.find((record) => record.id === "rule-1")!,
+        sourceNodeIds: ["evidence-real-1"] };
+      const scoreBreakdown = computeRecallScoreBreakdown(
+        ruleRecord,
+        { relevance: 1, scopeFit: 1 },
+        ["vector"],
+        { vector: 1 },
+      );
+      const loadout: AgentLoadout = {
+        id: "loadout-1", scope: { ...baseScope, visibility: "private" },
+        appId: baseScope.appId, agentId: baseScope.agentId, projectId: baseScope.projectId,
+        version: 1, visibility: "private",
+        slotBindings: [{ assetId: "asset-1", slot: "rules", disclosureMode: "must_read",
+          priority: 10, required: true }],
+        nativeMemoryPolicy: {
+          semanticTypes: ["profile", "task_context", "rules", "experience", "resource"],
+          scopeReuse: "project_only", treeDepth: "topic",
+          tokenBudgets: { profile: 500, task_context: 500, rules: 500, experience: 500, resource: 500 },
+        },
+        createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z",
+      };
+      const candidate: LoadoutAssetCandidate = {
+        assetId: "asset-1", assetVersion: 1, assetKind: "memory_view", status: "published",
+        contentValidity: "current", scope: { ...baseScope, visibility: "private" },
+        semanticTypes: ["rules"], recordId: ruleRecord.id, content: "固定安全规则",
+        evidenceRefs: ["evidence-real-1"], lifecycleEligible: true, riskBlocked: false,
+        conflictUnresolved: false, score: scoreBreakdown.score, scoreBreakdown,
+        recallSource: "vector", tokenEstimate: 20,
+      };
+      const governed = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecallHitsForScope: async () => [{ record: ruleRecord, score: scoreBreakdown.score,
+          source: "vector", scoreBreakdown }],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        resolveLoadout: async () => loadout,
+        resolveLoadoutAssetCandidates: async (_scope, resolved, hits) => {
+          expect(resolved).toBe(loadout);
+          expect(hits).toHaveLength(1);
+          return [candidate];
+        },
+      });
+
+      const response = await governed.context({ scope: baseScope, task: "upgrade" });
+
+      expect(response.slots.rules?.sourceIds).toContain("asset:asset-1@1");
+      expect(response.content).toContain("固定安全规则");
+      expect(response.assemblyPlan?.versions.loadout).toBe(1);
+    });
+
+    it("F3: asset enhancement failure degrades to native slots when no binding is required", async () => {
+      const governed = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecallHitsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        resolveLoadout: async () => ({
+          id: "loadout-optional", scope: { ...baseScope, visibility: "private" },
+          appId: baseScope.appId, agentId: baseScope.agentId, projectId: baseScope.projectId,
+          version: 1, visibility: "private", slotBindings: [],
+          nativeMemoryPolicy: {
+            semanticTypes: [], scopeReuse: "project_only", treeDepth: "source",
+            tokenBudgets: { profile: 0, task_context: 0, rules: 0, experience: 0, resource: 0 },
+          },
+          createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z",
+        }),
+        resolveLoadoutAssetCandidates: async () => { throw new Error("asset unavailable"); },
+      });
+
+      const response = await governed.context({ scope: baseScope, task: "upgrade" });
+      expect(response.warnings).toContain("asset_enhancement_disabled: asset unavailable");
+      expect(response.assemblyPlan?.versions.loadout).toBeUndefined();
+    });
+
+    it.each(["loadout lookup", "required binding"])(
+      "F3: %s failure preserves native five-slot context",
+      async (failure) => {
+        const requiredLoadout: AgentLoadout = {
+          id: "loadout-required", scope: { ...baseScope, visibility: "private" },
+          appId: baseScope.appId, agentId: baseScope.agentId, projectId: baseScope.projectId,
+          version: 1, visibility: "private",
+          slotBindings: [{ assetId: "asset-revoked", slot: "rules", disclosureMode: "must_read",
+            priority: 10, required: true }],
+          nativeMemoryPolicy: {
+            semanticTypes: ["rules"], scopeReuse: "project_only", treeDepth: "source",
+            tokenBudgets: { profile: 500, task_context: 500, rules: 500,
+              experience: 500, resource: 500 },
+          },
+          createdAt: "2026-08-13T00:00:00.000Z", updatedAt: "2026-08-13T00:00:00.000Z",
+        };
+        const governed = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecallHitsForScope: async () => [],
+          recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+          resolveLoadout: failure === "loadout lookup"
+            ? async () => { throw new Error("loadout unavailable"); }
+            : async () => requiredLoadout,
+          resolveLoadoutAssetCandidates: async () => [],
+        });
+
+        const response = await governed.context({ scope: baseScope, task: "upgrade" });
+
+        expect(response.content).toContain("<relevant-memories>");
+        expect(response.assemblyPlan?.versions.loadout).toBeUndefined();
+        expect(response.warnings?.some((warning) =>
+          warning.startsWith("asset_enhancement_disabled:"))).toBe(true);
+      },
+    );
+
+    it("F1: assembly plan and drill-down actions use real evidence refs instead of memory ids", async () => {
+      const ruleRecord = records.find((record) => record.id === "rule-1")!;
+      const scoreBreakdown = computeRecallScoreBreakdown(
+        ruleRecord,
+        { relevance: 0.9, scopeFit: 1 },
+        ["text"],
+        { text: 0.9 },
+      );
+      const governed = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecallHitsForScope: async () => [{
+          record: { ...ruleRecord, sourceNodeIds: ["evidence-real-1"] },
+          score: scoreBreakdown.score,
+          source: "text",
+          scoreBreakdown,
+        }],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+      });
+
+      const response = await governed.context({ scope: baseScope, task: "upgrade" });
+
+      expect(response.slots.rules?.sourceIds).toEqual(["rule-1"]);
+      expect(response.slots.rules?.evidenceRefs).toEqual(["evidence-real-1"]);
+      expect(response.taskHints?.[0]?.evidenceIds).toEqual(["evidence-real-1"]);
+      expect(response.assemblyPlan?.slots.rules?.mustRead[0]?.evidenceRefs)
+        .toEqual(["evidence-real-1"]);
+      expect(response.actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: "drill_down",
+          input: expect.objectContaining({ ref: "evidence-real-1", level: "R4" }),
+        }),
+      ]));
+    });
+
     it("返回 5 槽位上下文，包含 task_context / resource / rules", async () => {
       const response = await service.context({
         scope: baseScope,
@@ -149,6 +484,49 @@ describe("AgentFastPathService", () => {
 
       expect(response.taskHints).toBeDefined();
       expect(response.taskHints!.some((h) => h.kind === "rule")).toBe(true);
+    });
+
+    it("taskHints 只来自最终槽位，revoked 与 session_candidate 不能旁路注入", async () => {
+      const activeRule = makeRecord({
+        id: "active-rule",
+        semanticType: "rules",
+        text: "最终槽位里的规则",
+        lifecycleStatus: "active",
+      });
+      const revokedExperience = makeRecord({
+        id: "revoked-experience",
+        semanticType: "experience",
+        text: "task revoked experience",
+        lifecycleStatus: "revoked",
+      });
+      const candidateExperience = makeRecord({
+        id: "candidate-experience",
+        semanticType: "experience",
+        text: "task candidate experience",
+        container: "session_candidate",
+      });
+      const hits = [activeRule, revokedExperience, candidateExperience].map((record) => {
+        const scoreBreakdown = computeRecallScoreBreakdown(
+          record,
+          { relevance: 1, scopeFit: 1 },
+          ["vector"],
+          { vector: 1 },
+        );
+        return { record, score: scoreBreakdown.score, source: "vector" as const, scoreBreakdown };
+      });
+      const governedService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecallHitsForScope: async () => hits,
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+      });
+
+      const response = await governedService.context({ scope: baseScope, task: "task" });
+
+      expect(response.taskHints).toEqual([
+        expect.objectContaining({ kind: "rule", text: "最终槽位里的规则" }),
+      ]);
+      expect(JSON.stringify(response.taskHints)).not.toContain("revoked experience");
+      expect(JSON.stringify(response.taskHints)).not.toContain("candidate experience");
     });
 
     it("第二次请求命中缓存", async () => {
@@ -224,8 +602,13 @@ describe("AgentFastPathService", () => {
       expect(enqueueJob).not.toHaveBeenCalled();
     });
 
-    it.each(["remember", "auto"] as const)("intent=%s 继续写入并入队", async (intent) => {
-      const storeObservation = vi.fn().mockResolvedValue({ id: `obs-${intent}`, stored: true });
+    it.each(["remember", "auto"] as const)("intent=%s 的原始 evidence 只入队 extract_candidate", async (intent) => {
+      const storeObservation = vi.fn().mockResolvedValue({
+        id: `obs-${intent}`,
+        stored: true,
+        recordType: "memory" as const,
+        admissionRoute: "evidence_only" as const,
+      });
       const enqueueJob = vi.fn().mockResolvedValue("job-x");
       const durableService = new AgentFastPathService({
         defaultScope: baseScope,
@@ -249,22 +632,103 @@ describe("AgentFastPathService", () => {
         duplicate: false,
       });
       expect(storeObservation).toHaveBeenCalledTimes(1);
-      expect(enqueueJob).toHaveBeenCalledTimes(3);
+      expect(enqueueJob).toHaveBeenCalledTimes(1);
       const callsByType = Object.fromEntries(enqueueJob.mock.calls.map(([input]) => [input.type, input.payload]));
       expect(callsByType.extract_candidate).toMatchObject({ traceId: `obs-${intent}` });
-      expect(callsByType.build_tree).toMatchObject({
-        traceId: `obs-${intent}`,
-        leaf: { id: `obs-${intent}`, chunkId: `obs-${intent}` },
+      expect(callsByType).not.toHaveProperty("build_tree");
+      expect(callsByType).not.toHaveProperty("extract_graph");
+    });
+
+    it.each(["candidate", "candidate_low_priority"] as const)(
+      "%s 写入只返回治理记录，不触发派生任务",
+      async (admissionRoute) => {
+        const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+        const candidateService = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecordsForScope: async () => [],
+          recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+          storeObservation: async () => ({
+            id: "candidate-1",
+            stored: true,
+            recordType: "candidate" as const,
+            admissionRoute,
+          }),
+          enqueueJob,
+        });
+
+        await expect(candidateService.observeLight({
+          scope: baseScope,
+          eventType: "user_input",
+          text: "该观察经过准入后仍处于候选状态",
+          intent: "auto",
+          idempotencyKey: "request-1",
+        })).resolves.toMatchObject({
+          ack: true,
+          persistedId: "candidate-1",
+          recordType: "candidate",
+          admissionRoute,
+          stored: true,
+          duplicate: false,
+          queuedJobs: [],
+        });
+        expect(enqueueJob).not.toHaveBeenCalled();
+      },
+    );
+
+    it("lookup_only memory 不触发 candidate/tree/graph 派生任务", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      const lookupOnlyService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => ({
+          id: "lookup-only-1",
+          stored: true,
+          recordType: "memory" as const,
+          admissionRoute: "lookup_only" as const,
+        }),
+        enqueueJob,
       });
-      expect(callsByType.extract_graph).toMatchObject({
-        chunkId: `obs-${intent}`,
-        sourceId: baseScope.appId,
-        context: {
-          projectName: baseScope.projectId,
-          userName: baseScope.userId,
-          agentName: baseScope.agentId,
-        },
+
+      await expect(lookupOnlyService.observeLight({
+        scope: baseScope,
+        eventType: "user_input",
+        text: "只允许按需查找的受控记忆",
+        idempotencyKey: "lookup-only-request-1",
+      })).resolves.toMatchObject({
+        persistedId: "lookup-only-1",
+        recordType: "memory",
+        admissionRoute: "lookup_only",
+        queuedJobs: [],
       });
+      expect(enqueueJob).not.toHaveBeenCalled();
+    });
+
+    it("drop 不是可持久化回执，严格拒绝且不触发派生任务", async () => {
+      const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
+      const droppedService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        storeObservation: async () => ({
+          id: "dropped-1",
+          stored: false,
+          recordType: "memory",
+          admissionRoute: "drop",
+        } as never),
+        enqueueJob,
+      });
+
+      await expect(droppedService.observeLight({
+        scope: baseScope,
+        eventType: "system_event",
+        text: "应由 admission drop 的噪声",
+      })).resolves.toMatchObject({
+        persistedId: undefined,
+        queuedJobs: [],
+        warnings: ["observation_store_outcome_invalid"],
+      });
+      expect(enqueueJob).not.toHaveBeenCalled();
     });
 
     it("storeObservation 失败时返回 warning", async () => {
@@ -286,13 +750,18 @@ describe("AgentFastPathService", () => {
       expect(response.queuedJobs).toEqual([]);
     });
 
-    it("F3-2：observe 同时入队 extract_candidate、build_tree 与 extract_graph", async () => {
+    it("F0：active transport receipt 不自行构造 graph/tree，统一等待 committed-active 派生", async () => {
       const enqueueJob = vi.fn().mockResolvedValue("job-x");
       const treeService = new AgentFastPathService({
         defaultScope: baseScope,
         loadRecordsForScope: async () => [],
         recall: async () => ({ scope: baseScope, query: "", hits: [] }),
-        storeObservation: async () => ({ id: "persisted-tree-id", stored: true }),
+        storeObservation: async () => ({
+          id: "persisted-tree-id",
+          stored: true,
+          recordType: "memory" as const,
+          admissionRoute: "active" as const,
+        }),
         enqueueJob,
       });
 
@@ -302,30 +771,7 @@ describe("AgentFastPathService", () => {
         text: "禁止删除生产库",
       });
 
-      const types = enqueueJob.mock.calls.map((c) => (c[0] as { type: string }).type);
-      expect(types).toContain("extract_candidate");
-      expect(types).toContain("build_tree");
-      expect(types).toContain("extract_graph");
-      const treeCall = enqueueJob.mock.calls.find((c) => (c[0] as { type: string }).type === "build_tree");
-      const payload = (treeCall![0] as { payload: Record<string, unknown> }).payload;
-      expect(payload.treeType).toBe("source");
-      expect(payload.treeKey).toBe("s-1");
-      expect(payload).toMatchObject({
-        leaf: {
-          id: "persisted-tree-id",
-          chunkId: "persisted-tree-id",
-        },
-      });
-      const graphCall = enqueueJob.mock.calls.find((c) => (c[0] as { type: string }).type === "extract_graph");
-      expect((graphCall![0] as { payload: Record<string, unknown> }).payload).toMatchObject({
-        chunkId: "persisted-tree-id",
-        sourceId: "s-1",
-        context: {
-          projectName: baseScope.projectId,
-          userName: baseScope.userId,
-          agentName: baseScope.agentId,
-        },
-      });
+      expect(enqueueJob).not.toHaveBeenCalled();
     });
 
     it("100 persistent duplicates return explicit duplicate ack and enqueue no dangling side effects", async () => {
@@ -384,10 +830,10 @@ describe("AgentFastPathService", () => {
         persistedId: "persisted-cleanup-id",
         stored: true,
         duplicate: false,
-        queuedJobs: ["extract_candidate-job", "build_tree-job", "extract_graph-job"],
+        queuedJobs: ["extract_candidate-job"],
         warnings: [DATABASE_STORE_CLEANUP_WARNING],
       });
-      expect(enqueueJob).toHaveBeenCalledTimes(3);
+      expect(enqueueJob).toHaveBeenCalledTimes(1);
     });
 
     it("does not enqueue jobs for duplicate cleanup receipt and keeps the fixed warning", async () => {
@@ -442,7 +888,7 @@ describe("AgentFastPathService", () => {
       expect(enqueueJob).not.toHaveBeenCalled();
     });
 
-    it("100 concurrent new observations bind every downstream payload to the persisted ID", async () => {
+    it("100 concurrent new observations bind every candidate payload to the persisted evidence ID", async () => {
       const enqueueJob = vi.fn(async ({ type, payload }: { type: string; payload: Record<string, unknown> }) =>
         `${type}:${String(payload.traceId)}`);
       const concurrentService = new AgentFastPathService({
@@ -461,13 +907,11 @@ describe("AgentFastPathService", () => {
         })));
 
       expect(results).toHaveLength(100);
-      expect(enqueueJob).toHaveBeenCalledTimes(300);
-      for (const [{ payload }] of enqueueJob.mock.calls) {
-        const persistedId = String(payload.traceId ?? payload.chunkId);
+      expect(enqueueJob).toHaveBeenCalledTimes(100);
+      for (const [{ type, payload }] of enqueueJob.mock.calls) {
+        expect(type).toBe("extract_candidate");
+        const persistedId = String(payload.traceId);
         expect(persistedId).toMatch(/^persisted-observation-/);
-        if (payload.leaf && typeof payload.leaf === "object") {
-          expect(payload.leaf).toMatchObject({ id: persistedId, chunkId: persistedId });
-        }
       }
     });
 
@@ -542,29 +986,69 @@ describe("AgentFastPathService", () => {
       expect(enqueueJob).not.toHaveBeenCalled();
     });
 
-    it("duplicate repair uses only the explicit durable ensure capability", async () => {
-      const enqueueJob = vi.fn().mockResolvedValue("generic-must-not-run");
-      const ensureJob = vi.fn(async ({ type }: { type: string }) => `ensured-${type}`);
-      const repairService = new AgentFastPathService({
-        defaultScope: baseScope,
-        loadRecordsForScope: async () => [],
-        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
-        storeObservation: async () => ({ id: "persisted-existing-repair", stored: false }),
-        enqueueJob,
-        ensureJob,
-      });
+    it.each([
+      {
+        admissionRoute: "evidence_only" as const,
+        recordType: "memory" as const,
+        expectedTypes: ["extract_candidate"],
+      },
+      {
+        admissionRoute: "active" as const,
+        recordType: "memory" as const,
+        expectedTypes: [],
+      },
+      {
+        admissionRoute: "lookup_only" as const,
+        recordType: "memory" as const,
+        expectedTypes: [],
+      },
+      {
+        admissionRoute: "candidate" as const,
+        recordType: "candidate" as const,
+        expectedTypes: [],
+      },
+      {
+        admissionRoute: "candidate_low_priority" as const,
+        recordType: "candidate" as const,
+        expectedTypes: [],
+      },
+    ])(
+      "同幂等键 $admissionRoute replay/ensure 只保持路由对应 job 集合",
+      async ({ admissionRoute, recordType, expectedTypes }) => {
+        const enqueueJob = vi.fn().mockResolvedValue("generic-must-not-run");
+        const ensureJob = vi.fn(async ({ type }: { type: string }) => `ensured-${type}`);
+        const repairService = new AgentFastPathService({
+          defaultScope: baseScope,
+          loadRecordsForScope: async () => [],
+          recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+          storeObservation: async ({ idempotencyKey }) => {
+            expect(idempotencyKey).toBe("stable-replay-key");
+            return {
+              id: `persisted-${admissionRoute}`,
+              stored: false,
+              recordType,
+              admissionRoute,
+            };
+          },
+          enqueueJob,
+          ensureJob,
+        });
 
-      await expect(repairService.observeLight({
-        scope: baseScope,
-        eventType: "user_input",
-        text: "repair missing derived jobs",
-      })).resolves.toMatchObject({
-        duplicate: true,
-        queuedJobs: ["ensured-extract_candidate", "ensured-build_tree", "ensured-extract_graph"],
-      });
-      expect(ensureJob).toHaveBeenCalledTimes(3);
-      expect(enqueueJob).not.toHaveBeenCalled();
-    });
+        await expect(repairService.observeLight({
+          scope: baseScope,
+          eventType: "user_input",
+          text: "repair only route-owned jobs",
+          idempotencyKey: "stable-replay-key",
+        })).resolves.toMatchObject({
+          persistedId: `persisted-${admissionRoute}`,
+          admissionRoute,
+          duplicate: true,
+          queuedJobs: expectedTypes.map((type) => `ensured-${type}`),
+        });
+        expect(ensureJob.mock.calls.map(([input]) => input.type)).toEqual(expectedTypes);
+        expect(enqueueJob).not.toHaveBeenCalled();
+      },
+    );
 
     it("missing storeObservation dependency does not enqueue jobs with an unpersisted traceId", async () => {
       const enqueueJob = vi.fn().mockResolvedValue("must-not-enqueue");
@@ -588,6 +1072,68 @@ describe("AgentFastPathService", () => {
   });
 
   describe("lookup()", () => {
+    it("F1: lookup hydrates real evidence previews and advertises drill-down only when available", async () => {
+      const record = { ...records[0]!, sourceNodeIds: ["evidence-real-1"] };
+      const scoreBreakdown = computeRecallScoreBreakdown(
+        record,
+        { relevance: 0.9, scopeFit: 1 },
+        ["text"],
+        { text: 0.9 },
+      );
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        recall: async () => ({
+          scope: baseScope,
+          query: "upgrade",
+          hits: [{ record, score: scoreBreakdown.score, source: "text", scoreBreakdown }],
+        }),
+        readEvidence: async (_scope, refs) => refs.map((ref) => ({
+          ref,
+          preview: "original evidence",
+          source: "memory",
+        })),
+      });
+
+      const response = await testService.lookup({ scope: baseScope, query: "upgrade" });
+
+      expect(response.hits[0]?.evidence).toEqual([
+        { id: "evidence-real-1", preview: "original evidence" },
+      ]);
+      expect(response.hits[0]?.actions).toContain("drill_down");
+    });
+
+    it("F1: memory_navigate and evidence_read stay inside normalized authority scope", async () => {
+      const navigate = vi.fn(async (_scope: MemoryScope) => [{
+        ref: "evidence-real-1",
+        kind: "evidence" as const,
+        level: "R4" as const,
+        title: "Evidence",
+      }]);
+      const readEvidence = vi.fn(async (_scope: MemoryScope) => [{
+        ref: "evidence-real-1",
+        preview: "original evidence",
+        source: "memory" as const,
+      }]);
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        navigate,
+        readEvidence,
+      });
+
+      await expect(testService.navigate({
+        scope: { appId: baseScope.appId, projectId: baseScope.projectId },
+        ref: "goal-1",
+        level: "R0",
+      })).resolves.toMatchObject({ items: [{ ref: "evidence-real-1", level: "R4" }] });
+      await expect(testService.evidenceRead({
+        scope: { appId: baseScope.appId, projectId: baseScope.projectId },
+        refs: ["evidence-real-1"],
+      })).resolves.toMatchObject({ evidence: [{ ref: "evidence-real-1" }] });
+      expect(navigate.mock.calls[0]?.[0]).toEqual(baseScope);
+      expect(readEvidence.mock.calls[0]?.[0]).toEqual(baseScope);
+    });
+
     it("返回符合 query 的 hits", async () => {
       const response = await service.lookup({
         scope: baseScope,
@@ -596,6 +1142,39 @@ describe("AgentFastPathService", () => {
 
       expect(response.hits.length).toBeGreaterThan(0);
       expect(response.hits[0].preview).toContain("LanceDB");
+    });
+
+    it("缺少唯一六因子回执时 lookup fail-closed", async () => {
+      const invalidService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({
+          scope: baseScope,
+          query: "invalid",
+          hits: [{ record: records[0], score: 0.9, source: "vector" }],
+        }),
+      });
+
+      await expect(invalidService.lookup({ scope: baseScope, query: "invalid" }))
+        .rejects.toThrow("RECALL_SCORE_BREAKDOWN_REQUIRED");
+    });
+
+    it("原样透传 governed retrieval filteredReason", async () => {
+      const filtered = [{
+        candidateId: "tree:blocked",
+        authoritativeRecordId: "memory-blocked",
+        source: "tree" as const,
+        filteredReason: "risk_blocked" as const,
+      }];
+      const lookupService = new AgentFastPathService({
+        defaultScope: baseScope,
+        loadRecordsForScope: async () => [],
+        recall: async () => ({ scope: baseScope, query: "blocked", hits: [], filtered }),
+      });
+
+      const response = await lookupService.lookup({ scope: baseScope, query: "blocked" });
+
+      expect(response.filtered).toBe(filtered);
     });
 
     it("recall 失败时返回 warning", async () => {
@@ -614,7 +1193,7 @@ describe("AgentFastPathService", () => {
       expect(response.hits).toEqual([]);
     });
 
-    it("F3-3：deep 模式融合记忆树摘要", async () => {
+    it("F0：裸 tree summary 缺少六因子回执时不进入 lookup，并明确降级", async () => {
       const treeNode = {
         id: "sum_1",
         scope: baseScope,
@@ -648,10 +1227,8 @@ describe("AgentFastPathService", () => {
         mode: "deep",
       });
 
-      const treeHit = response.hits.find((h) => h.source === "tree:source");
-      expect(treeHit).toBeDefined();
-      expect(treeHit?.preview).toContain("LanceDB");
-      expect(treeHit?.evidence.length).toBe(2);
+      expect(response.hits.find((h) => h.source === "tree:source")).toBeUndefined();
+      expect(response.warnings).toContain("tree_recall_breakdown_unavailable");
     });
 
     it("F3-3：fast 模式不查树", async () => {
@@ -997,14 +1574,35 @@ describe("AgentFastPathService", () => {
   });
 
   describe("sessionCommit()", () => {
-    it("入队 refresh + extract job", async () => {
+    it("同步失效 slot cache，并且只入队有 consumer 的 extract job", async () => {
+      const invalidateCache = vi.fn();
+      const enqueueJob = vi.fn().mockResolvedValue("job-extract");
+      const testService = new AgentFastPathService({
+        defaultScope: baseScope,
+        recall: async () => ({ scope: baseScope, query: "", hits: [] }),
+        enqueueJob,
+        builder: {
+          buildSlotContext: vi.fn(),
+          buildSlotContextFromRecallHits: vi.fn(),
+          invalidateCache,
+        } as unknown as ConstructorParameters<typeof AgentFastPathService>[0]["builder"],
+      });
       const response = await service.sessionCommit({
         scope: baseScope,
         summary: "today we upgraded the schema",
       });
 
       expect(response.ack).toBe(true);
-      expect(response.jobs.length).toBeGreaterThanOrEqual(1);
+      expect(response.jobs).toEqual(["job-1"]);
+
+      const explicit = await testService.sessionCommit({
+        scope: baseScope,
+        summary: "today we upgraded the schema",
+      });
+      expect(explicit.jobs).toEqual(["job-extract"]);
+      expect(invalidateCache).toHaveBeenCalledWith(baseScope);
+      expect(enqueueJob).toHaveBeenCalledOnce();
+      expect(enqueueJob.mock.calls[0]?.[0]).toMatchObject({ type: "extract_candidate" });
     });
   });
 });

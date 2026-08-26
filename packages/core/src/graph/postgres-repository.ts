@@ -94,9 +94,9 @@ const ENTITY_UPDATE_SQL = `UPDATE ${MENGSHU_GRAPH_ENTITY_RELATION} SET
   mention_count_30d = mention_count_30d + $17,
   distinct_source_count = GREATEST(distinct_source_count, $18),
   last_seen_at = CASE
-    WHEN last_seen_at IS NULL THEN $19
-    WHEN $19 IS NULL THEN last_seen_at
-    ELSE GREATEST(last_seen_at, $19)
+    WHEN last_seen_at IS NULL THEN $19::bigint
+    WHEN $19::bigint IS NULL THEN last_seen_at
+    ELSE GREATEST(last_seen_at, $19::bigint)
   END,
   hotness = GREATEST(hotness, $20),
   graph_centrality = COALESCE($21, graph_centrality),
@@ -167,6 +167,7 @@ WHERE scope_fingerprint = $2
   AND tenant_id = $3 AND user_id = $4 AND app_id = $5 AND project_id = $6
   AND agent_id = $7 AND namespace = $8 AND visibility = $9
   AND workspace_id = $10 AND session_id = $11 AND id = $1
+  AND $17::bigint = jsonb_array_length($16::jsonb)
 RETURNING id`;
 
 function invalid(label = "Postgres graph input is invalid"): Error {

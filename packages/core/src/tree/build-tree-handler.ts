@@ -107,6 +107,14 @@ export function createBuildTreeHandler(deps: BuildTreeHandlerDeps): JobHandler {
     const now = Date.now();
     const completeLeafData = completeLeaf({ ...leaf, scope }, now);
 
+    // A sealed target has no open buffer. Detect it before append so a job
+    // replay returns the original summary instead of creating a second buffer.
+    const summaries = await deps.repository.listSummaries({ scope, treeType, treeKey });
+    const sealedReplay = summaries.find((node) => node.leafIds.includes(completeLeafData.id));
+    if (sealedReplay) {
+      return { sealed: true, nodeId: sealedReplay.id };
+    }
+
     // 追加 leaf 到 buffer
     const { buffer, shouldSeal } = await appendLeafToBuffer(
       deps.repository,

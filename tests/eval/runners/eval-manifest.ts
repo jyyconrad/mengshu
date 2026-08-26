@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { isKnownEvalMetricName } from "./eval-metrics.js";
+import {
+  isKnownEvalMetricName,
+  REQUIRED_PRODUCTION_STAGES,
+} from "./eval-metrics.js";
+import type { ProductionRuntimeStage } from "./types.js";
 
 export type EvalSuiteKind = "baseline" | "extension";
 
@@ -14,7 +18,29 @@ export interface EvalSuiteDefinition {
   sha256: string;
   metrics: string[];
   gate?: Record<string, number>;
+  requiredProductionStages?: ProductionRuntimeStage[];
   [key: string]: unknown;
+}
+
+function requireProductionStages(
+  value: unknown,
+  suiteName: string,
+  manifestPath: string,
+): ProductionRuntimeStage[] {
+  if (!Array.isArray(value)) {
+    fail(manifestPath, `runtime-e2e suite '${suiteName}'.requiredProductionStages 必须为数组`);
+  }
+  const stages = value.filter((stage): stage is ProductionRuntimeStage =>
+    typeof stage === "string" &&
+    REQUIRED_PRODUCTION_STAGES.includes(stage as ProductionRuntimeStage));
+  if (stages.length !== value.length || new Set(stages).size !== stages.length ||
+      REQUIRED_PRODUCTION_STAGES.some((stage) => !stages.includes(stage))) {
+    fail(
+      manifestPath,
+      `runtime-e2e suite '${suiteName}'.requiredProductionStages 必须完整声明五阶段`,
+    );
+  }
+  return [...REQUIRED_PRODUCTION_STAGES];
 }
 
 export interface EvalManifest {
@@ -203,6 +229,9 @@ export function loadEvalManifest(manifestPath: string): EvalManifest {
     const gate = kind === "extension"
       ? requireGate(value.gate, name, metrics, absolutePath)
       : undefined;
+    const requiredProductionStages = value.runMode === "runtime-e2e"
+      ? requireProductionStages(value.requiredProductionStages, name, absolutePath)
+      : undefined;
 
     suites[name] = {
       ...value,
@@ -214,6 +243,7 @@ export function loadEvalManifest(manifestPath: string): EvalManifest {
       sha256: value.sha256,
       metrics,
       ...(gate ? { gate } : {}),
+      ...(requiredProductionStages ? { requiredProductionStages } : {}),
     };
     verifySuiteFile(name, suites[name], absolutePath);
   }

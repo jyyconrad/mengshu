@@ -11,8 +11,18 @@ import {
   createWriteIdempotencyIdentity,
   validateMemoryWriteReceipt,
   type MemoryWriteReceipt,
+  type NormalizedMemoryWriteReceipt,
   type WriteIdempotencyIdentity,
 } from "./write-kernel-transaction.js";
+import type { MemoryCategory } from "../../../../config.js";
+import type {
+  MemoryContainer,
+  MemoryKind,
+  MemorySemanticType,
+  RecordProvenance,
+} from "../domain/types.js";
+import type { DataType, TableName } from "../db/types.js";
+import type { ValueScoreSignalProvenance } from "../scoring/value-score-signals.js";
 
 export type WriteAdmissionRoute =
   | "drop"
@@ -22,6 +32,9 @@ export type WriteAdmissionRoute =
   | "lookup_only"
   | "evidence_only";
 
+export type CandidateWriteAdmissionRoute = "candidate_low_priority" | "candidate";
+export type MemoryWriteAdmissionRoute = "active" | "lookup_only" | "evidence_only";
+
 export interface WriteScope {
   tenantId: string;
   userId: string;
@@ -29,6 +42,8 @@ export interface WriteScope {
   projectId: string;
   agentId: string;
   namespace: string;
+  workspaceId?: string;
+  sessionId?: string;
   visibility?: "private" | "workspace" | "team" | "public";
 }
 
@@ -42,6 +57,17 @@ interface WriteCommandContext {
 
 interface TextWriteCommand extends WriteCommandContext {
   text: string;
+  /** Mengshu 底层通用分类；即使没有 5-slot semanticType 也必须保留。 */
+  kind: MemoryKind;
+  /** 可选上下文视图。kind-only 显式保存可以持久化，但不会进入 5 槽位。 */
+  semanticType?: MemorySemanticType;
+  container?: MemoryContainer;
+  confidence?: number;
+  category?: MemoryCategory;
+  dataType?: DataType;
+  tableName?: TableName;
+  provenance?: Readonly<RecordProvenance>;
+  evidenceIds?: readonly string[];
   /** Untrusted caller-supplied vector; never consumed before embeddingGuard. */
   vector?: readonly number[];
 }
@@ -87,11 +113,15 @@ export interface WriteAdmissionResult {
   route: WriteAdmissionRoute;
   valueScore: number;
   reason?: string;
+  breakdown?: Readonly<Record<string, number>>;
+  valueSignalProvenance?: ValueScoreSignalProvenance;
 }
 
 export interface WriteDedupResult {
   duplicate: boolean;
   duplicateOf?: string;
+  /** Deterministic dedup layer used for explain/audit; legacy adapters may omit it. */
+  layer?: "exact" | "lexical" | "semantic";
 }
 
 interface BaseWriteMemoryRecord {
@@ -109,6 +139,27 @@ export type WriteMemoryRecord =
       vector: readonly number[];
       route: WriteAdmissionRoute;
       valueScore: number;
+      /**
+       * Recall salience, computed independently from admission valueScore.
+       * Optional only for transitional provider fixtures; kernel output always sets it and
+       * persistence mappers reject a missing value.
+       */
+      importance?: number;
+      kind: MemoryKind;
+      semanticType?: MemorySemanticType;
+      container?: MemoryContainer;
+      confidence?: number;
+      category?: MemoryCategory;
+      dataType?: DataType;
+      tableName?: TableName;
+      provenance: Readonly<RecordProvenance>;
+      evidenceIds: readonly string[];
+      governance: Readonly<{
+        candidate: ValidatedWriteCandidate;
+        admissionReason?: string;
+        admissionBreakdown?: Readonly<Record<string, number>>;
+        valueSignalProvenance?: ValueScoreSignalProvenance;
+      }>;
       correctsId?: string;
       sourceId?: string;
     })
@@ -118,9 +169,9 @@ export type WriteMemoryRecord =
       lifecycleAction: "revoke" | "archive" | "delete";
     });
 
-export interface WriteAuditEvent {
-  action: "memory.write";
+interface BaseWriteAuditEvent {
   memoryId: string;
+  requestFingerprint: string;
   commandType: MemoryWriteCommand["type"];
   scope: WriteScope;
   route?: WriteAdmissionRoute;
@@ -128,20 +179,33 @@ export interface WriteAuditEvent {
   at: number;
 }
 
-export interface WriteOutboxEvent {
-  topic: "memory.written" | "memory.lifecycle.changed";
+export type WriteAuditEvent = BaseWriteAuditEvent & (
+  | { action: "candidate.write"; recordType: "candidate" }
+  | { action: "memory.write"; recordType?: "memory" }
+);
+
+interface BaseWriteOutboxEvent {
   memoryId: string;
+  requestFingerprint: string;
   commandType: MemoryWriteCommand["type"];
   scope: WriteScope;
   correctionKind?: MemoryCorrectionKind;
   at: number;
 }
 
+export type WriteOutboxEvent = BaseWriteOutboxEvent & (
+  | { topic: "candidate.written"; recordType: "candidate" }
+  | { topic: "memory.written" | "memory.lifecycle.changed"; recordType?: "memory" }
+);
+
 export interface MemoryWriteTransactionContext {
   /** Must lock this identity for the lifetime of the callback transaction. */
   getReceipt(identity: WriteIdempotencyIdentity): Promise<MemoryWriteReceipt | undefined>;
   saveReceipt(receipt: MemoryWriteReceipt): Promise<void>;
-  writeMemory(memory: WriteMemoryRecord): Promise<void>;
+  writeMemory(memory: WriteMemoryRecord): Promise<{
+    memoryId: string;
+    stored: boolean;
+  }>;
   appendAudit(event: WriteAuditEvent): Promise<void>;
   appendOutbox(event: WriteOutboxEvent): Promise<void>;
 }
@@ -180,6 +244,7 @@ export interface MemoryWriteKernelDependencies {
     vector: readonly number[];
     candidate: ValidatedWriteCandidate;
   }): Promise<WriteAdmissionResult> | WriteAdmissionResult;
+  scoreImportance(input: WritePipelineInput): Promise<number> | number;
   exactDedup(input: WritePipelineInput): Promise<WriteDedupResult> | WriteDedupResult;
   semanticDedup(input: WritePipelineInput): Promise<WriteDedupResult> | WriteDedupResult;
   /** Resolves only after commit; rejects on work, receipt, commit, or release failure. */
@@ -187,7 +252,7 @@ export interface MemoryWriteKernelDependencies {
   ack(input: {
     command: MemoryWriteCommand;
     /** Receipt is committed before this post-commit presentation hook is invoked. */
-    committedReceipt: MemoryWriteReceipt;
+    committedReceipt: NormalizedMemoryWriteReceipt;
   }): Promise<void> | void;
   createId(): string;
   now(): number;
@@ -202,11 +267,42 @@ export interface WritePipelineInput {
   admission: WriteAdmissionResult;
 }
 
+export type PersistedMemoryWriteResult = {
+  status: "persisted";
+  route: MemoryWriteAdmissionRoute;
+  recordType: "memory";
+  memoryId: string;
+  stored: boolean;
+};
+
+export type PersistedCandidateWriteResult = {
+  status: "persisted";
+  route: CandidateWriteAdmissionRoute;
+  recordType: "candidate";
+  candidateId: string;
+  /** Compatibility alias for callers that historically consumed only memoryId. */
+  memoryId: string;
+  stored: boolean;
+};
+
+export type PersistedLifecycleWriteResult = {
+  status: "persisted";
+  correctionKind: Exclude<MemoryCorrectionKind, "replaceText">;
+  recordType: "memory";
+  memoryId: string;
+  stored: boolean;
+};
+
 export type MemoryWriteKernelResult =
-  | ({ status: "persisted"; route: WriteAdmissionRoute; memoryId: string } & Readonly<Record<string, unknown>>)
-  | ({ status: "persisted"; correctionKind: Exclude<MemoryCorrectionKind, "replaceText">; memoryId: string } & Readonly<Record<string, unknown>>)
+  | PersistedMemoryWriteResult
+  | PersistedCandidateWriteResult
+  | PersistedLifecycleWriteResult
   | { status: "rejected"; reason: string }
-  | { status: "duplicate"; kind: "exact" | "semantic"; duplicateOf?: string }
+  | {
+      status: "duplicate";
+      kind: "exact" | "lexical" | "semantic";
+      duplicateOf?: string;
+    }
   | { status: "ignored"; durable: false };
 
 export type WriteKernelErrorCode =
@@ -235,6 +331,33 @@ function persistedRoute(
   return admission.route;
 }
 
+function isCandidateRoute(route: WriteAdmissionRoute): route is CandidateWriteAdmissionRoute {
+  return route === "candidate_low_priority" || route === "candidate";
+}
+
+function isMemoryRoute(route: WriteAdmissionRoute): route is MemoryWriteAdmissionRoute {
+  return route === "active" || route === "lookup_only" || route === "evidence_only";
+}
+
+function validScore(value: number, label: string): number {
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`write kernel ${label} must be within [0,1]`);
+  }
+  return value;
+}
+
+function governedConfidence(
+  command: MemoryWriteCommand,
+  candidate: ValidatedWriteCandidate,
+): number | undefined {
+  if (typeof candidate.confidence === "number") {
+    return validScore(candidate.confidence, "confidence");
+  }
+  return "confidence" in command && command.confidence !== undefined
+    ? validScore(command.confidence, "confidence")
+    : undefined;
+}
+
 function isLifecycleCorrection(
   command: MemoryWriteCommand,
 ): command is Extract<CorrectMemoryCommand, { correctionKind: "revoke" | "archive" | "delete" }> {
@@ -248,8 +371,8 @@ export class MemoryWriteKernel {
     existing: MemoryWriteReceipt,
     identity: WriteIdempotencyIdentity,
     fingerprint: string,
-  ): MemoryWriteReceipt {
-    let validated: MemoryWriteReceipt;
+  ): NormalizedMemoryWriteReceipt {
+    let validated: NormalizedMemoryWriteReceipt;
     try {
       validated = validateMemoryWriteReceipt(existing, identity);
     } catch (error) {
@@ -269,7 +392,7 @@ export class MemoryWriteKernel {
 
   private async acknowledge(
     command: MemoryWriteCommand,
-    receipt: MemoryWriteReceipt,
+    receipt: NormalizedMemoryWriteReceipt,
   ): Promise<Extract<MemoryWriteKernelResult, { status: "persisted" }>> {
     await this.dependencies.ack({ command, committedReceipt: receipt });
     return receipt.result;
@@ -281,48 +404,82 @@ export class MemoryWriteKernel {
     identity: WriteIdempotencyIdentity,
     fingerprint: string,
   ): Promise<Extract<MemoryWriteKernelResult, { status: "persisted" }>> {
-    const result: Extract<MemoryWriteKernelResult, { status: "persisted" }> =
-      memory.mutation === "lifecycle"
-        ? {
-            status: "persisted",
-            correctionKind: memory.lifecycleAction,
-            memoryId: memory.id,
-          }
-        : {
-            status: "persisted",
-            route: memory.route,
-            memoryId: memory.id,
-          };
-    const proposedReceipt = createMemoryWriteReceipt(identity, fingerprint, result);
-
     // Final short transaction performs the concurrency second-check and all durable mutation.
     const committedReceipt = await this.dependencies.transaction(async (transaction) => {
       const winner = await transaction.getReceipt(identity);
       if (winner) return this.validateExistingReceipt(winner, identity, fingerprint);
 
-      await transaction.writeMemory(memory);
-      await transaction.appendAudit({
-        action: "memory.write",
-        memoryId: memory.id,
-        commandType: command.type,
-        scope: memory.scope,
-        ...(memory.mutation === "lifecycle"
-          ? { correctionKind: memory.lifecycleAction }
-          : { route: memory.route }),
-        at: memory.createdAt,
-      });
-      await transaction.appendOutbox({
-        topic: memory.mutation === "lifecycle"
-          ? "memory.lifecycle.changed"
-          : "memory.written",
-        memoryId: memory.id,
-        commandType: command.type,
-        scope: memory.scope,
-        ...(memory.mutation === "lifecycle"
-          ? { correctionKind: memory.lifecycleAction }
-          : {}),
-        at: memory.createdAt,
-      });
+      const mutation = await transaction.writeMemory(memory);
+      if (typeof mutation.memoryId !== "string" || mutation.memoryId.length === 0 ||
+          typeof mutation.stored !== "boolean") {
+        throw new Error("write transaction returned an invalid mutation result");
+      }
+      const result: Extract<MemoryWriteKernelResult, { status: "persisted" }> =
+        memory.mutation === "lifecycle"
+          ? {
+              status: "persisted",
+              correctionKind: memory.lifecycleAction,
+              recordType: "memory",
+              memoryId: mutation.memoryId,
+              stored: mutation.stored,
+            }
+          : isCandidateRoute(memory.route)
+          ? {
+              status: "persisted",
+              route: memory.route,
+              recordType: "candidate",
+              candidateId: mutation.memoryId,
+              memoryId: mutation.memoryId,
+              stored: mutation.stored,
+            }
+          : isMemoryRoute(memory.route)
+          ? {
+              status: "persisted",
+              route: memory.route,
+              recordType: "memory",
+              memoryId: mutation.memoryId,
+              stored: mutation.stored,
+            }
+          : (() => { throw new Error("write kernel cannot persist a drop route"); })();
+      const proposedReceipt = createMemoryWriteReceipt(identity, fingerprint, result);
+
+      if (mutation.stored) {
+        const recordType = memory.mutation === "content" && isCandidateRoute(memory.route)
+          ? "candidate" as const
+          : "memory" as const;
+        const auditBase: BaseWriteAuditEvent = {
+          memoryId: mutation.memoryId,
+          requestFingerprint: fingerprint,
+          commandType: command.type,
+          scope: memory.scope,
+          ...(memory.mutation === "lifecycle"
+            ? { correctionKind: memory.lifecycleAction }
+            : { route: memory.route }),
+          at: memory.createdAt,
+        };
+        await transaction.appendAudit(recordType === "candidate"
+          ? { ...auditBase, action: "candidate.write", recordType: "candidate" }
+          : { ...auditBase, action: "memory.write", recordType: "memory" });
+        const outboxBase: BaseWriteOutboxEvent = {
+          memoryId: mutation.memoryId,
+          requestFingerprint: fingerprint,
+          commandType: command.type,
+          scope: memory.scope,
+          ...(memory.mutation === "lifecycle"
+            ? { correctionKind: memory.lifecycleAction }
+            : {}),
+          at: memory.createdAt,
+        };
+        await transaction.appendOutbox(recordType === "candidate"
+          ? { ...outboxBase, topic: "candidate.written", recordType: "candidate" }
+          : {
+              ...outboxBase,
+              topic: memory.mutation === "lifecycle"
+                ? "memory.lifecycle.changed"
+                : "memory.written",
+              recordType: "memory",
+            });
+      }
       await transaction.saveReceipt(proposedReceipt);
       return proposedReceipt;
     });
@@ -430,17 +587,30 @@ export class MemoryWriteKernel {
         candidate: validation.candidate,
         admission,
     };
+    const importance = validScore(
+      await this.dependencies.scoreImportance(pipelineInput),
+      "importance",
+    );
 
     const exact = await this.dependencies.exactDedup(pipelineInput);
     if (exact.duplicate) {
-      return { status: "duplicate", kind: "exact", duplicateOf: exact.duplicateOf };
+      return {
+        status: "duplicate",
+        kind: exact.layer ?? "exact",
+        duplicateOf: exact.duplicateOf,
+      };
     }
     const semantic = await this.dependencies.semanticDedup(pipelineInput);
     if (semantic.duplicate) {
-      return { status: "duplicate", kind: "semantic", duplicateOf: semantic.duplicateOf };
+      return {
+        status: "duplicate",
+        kind: semantic.layer ?? "semantic",
+        duplicateOf: semantic.duplicateOf,
+      };
     }
 
     const route = persistedRoute(command, admission);
+    const confidence = governedConfidence(command, validation.candidate);
     const memory: WriteMemoryRecord = {
         id: this.dependencies.createId(),
         commandType: command.type,
@@ -451,6 +621,28 @@ export class MemoryWriteKernel {
         vector,
         route,
         valueScore: admission.valueScore,
+        importance,
+        kind: command.kind,
+        ...(command.semanticType === undefined ? {} : { semanticType: command.semanticType }),
+        ...(command.container === undefined ? {} : { container: command.container }),
+        ...(confidence === undefined ? {} : { confidence }),
+        ...(command.category === undefined ? {} : { category: command.category }),
+        ...(command.dataType === undefined ? {} : { dataType: command.dataType }),
+        ...(command.tableName === undefined ? {} : { tableName: command.tableName }),
+        provenance: Object.freeze({ ...(command.provenance ?? {}) }),
+        evidenceIds: Object.freeze([...(command.evidenceIds ?? [])]),
+        governance: Object.freeze({
+          candidate: validation.candidate,
+          ...(admission.reason === undefined
+            ? {}
+            : { admissionReason: admission.reason }),
+          ...(admission.breakdown === undefined
+            ? {}
+            : { admissionBreakdown: Object.freeze({ ...admission.breakdown }) }),
+          ...(admission.valueSignalProvenance === undefined
+            ? {}
+            : { valueSignalProvenance: admission.valueSignalProvenance }),
+        }),
         createdAt: this.dependencies.now(),
         ...(command.type === "correctMemory" ? { correctsId: command.targetId } : {}),
         ...(command.type === "importEvidence" ? { sourceId: command.sourceId } : {}),

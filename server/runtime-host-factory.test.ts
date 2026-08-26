@@ -10,11 +10,13 @@ import {
   type PostgresDurableJobV2RuntimeBundle,
 } from "../packages/core/src/db/providers/postgres.js";
 import { PostgresDurableJobV2Repository } from "../packages/core/src/storage/repositories/postgres-job-v2.js";
+import type { AuthorityScope } from "../packages/core/src/domain/authority-scope.js";
 import type {
+  BroadAuthorityDurableJobV2RepositoryPort,
+  BroadAuthorityDurableJobV2SupervisorHandle,
+  BroadAuthorityDurableJobV2SupervisorOptions,
   DurableJobV2AuthoritativeHandlerRegistry,
   DurableJobV2RepositoryPort,
-  DurableJobV2WorkerLoopHandle,
-  DurableJobV2WorkerLoopOptions,
 } from "./workers-v2.js";
 import {
   RuntimeHostError,
@@ -34,6 +36,18 @@ const scope: DurableJobV2Scope = {
   agentId: "agent-a",
   namespace: "working-context",
   visibility: "private",
+};
+
+const broadAuthority: AuthorityScope = {
+  tenantId: scope.tenantId,
+  userId: scope.userId,
+  allow: {
+    appIds: [scope.appId],
+    projectIds: [scope.projectId, "project-b", "project-c"],
+    agentIds: [scope.agentId],
+    namespaces: [scope.namespace],
+    visibilities: [scope.visibility],
+  },
 };
 
 function fakeRepository(): DurableJobV2RepositoryPort {
@@ -155,6 +169,84 @@ function runtime(
 }
 
 describe("createServeRuntimeHost", () => {
+  test("有效 production composition 缺 authority 时在启动副作用前 fail-closed", () => {
+    const { provider, bundle } = providerBundle();
+    const source = runtime(
+      "postgres",
+      mintedCapability(authoritativeRegistry(), scope, bundle.repository),
+      bundle,
+      true,
+      provider,
+    );
+
+    expect(() => createServeRuntimeHost(source)).toThrow(
+      expect.objectContaining({ code: "DURABLE_JOB_V2_AUTHORITY_REQUIRED" }),
+    );
+    expect(source.start).not.toHaveBeenCalled();
+  });
+
+  test("production Host 使用有界 broad-authority supervisor 并保持 worker-first stop", async () => {
+    const calls: string[] = [];
+    const { provider, bundle } = providerBundle(calls);
+    const worker = {
+      tick: vi.fn(async () => []),
+      stop: vi.fn(async () => {
+        calls.push("supervisor:stop");
+        return { status: "stopped" as const };
+      }),
+      snapshot: vi.fn(() => ({
+        state: "healthy" as const,
+        ready: true,
+        consecutiveFailures: 0,
+        failingScopes: 0,
+      })),
+    };
+    const startSupervisor = vi.fn((
+      _repository: BroadAuthorityDurableJobV2RepositoryPort,
+      options: BroadAuthorityDurableJobV2SupervisorOptions,
+    ) => {
+      calls.push("supervisor:start");
+      expect(options).toMatchObject({
+        authority: broadAuthority,
+        workerId: "mengshu-serve-worker",
+        leaseMs: 30_000,
+        heartbeatIntervalMs: 10_000,
+        intervalMs: 1_000,
+        maxScopesPerTick: 100,
+        maxJobsPerTick: 100,
+        stopTimeoutMs: 5_000,
+      });
+      expect(options).not.toHaveProperty("scope");
+      return worker;
+    });
+    const source = runtime(
+      "postgres",
+      mintedCapability(authoritativeRegistry(), scope, bundle.repository),
+      bundle,
+      true,
+      provider,
+    );
+    source.start.mockImplementation(async () => { calls.push("runtime:start"); });
+    source.stop.mockImplementation(async () => { calls.push("runtime:stop"); });
+
+    const host = createServeRuntimeHost(source, {
+      authority: broadAuthority,
+      startSupervisor,
+    });
+    await host.start();
+    await host.stop();
+
+    expect(startSupervisor).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual([
+      "bundle:ready",
+      "runtime:start",
+      "supervisor:start",
+      "supervisor:stop",
+      "runtime:stop",
+      "bundle:close",
+    ]);
+  });
+
   test("production factory 拒绝裸 capability，且 exact-three 来自 core SSOT", () => {
     const source = runtime("postgres", mintedCapability());
 
@@ -173,14 +265,17 @@ describe("createServeRuntimeHost", () => {
     const { provider, bundle } = providerBundle();
     const forged = capability({ repository: bundle.repository });
     const source = runtime("postgres", forged, bundle, true, provider);
-    const startWorker = vi.fn();
+    const startSupervisor = vi.fn();
 
-    expect(() => createServeRuntimeHost(source, { startWorker })).toThrow(
+    expect(() => createServeRuntimeHost(source, {
+      authority: broadAuthority,
+      startSupervisor,
+    })).toThrow(
       new RuntimeHostFactoryError("DURABLE_JOB_V2_CAPABILITY_INVALID"),
     );
 
     expect(source.start).not.toHaveBeenCalled();
-    expect(startWorker).not.toHaveBeenCalled();
+    expect(startSupervisor).not.toHaveBeenCalled();
   });
 
   test("native capability constructor 拒绝单类型 registry，且复制冻结 exact SSOT/scope", () => {
@@ -217,12 +312,15 @@ describe("createServeRuntimeHost", () => {
 
   test("非 Postgres 明确 fail-closed，绝不探测或构造旧 jobs fallback", () => {
     const source = runtime("lancedb", capability());
-    const startWorker = vi.fn();
+    const startSupervisor = vi.fn();
 
-    expect(() => createServeRuntimeHost(source, { startWorker }))
+    expect(() => createServeRuntimeHost(source, {
+      authority: broadAuthority,
+      startSupervisor,
+    }))
       .toThrow(new RuntimeHostFactoryError("DURABLE_JOB_V2_POSTGRES_REQUIRED"));
 
-    expect(startWorker).not.toHaveBeenCalled();
+    expect(startSupervisor).not.toHaveBeenCalled();
     expect(source.start).not.toHaveBeenCalled();
   });
 
@@ -259,28 +357,36 @@ describe("createServeRuntimeHost", () => {
     }
   });
 
-  test("真实 capability 构造 Host，依赖 ready 后才启动 v2 worker，且从不 tick 探测", async () => {
+  test("真实 capability 构造 Host，依赖 ready 后才启动 broad supervisor，且从不 tick 探测", async () => {
     const calls: string[] = [];
     const { provider, bundle, pool } = providerBundle(calls);
-    const worker: DurableJobV2WorkerLoopHandle = {
-      tick: vi.fn<DurableJobV2WorkerLoopHandle["tick"]>(async () => [{ status: "idle" }]),
-      stop: vi.fn<DurableJobV2WorkerLoopHandle["stop"]>(async () => {
+    const worker: BroadAuthorityDurableJobV2SupervisorHandle = {
+      tick: vi.fn<BroadAuthorityDurableJobV2SupervisorHandle["tick"]>(async () => []),
+      stop: vi.fn<BroadAuthorityDurableJobV2SupervisorHandle["stop"]>(async () => {
         calls.push("worker:stop");
         return { status: "stopped" };
       }),
+      snapshot: vi.fn(() => ({
+        state: "healthy" as const,
+        ready: true,
+        consecutiveFailures: 0,
+        failingScopes: 0,
+      })),
     };
-    const startWorker = vi.fn((
-      repository: DurableJobV2RepositoryPort,
-      options: DurableJobV2WorkerLoopOptions,
+    const startSupervisor = vi.fn((
+      repository: BroadAuthorityDurableJobV2RepositoryPort,
+      options: BroadAuthorityDurableJobV2SupervisorOptions,
     ) => {
       calls.push("worker:start");
       expect(repository).toBe(source.durableJobV2ServeCapability?.repository);
       expect(options).toMatchObject({
-        scope,
+        authority: broadAuthority,
         workerId: "mengshu-serve-worker",
         leaseMs: 30_000,
         heartbeatIntervalMs: 10_000,
         intervalMs: 1_000,
+        maxScopesPerTick: 100,
+        maxJobsPerTick: 100,
         stopTimeoutMs: 5_000,
         registry: source.durableJobV2ServeCapability?.registry,
       });
@@ -295,7 +401,10 @@ describe("createServeRuntimeHost", () => {
     );
     source.start.mockImplementation(async () => { calls.push("runtime:start"); });
     source.stop.mockImplementation(async () => { calls.push("runtime:stop"); });
-    const host = createServeRuntimeHost(source, { startWorker });
+    const host = createServeRuntimeHost(source, {
+      authority: broadAuthority,
+      startSupervisor,
+    });
 
     await host.start();
 
@@ -325,15 +434,18 @@ describe("createServeRuntimeHost", () => {
       true,
       provider,
     );
-    const startWorker = vi.fn();
-    const host = createServeRuntimeHost(source, { startWorker });
+    const startSupervisor = vi.fn();
+    const host = createServeRuntimeHost(source, {
+      authority: broadAuthority,
+      startSupervisor,
+    });
 
     await expect(host.start()).rejects.toEqual(new RuntimeHostError("HOST_START_FAILED"));
 
     expect(calls).toEqual(["bundle:ready", "bundle:close"]);
     expect(source.start).not.toHaveBeenCalled();
     expect(source.stop).not.toHaveBeenCalled();
-    expect(startWorker).not.toHaveBeenCalled();
+    expect(startSupervisor).not.toHaveBeenCalled();
     expect(pool.end).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(host.snapshot())).not.toMatch(/unused|password|postgres:\/\//);
   });
@@ -352,13 +464,16 @@ describe("createServeRuntimeHost", () => {
       calls.push("runtime:start");
       throw new Error("postgres://admin:secret@private-host/runtime");
     });
-    const startWorker = vi.fn();
-    const host = createServeRuntimeHost(source, { startWorker });
+    const startSupervisor = vi.fn();
+    const host = createServeRuntimeHost(source, {
+      authority: broadAuthority,
+      startSupervisor,
+    });
 
     await expect(host.start()).rejects.toEqual(new RuntimeHostError("HOST_START_FAILED"));
 
     expect(calls).toEqual(["bundle:ready", "runtime:start", "bundle:close"]);
-    expect(startWorker).not.toHaveBeenCalled();
+    expect(startSupervisor).not.toHaveBeenCalled();
     expect(source.stop).not.toHaveBeenCalled();
     expect(pool.end).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(host.snapshot())).not.toMatch(/secret|private-host|admin/);
@@ -400,14 +515,14 @@ describe("createServeRuntimeHost", () => {
       scope,
       first.bundle.repository,
     );
-    const startWorker = vi.fn();
+    const startSupervisor = vi.fn();
 
     expect(() => createServeRuntimeHost(runtime(
       "postgres",
       capabilityForFirst,
       first.bundle,
       true,
-    ), { startWorker })).toThrow(
+    ), { authority: broadAuthority, startSupervisor })).toThrow(
       new RuntimeHostFactoryError("DURABLE_JOB_V2_RUNTIME_BUNDLE_INVALID"),
     );
     expect(() => createServeRuntimeHost(runtime(
@@ -416,12 +531,12 @@ describe("createServeRuntimeHost", () => {
       first.bundle,
       true,
       second.provider,
-    ), { startWorker })).toThrow(
+    ), { authority: broadAuthority, startSupervisor })).toThrow(
       new RuntimeHostFactoryError("DURABLE_JOB_V2_RUNTIME_BUNDLE_INVALID"),
     );
 
     expect(calls).toEqual([]);
-    expect(startWorker).not.toHaveBeenCalled();
+    expect(startSupervisor).not.toHaveBeenCalled();
   });
 
   test("runtime lifecycle degraded 时 Host degraded 且 worker 永不启动", async () => {
@@ -436,13 +551,16 @@ describe("createServeRuntimeHost", () => {
     );
     source.start.mockImplementation(async () => { calls.push("runtime:start"); });
     source.stop.mockImplementation(async () => { calls.push("runtime:stop"); });
-    const startWorker = vi.fn();
-    const host = createServeRuntimeHost(source, { startWorker });
+    const startSupervisor = vi.fn();
+    const host = createServeRuntimeHost(source, {
+      authority: broadAuthority,
+      startSupervisor,
+    });
 
     await host.start();
 
     expect(host.snapshot()).toMatchObject({ state: "degraded", ready: false, accepting: false });
-    expect(startWorker).not.toHaveBeenCalled();
+    expect(startSupervisor).not.toHaveBeenCalled();
     await host.stop();
     expect(source.stop).toHaveBeenCalledTimes(1);
     expect(calls).toEqual(["bundle:ready", "runtime:start", "runtime:stop", "bundle:close"]);

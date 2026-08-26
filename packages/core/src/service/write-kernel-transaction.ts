@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import type {
+  CandidateWriteAdmissionRoute,
+  MemoryCorrectionKind,
+  MemoryWriteAdmissionRoute,
   MemoryWriteCommand,
   MemoryWriteKernelResult,
+  WriteAdmissionRoute,
   WriteScope,
 } from "./write-kernel.js";
 import type { MemoryRecord, MemoryScope } from "../domain/types.js";
@@ -19,11 +23,37 @@ export interface WriteIdempotencyIdentity {
 export interface MemoryWriteReceipt {
   readonly identity: WriteIdempotencyIdentity;
   readonly requestFingerprint: string;
-  readonly result: Extract<MemoryWriteKernelResult, { status: "persisted" }>;
+  readonly result: MemoryWriteReceiptResult;
+}
+
+type NormalizedPersistedWriteResult = Extract<MemoryWriteKernelResult, { status: "persisted" }>;
+
+/** Durable v11 receipts persisted before recordType/candidateId/stored were mandatory. */
+export type LegacyMemoryWriteReceiptResult =
+  | {
+      readonly status: "persisted";
+      readonly route: Exclude<WriteAdmissionRoute, "drop">;
+      readonly memoryId: string;
+      readonly stored?: boolean;
+    }
+  | {
+      readonly status: "persisted";
+      readonly correctionKind: Exclude<MemoryCorrectionKind, "replaceText">;
+      readonly memoryId: string;
+      readonly stored?: boolean;
+    };
+
+export type MemoryWriteReceiptResult =
+  | NormalizedPersistedWriteResult
+  | LegacyMemoryWriteReceiptResult;
+
+export interface NormalizedMemoryWriteReceipt extends Omit<MemoryWriteReceipt, "result"> {
+  readonly result: NormalizedPersistedWriteResult;
 }
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const ROUTES = new Set(["candidate_low_priority", "candidate", "active", "lookup_only", "evidence_only"]);
+const CANDIDATE_ROUTES = new Set(["candidate_low_priority", "candidate"]);
 const LIFECYCLE_CORRECTIONS = new Set(["revoke", "archive", "delete"]);
 
 function requiredOwnerField(value: unknown, field: string): string {
@@ -347,31 +377,79 @@ WHERE storage_key = $1`,
 }
 
 function clonePersistedResult(
-  result: Extract<MemoryWriteKernelResult, { status: "persisted" }>,
-): Extract<MemoryWriteKernelResult, { status: "persisted" }> {
+  result: MemoryWriteReceiptResult,
+): NormalizedPersistedWriteResult {
   const canonical = canonicalJsonValue(result, new Set());
   if (!canonical) throw new Error("write acknowledgement must be JSON serializable");
   const cloned = JSON.parse(canonical) as Record<string, unknown>;
+  const keys = Object.keys(cloned);
   const route = cloned.route;
   const correctionKind = cloned.correctionKind;
-  if (
-    cloned.status !== "persisted" ||
-    typeof cloned.memoryId !== "string" || cloned.memoryId.length === 0 ||
-    !(
-      (typeof route === "string" && ROUTES.has(route) && correctionKind === undefined) ||
-      (typeof correctionKind === "string" && LIFECYCLE_CORRECTIONS.has(correctionKind) && route === undefined)
-    )
-  ) {
+  if (cloned.status !== "persisted" ||
+      typeof cloned.memoryId !== "string" || cloned.memoryId.length === 0 ||
+      (cloned.stored !== undefined && typeof cloned.stored !== "boolean")) {
     throw new Error("write acknowledgement has an invalid durable result shape");
   }
-  return cloned as Extract<MemoryWriteKernelResult, { status: "persisted" }>;
+  const stored = cloned.stored ?? true;
+  if (typeof route === "string" && ROUTES.has(route) && correctionKind === undefined) {
+    const candidate = CANDIDATE_ROUTES.has(route);
+    const expectedRecordType = candidate ? "candidate" : "memory";
+    const allowed = new Set(candidate
+      ? ["status", "route", "recordType", "candidateId", "memoryId", "stored"]
+      : ["status", "route", "recordType", "memoryId", "stored"]);
+    if (keys.some((key) => !allowed.has(key))) {
+      throw new Error("write acknowledgement has an invalid durable result shape");
+    }
+    if (cloned.recordType !== undefined && cloned.recordType !== expectedRecordType) {
+      throw new Error("write acknowledgement has an invalid durable result shape");
+    }
+    if (candidate) {
+      if (cloned.candidateId !== undefined && cloned.candidateId !== cloned.memoryId) {
+        throw new Error("write acknowledgement has an invalid durable result shape");
+      }
+      return {
+        status: "persisted",
+        route: route as CandidateWriteAdmissionRoute,
+        recordType: "candidate",
+        candidateId: cloned.memoryId,
+        memoryId: cloned.memoryId,
+        stored,
+      };
+    }
+    if (cloned.candidateId !== undefined) {
+      throw new Error("write acknowledgement has an invalid durable result shape");
+    }
+    return {
+      status: "persisted",
+      route: route as MemoryWriteAdmissionRoute,
+      recordType: "memory",
+      memoryId: cloned.memoryId,
+      stored,
+    };
+  }
+  if (typeof correctionKind === "string" && LIFECYCLE_CORRECTIONS.has(correctionKind) &&
+      route === undefined && cloned.candidateId === undefined &&
+      (cloned.recordType === undefined || cloned.recordType === "memory")) {
+    const allowed = new Set(["status", "correctionKind", "recordType", "memoryId", "stored"]);
+    if (keys.some((key) => !allowed.has(key))) {
+      throw new Error("write acknowledgement has an invalid durable result shape");
+    }
+    return {
+      status: "persisted",
+      correctionKind: correctionKind as Exclude<MemoryCorrectionKind, "replaceText">,
+      recordType: "memory",
+      memoryId: cloned.memoryId,
+      stored,
+    };
+  }
+  throw new Error("write acknowledgement has an invalid durable result shape");
 }
 
 export function createMemoryWriteReceipt(
   identity: WriteIdempotencyIdentity,
   requestFingerprint: string,
-  result: Extract<MemoryWriteKernelResult, { status: "persisted" }>,
-): MemoryWriteReceipt {
+  result: MemoryWriteReceiptResult,
+): NormalizedMemoryWriteReceipt {
   if (!SHA256.test(requestFingerprint)) {
     throw new Error("write receipt fingerprint is invalid");
   }
@@ -385,7 +463,7 @@ export function createMemoryWriteReceipt(
 export function validateMemoryWriteReceipt(
   receipt: MemoryWriteReceipt,
   expectedIdentity: WriteIdempotencyIdentity,
-): MemoryWriteReceipt {
+): NormalizedMemoryWriteReceipt {
   if (
     receipt.identity.tenantId !== expectedIdentity.tenantId ||
     receipt.identity.userId !== expectedIdentity.userId ||
@@ -409,6 +487,15 @@ function commandPayload(command: MemoryWriteCommand): Record<string, unknown> {
   if ("text" in command) {
     common.text = command.text;
     common.vector = command.vector;
+    common.kind = command.kind;
+    common.semanticType = command.semanticType;
+    common.container = command.container;
+    common.confidence = command.confidence;
+    common.category = command.category;
+    common.dataType = command.dataType;
+    common.tableName = command.tableName;
+    common.provenance = command.provenance;
+    common.evidenceIds = command.evidenceIds;
   }
   if (command.type === "observeAuto") common.intent = command.intent;
   if (command.type === "importEvidence") common.sourceId = command.sourceId;
@@ -431,6 +518,8 @@ export function createWriteCommandFingerprint(
       projectId: scope.projectId,
       agentId: scope.agentId,
       namespace: scope.namespace,
+      workspaceId: scope.workspaceId,
+      sessionId: scope.sessionId,
       visibility: scope.visibility ?? "private",
     },
     command: commandPayload(command),

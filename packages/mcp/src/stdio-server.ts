@@ -29,19 +29,41 @@ import type { IngestionPipeline } from "../../core/src/ingest/pipeline.js";
 import type { LlmClient } from "../../core/src/runtime/llm/llm-client.js";
 import type { AuthorityScope } from "../../core/src/domain/authority-scope.js";
 import type { MemoryScope } from "../../core/src/domain/types.js";
+import { DURABLE_JOB_V2_AUTHORITATIVE_TYPES } from
+  "../../core/src/storage/repositories/job-v2.js";
+import { PostgresDurableJobV2Repository } from
+  "../../core/src/storage/repositories/postgres-job-v2.js";
+import type { ContextAssemblyReceiptRepository } from
+  "../../core/src/context/assembly-receipt.js";
+import {
+  startBroadAuthorityDurableJobV2Supervisor,
+  type BroadAuthorityDurableJobV2SupervisorHandle,
+  type DurableJobV2AuthoritativeHandlerRegistry,
+} from "../../../server/workers-v2.js";
 import {
   createMcpMemoryTools,
   freezeMcpToolRegistry,
   type McpMemoryTool,
+  type MemoryWriteCommandExecutor,
+  type MemoryAssetReadCapability,
+  type MemoryKnowledgeResourceCapability,
 } from "./tools.js";
 import { parseMcpServerAuthorityConfig } from "./server.js";
 import { formatMcpToolError } from "./tool-error.js";
 
 const SERVER_NAME = "mengshu";
-const SERVER_VERSION = "1.0.6";
+const SERVER_VERSION = "1.0.7";
+
+export interface McpDurableJobV2Capability {
+  /** 必须是当前 runtime bundle 与 native handler composition 共同持有的同一 PG repository。 */
+  readonly repository: PostgresDurableJobV2Repository;
+  /** 必须是完整且顺序固定的 runtime authoritative registry。 */
+  readonly registry: DurableJobV2AuthoritativeHandlerRegistry;
+}
 
 export interface McpStdioServerOptions {
   service: MemoryService;
+  memoryWrite?: MemoryWriteCommandExecutor;
   forgetCapability?: AuthorityScopedForgetCapability;
   /** @deprecated Ignored. Structural services cannot enable destructive tools. */
   forgetService?: AuthorityScopedForgetService;
@@ -50,11 +72,18 @@ export interface McpStdioServerOptions {
   /** Server-selected default request, validated against authority at host startup. */
   defaultScope?: MemoryScope;
   agentFastPath?: AgentFastPathService;
+  memoryAssets?: MemoryAssetReadCapability;
+  /** Optional exact-scope read-only Knowledge resource capability. */
+  knowledgeResources?: MemoryKnowledgeResourceCapability;
+  /** Optional v22 exact-session assembly receipt read capability. */
+  sessionReceipts?: Pick<ContextAssemblyReceiptRepository, "getLatest">;
   namespaces?: string[];
   /** 注入后 memory_ingest 走真实持久化链路 */
   pipeline?: IngestionPipeline;
   /** 预留给 ingest 增强；当前热路径不调用 LLM */
   llmClient?: LlmClient;
+  /** Postgres runtime 注入后启动 broad-authority supervisor；非 Postgres 明确省略。 */
+  durableJobV2?: McpDurableJobV2Capability;
 }
 
 /** MCP CallTool 响应的 content 形态 */
@@ -152,6 +181,61 @@ export interface RunningMcpStdioServer {
 
 export interface McpStdioStartDependencies {
   transport?: Transport;
+  startDurableJobV2Supervisor?: typeof startBroadAuthorityDurableJobV2Supervisor;
+}
+
+const MCP_DURABLE_JOB_V2_SUPERVISOR_OPTIONS = Object.freeze({
+  workerId: "mengshu-mcp-worker",
+  leaseMs: 30_000,
+  heartbeatIntervalMs: 10_000,
+  intervalMs: 250,
+  maxScopesPerTick: 100,
+  maxJobsPerTick: 100,
+  stopTimeoutMs: 5_000,
+});
+
+function validatedDurableJobV2Capability(
+  raw: McpDurableJobV2Capability | undefined,
+): McpDurableJobV2Capability | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) ||
+        !(raw.repository instanceof PostgresDurableJobV2Repository) ||
+        typeof raw.repository.listRunnableScopes !== "function" ||
+        raw.registry?.authoritative !== true || !Array.isArray(raw.registry.types) ||
+        raw.registry.types.length !== DURABLE_JOB_V2_AUTHORITATIVE_TYPES.length ||
+        raw.registry.types.some(
+          (type, index) => type !== DURABLE_JOB_V2_AUTHORITATIVE_TYPES[index],
+        ) || typeof raw.registry.get !== "function") {
+      throw new Error("invalid capability");
+    }
+    const handlers = new Map<string, ReturnType<typeof raw.registry.get>>();
+    for (const type of DURABLE_JOB_V2_AUTHORITATIVE_TYPES) {
+      const handler = raw.registry.get(type);
+      if (typeof handler !== "function") throw new Error("invalid handler");
+      handlers.set(type, handler);
+    }
+    return Object.freeze({
+      repository: raw.repository,
+      registry: Object.freeze({
+        authoritative: true as const,
+        types: DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
+        get: (type: string) => handlers.get(type),
+      }),
+    });
+  } catch {
+    throw new Error("MCP durable job v2 capability is invalid");
+  }
+}
+
+async function stopMcpDurableJobV2Supervisor(
+  supervisor: BroadAuthorityDurableJobV2SupervisorHandle | undefined,
+): Promise<void> {
+  if (!supervisor) return;
+  const result = await supervisor.stop();
+  if (result.status !== "stopped") {
+    throw new Error("MCP durable job v2 supervisor did not stop cleanly");
+  }
 }
 
 /**
@@ -161,21 +245,78 @@ export async function startMcpStdioServer(
   options: McpStdioServerOptions,
   dependencies: McpStdioStartDependencies = {},
 ): Promise<RunningMcpStdioServer> {
+  const authorityConfig = parseMcpServerAuthorityConfig({
+    authority: options.authority,
+    defaultScope: options.defaultScope,
+  });
+  const durableJobV2 = validatedDurableJobV2Capability(options.durableJobV2);
   const { server } = createMcpStdioServer(options);
   const transport = dependencies.transport ?? new StdioServerTransport();
+  const startSupervisor = dependencies.startDurableJobV2Supervisor ??
+    startBroadAuthorityDurableJobV2Supervisor;
+  const supervisor = durableJobV2
+    ? startSupervisor(durableJobV2.repository, {
+        authority: authorityConfig.authority,
+        registry: durableJobV2.registry,
+        ...MCP_DURABLE_JOB_V2_SUPERVISOR_OPTIONS,
+      })
+    : undefined;
   let resolveClosed!: () => void;
   const closed = new Promise<void>((resolve) => {
     resolveClosed = resolve;
   });
-  server.onclose = resolveClosed;
-  await server.connect(transport);
   let closePromise: Promise<void> | undefined;
+  const shutdown = async (closeServer: boolean): Promise<void> => {
+    const failures: unknown[] = [];
+    if (closeServer) {
+      try {
+        await server.close();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    try {
+      await stopMcpDurableJobV2Supervisor(supervisor);
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "MCP transport and durable worker shutdown failed");
+    }
+  };
+  const beginShutdown = (closeServer: boolean): Promise<void> => {
+    if (!closePromise) {
+      // Defer shutdown until closePromise is assigned: server.close may synchronously fire onclose.
+      closePromise = Promise.resolve()
+        .then(() => shutdown(closeServer))
+        .finally(resolveClosed);
+    }
+    return closePromise;
+  };
+  server.onclose = () => {
+    void beginShutdown(false).catch(() => undefined);
+  };
+  try {
+    await server.connect(transport);
+  } catch (connectionFailure) {
+    let shutdownFailure: unknown;
+    try {
+      await beginShutdown(true);
+    } catch (error) {
+      shutdownFailure = error;
+    }
+    if (shutdownFailure) {
+      throw new AggregateError(
+        [connectionFailure, shutdownFailure],
+        "MCP transport startup and durable worker shutdown failed",
+      );
+    }
+    throw connectionFailure;
+  }
   return {
     closed,
-    close: () => {
-      closePromise ??= server.close().finally(resolveClosed);
-      return closePromise;
-    },
+    close: () => beginShutdown(true),
   };
 }
 

@@ -14,7 +14,13 @@ import type {
   MemoryService,
 } from "../../../core/service-types.js";
 import type { MemoryRecord, RecallHit, MemoryScope } from "../../../core/types.js";
+import {
+  isRecallScoreBreakdown,
+  type CompleteRecallScoreBreakdown,
+} from "../../../core/recall-scoring.js";
 import type { AuthorityScope } from "../../../packages/core/src/domain/authority-scope.js";
+import type { MemoryWriteKernelResult } from "../../../packages/core/src/service/write-kernel.js";
+import type { MemoryWriteCommandExecutor } from "./memory-write.js";
 import type { IngestionPipeline } from "../../../ingest/pipeline.js";
 import { ingestMarkdownDirectory } from "../../../ingest/adapters/file-system.js";
 import { computeContentHash } from "../../../processing/hash-utils.js";
@@ -243,6 +249,7 @@ export interface MemoryRecallParams {
 
 export interface MemoryStoreParams {
   text: string;
+  idempotencyKey?: string;
   importance?: number;
   category?: MemoryCategory;
   metadata?: Record<string, unknown>;
@@ -277,8 +284,11 @@ export interface OpenClawAuthorityContext {
 
 export interface MemoryStoreContext extends OpenClawAuthorityContext {
   service: MemoryService;
-  embed(text: string): Promise<number[]>;
-  existsByContentHash(contentHashes: string[]): Promise<string[]>;
+  memoryWrite?: MemoryWriteCommandExecutor;
+  /** @deprecated Explicit test-only compatibility path. */
+  unsafeLegacyWrite?: true;
+  embed?(text: string): Promise<number[]>;
+  existsByContentHash?(contentHashes: string[]): Promise<string[]>;
   embeddingModel?: string;
   routingEngine?: {
     routeToKnowledgeBases(text: string, metadata?: Record<string, unknown>): {
@@ -291,6 +301,31 @@ export interface MemoryStoreContext extends OpenClawAuthorityContext {
   };
   idFactory?: () => string;
   now?: () => number;
+}
+
+function requiredWriteKey(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+    throw new Error("OpenClaw memory_store requires idempotencyKey");
+  }
+  return value;
+}
+
+function kernelStoreOutcome(
+  result: MemoryWriteKernelResult,
+): { id: string; action: "created" | "duplicate" } {
+  if (result.status === "persisted") {
+    return { id: result.memoryId, action: result.stored ? "created" : "duplicate" };
+  }
+  if (result.status === "duplicate") {
+    if (!result.duplicateOf) {
+      throw new Error("OpenClaw duplicate result is missing duplicateOf");
+    }
+    return { id: result.duplicateOf, action: "duplicate" };
+  }
+  if (result.status === "rejected") {
+    throw new Error(`OpenClaw memory write rejected: ${result.reason}`);
+  }
+  throw new Error("OpenClaw explicit memory write cannot be ignored");
 }
 
 export interface MemoryServiceContext extends OpenClawAuthorityContext {
@@ -408,12 +443,23 @@ function formatRecallHit(hit: RecallHit, index: number): string {
   return `${index + 1}. [${hit.record.category}]${categoryInfo} ${hit.record.text}${source} (${(hit.score * 100).toFixed(0)}%)`;
 }
 
+function requireRecallBreakdown(hit: RecallHit): CompleteRecallScoreBreakdown {
+  if (!isRecallScoreBreakdown(hit.scoreBreakdown) ||
+      Math.abs(hit.score - hit.scoreBreakdown.score) > 1e-9 ||
+      !hit.scoreBreakdown.matchedBy.includes(hit.source)) {
+    throw new Error("RECALL_SCORE_BREAKDOWN_REQUIRED");
+  }
+  return hit.scoreBreakdown;
+}
+
 function sanitizeRecallHit(hit: RecallHit): Record<string, unknown> {
+  const scoreBreakdown = requireRecallBreakdown(hit);
   if (!isMemoryRecord(hit.record)) {
     return {
       id: hit.record.id,
       score: hit.score,
       source: hit.source,
+      scoreBreakdown,
     };
   }
   return {
@@ -425,6 +471,8 @@ function sanitizeRecallHit(hit: RecallHit): Record<string, unknown> {
     metadata: hit.record.metadata,
     importance: hit.record.importance,
     score: hit.score,
+    source: hit.source,
+    scoreBreakdown,
   };
 }
 
@@ -455,9 +503,14 @@ export async function handleMemoryRecall(
   if (result.hits.length === 0) {
     return {
       content: [{ type: "text", text: "No relevant memories found." }],
-      details: { count: 0 },
+      details: {
+        count: 0,
+        ...(result.filtered === undefined ? {} : { filtered: result.filtered }),
+      },
     };
   }
+
+  for (const hit of result.hits) requireRecallBreakdown(hit);
 
   const text = result.hits.map(formatRecallHit).join("\n");
   return {
@@ -465,6 +518,7 @@ export async function handleMemoryRecall(
     details: {
       count: result.hits.length,
       memories: result.hits.map(sanitizeRecallHit),
+      ...(result.filtered === undefined ? {} : { filtered: result.filtered }),
     },
   };
 }
@@ -507,8 +561,66 @@ export async function handleMemoryStore(
     );
   }
 
+  if (context.unsafeLegacyWrite !== true) {
+    const idempotencyKey = requiredWriteKey(params.idempotencyKey);
+    if (!context.memoryWrite) {
+      throw new Error("OpenClaw memory write capability is unavailable");
+    }
+    const outcomes: Array<{
+      tableName: TableName;
+      id: string;
+      action: "created" | "duplicate";
+    }> = [];
+    for (const targetTable of targetTables) {
+      const result = await context.memoryWrite.executeMemoryWrite({
+        type: "saveExplicit",
+        idempotencyKey: targetTables.length === 1
+          ? idempotencyKey
+          : `${idempotencyKey}:${targetTable}`,
+        serverAuthority: context.authority!,
+        clientScope: scope,
+        text,
+        kind: resolveDataType(targetTable) === "knowledge"
+          ? "knowledge"
+          : resolvedCategory === "other" || resolvedCategory === "core"
+            ? "other"
+            : resolvedCategory,
+        category: resolvedCategory,
+        dataType: resolveDataType(targetTable),
+        tableName: targetTable,
+        metadata: {
+          ...enrichedMetadata,
+          requestedImportance: importance,
+        },
+        provenance: {
+          source: "user",
+          sessionId: typeof enrichedMetadata.sessionId === "string"
+            ? enrichedMetadata.sessionId
+            : undefined,
+          conversationId: typeof enrichedMetadata.conversationId === "string"
+            ? enrichedMetadata.conversationId
+            : undefined,
+          messageId: typeof enrichedMetadata.messageId === "string"
+            ? enrichedMetadata.messageId
+            : undefined,
+          createdAt: now(),
+        },
+      });
+      outcomes.push({ tableName: targetTable, ...kernelStoreOutcome(result) });
+    }
+    return formatStoreResponse(
+      text,
+      tableName,
+      targetTables,
+      outcomes,
+      contentHash,
+      Boolean(context.routingEngine),
+    );
+  }
+
   // Global content-hash lookup is not authority-scoped and therefore cannot be
   // used as a cross-tenant existence oracle. Scoped write-kernel dedupe owns it.
+  if (!context.embed) throw new Error("OpenClaw legacy embed capability is unavailable");
   const vector = await context.embed(text);
 
   const outcomes: Array<{
@@ -558,6 +670,24 @@ export async function handleMemoryStore(
     });
   }
 
+  return formatStoreResponse(
+    text,
+    tableName,
+    targetTables,
+    outcomes,
+    contentHash,
+    Boolean(context.routingEngine),
+  );
+}
+
+function formatStoreResponse(
+  text: string,
+  tableName: TableName,
+  targetTables: TableName[],
+  outcomes: Array<{ tableName: TableName; id: string; action: "created" | "duplicate" }>,
+  contentHash: string,
+  routingEnabled: boolean,
+): ToolResponse {
   const tableNamesDisplay = targetTables.map((table) => resolveCategoryName(table)).join(", ");
   const createdCount = outcomes.filter((outcome) => outcome.action === "created").length;
   const duplicateCount = outcomes.length - createdCount;
@@ -582,7 +712,7 @@ export async function handleMemoryStore(
       contentHash,
       targetTables,
       storageCategory: resolveCategoryName(tableName),
-      routingEnabled: !!context.routingEngine,
+      routingEnabled,
     },
   };
 }

@@ -20,9 +20,14 @@
  */
 
 import type { AdmissionRoute } from "../domain/types.js";
+import type { SourceKind } from "../scoring/importance-score.js";
 import type { ValidatedCandidate } from "./candidate-validator.js";
 import { computeValueScore, computeValueScoreWithBreakdown } from "../scoring/value-score.js";
-import { deriveValueScoreSignals } from "../scoring/value-score-signals.js";
+import {
+  deriveValueScoreSignalsWithProvenance,
+  type ValueScoreSignalInput,
+  type ValueScoreSignalProvenance,
+} from "../scoring/value-score-signals.js";
 
 /**
  * 准入阈值带（§6.2 D-02 定稿，v1.0）
@@ -48,8 +53,10 @@ export const ADMISSION_THRESHOLDS = {
 export interface AdmissionContext {
   /** 抽取意图（remember=显式保存，auto=自动抽取） */
   intent?: string;
-  /** 来源类型（rule_file 快速通道） */
-  sourceKind?: "rule_file" | "session_user" | "work_log" | "document" | "tool_result" | "agent_output";
+  /** @deprecated 仅保留结构兼容；评分和 rule_file 快速通道只信 valueSignals。 */
+  sourceKind?: SourceKind;
+  /** 调用方从 authoritative evidence 与当前 embedding space 解析的评分事实。 */
+  valueSignals?: ValueScoreSignalInput;
   /** 是否检测到冲突（冲突时阻止自动晋升 active） */
   hasConflict?: boolean;
 }
@@ -69,7 +76,15 @@ export interface AdmissionDecisionResult {
    * 仅在调用 decideAdmissionWithBreakdown 时提供。
    */
   breakdown?: Record<string, number>;
+  /** evidence/novelty 的来源凭据；与纯数值 breakdown 分离。 */
+  valueSignalProvenance: ValueScoreSignalProvenance;
 }
+
+const LEGACY_UNKNOWN_PROVENANCE: ValueScoreSignalProvenance = Object.freeze({
+  mode: "legacy_unknown",
+  evidence: "unknown",
+  novelty: "unknown",
+});
 
 /**
  * 候选准入路由决策（P1-Q4 核心入口）
@@ -102,6 +117,7 @@ export function decideAdmission(
       route: "evidence_only",
       valueScore: 0,
       reason: "prompt_injection_detected",
+      valueSignalProvenance: LEGACY_UNKNOWN_PROVENANCE,
     };
   }
 
@@ -111,11 +127,12 @@ export function decideAdmission(
       route: "evidence_only",
       valueScore: 0,
       reason: "evidence_only_by_validator",
+      valueSignalProvenance: LEGACY_UNKNOWN_PROVENANCE,
     };
   }
 
   // 计算 valueScore（8 维加权）
-  const signals = deriveValueScoreSignals(candidate, context);
+  const { signals, provenance } = deriveValueScoreSignalsWithProvenance(candidate, context);
   const valueScore = computeValueScore(signals);
 
   // 阈值路由：< 0.40 → drop
@@ -124,6 +141,7 @@ export function decideAdmission(
       route: "drop",
       valueScore,
       reason: "value_score_below_threshold",
+      valueSignalProvenance: provenance,
     };
   }
 
@@ -133,15 +151,20 @@ export function decideAdmission(
       route: "active",
       valueScore,
       reason: "explicit_save_fast_track",
+      valueSignalProvenance: provenance,
     };
   }
 
   // 快速通道 2：rule_file 来源（高权威，直接晋升）
-  if (context.sourceKind === "rule_file") {
+  if (
+    context.valueSignals?.mode === "authoritative" &&
+    context.valueSignals.sourceKind === "rule_file"
+  ) {
     return {
       route: "active",
       valueScore,
       reason: "rule_file_fast_track",
+      valueSignalProvenance: provenance,
     };
   }
 
@@ -155,6 +178,7 @@ export function decideAdmission(
       route: "active",
       valueScore,
       reason: "high_value_score_auto_promote",
+      valueSignalProvenance: provenance,
     };
   }
 
@@ -164,6 +188,7 @@ export function decideAdmission(
       route: "candidate",
       valueScore,
       reason: "medium_value_score",
+      valueSignalProvenance: provenance,
     };
   }
 
@@ -172,6 +197,7 @@ export function decideAdmission(
     route: "candidate_low_priority",
     valueScore,
     reason: "low_priority_value_score",
+    valueSignalProvenance: provenance,
   };
 }
 
@@ -196,6 +222,7 @@ export function decideAdmissionWithBreakdown(
       valueScore: 0,
       reason: "prompt_injection_detected",
       breakdown: {},
+      valueSignalProvenance: LEGACY_UNKNOWN_PROVENANCE,
     };
   }
 
@@ -205,11 +232,12 @@ export function decideAdmissionWithBreakdown(
       valueScore: 0,
       reason: "evidence_only_by_validator",
       breakdown: {},
+      valueSignalProvenance: LEGACY_UNKNOWN_PROVENANCE,
     };
   }
 
   // 计算 valueScore + 8 维明细
-  const signals = deriveValueScoreSignals(candidate, context);
+  const { signals, provenance } = deriveValueScoreSignalsWithProvenance(candidate, context);
   const { score: valueScore, breakdown } = computeValueScoreWithBreakdown(signals);
 
   // 复用 decideAdmission 的路由逻辑（避免代码重复）
@@ -219,5 +247,6 @@ export function decideAdmissionWithBreakdown(
     ...baseResult,
     valueScore,
     breakdown,
+    valueSignalProvenance: provenance,
   };
 }

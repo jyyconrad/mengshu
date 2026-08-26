@@ -18,7 +18,19 @@ function migration(version: number, name = `migration-${version}`): SchemaMigrat
 }
 
 describe("schema migration registry", () => {
-  test("内置 migration 从 1 连续递增，v6/v10 仅允许各自白名单 contract", () => {
+  test("v22 expand-only persists exact-session context assembly receipts", () => {
+    const v22 = SCHEMA_MIGRATIONS.find((item) => item.version === 22);
+    const sql = v22?.statements.join("\n") ?? "";
+    expect(v22?.name).toBe("add-context-assembly-receipts");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_context_assembly_receipts");
+    expect(sql).toContain("scope_fingerprint TEXT NOT NULL");
+    expect(sql).toContain("session_id TEXT NOT NULL");
+    expect(sql).toContain("receipt JSONB NOT NULL");
+    expect(sql).toContain("expires_at BIGINT NOT NULL");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("内置 migration 从 1 连续递增，v6/v10/v18 仅允许各自白名单 contract", () => {
     expect(validateMigrationRegistry(SCHEMA_MIGRATIONS, CURRENT_SCHEMA_VERSION)).toBeUndefined();
     expect(SCHEMA_MIGRATIONS.map((item) => item.version)).toEqual(
       Array.from({ length: CURRENT_SCHEMA_VERSION }, (_, index) => index + 1),
@@ -27,7 +39,8 @@ describe("schema migration registry", () => {
     expect(SCHEMA_MIGRATIONS[5]?.kind).toBe("contract");
     expect(SCHEMA_MIGRATIONS.slice(6, 9).every((item) => item.kind === "expand")).toBe(true);
     expect(SCHEMA_MIGRATIONS[9]?.kind).toBe("contract");
-    expect(SCHEMA_MIGRATIONS[10]?.kind).toBe("expand");
+    expect(SCHEMA_MIGRATIONS.slice(10, 17).every((item) => item.kind === "expand")).toBe(true);
+    expect(SCHEMA_MIGRATIONS[17]?.kind).toBe("contract");
   });
 
   test.each([
@@ -479,7 +492,7 @@ describe("schema migration registry", () => {
     const v12 = SCHEMA_MIGRATIONS.find((item) => item.version === 12);
     const sql = v12?.statements.join("\n") ?? "";
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(12);
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(12);
     expect(v12?.name).toBe("add-embedding-reembed-shadow-journal");
     expect(v12?.kind).toBe("expand");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_embedding_reembed_shadow");
@@ -521,10 +534,442 @@ describe("schema migration registry", () => {
       checksum: checksum!,
     }));
 
-    expect(planSchemaMigrations(appliedV11)).toMatchObject({
+    expect(planSchemaMigrations(appliedV11, {
+      migrations: SCHEMA_MIGRATIONS.slice(0, 12),
+      currentSchemaVersion: 12,
+    })).toMatchObject({
       fromVersion: 11,
       toVersion: 12,
       pending: [SCHEMA_MIGRATIONS[11]],
+    });
+  });
+
+  test("v13 使用独立 work memory node/edge 表并保持 scope 外键", () => {
+    const v13 = SCHEMA_MIGRATIONS.find((item) => item.version === 13);
+    const sql = v13?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(13);
+    expect(v13?.name).toBe("add-durable-work-memory-graph");
+    expect(v13?.kind).toBe("expand");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_work_memory_nodes");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_work_memory_edges");
+    expect(sql).toMatch(/PRIMARY KEY \(scope_fingerprint, id\)/i);
+    expect(sql).toMatch(/REFERENCES mengshu_work_memory_nodes \(scope_fingerprint, id\)/i);
+    expect(sql).toMatch(/node_type IN \('evidence', 'memory', 'summary', 'skill_candidate'\)/i);
+    expect(sql).toMatch(/predicate IN \('grounded_by', 'derives_from', 'contradicts', 'supersedes', 'promoted_to'\)/i);
+    expect(sql).not.toContain("mengshu_graph_entities");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v14 为 candidate route 建立独立 write journal，不冒充 active memory", () => {
+    const v14 = SCHEMA_MIGRATIONS.find((item) => item.version === 14);
+    const sql = v14?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(14);
+    expect(v14?.name).toBe("add-atomic-candidate-write-journal");
+    expect(v14?.kind).toBe("expand");
+    for (const tableName of [
+      "mengshu_candidate_write_receipts",
+      "mengshu_candidate_write_audit",
+      "mengshu_candidate_write_outbox",
+    ]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${tableName}`);
+    }
+    for (const column of [
+      "candidate_id TEXT NOT NULL REFERENCES mengshu_candidates (id)",
+      "tenant_id TEXT NOT NULL",
+      "user_id TEXT NOT NULL",
+      "app_id TEXT NOT NULL",
+      "project_id TEXT NOT NULL",
+      "agent_id TEXT NOT NULL",
+      "namespace TEXT NOT NULL",
+      "visibility TEXT NOT NULL",
+      "workspace_id TEXT NOT NULL DEFAULT ''",
+      "session_id TEXT NOT NULL DEFAULT ''",
+      "route TEXT NOT NULL CHECK (route IN ('candidate_low_priority', 'candidate'))",
+    ]) {
+      expect(sql.match(new RegExp(column.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))?.length)
+        .toBe(3);
+    }
+    expect(sql).toContain("action TEXT NOT NULL CHECK (action = 'candidate.store')");
+    expect(sql).toContain("topic TEXT NOT NULL CHECK (topic = 'candidate.written')");
+    expect(sql).toMatch(/UNIQUE \(storage_key, candidate_id, action\)/i);
+    expect(sql).toMatch(/UNIQUE \(storage_key, topic, candidate_id\)/i);
+    expect(sql).toMatch(/result JSONB NOT NULL CHECK \(jsonb_typeof\(result\) = 'object'\)/i);
+    expect(sql).not.toMatch(/\bmemory_id\b|memory\.store|memory\.written/i);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v15 建立通用 memory evidence link 与 Entity Graph evidence/alias ledger", () => {
+    const v15 = SCHEMA_MIGRATIONS.find((item) => item.version === 15);
+    const sql = v15?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(15);
+    expect(v15?.name).toBe("add-authoritative-evidence-link-ledgers");
+    expect(v15?.kind).toBe("expand");
+    for (const tableName of [
+      "mengshu_memory_evidence_links",
+      "mengshu_graph_entity_evidence",
+      "mengshu_graph_relation_evidence",
+      "mengshu_graph_entity_aliases",
+    ]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${tableName}`);
+    }
+    for (const dimension of [
+      "scope_fingerprint", "tenant_id", "user_id", "app_id", "project_id",
+      "agent_id", "namespace", "visibility", "workspace_id", "session_id",
+    ]) {
+      expect(sql).toContain(dimension);
+    }
+    expect(sql).toMatch(/UNIQUE \(\s*scope_fingerprint, target_memory_id, evidence_memory_id, link_kind, source\s*\)/i);
+    expect(sql).toMatch(/REFERENCES mengshu_graph_entities \(scope_fingerprint, id\)/i);
+    expect(sql).toMatch(/REFERENCES mengshu_graph_relations \(scope_fingerprint, id\)/i);
+    expect(sql).toMatch(/UNIQUE \(scope_fingerprint, entity_id, normalized_alias\)/i);
+    const memoryLedger = v15?.statements.find((statement) =>
+      statement.includes("CREATE TABLE IF NOT EXISTS mengshu_memory_evidence_links"),
+    ) ?? "";
+    expect(memoryLedger).not.toMatch(/REFERENCES mengshu_work_memory_/i);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v16 append-only 建立 D-21 scoped topic alias migration ledger", () => {
+    const v16 = SCHEMA_MIGRATIONS.find((item) => item.version === 16);
+    const sql = v16?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(16);
+    expect(v16?.name).toBe("add-topic-tree-alias-migration-ledger");
+    expect(v16?.kind).toBe("expand");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_topic_tree_aliases");
+    for (const column of [
+      "scope_fingerprint TEXT NOT NULL",
+      "tenant_id TEXT NOT NULL",
+      "user_id TEXT NOT NULL",
+      "app_id TEXT NOT NULL",
+      "project_id TEXT NOT NULL",
+      "agent_id TEXT NOT NULL",
+      "namespace TEXT NOT NULL",
+      "visibility TEXT NOT NULL",
+      "workspace_id TEXT NOT NULL DEFAULT ''",
+      "session_id TEXT NOT NULL DEFAULT ''",
+      "legacy_tree_key TEXT NOT NULL",
+      "canonical_topic_label TEXT NOT NULL",
+      "status TEXT NOT NULL",
+      "merged_from JSONB NOT NULL",
+      "sealed_node_id TEXT",
+      "created_at BIGINT NOT NULL",
+      "updated_at BIGINT NOT NULL",
+      "superseded_at BIGINT",
+      "archived_at BIGINT",
+    ]) expect(sql).toContain(column);
+    expect(sql).toMatch(/PRIMARY KEY \(scope_fingerprint, legacy_tree_key\)/i);
+    expect(sql).toMatch(/status IN \('active', 'superseded', 'archived'\)/i);
+    expect(sql).toMatch(/jsonb_typeof\(merged_from\) = 'array'/i);
+    expect(sql).toMatch(/merged_from @> jsonb_build_array\(legacy_tree_key\)/i);
+    expect(sql).toContain("mengshu_topic_tree_aliases_scope_canonical_idx");
+    expect(sql).toContain("mengshu_topic_tree_aliases_scope_status_idx");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v16 append 不改变 v1-v15 checksum，v15 ledger 只计划 v16", () => {
+    const appliedV15 = SCHEMA_MIGRATIONS.slice(0, 15).map(({ version, name, checksum }) => ({
+      version, name, checksum: checksum!,
+    }));
+    const plan = planSchemaMigrations(appliedV15, {
+      migrations: SCHEMA_MIGRATIONS.slice(0, 16),
+      currentSchemaVersion: 16,
+    });
+
+    expect(plan).toMatchObject({
+      fromVersion: 15,
+      toVersion: 16,
+      pending: [SCHEMA_MIGRATIONS[15]],
+    });
+    expect(SCHEMA_MIGRATIONS.slice(0, 15).map((migration) => migration.checksum))
+      .toEqual(appliedV15.map((migration) => migration.checksum));
+  });
+
+  test("v17 append-only 建立 §5.10 canonical entity identity 的四个事务表", () => {
+    const v17 = SCHEMA_MIGRATIONS.find((item) => item.version === 17);
+    const sql = v17?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(17);
+    expect(v17?.name).toBe("add-canonical-entity-resolution-journal");
+    expect(v17?.kind).toBe("expand");
+    for (const tableName of [
+      "mengshu_graph_entity_alias_bindings",
+      "mengshu_graph_entity_resolution_ledger",
+      "mengshu_graph_relation_resolution_ledger",
+      "mengshu_graph_entity_embeddings",
+    ]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${tableName}`);
+    }
+    for (const dimension of [
+      "scope_fingerprint", "tenant_id", "user_id", "app_id", "project_id",
+      "agent_id", "namespace", "visibility", "workspace_id", "session_id",
+    ]) {
+      expect(sql.match(new RegExp(`\\b${dimension}\\b`, "g"))?.length).toBeGreaterThanOrEqual(4);
+    }
+
+    expect(sql).toMatch(/status IN \('active', 'retired'\)/i);
+    expect(sql).toMatch(
+      /CREATE UNIQUE INDEX IF NOT EXISTS mengshu_graph_entity_alias_bindings_active_uidx[\s\S]+scope_fingerprint, entity_type, normalized_alias[\s\S]+WHERE status = 'active'/i,
+    );
+    expect(sql).toMatch(/method IN \('exact', 'alias', 'semantic', 'create'\)/i);
+    expect(sql).toMatch(/raw_entity_id TEXT NOT NULL[\s\S]+canonical_entity_id TEXT NOT NULL[\s\S]+entity_type TEXT NOT NULL/i);
+    expect(sql).toMatch(/status IN \('applied', 'rolled_back'\)/i);
+    expect(sql).toMatch(/method = 'semantic'[\s\S]+similarity IS NOT NULL[\s\S]+can_rollback = TRUE/i);
+    expect(sql).toMatch(/outcome IN \('canonicalized', 'dropped_self'\)/i);
+    expect(sql).toMatch(/outcome = 'dropped_self'[\s\S]+canonical_relation_id IS NULL[\s\S]+canonical_subject_id = canonical_object_id/i);
+    expect(sql).toMatch(/embedding_space_state IN \('known-queryable', 'unknown-unqueryable'\)/i);
+    expect(sql).toMatch(/REFERENCES mengshu_embedding_spaces \(embedding_space_id\)/i);
+    expect(sql).toMatch(
+      /CREATE INDEX IF NOT EXISTS mengshu_graph_entity_embeddings_queryable_idx[\s\S]+scope_fingerprint, entity_type, embedding_space_id, entity_id[\s\S]+WHERE embedding_space_state = 'known-queryable'/i,
+    );
+    expect(sql).not.toMatch(/USING (?:ivfflat|hnsw)/i);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v17 append 不改变 v1-v16 checksum，v16 ledger 只计划 v17", () => {
+    const v1ToV16Checksums = [
+      "579838a230d7e915c1a82d7937d42d04b73dcd0a7682b0320ba8920444c04b55",
+      "351de9a732b876ac7ebcfe68e6aad89cbacf56c416c32482e504dd07d674db74",
+      "dfdca1eee72077512614cedd89a7f832fc3e5ef0579fc4c600ec74ae8cad2491",
+      "a448b7db685ab929bb47b6851018a633df3bd0aa1bc87f42961d22dd8d4dfb2c",
+      "b98b8d4f4c23f3f1978ea8653bb73f64b3cb8fcb566411c50e725fbd2c37b4c2",
+      "0e1b2fa7016cddc9da9b324bf5d0531f3c70329ecf024cc3b7b4858a72f49e93",
+      "c15af146bef3270f1a8e39d138bf1628eb8fb0cb816d351daa748ab8538c9da7",
+      "6abe4c875385418efaf2b5a195c68a30cdc377f8d080db6b25d5832da87417a2",
+      "f70c1d636493d2379dbcd88043853343828d86f06c6a8bdecac5a9f099b1397f",
+      "e2325803791bd7ac34ee723c9d81cf26c9a3163d54167741ee10183dfcd72ded",
+      "8b0284e17cd4e6efe4dcda913d91779735d99f9e477484f1445d41b6b45607c5",
+      "26dcfcfd6ca0a55496f60cfe37d718751d75beb6c89bd28177668af4d660ea82",
+      "ec3d7bd001828317bd38dea5137cc38c0c957bbbc42ae2e9217a76b18bfb0a42",
+      "8cdadbedc3283cc8ba760429808d09965b615d0d831d7a8df978f76dfa63aeaa",
+      "b29861f3f76806f5843a19700192163d941c11c21647f0e3a55feb754f372e4f",
+      "03f32ac752804aba5dabdca4967e728c91dc217ac97f3896399214cb02938eb4",
+    ];
+    expect(SCHEMA_MIGRATIONS.slice(0, 16).map((item) => item.checksum))
+      .toEqual(v1ToV16Checksums);
+    const appliedV16 = SCHEMA_MIGRATIONS.slice(0, 16).map(({ version, name, checksum }) => ({
+      version, name, checksum: checksum!,
+    }));
+
+    expect(planSchemaMigrations(appliedV16, {
+      migrations: SCHEMA_MIGRATIONS.slice(0, 17),
+      currentSchemaVersion: 17,
+    })).toMatchObject({
+      fromVersion: 16,
+      toVersion: 17,
+      pending: [SCHEMA_MIGRATIONS[16]],
+    });
+  });
+
+  test("v18 contract 仅把 memories authority hash 改为 active partial unique，knowledge 保持原合同", () => {
+    const v18 = SCHEMA_MIGRATIONS.find((item) => item.version === 18);
+    const sql = v18?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(18);
+    expect(v18?.name).toBe("evidence-first-active-memory-dedupe");
+    expect(v18?.kind).toBe("contract");
+    expect(sql).toMatch(/DROP INDEX memories_authority_content_hash_uidx/i);
+    expect(sql).toMatch(
+      /CREATE UNIQUE INDEX memories_active_authority_content_hash_uidx ON memories[\s\S]+tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, visibility, content_hash[\s\S]+WHERE lifecycle_status = 'active'/i,
+    );
+    expect(sql).toMatch(/ALTER INDEX memories_active_authority_content_hash_uidx RENAME TO memories_authority_content_hash_uidx/i);
+    expect(sql).not.toMatch(/DROP INDEX knowledge_authority_content_hash_uidx/i);
+    expect(sql).not.toMatch(/UPDATE|DELETE|TRUNCATE|ALTER\s+TABLE/i);
+  });
+
+  test("v18 append 不改变 v1-v17 checksum，v17 ledger 只计划 v18", () => {
+    const appliedV17 = SCHEMA_MIGRATIONS.slice(0, 17).map(({ version, name, checksum }) => ({
+      version, name, checksum: checksum!,
+    }));
+
+    expect(SCHEMA_MIGRATIONS.slice(0, 17).map((item) => item.checksum)).toEqual([
+      "579838a230d7e915c1a82d7937d42d04b73dcd0a7682b0320ba8920444c04b55",
+      "351de9a732b876ac7ebcfe68e6aad89cbacf56c416c32482e504dd07d674db74",
+      "dfdca1eee72077512614cedd89a7f832fc3e5ef0579fc4c600ec74ae8cad2491",
+      "a448b7db685ab929bb47b6851018a633df3bd0aa1bc87f42961d22dd8d4dfb2c",
+      "b98b8d4f4c23f3f1978ea8653bb73f64b3cb8fcb566411c50e725fbd2c37b4c2",
+      "0e1b2fa7016cddc9da9b324bf5d0531f3c70329ecf024cc3b7b4858a72f49e93",
+      "c15af146bef3270f1a8e39d138bf1628eb8fb0cb816d351daa748ab8538c9da7",
+      "6abe4c875385418efaf2b5a195c68a30cdc377f8d080db6b25d5832da87417a2",
+      "f70c1d636493d2379dbcd88043853343828d86f06c6a8bdecac5a9f099b1397f",
+      "e2325803791bd7ac34ee723c9d81cf26c9a3163d54167741ee10183dfcd72ded",
+      "8b0284e17cd4e6efe4dcda913d91779735d99f9e477484f1445d41b6b45607c5",
+      "26dcfcfd6ca0a55496f60cfe37d718751d75beb6c89bd28177668af4d660ea82",
+      "ec3d7bd001828317bd38dea5137cc38c0c957bbbc42ae2e9217a76b18bfb0a42",
+      "8cdadbedc3283cc8ba760429808d09965b615d0d831d7a8df978f76dfa63aeaa",
+      "b29861f3f76806f5843a19700192163d941c11c21647f0e3a55feb754f372e4f",
+      "03f32ac752804aba5dabdca4967e728c91dc217ac97f3896399214cb02938eb4",
+      "b3ace4e344bcadb3ddd8f15f7bbb0139834f8c32ec5874ad49639ba1be00886f",
+    ]);
+    expect(planSchemaMigrations(appliedV17)).toMatchObject({
+      fromVersion: 17,
+      toVersion: 24,
+      pending: [
+        SCHEMA_MIGRATIONS[17],
+        SCHEMA_MIGRATIONS[18],
+        SCHEMA_MIGRATIONS[19],
+        SCHEMA_MIGRATIONS[20],
+        SCHEMA_MIGRATIONS[21],
+        SCHEMA_MIGRATIONS[22],
+        SCHEMA_MIGRATIONS[23],
+      ],
+    });
+  });
+
+  test("v19 expand-only 新增 semanticType backfill shadow、receipt 与 checkpoint", () => {
+    const v19 = SCHEMA_MIGRATIONS.find((item) => item.version === 19);
+    const sql = v19?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(19);
+    expect(v19?.name).toBe("add-semantic-type-backfill-ledger");
+    expect(v19?.kind).toBe("expand");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_semantic_type_backfill_shadow");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_semantic_type_backfill_receipts");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_semantic_type_backfill_checkpoints");
+    expect(sql).toMatch(/disposition IN \('preserve_explicit', 'backfill', 'lookup_only', 'invalid_explicit'\)/);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v20 expand-only 新增 private asset/loadout overlay、不可变版本、回执和 outbox", () => {
+    const v20 = SCHEMA_MIGRATIONS.find((item) => item.version === 20);
+    const sql = v20?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(20);
+    expect(v20?.name).toBe("add-private-asset-loadout-overlay");
+    expect(v20?.kind).toBe("expand");
+    for (const table of [
+      "mengshu_asset_versions",
+      "mengshu_asset_heads",
+      "mengshu_asset_promotion_receipts",
+      "mengshu_asset_audit",
+      "mengshu_asset_outbox",
+      "mengshu_loadout_versions",
+      "mengshu_loadout_heads",
+      "mengshu_loadout_receipts",
+    ]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+    }
+    expect(sql).toMatch(/kind TEXT NOT NULL CHECK \(kind IN \('memory_view'\)\)/);
+    expect(sql).toMatch(/visibility TEXT NOT NULL CHECK \(visibility = 'private'\)/);
+    expect(sql).toMatch(/PRIMARY KEY \(scope_fingerprint, asset_id, version\)/);
+    expect(sql).toMatch(/PRIMARY KEY \(scope_fingerprint, loadout_id, version\)/);
+    expect(sql).toMatch(/UNIQUE \(scope_fingerprint, request_key\)/);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v21 expand-only 为 Loadout 写入补齐 audit/outbox，且只追加 v20 ledger", () => {
+    const v21 = SCHEMA_MIGRATIONS.find((item) => item.version === 21);
+    const sql = v21?.statements.join("\n") ?? "";
+    const appliedV20 = SCHEMA_MIGRATIONS.slice(0, 20).map(({ version, name, checksum }) => ({
+      version,
+      name,
+      checksum: checksum!,
+    }));
+
+    expect(CURRENT_SCHEMA_VERSION).toBe(24);
+    expect(v21?.name).toBe("add-loadout-audit-invalidation-outbox");
+    expect(v21?.kind).toBe("expand");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_loadout_audit");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_loadout_outbox");
+    expect(sql).toMatch(/event_type TEXT NOT NULL CHECK \(event_type = 'loadout\.version\.created'\)/);
+    expect(sql).toMatch(/published_at BIGINT/);
+    expect(sql).toMatch(/mengshu_loadout_outbox_pending_idx/);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+    expect(SCHEMA_MIGRATIONS.slice(0, 20).map((item) => item.checksum)).toEqual([
+      "579838a230d7e915c1a82d7937d42d04b73dcd0a7682b0320ba8920444c04b55",
+      "351de9a732b876ac7ebcfe68e6aad89cbacf56c416c32482e504dd07d674db74",
+      "dfdca1eee72077512614cedd89a7f832fc3e5ef0579fc4c600ec74ae8cad2491",
+      "a448b7db685ab929bb47b6851018a633df3bd0aa1bc87f42961d22dd8d4dfb2c",
+      "b98b8d4f4c23f3f1978ea8653bb73f64b3cb8fcb566411c50e725fbd2c37b4c2",
+      "0e1b2fa7016cddc9da9b324bf5d0531f3c70329ecf024cc3b7b4858a72f49e93",
+      "c15af146bef3270f1a8e39d138bf1628eb8fb0cb816d351daa748ab8538c9da7",
+      "6abe4c875385418efaf2b5a195c68a30cdc377f8d080db6b25d5832da87417a2",
+      "f70c1d636493d2379dbcd88043853343828d86f06c6a8bdecac5a9f099b1397f",
+      "e2325803791bd7ac34ee723c9d81cf26c9a3163d54167741ee10183dfcd72ded",
+      "8b0284e17cd4e6efe4dcda913d91779735d99f9e477484f1445d41b6b45607c5",
+      "26dcfcfd6ca0a55496f60cfe37d718751d75beb6c89bd28177668af4d660ea82",
+      "ec3d7bd001828317bd38dea5137cc38c0c957bbbc42ae2e9217a76b18bfb0a42",
+      "8cdadbedc3283cc8ba760429808d09965b615d0d831d7a8df978f76dfa63aeaa",
+      "b29861f3f76806f5843a19700192163d941c11c21647f0e3a55feb754f372e4f",
+      "03f32ac752804aba5dabdca4967e728c91dc217ac97f3896399214cb02938eb4",
+      "b3ace4e344bcadb3ddd8f15f7bbb0139834f8c32ec5874ad49639ba1be00886f",
+      "1394410f346b9411b2677ca2edd777340b053dafd954fa0b784cbe0b68209943",
+      "23ffa2e19c3ac66136e686fd20d45ed47826fe02fe37000e7574d6a708698e96",
+      "e5450cfe2e1c3814a367122efaff7fb314aba0b0b61f5aa347d51f4b997b3cf8",
+    ]);
+    expect(planSchemaMigrations(appliedV20)).toMatchObject({
+      fromVersion: 20,
+      toVersion: 24,
+      pending: [v21, SCHEMA_MIGRATIONS[21], SCHEMA_MIGRATIONS[22], SCHEMA_MIGRATIONS[23]],
+    });
+  });
+
+  test("v23 expand-only 新增历史重建 run/snapshot/checkpoint/plan/model/operation ledger", () => {
+    const v23 = SCHEMA_MIGRATIONS.find((item) => item.version === 23);
+    const sql = v23?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBe(24);
+    expect(v23?.name).toBe("add-history-rebuild-ledger");
+    expect(v23?.kind).toBe("expand");
+    for (const table of [
+      "mengshu_history_rebuild_runs",
+      "mengshu_history_rebuild_source_snapshots",
+      "mengshu_history_rebuild_source_rows",
+      "mengshu_history_rebuild_checkpoints",
+      "mengshu_history_rebuild_shadow_plans",
+      "mengshu_history_rebuild_model_receipts",
+      "mengshu_history_rebuild_operation_receipts",
+      "mengshu_history_rebuild_artifacts",
+    ]) expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+    expect(sql).toMatch(/source_table TEXT NOT NULL CHECK \(source_table IN \('memories', 'knowledge'\)\)/);
+    expect(sql).toMatch(/disposition TEXT NOT NULL CHECK \(disposition IN \('preserve', 'backfill', 'model_classify', 'lookup_only', 'quarantine'\)\)/);
+    expect(sql).toMatch(/semantic_type TEXT CHECK \(semantic_type IS NULL OR semantic_type IN \('profile', 'task_context', 'rules', 'experience', 'resource'\)\)/);
+    expect(sql).toMatch(/operation TEXT NOT NULL CHECK \(operation IN \('plan', 'apply', 'verify', 'rollback'\)\)/);
+    expect(sql).toMatch(/status TEXT NOT NULL CHECK \(status IN \('applied', 'verified', 'rolled_back', 'drifted', 'failed'\)\)/);
+    expect(sql).toMatch(/artifact_type TEXT NOT NULL CHECK \(artifact_type IN \('evidence_memory', 'evidence_link', 'tree_job'\)\)/);
+    expect(sql).toMatch(/artifact_role TEXT NOT NULL CHECK \(artifact_role IN \('evidence_mirror', 'grounded_by', 'source_leaf', 'source_finalize', 'topic_leaf', 'topic_finalize'\)\)/);
+    expect(sql).toContain("FOREIGN KEY (run_id, source_table, record_id)");
+    expect(sql).toContain("ON mengshu_history_rebuild_artifacts (run_id, source_table, record_id, artifact_type, artifact_role)");
+    expect(sql).not.toMatch(/prompt(?:_text| TEXT| JSONB)/i);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME|ALTER\s+TABLE)\b/i);
+  });
+
+  test("v23 append 不改变 v1-v22 checksum", () => {
+    const appliedV22 = SCHEMA_MIGRATIONS.slice(0, 22).map(({ version, name, checksum }) => ({
+      version, name, checksum: checksum!,
+    }));
+    expect(planSchemaMigrations(appliedV22, {
+      migrations: SCHEMA_MIGRATIONS.slice(0, 23), currentSchemaVersion: 23,
+    })).toMatchObject({
+      fromVersion: 22,
+      toVersion: 23,
+      pending: [SCHEMA_MIGRATIONS[22]],
+    });
+  });
+
+  test("v24 append-only 新增 crash-safe 模型 attempt ledger，且不改变 v23 checksum", () => {
+    const v24 = SCHEMA_MIGRATIONS.find((item) => item.version === 24);
+    const sql = v24?.statements.join("\n") ?? "";
+    const appliedV23 = SCHEMA_MIGRATIONS.slice(0, 23).map(({ version, name, checksum }) => ({
+      version, name, checksum: checksum!,
+    }));
+
+    expect(v24?.name).toBe("add-history-rebuild-model-attempt-ledger");
+    expect(v24?.kind).toBe("expand");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_history_rebuild_model_attempts");
+    expect(sql).toContain("PRIMARY KEY (run_id, source_table, record_id, attempt)");
+    expect(sql).toContain("state IN ('reserved', 'completed')");
+    expect(sql).toContain("actual_output_tokens <= reserved_output_tokens");
+    expect(sql).toContain("actual_cost_minor_units <= reserved_cost_minor_units");
+    expect(sql).toContain("mengshu_history_rebuild_model_attempts_budget_idx");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME|ALTER\s+TABLE)\b/i);
+    expect(planSchemaMigrations(appliedV23)).toMatchObject({
+      fromVersion: 23,
+      toVersion: 24,
+      pending: [v24],
     });
   });
 });

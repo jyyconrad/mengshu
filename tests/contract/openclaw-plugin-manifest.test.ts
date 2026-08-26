@@ -40,4 +40,23 @@ describe("OpenClaw plugin manifests", () => {
       serviceKey: { type: "string" },
     });
   });
+
+  test.each([
+    "plugins/openclaw/openclaw.plugin.json",
+    "openclaw.plugin.json",
+  ])("%s constrains multi-Agent configuration", (relativePath) => {
+    const manifest = readJson(join(rootDir, relativePath));
+    const configSchema = manifest.configSchema as Record<string, unknown>;
+    const properties = configSchema.properties as Record<string, Record<string, unknown>>;
+    const authority = properties.authority.properties as Record<string, Record<string, unknown>>;
+    const allow = authority.allow.properties as Record<string, Record<string, unknown>>;
+
+    expect(allow.agentIds.maxItems).toBe(64);
+    expect(configSchema.allOf).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        if: expect.any(Object),
+        then: expect.objectContaining({ required: ["defaultAgentId"] }),
+      }),
+    ]));
+  });
 });

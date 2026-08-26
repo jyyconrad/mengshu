@@ -1,5 +1,8 @@
 import { describe, expect, test, vi } from "vitest";
-import { registerMemoryServerCliCommands as registerMemoryServerCliCommandsRaw } from "./index.js";
+import {
+  registerMemoryServerCliCommands as registerMemoryServerCliCommandsRaw,
+  registerNodeShutdownSignals,
+} from "./index.js";
 import {
   POSTGRES_SCHEMA_CUTOVER_TARGET,
   type PostgresSchemaCutoverPort,
@@ -46,7 +49,7 @@ class FakeCommand {
 }
 
 describe("OpenClaw server CLI commands", () => {
-  test.each(["serve", "status", "health", "migrate"])(
+  test.each(["serve", "status", "migrate"])(
     "缺少 authenticated authority 时在 %s action 副作用前拒绝",
     async (commandName) => {
       const ms = new FakeCommand("ms");
@@ -63,6 +66,24 @@ describe("OpenClaw server CLI commands", () => {
       expect(health).not.toHaveBeenCalled();
     },
   );
+
+  test("health 是不依赖 scope authority 的 host readiness", async () => {
+    const ms = new FakeCommand("ms");
+    const health = vi.fn(async () => ({ ok: true, records: 2 }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      registerMemoryServerCliCommandsRaw(ms as never, {
+        config: { dbType: "postgres" },
+        service: { health } as never,
+      });
+
+      await expect(ms.subcommands.find((command) => command.name === "health")?.actionHandler?.({}))
+        .resolves.toBeUndefined();
+      expect(health).toHaveBeenCalledTimes(1);
+    } finally {
+      log.mockRestore();
+    }
+  });
 
   test("registers serve, status, and health commands", () => {
     const ms = new FakeCommand("ms");
@@ -157,11 +178,15 @@ describe("OpenClaw server CLI commands", () => {
       snapshot: vi.fn(() => ({ state: "ready", ready: true })),
     };
     const runtimeHostFactory = vi.fn(() => runtimeHost);
+    const memoryWrite = { executeMemoryWrite: vi.fn() };
+    const serverLogger = { error: vi.fn() };
     try {
       registerMemoryServerCliCommands(ms as never, {
         config: { dbType: "lancedb", server: { host: "127.0.0.1", port: 3847, secret: "secret" } },
         service: { health: async () => ({ ok: true }) } as never,
         startServer,
+        memoryWrite,
+        serverLogger,
         runtimeHostFactory,
         keepAlive: false,
       });
@@ -170,6 +195,7 @@ describe("OpenClaw server CLI commands", () => {
 
       expect(startServer).toHaveBeenCalledWith({
         service: expect.anything(),
+        memoryWrite,
         console: undefined,
         agentFastPath: undefined,
         authority,
@@ -179,11 +205,42 @@ describe("OpenClaw server CLI commands", () => {
         port: 3847,
         secret: "secret",
         requireHttps: undefined,
+        logger: serverLogger,
+        registerShutdownSignal: registerNodeShutdownSignals,
       });
       expect(runtimeHostFactory).toHaveBeenCalledTimes(1);
       expect(log).toHaveBeenCalledWith("Memory server listening at http://127.0.0.1:3847");
     } finally {
       log.mockRestore();
+    }
+  });
+
+  test("Node shutdown registrar 对 SIGINT/SIGTERM 只触发一次 stop 并可注销", async () => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const once = vi.spyOn(process, "once").mockImplementation(((signal: string, listener: (...args: unknown[]) => void) => {
+      listeners.set(signal, listener);
+      return process;
+    }) as never);
+    const removeListener = vi.spyOn(process, "removeListener").mockImplementation(((signal: string) => {
+      listeners.delete(signal);
+      return process;
+    }) as never);
+    const stop = vi.fn(async () => undefined);
+    try {
+      const unregister = registerNodeShutdownSignals(stop);
+
+      expect([...listeners.keys()].sort()).toEqual(["SIGINT", "SIGTERM"]);
+      listeners.get("SIGTERM")?.();
+      listeners.get("SIGINT")?.();
+      await Promise.resolve();
+
+      expect(stop).toHaveBeenCalledTimes(1);
+      unregister();
+      expect(removeListener).toHaveBeenCalledTimes(2);
+      expect(listeners.size).toBe(0);
+    } finally {
+      once.mockRestore();
+      removeListener.mockRestore();
     }
   });
 

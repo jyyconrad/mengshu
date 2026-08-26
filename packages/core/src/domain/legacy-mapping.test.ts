@@ -65,6 +65,7 @@ describe("legacy memory mapping", () => {
       projectId: "/workspace/app",
       agentId: "openclaw-agent",
       namespace: "memories",
+      sessionId: "session-1",
     });
     expect(scopeToKey(record.scope)).toBe(
       "tenant-a:openclaw:user-1:%2Fworkspace%2Fapp:openclaw-agent:memories",
@@ -156,6 +157,20 @@ describe("legacy memory mapping", () => {
     expect(restored.confidence).toBe(0.91);
     expect(restored.semanticType).toBe("experience");
     expect(restored.updatedAt).toBe(1710000001000);
+  });
+
+  test("preserves MemoryContainer across the legacy metadata boundary", () => {
+    const record = memoryEntryToRecord(baseEntry, { appId: "openclaw" });
+    const entry = recordToMemoryEntry({
+      ...record,
+      container: "session_candidate",
+      metadata: { ...record.metadata, admissionRoute: "evidence_only" },
+    });
+    const restored = memoryEntryToRecord(entry, { appId: "openclaw" });
+
+    expect(entry.metadata.memoryContainer).toBe("session_candidate");
+    expect(restored.container).toBe("session_candidate");
+    expect(restored.metadata.admissionRoute).toBe("evidence_only");
   });
 
   test("falls back to undefined for v3.0 fields missing from legacy metadata", () => {

@@ -1,0 +1,5 @@
+{"id":"ap-001","suite":"mengshu-asset-promotion","scenario":"publish_exact_private_active"}
+{"id":"ap-002","suite":"mengshu-asset-promotion","scenario":"reject_workspace_scope"}
+{"id":"ap-003","suite":"mengshu-asset-promotion","scenario":"reject_revoked_source"}
+{"id":"ap-004","suite":"mengshu-asset-promotion","scenario":"reject_missing_evidence"}
+{"id":"ap-005","suite":"mengshu-asset-promotion","scenario":"revoke_overrides_pinned_version"}

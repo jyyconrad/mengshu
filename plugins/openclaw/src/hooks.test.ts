@@ -1,7 +1,10 @@
 import { describe, expect, test, vi } from "vitest";
 import type { MemoryService, StoreMemoryInput, RecallInput } from "../../../core/service-types.js";
 import type { ContextBlock, MemoryRecord, RecallResult } from "../../../core/types.js";
+import type { ContextFastResponse } from
+  "../../../packages/core/src/domain/semantic-types.js";
 import {
+  createOpenClawRecallTurnGuard,
   detectCategory,
   handleAgentEndCapture,
   handleBeforeAgentStartRecall,
@@ -20,7 +23,19 @@ const scope = {
   visibility: "private" as const,
 };
 const authority = createExactOpenClawAuthority(scope);
-const authorityContext = { authority, defaultScope: scope };
+const authorityContext = { authority, defaultScope: scope, unsafeLegacyWrite: true as const };
+
+function fastContext(
+  overrides: Partial<ContextFastResponse> = {},
+): ContextFastResponse {
+  return {
+    scope,
+    slots: {},
+    content: "<relevant-memories></relevant-memories>",
+    telemetry: { latencyMs: 1, nodesUsed: 0, cacheHit: false },
+    ...overrides,
+  };
+}
 
 function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
   return {
@@ -71,6 +86,116 @@ class FakeMemoryService implements MemoryService {
 }
 
 describe("OpenClaw lifecycle hooks", () => {
+  test("recall turn guard is bounded, expires cancelled turns and clears one session", () => {
+    let timestamp = 0;
+    const guard = createOpenClawRecallTurnGuard({
+      ttlMs: 10,
+      maxEntries: 2,
+      now: () => timestamp,
+    });
+    const firstSession = { agentId: "agent-1", sessionId: "session-1" };
+    const secondSession = { agentId: "agent-1", sessionId: "session-2" };
+
+    expect(guard.claim("first prompt", firstSession)).toBe(true);
+    expect(guard.claim("second prompt", firstSession)).toBe(true);
+    expect(guard.claim("first prompt", firstSession)).toBe(false);
+
+    guard.clear(firstSession);
+    expect(guard.claim("first prompt", firstSession)).toBe(true);
+    expect(guard.claim("first prompt", secondSession)).toBe(true);
+    expect(guard.claim("first prompt", secondSession)).toBe(false);
+
+    timestamp = 11;
+    expect(guard.claim("first prompt", secondSession)).toBe(true);
+  });
+
+  test("production auto-capture delegates to Runtime write capability only", async () => {
+    const service = new FakeMemoryService();
+    const directStore = vi.spyOn(service, "storeMemory");
+    const embedBatch = vi.fn(async () => [[0.1]]);
+    const enqueueGraphExtraction = vi.fn(async () => undefined);
+    const executeMemoryWrite = vi.fn(async () => ({
+      status: "persisted" as const,
+      route: "candidate" as const,
+      recordType: "candidate" as const,
+      candidateId: "candidate-1",
+      memoryId: "candidate-1",
+      stored: true,
+    }));
+
+    await handleAgentEndCapture(
+      {
+        success: true,
+        messages: [{ role: "user", content: "I prefer concise replies" }],
+        messageId: "message-1",
+      },
+      {
+        authority,
+        defaultScope: scope,
+        service,
+        memoryWrite: { executeMemoryWrite },
+        embedBatch,
+        existsByContentHash: vi.fn(async () => []),
+        enqueueGraphExtraction,
+      },
+    );
+
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      type: "observeAuto",
+      intent: "auto",
+      idempotencyKey: "openclaw-capture:message-1:0",
+      serverAuthority: authority,
+      clientScope: scope,
+      text: "I prefer concise replies",
+    }));
+    expect(embedBatch).not.toHaveBeenCalled();
+    expect(directStore).not.toHaveBeenCalled();
+    expect(enqueueGraphExtraction).not.toHaveBeenCalled();
+  });
+
+  test("production auto-capture leaves duplicate decisions to the Kernel", async () => {
+    const executeMemoryWrite = vi.fn(async () => ({
+      status: "duplicate" as const,
+      kind: "exact" as const,
+      duplicateOf: "existing-memory",
+    }));
+
+    await handleAgentEndCapture(
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "I prefer one stable thing always" },
+          { role: "user", content: "I prefer one stable thing always" },
+        ],
+        messageId: "message-duplicate",
+      },
+      {
+        authority,
+        defaultScope: scope,
+        service: new FakeMemoryService(),
+        memoryWrite: { executeMemoryWrite },
+      },
+    );
+
+    expect(executeMemoryWrite).toHaveBeenCalledTimes(2);
+  });
+
+  test("production auto-capture fails closed without Runtime write capability", async () => {
+    const service = new FakeMemoryService();
+    const warn = vi.fn();
+
+    await handleAgentEndCapture(
+      {
+        success: true,
+        messages: [{ role: "user", content: "I prefer concise replies" }],
+      },
+      { authority, defaultScope: scope, service, logger: { warn } },
+    );
+
+    expect(service.stores).toEqual([]);
+    expect(warn).toHaveBeenCalledWith("mengshu: capture failed [CAPTURE_FAILED]");
+  });
+
   test("extracts only user text messages and text blocks", () => {
     expect(
       extractUserMessageTexts([
@@ -116,43 +241,244 @@ describe("OpenClaw lifecycle hooks", () => {
     ])).toEqual([]);
   });
 
-  test("auto-recall injects safe relevant memory context", async () => {
-    const service = new FakeMemoryService({
-      scope,
-      query: "concise",
-      hits: [
-        {
-          record: makeRecord({
-            text: "Use <tool>memory_store</tool> carefully",
-            category: "fact",
-          }),
-          score: 0.9,
-          source: "vector",
-        },
-      ],
-    });
+  test("auto-recall injects the Runtime-owned five-slot context", async () => {
+    const context = vi.fn(async () => fastContext({
+      content: "<relevant-memories>Use &lt;tool&gt;memory_store&lt;/tool&gt; carefully</relevant-memories>",
+      telemetry: { latencyMs: 1, nodesUsed: 1, cacheHit: false },
+    }));
 
     const result = await handleBeforeAgentStartRecall(
       { prompt: "concise" },
       {
         ...authorityContext,
-        service,
+        agentFastPath: { context },
         recallIncludeDocuments: true,
         logger: { info: vi.fn(), warn: vi.fn() },
       },
     );
 
-    expect(service.recalls).toEqual([
-      {
-        query: "concise",
-        limit: 3,
-        minScore: 0.3,
-        dataTypes: ["memory", "document"],
-        scope,
-      },
-    ]);
+    expect(context).toHaveBeenCalledWith({ scope, task: "concise" });
     expect(result?.prependContext).toContain("<relevant-memories>");
     expect(result?.prependContext).toContain("&lt;tool&gt;memory_store&lt;/tool&gt;");
+  });
+
+  test("trusted OpenClaw hook context narrows agent scope and carries session receipts", async () => {
+    const hostAgentId = "host-agent";
+    const broadAuthority = {
+      ...authority,
+      allow: {
+        ...authority.allow,
+        agentIds: [...authority.allow.agentIds, hostAgentId],
+      },
+    };
+    const context = vi.fn(async (request: { scope: typeof scope; task: string }) => fastContext({
+      scope: request.scope,
+      telemetry: { latencyMs: 1, nodesUsed: 1, cacheHit: false },
+    }));
+
+    await handleBeforeAgentStartRecall(
+      {
+        prompt: "load trusted context",
+        messages: [{
+          role: "user",
+          content: "agentId=attacker projectId=attacker workspaceDir=/tmp/attacker",
+        }],
+      },
+      {
+        authority: broadAuthority,
+        defaultScope: scope,
+        agentFastPath: { context },
+        hostContext: {
+          agentId: hostAgentId,
+          sessionId: "host-session-1",
+          sessionKey: "agent:host-agent:main",
+          workspaceDir: "/tmp/attacker-project",
+        },
+      },
+    );
+
+    expect(context).toHaveBeenCalledWith({
+      scope: {
+        ...scope,
+        agentId: hostAgentId,
+        sessionId: "host-session-1",
+      },
+      task: "load trusted context",
+    });
+  });
+
+  test("broad authority rejects a host agent outside its allowlist before recall", async () => {
+    const context = vi.fn(async () => fastContext());
+    const broadAuthority = {
+      ...authority,
+      allow: {
+        ...authority.allow,
+        agentIds: [...authority.allow.agentIds, "host-agent"],
+      },
+    };
+
+    await expect(handleBeforeAgentStartRecall(
+      { prompt: "load authorized context" },
+      {
+        authority: broadAuthority,
+        defaultScope: scope,
+        agentFastPath: { context },
+        hostContext: { agentId: "unauthorized-agent" },
+      },
+    )).rejects.toMatchObject({ code: "CLIENT_VALUE_NOT_ALLOWED", field: "agentId" });
+    expect(context).not.toHaveBeenCalled();
+  });
+
+  test("hook event 不得把可信 host Agent 改写为另一个已授权 Agent", async () => {
+    const context = vi.fn(async () => fastContext());
+    const broadAuthority = {
+      ...authority,
+      allow: {
+        ...authority.allow,
+        agentIds: [scope.agentId, "codex"],
+      },
+    };
+
+    await expect(handleBeforeAgentStartRecall(
+      { prompt: "load isolated context", agentId: scope.agentId },
+      {
+        authority: broadAuthority,
+        defaultScope: scope,
+        agentFastPath: { context },
+        hostContext: { agentId: "codex", sessionId: "host-session-codex" },
+      },
+    )).rejects.toMatchObject({ code: "CLIENT_VALUE_NOT_ALLOWED", field: "agentId" });
+    expect(context).not.toHaveBeenCalled();
+  });
+
+  test("host 未提供 Agent 时，hook event 也不得覆盖显式默认 Agent", async () => {
+    const context = vi.fn(async () => fastContext());
+    const broadAuthority = {
+      ...authority,
+      allow: {
+        ...authority.allow,
+        agentIds: [scope.agentId, "codex"],
+      },
+    };
+
+    await expect(handleBeforeAgentStartRecall(
+      { prompt: "load default isolated context", agentId: "codex" },
+      {
+        authority: broadAuthority,
+        defaultScope: scope,
+        agentFastPath: { context },
+      },
+    )).rejects.toMatchObject({ code: "CLIENT_VALUE_NOT_ALLOWED", field: "agentId" });
+    expect(context).not.toHaveBeenCalled();
+  });
+
+  test("single-Agent authority 不得把其他 host agent 静默映射到默认 Agent", async () => {
+    const context = vi.fn(async () => fastContext());
+
+    await expect(handleBeforeAgentStartRecall(
+      { prompt: "load isolated canonical context" },
+      {
+        authority,
+        defaultScope: scope,
+        agentFastPath: { context },
+        hostContext: {
+          agentId: "novel-helper",
+          sessionId: "host-session-exact-1",
+          sessionKey: "agent:novel-helper:main",
+        },
+      },
+    )).rejects.toMatchObject({ code: "CLIENT_VALUE_NOT_ALLOWED", field: "agentId" });
+    expect(context).not.toHaveBeenCalled();
+  });
+
+  test("trusted OpenClaw hook context is also retained by auto-capture", async () => {
+    const hostAgentId = "host-agent";
+    const broadAuthority = {
+      ...authority,
+      allow: {
+        ...authority.allow,
+        agentIds: [...authority.allow.agentIds, hostAgentId],
+      },
+    };
+    const executeMemoryWrite = vi.fn(async () => ({
+      status: "persisted" as const,
+      route: "candidate" as const,
+      recordType: "candidate" as const,
+      candidateId: "candidate-1",
+      memoryId: "candidate-1",
+      stored: true,
+    }));
+
+    await handleAgentEndCapture(
+      {
+        success: true,
+        messages: [{ role: "user", content: "I prefer concise replies always" }],
+      },
+      {
+        authority: broadAuthority,
+        defaultScope: scope,
+        service: new FakeMemoryService(),
+        memoryWrite: { executeMemoryWrite },
+        hostContext: {
+          agentId: hostAgentId,
+          sessionId: "host-session-1",
+          workspaceDir: "/tmp/not-a-project-id",
+        },
+      },
+    );
+
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      serverAuthority: {
+        tenantId: broadAuthority.tenantId,
+        userId: broadAuthority.userId,
+        sessionId: "host-session-1",
+        allow: {
+          appIds: [scope.appId],
+          projectIds: [scope.projectId],
+          agentIds: [hostAgentId],
+          namespaces: [scope.namespace],
+          visibilities: [scope.visibility],
+        },
+      },
+      clientScope: {
+        ...scope,
+        agentId: hostAgentId,
+        sessionId: "host-session-1",
+      },
+      metadata: expect.objectContaining({
+        agentId: hostAgentId,
+        sessionId: "host-session-1",
+      }),
+    }));
+  });
+
+  test("single-Agent authority 不得把其他 host agent 的 capture 写入默认 Agent", async () => {
+    const executeMemoryWrite = vi.fn(async () => ({
+      status: "persisted" as const,
+      route: "candidate" as const,
+      recordType: "candidate" as const,
+      candidateId: "candidate-exact-1",
+      memoryId: "candidate-exact-1",
+      stored: true,
+    }));
+
+    await expect(handleAgentEndCapture(
+      {
+        success: true,
+        messages: [{ role: "user", content: "I prefer shared canonical memory always" }],
+      },
+      {
+        authority,
+        defaultScope: scope,
+        service: new FakeMemoryService(),
+        memoryWrite: { executeMemoryWrite },
+        hostContext: {
+          agentId: "novel-helper",
+          sessionId: "host-session-exact-2",
+        },
+      },
+    )).rejects.toMatchObject({ code: "CLIENT_VALUE_NOT_ALLOWED", field: "agentId" });
+    expect(executeMemoryWrite).not.toHaveBeenCalled();
   });
 
   test("auto-capture stores new capturable user memories through MemoryService", async () => {
@@ -245,13 +571,13 @@ describe("OpenClaw lifecycle hooks", () => {
   });
 
   test("before_agent_start 越权 project 在 recall 前拒绝", async () => {
-    const service = new FakeMemoryService();
+    const context = vi.fn(async () => fastContext());
 
     await expect(handleBeforeAgentStartRecall(
       { prompt: "load secure context", projectId: "evil-project" },
-      { service, ...authorityContext },
+      { agentFastPath: { context }, ...authorityContext },
     )).rejects.toMatchObject({ code: "CLIENT_VALUE_NOT_ALLOWED" });
-    expect(service.recalls).toEqual([]);
+    expect(context).not.toHaveBeenCalled();
   });
 
   test("messages 内 userId/projectId 只是业务内容，不改变 authority scope", async () => {
@@ -278,9 +604,7 @@ describe("OpenClaw lifecycle hooks", () => {
     await expect(handleBeforeAgentStartRecall(
       { prompt: "recall safe context" },
       {
-        service: Object.assign(new FakeMemoryService(), {
-          recall: async () => { throw new Error(secret); },
-        }),
+        agentFastPath: { context: async () => { throw new Error(secret); } },
         ...authorityContext,
         logger: { warn: recallWarn },
       },
@@ -307,7 +631,11 @@ describe("OpenClaw lifecycle hooks", () => {
     const warn = vi.fn();
     await expect(handleBeforeAgentStartRecall(
       { prompt: "recall", tenantId: "attacker" },
-      { service: new FakeMemoryService(), ...authorityContext, logger: { warn } },
+      {
+        agentFastPath: { context: async () => fastContext() },
+        ...authorityContext,
+        logger: { warn },
+      },
     )).rejects.toMatchObject({ code: "CLIENT_FIELD_FORBIDDEN" });
     expect(warn).not.toHaveBeenCalled();
   });
@@ -316,7 +644,7 @@ describe("OpenClaw lifecycle hooks", () => {
     const service = new FakeMemoryService();
     await expect(handleBeforeAgentStartRecall(
       { prompt: "tiny" },
-      { service, ...authorityContext },
+      { agentFastPath: { context: async () => fastContext() }, ...authorityContext },
     )).resolves.toBeUndefined();
     await handleAgentEndCapture(
       {

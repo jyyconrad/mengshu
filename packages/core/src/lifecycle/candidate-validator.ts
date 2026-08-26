@@ -35,6 +35,28 @@ import {
 // political/religious/sexual_orientation），口径严格（如 health 要求"患有/确诊/诊断"前缀），
 // 不会把"健康饮食"误标 sensitive。闸门 7 复用其判定，避免 extraction-rules 简化版的双轨漂移。
 import { detectSensitive } from "./sensitive-filter.js";
+import {
+  CANDIDATE_GATE_IDS,
+  CANDIDATE_VALIDATION_POLICY_VERSION,
+  candidateGateReceipt,
+  finalizeCandidateValidationReceipt,
+  initialCandidateGateReceipts,
+  type CandidateValidationReceiptOptions,
+  type CandidateValidationReceiptV1,
+} from "./candidate-validation-receipt.js";
+
+export {
+  CANDIDATE_GATE_IDS,
+  CANDIDATE_VALIDATION_POLICY_VERSION,
+};
+export type {
+  CandidateGateId,
+  CandidateGateReceipt,
+  CandidateGateSnapshotValue,
+  CandidateGateStatus,
+  CandidateValidationReceiptOptions,
+  CandidateValidationReceiptV1,
+} from "./candidate-validation-receipt.js";
 
 /** salience 准入下限（§3.1 闸门 4，默认 0.3）。 */
 export const MIN_SALIENCE = 0.3 as const;
@@ -280,39 +302,91 @@ export function validateCandidate(
   c: RawCandidate,
   source: CandidateSource,
 ): ValidatedCandidate | RejectedCandidate {
+  return validateCandidateWithReceipt(c, source).verdict;
+}
+
+/** 在不改变既有裁决语义的前提下，返回固定 G01-G11 的版本化执行回执。 */
+export function validateCandidateWithReceipt(
+  c: RawCandidate,
+  source: CandidateSource,
+  options: CandidateValidationReceiptOptions = {},
+): {
+  readonly verdict: ValidatedCandidate | RejectedCandidate;
+  readonly receipt: CandidateValidationReceiptV1;
+} {
+  const candidateOrdinal = Number.isSafeInteger(options.candidateOrdinal) &&
+      (options.candidateOrdinal ?? -1) >= 0
+    ? options.candidateOrdinal!
+    : 0;
+  const gates = initialCandidateGateReceipts();
+  const acceptedGate = (index: number, reasonCode: string, transition?: Parameters<typeof candidateGateReceipt>[3]) => {
+    gates[index] = candidateGateReceipt(CANDIDATE_GATE_IDS[index]!, "passed", reasonCode, transition);
+  };
+  const rejected = (
+    index: number,
+    reason: RejectReason,
+    riskFlags?: CandidateRiskFlag[],
+  ) => {
+    gates[index] = candidateGateReceipt(CANDIDATE_GATE_IDS[index]!, "rejected", reason);
+    const verdict = reject(reason, riskFlags);
+    return Object.freeze({
+      verdict,
+      receipt: finalizeCandidateValidationReceipt({
+        candidate: c,
+        source,
+        candidateOrdinal,
+        outcome: "rejected",
+        rejectedReason: reason,
+        gates,
+      }),
+    });
+  };
+
   // 闸门 1：structured-output schema 结构存在性
   if (!hasValidSchema(c)) {
-    return reject("schema_invalid");
+    return rejected(0, "schema_invalid");
   }
+  acceptedGate(0, "schema_valid");
 
   // 闸门 2：evidence 真实性（quote 在源 + eventIds 子集）
   if (!fuzzyContains(source.text, c.evidence.quote, EVIDENCE_FUZZY_THRESHOLD)) {
-    return reject("evidence_not_in_source", ["low_evidence"]);
+    return rejected(1, "evidence_not_in_source", ["low_evidence"]);
   }
   if (!eventIdsSubsetOf(c.evidence.eventIds, source.eventIds)) {
-    return reject("event_id_not_in_source", ["low_evidence"]);
+    return rejected(1, "event_id_not_in_source", ["low_evidence"]);
   }
+  acceptedGate(1, "evidence_verified");
 
   // 闸门 3：text 长度下限（去空白 >= 8）
   if (c.text.replace(/\s+/g, "").length < MIN_TEXT_LENGTH) {
-    return reject("text_too_short");
+    return rejected(2, "text_too_short");
   }
+  acceptedGate(2, "text_length_valid");
 
   // 闸门 4：salience 下限
   if (c.salience < MIN_SALIENCE) {
-    return reject("salience_below_min");
+    return rejected(3, "salience_below_min");
   }
+  acceptedGate(3, "salience_valid");
 
   // 闸门 5：semanticType 在 5 type 枚举内（基础准入，细分门槛由权重体现）
   if (!c.semanticType || !SEMANTIC_TYPES.includes(c.semanticType)) {
-    return reject("unknown_semantic_type");
+    return rejected(4, "unknown_semantic_type");
   }
+  acceptedGate(4, "semantic_type_valid");
 
   // 闸门 6：profile 白名单
   if (c.semanticType === "profile") {
     if (!c.profileDimension || !PROFILE_WHITELIST.has(c.profileDimension)) {
-      return reject("profile_dimension_not_whitelisted");
+      return rejected(5, "profile_dimension_not_whitelisted");
     }
+    acceptedGate(5, "profile_dimension_whitelisted");
+  } else {
+    gates[5] = candidateGateReceipt(
+      "G06",
+      "not_applicable",
+      "semantic_type_not_profile",
+    );
   }
 
   // 以下为「降级/校准」闸门：不拒绝，逐步构造最终字段（保持输入不可变）
@@ -324,17 +398,22 @@ export function validateCandidate(
   if (sensitiveDetection.sensitive) {
     riskFlags.push("sensitive");
   }
+  acceptedGate(6, sensitiveDetection.sensitive ? "sensitive_detected" : "sensitive_not_detected");
 
   // 闸门 8：prompt injection（标记 + 降级 evidence-only，不执行任何指令）
-  if (PROMPT_INJECTION_PATTERNS.some((p) => p.test(c.text))) {
+  const promptInjectionDetected = PROMPT_INJECTION_PATTERNS.some((p) => p.test(c.text));
+  if (promptInjectionDetected) {
     riskFlags.push("prompt_injection");
     evidenceOnly = true;
   }
+  acceptedGate(7, promptInjectionDetected ? "prompt_injection_detected" : "prompt_injection_not_detected");
 
   // 闸门 9：泛词过滤（纯泛词降级 evidence-only）
-  if (isGenericText(c.text)) {
+  const genericTextDetected = isGenericText(c.text);
+  if (genericTextDetected) {
     evidenceOnly = true;
   }
+  acceptedGate(8, genericTextDetected ? "generic_text_detected" : "specific_text_detected");
 
   // 闸门 10：时效一致性。先用 reconcileCrossContextual 校准跨情境，
   // 再修正 ephemeral 与 rules/profile 的冲突。
@@ -357,14 +436,33 @@ export function validateCandidate(
   ) {
     semanticType = "experience";
   }
+  acceptedGate(9, (
+    semanticType !== c.semanticType || temporality !== c.temporality ||
+    reconciled !== (c.crossContextual ?? false)
+  ) ? "temporality_reconciled" : "temporality_consistent", {
+    before: {
+      semanticType: c.semanticType,
+      temporality: c.temporality,
+      crossContextual: c.crossContextual ?? false,
+    },
+    after: {
+      semanticType,
+      temporality,
+      crossContextual: reconciled,
+    },
+  });
 
   // 闸门 11：scope 不超界（targetScope 不得宽于 source.scope）
   const targetScope: ScopeLevel =
     SCOPE_RANK[c.targetScope] > SCOPE_RANK[source.scope]
       ? source.scope
       : c.targetScope;
+  acceptedGate(10, targetScope === c.targetScope ? "scope_within_source" : "scope_narrowed", {
+    before: { targetScope: c.targetScope },
+    after: { targetScope },
+  });
 
-  return {
+  const verdict: ValidatedCandidate = {
     rejected: false,
     text: c.text,
     semanticType,
@@ -380,4 +478,14 @@ export function validateCandidate(
     riskFlags,
     evidenceOnly,
   };
+  return Object.freeze({
+    verdict,
+    receipt: finalizeCandidateValidationReceipt({
+      candidate: c,
+      source,
+      candidateOrdinal,
+      outcome: "accepted",
+      gates,
+    }),
+  });
 }

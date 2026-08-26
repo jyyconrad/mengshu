@@ -11,7 +11,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { createBuildTreeHandler } from "./build-tree-handler.js";
-import { InMemoryTreeRepository } from "./buffer.js";
+import { bufferId, InMemoryTreeRepository } from "./buffer.js";
 import type { LlmClient } from "../runtime/llm/llm-client.js";
 import type { MemoryScope } from "../domain/types.js";
 import type { JobRecord } from "../storage/repositories/types.js";
@@ -118,6 +118,31 @@ describe("build_tree job handler", () => {
     expect(buffer).toBeDefined();
     expect(buffer?.leafIds).toContain("leaf-1");
     expect(buffer?.leafIds).toHaveLength(1);
+  });
+
+  it("seal 后 replay 返回既有 node，不重建 buffer", async () => {
+    const repository = new InMemoryTreeRepository();
+    const handler = createBuildTreeHandler({ repository, policy: { maxLeafCount: 1 } });
+    const payload = {
+      scope: testScope,
+      treeType: "source",
+      treeKey: "source-1",
+      leaf: {
+        id: "leaf-replay",
+        chunkId: "chunk-replay",
+        sourceId: "source-1",
+        text: "replayable evidence",
+        importance: 0.8,
+        eventAt: 1710000000000,
+        createdAt: 1710000000000,
+      },
+    };
+
+    const first = await handler(makeJobPayload(payload));
+    const replay = await handler(makeJobPayload(payload));
+
+    expect(replay).toEqual(first);
+    expect(await repository.getBuffer(bufferId(testScope, "source", "source-1", 0))).toBeUndefined();
   });
 
   it("追加 leaf 超过 maxLeafCount 触发 seal", async () => {

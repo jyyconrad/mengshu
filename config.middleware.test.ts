@@ -28,6 +28,7 @@ describe("middleware config", () => {
       graph: false,
       summaryTree: false,
       webConsole: false,
+      assetInjection: false,
     });
   });
 
@@ -60,6 +61,74 @@ describe("middleware config", () => {
     });
     expect(Object.isFrozen(config.authority)).toBe(true);
     expect(Object.isFrozen(config.authority?.allow.appIds)).toBe(true);
+  });
+
+  test("多 Agent authority 要求显式 defaultAgentId 且默认值必须在 allowlist 中", () => {
+    const multiAgentAuthority = {
+      tenantId: "default",
+      userId: "default",
+      allow: {
+        appIds: ["openclaw"],
+        projectIds: ["default"],
+        agentIds: ["main", "codex"],
+        namespaces: ["default"],
+        visibilities: ["private"],
+      },
+    };
+
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      authority: multiAgentAuthority,
+    })).toThrow(/defaultAgentId.*required/i);
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      authority: multiAgentAuthority,
+      defaultAgentId: "attacker",
+    })).toThrow(/defaultAgentId.*allowlist/i);
+
+    const config = memoryConfigSchema.parse({
+      ...baseConfig,
+      authority: multiAgentAuthority,
+      defaultAgentId: "main",
+    });
+    expect(config.defaultAgentId).toBe("main");
+  });
+
+  test("单 Agent authority 将唯一 allowlist 值规范化为 defaultAgentId", () => {
+    const config = memoryConfigSchema.parse({
+      ...baseConfig,
+      authority: {
+        tenantId: "default",
+        userId: "default",
+        allow: {
+          appIds: ["openclaw"],
+          projectIds: ["default"],
+          agentIds: ["main"],
+          namespaces: ["default"],
+          visibilities: ["private"],
+        },
+      },
+    });
+
+    expect(config.defaultAgentId).toBe("main");
+  });
+
+  test("拒绝超过 64 个 Agent 的 host authority allowlist", () => {
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      authority: {
+        tenantId: "default",
+        userId: "default",
+        allow: {
+          appIds: ["openclaw"],
+          projectIds: ["default"],
+          agentIds: Array.from({ length: 65 }, (_, index) => `agent-${index}`),
+          namespaces: ["default"],
+          visibilities: ["private"],
+        },
+      },
+      defaultAgentId: "agent-0",
+    })).toThrow(/agentIds.*64/i);
   });
 
   test.each([
@@ -110,6 +179,7 @@ describe("middleware config", () => {
         graph: true,
         summaryTree: true,
         webConsole: true,
+        assetInjection: true,
       },
     });
 
@@ -126,6 +196,7 @@ describe("middleware config", () => {
       graph: true,
       summaryTree: true,
       webConsole: true,
+      assetInjection: true,
     });
   });
 
@@ -139,6 +210,10 @@ describe("middleware config", () => {
     expect(() => memoryConfigSchema.parse({ ...baseConfig, features: { unknown: true } })).toThrow(
       "features config has unknown keys: unknown",
     );
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      features: { assetInjection: "yes" },
+    })).toThrow("features.assetInjection must be a boolean");
   });
 
   test("validates server field types and port range", () => {
@@ -170,7 +245,6 @@ describe("middleware config", () => {
         baseURL: "https://api.openai.com/v1",
         apiKey: "llm-key",
         maxTokens: 512,
-        temperature: 0.3,
       },
     });
 
@@ -180,7 +254,6 @@ describe("middleware config", () => {
       baseURL: "https://api.openai.com/v1",
       apiKey: "llm-key",
       maxTokens: 512,
-      temperature: 0.3,
     });
   });
 
@@ -196,7 +269,6 @@ describe("middleware config", () => {
       apiKey: "llm-key",
       baseURL: undefined,
       maxTokens: undefined,
-      temperature: undefined,
     });
   });
 
@@ -204,6 +276,9 @@ describe("middleware config", () => {
     expect(() =>
       memoryConfigSchema.parse({ ...baseConfig, llm: { apiKey: "k", model: "m", unknown: true } }),
     ).toThrow("llm config has unknown keys: unknown");
+    expect(() =>
+      memoryConfigSchema.parse({ ...baseConfig, llm: { apiKey: "k", model: "m", temperature: 0 } }),
+    ).toThrow("llm config has unknown keys: temperature");
   });
 
   test("validates llm field requirements and ranges", () => {
@@ -219,9 +294,6 @@ describe("middleware config", () => {
     expect(() =>
       memoryConfigSchema.parse({ ...baseConfig, llm: { apiKey: "k", model: "m", maxTokens: 0 } }),
     ).toThrow("llm.maxTokens must be a positive integer");
-    expect(() =>
-      memoryConfigSchema.parse({ ...baseConfig, llm: { apiKey: "k", model: "m", temperature: 3 } }),
-    ).toThrow("llm.temperature must be between 0 and 2");
   });
 
   test("uses MENGSHU_HOME for default dbPath when not specified", () => {

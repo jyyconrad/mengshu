@@ -78,6 +78,7 @@ class FakeCommand {
 let workDir: string;
 let logs: string[];
 let originalLog: typeof console.log;
+let originalExitCode: number | string | null | undefined;
 
 const validConfig = {
   embedding: { provider: "openai", model: "text-embedding-3-small", apiKey: "k", baseURL: "http://x" },
@@ -90,6 +91,7 @@ beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "mengshu-doctor-"));
   logs = [];
   originalLog = console.log;
+  originalExitCode = process.exitCode;
   console.log = (message?: unknown) => {
     logs.push(String(message));
   };
@@ -97,6 +99,7 @@ beforeEach(() => {
 
 afterEach(() => {
   console.log = originalLog;
+  process.exitCode = originalExitCode;
   rmSync(workDir, { recursive: true, force: true });
 });
 
@@ -337,8 +340,15 @@ describe("ms doctor", () => {
       embeddings: { embed: vi.fn(async () => [0.1]) },
     });
 
-    await ms.find("doctor")?.actionHandler?.(workDir, {});
-    expect(logs.join("\n")).toMatch(/FATAL/);
+    const originalExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await ms.find("doctor")?.actionHandler?.(workDir, {});
+      expect(logs.join("\n")).toMatch(/FATAL/);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = originalExitCode;
+    }
   });
 
   test("PostgreSQL 配置跳过本地 dbPath 磁盘 warning", async () => {

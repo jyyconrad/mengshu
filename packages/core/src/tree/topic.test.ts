@@ -121,7 +121,7 @@ describe("topic tree policy", () => {
 
     expect(routed).toHaveLength(1);
     expect(routed[0].buffer.treeType).toBe("topic");
-    expect(routed[0].buffer.treeKey).toBe("entity-hot");
+    expect(routed[0].buffer.treeKey).toBe("mengshu");
     expect(routed[0].shouldSeal).toBe(true);
   });
 

@@ -16,13 +16,23 @@ import type { LlmClient } from "../runtime/llm/llm-client.js";
 import { types as nodeUtilTypes } from "node:util";
 import {
   computeCandidateSpecs,
+  type CandidateComputationDeps,
   type ComputedCandidateSpec,
 } from "./candidate-spec-computation.js";
+import type { AuthoritativeCandidateEvidenceFact } from
+  "./candidate-confidence-deriver.js";
 
 export interface ExtractCandidateHandlerDeps {
   extractor: TypeExtractor;
   candidates: CandidateRepository;
   llmClient?: LlmClient;
+  /** Legacy adapter 可选接入；缺失时 valueScore receipt 明确标 legacy_unknown。 */
+  resolveMaxSimilarity?: CandidateComputationDeps["resolveMaxSimilarity"];
+  /** Legacy adapters must explicitly prove persisted evidence; absence stays fail-closed. */
+  readEvidenceFacts?(input: {
+    scope: MemoryScope;
+    evidenceIds: readonly string[];
+  }): Promise<readonly AuthoritativeCandidateEvidenceFact[]>;
   audit?(input: {
     scope: MemoryScope;
     action: string;
@@ -129,9 +139,18 @@ export function createExtractCandidateHandler(
       throw new Error("extract_candidate traceId is required");
     }
 
+    const evidenceFacts = deps.readEvidenceFacts
+      ? await deps.readEvidenceFacts({ scope, evidenceIds: [traceId] })
+      : undefined;
     const computation = await computeCandidateSpecs(
-      { extractor: deps.extractor, ...(deps.llmClient ? { llmClient: deps.llmClient } : {}) },
-      { scope, text, traceId, ...(intent ? { intent } : {}) },
+      {
+        extractor: deps.extractor,
+        ...(deps.llmClient ? { llmClient: deps.llmClient } : {}),
+        ...(deps.resolveMaxSimilarity
+          ? { resolveMaxSimilarity: deps.resolveMaxSimilarity }
+          : {}),
+      },
+      { scope, text, traceId, ...(intent ? { intent } : {}), ...(evidenceFacts ? { evidenceFacts } : {}) },
     );
     if (computation.fallbackReason === "llm_extraction_failed" && deps.audit) {
       await deps.audit({

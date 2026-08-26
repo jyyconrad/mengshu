@@ -12,6 +12,14 @@ import type { ConsoleApi } from "../../../../console/types.js";
 import type { AgentFastPathService } from "../agent-fast-path/index.js";
 import type { AuthorityScope } from "../../../core/src/domain/authority-scope.js";
 import type { AuthorityScopedForgetService } from "../../../core/src/domain/service-types.js";
+import type {
+  MemoryWriteCommand,
+  MemoryWriteKernelResult,
+} from "../../../core/src/service/write-kernel.js";
+
+export interface MemoryWriteCommandExecutor {
+  executeMemoryWrite(command: MemoryWriteCommand): Promise<MemoryWriteKernelResult>;
+}
 
 export type RestMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | string;
 
@@ -34,6 +42,8 @@ export type RestServerConfig = NonNullable<MemoryConfig["server"]>;
 
 export interface RestRouterOptions {
   service: MemoryService;
+  /** Runtime-owned F0 write capability. Production writes fail closed when absent. */
+  memoryWrite?: MemoryWriteCommandExecutor;
   forgetService?: AuthorityScopedForgetService;
   /** Server-owned authority. Required unless the explicit test-only legacy channel is used. */
   authority?: AuthorityScope;

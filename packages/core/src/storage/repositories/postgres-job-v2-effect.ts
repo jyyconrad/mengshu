@@ -104,6 +104,10 @@ export type PostgresDurableJobV2EffectResult<Result extends Record<string, unkno
   | { readonly status: "applied" | "replayed"; readonly receipt: PostgresDurableJobV2EffectReceipt<Result> }
   | { readonly status: "stale" };
 
+export type PostgresDurableJobV2EffectReplayInspection<Result extends Record<string, unknown>> =
+  | { readonly status: "replayed"; readonly receipt: PostgresDurableJobV2EffectReceipt<Result> }
+  | { readonly status: "missing" | "stale" };
+
 export class PostgresDurableJobV2EffectError extends Error {
   readonly code:
     | "DURABLE_JOB_EFFECT_INVALID_INPUT"
@@ -1231,6 +1235,96 @@ export class PostgresDurableJobV2EffectRepository {
     return this.#execute(rawInput, (client) => work(client), undefined, true);
   }
 
+  async inspectProviderOwnedDomainReplay<Result extends Record<string, unknown>>(
+    authority: object,
+    rawInput: PostgresDurableJobV2EffectInput,
+  ): Promise<PostgresDurableJobV2EffectReplayInspection<Result>> {
+    if (authority !== PROVIDER_OWNED_DOMAIN_EFFECT_AUTHORITY) {
+      effectError("DURABLE_JOB_EFFECT_INVALID_INPUT", "provider-owned domain authority is invalid");
+    }
+    const input = validateInput(rawInput);
+    const now = nowFrom(this.#clock);
+    const client = await this.#pool.connect();
+    let result: PostgresDurableJobV2EffectReplayInspection<Result> | undefined;
+    let failure: unknown;
+    try {
+      const fence = exactlyOneRow(await client.query(
+        `SELECT id
+FROM ${JOB_TABLE}
+WHERE id = $1
+  AND tenant_id = $2 AND user_id = $3 AND app_id = $4 AND project_id = $5
+  AND agent_id = $6 AND namespace = $7 AND visibility = $8
+  AND status = 'running'
+  AND lease_owner = $9 AND lease_token = $10 AND lease_generation = $11
+  AND lease_until > $12`,
+        [input.id, ...scopeParams(input.scope), input.owner, input.leaseToken,
+          input.leaseGeneration, now],
+      ));
+      if (!fence) {
+        result = { status: "stale" };
+      } else {
+        const priorRow = exactlyOneRow(await client.query(
+          `SELECT job_id, effect_key, request_fingerprint, lease_generation, result, committed_at
+FROM ${RECEIPT_TABLE}
+WHERE job_id = $1 AND effect_key = $2`,
+          [input.id, input.effectKey],
+        ));
+        if (!priorRow) {
+          result = { status: "missing" };
+        } else {
+          const receipt = decodeReceipt<Result>(priorRow, input);
+          if (receipt.requestFingerprint !== input.requestFingerprint) {
+            effectError(
+              "DURABLE_JOB_EFFECT_FINGERPRINT_MISMATCH",
+              "durable job effect receipt fingerprint mismatch",
+            );
+          }
+          result = { status: "replayed", receipt };
+        }
+      }
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      client.release();
+    } catch (releaseFailure) {
+      failure = failure
+        ? new AggregateError(
+          [failure, releaseFailure],
+          "Postgres durable job replay inspection and release both failed",
+        )
+        : new PostgresDurableJobV2EffectError(
+          "DURABLE_JOB_EFFECT_RELEASE_FAILED",
+          "Durable job replay inspection connection release failed",
+        );
+    }
+    if (failure) throw failure;
+    return result!;
+  }
+
+  async executeProviderOwnedDomainWithPendingCandidateCapacity<
+    Result extends Record<string, unknown>,
+  >(
+    authority: object,
+    rawInput: PostgresDurableJobV2EffectInput,
+    rawExecution: PostgresPendingCandidateCapacityExecution,
+    work: (
+      client: PostgresDurableJobV2EffectWorkClient,
+      capacity: PostgresPendingCandidateCapacityReservation,
+    ) => Promise<Result>,
+  ): Promise<PostgresDurableJobV2EffectResult<Result>> {
+    if (authority !== PROVIDER_OWNED_DOMAIN_EFFECT_AUTHORITY) {
+      effectError("DURABLE_JOB_EFFECT_INVALID_INPUT", "provider-owned domain authority is invalid");
+    }
+    const execution = canonicalCapacityExecution(rawExecution);
+    return this.#execute(
+      rawInput,
+      (client, capacity) => work(client, capacity!),
+      execution,
+      true,
+    );
+  }
+
   async #execute<Result extends Record<string, unknown>>(
     rawInput: PostgresDurableJobV2EffectInput,
     work: (
@@ -1397,9 +1491,20 @@ RETURNING job_id, effect_key, request_fingerprint, lease_generation, result, com
 }
 
 export interface PostgresProviderOwnedDomainEffectRunner {
+  inspectReplay<Result extends Record<string, unknown>>(
+    input: PostgresDurableJobV2EffectInput,
+  ): Promise<PostgresDurableJobV2EffectReplayInspection<Result>>;
   execute<Result extends Record<string, unknown>>(
     input: PostgresDurableJobV2EffectInput,
     work: (client: PostgresDurableJobV2EffectWorkClient) => Promise<Result>,
+  ): Promise<PostgresDurableJobV2EffectResult<Result>>;
+  executeWithPendingCandidateCapacity<Result extends Record<string, unknown>>(
+    input: PostgresDurableJobV2EffectInput,
+    execution: PostgresPendingCandidateCapacityExecution,
+    work: (
+      client: PostgresDurableJobV2EffectWorkClient,
+      capacity: PostgresPendingCandidateCapacityReservation,
+    ) => Promise<Result>,
   ): Promise<PostgresDurableJobV2EffectResult<Result>>;
 }
 
@@ -1414,12 +1519,31 @@ export function createPostgresProviderOwnedDomainEffectRunner(
     effectError("DURABLE_JOB_EFFECT_INVALID_INPUT", "provider-owned domain repository is invalid");
   }
   return Object.freeze({
+    inspectReplay: <Result extends Record<string, unknown>>(
+      input: PostgresDurableJobV2EffectInput,
+    ) => repository.inspectProviderOwnedDomainReplay<Result>(
+      PROVIDER_OWNED_DOMAIN_EFFECT_AUTHORITY,
+      input,
+    ),
     execute: <Result extends Record<string, unknown>>(
       input: PostgresDurableJobV2EffectInput,
       work: (client: PostgresDurableJobV2EffectWorkClient) => Promise<Result>,
     ) => repository.executeProviderOwnedDomain(
       PROVIDER_OWNED_DOMAIN_EFFECT_AUTHORITY,
       input,
+      work,
+    ),
+    executeWithPendingCandidateCapacity: <Result extends Record<string, unknown>>(
+      input: PostgresDurableJobV2EffectInput,
+      execution: PostgresPendingCandidateCapacityExecution,
+      work: (
+        client: PostgresDurableJobV2EffectWorkClient,
+        capacity: PostgresPendingCandidateCapacityReservation,
+      ) => Promise<Result>,
+    ) => repository.executeProviderOwnedDomainWithPendingCandidateCapacity(
+      PROVIDER_OWNED_DOMAIN_EFFECT_AUTHORITY,
+      input,
+      execution,
       work,
     ),
   });

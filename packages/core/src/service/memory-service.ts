@@ -10,7 +10,16 @@ import { packContext } from "../retrieval/context-packer.js";
 import { auditLifecycle } from "../../../../lifecycle/audit.js";
 import { normalizeScope, validateScopeForWrite } from "../domain/scope.js";
 import { computeScopeFit } from "../domain/scope-fit.js";
-import { computeNodeScoreWithBreakdown } from "../domain/recall-scoring.js";
+import { computeRecallScoreBreakdown } from "../domain/recall-scoring.js";
+import {
+  filterContextEligibleRecords,
+  filterRecallEligibleRecords,
+} from "../domain/recall-filter.js";
+import type {
+  GovernedRetrievalCandidateSource,
+  GovernedRetrievalEngine,
+  GovernedRetrievalSource,
+} from "../retrieval/governed-retrieval-engine.js";
 import {
   DATABASE_STORE_CLEANUP_WARNING,
   parseDatabaseStoreResult,
@@ -103,6 +112,13 @@ export interface DefaultMemoryServiceOptions {
   stampEmbeddingMetadata?: (
     metadata: Readonly<Record<string, unknown>>,
   ) => Record<string, unknown>;
+  /**
+   * F0 authoritative retrieval seam. RuntimeHost/Postgres injects the governed
+   * engine; provider-neutral callers retain the legacy compatibility path.
+   */
+  governedRetrieval?: Pick<GovernedRetrievalEngine, "retrieve">;
+  /** PostgreSQL multi-route producer; identities are rehydrated and governed by the engine above. */
+  governedCandidateSource?: Pick<GovernedRetrievalCandidateSource, "search">;
 }
 
 export type EmbeddingRecallResult = RecallResult & {
@@ -130,6 +146,16 @@ function validateSingleStoreOutcome(
   return record;
 }
 
+function publicRecallSource(source: GovernedRetrievalSource): RecallHit["source"] {
+  switch (source) {
+    case "bm25":
+    case "lexical": return "text";
+    case "entity_graph":
+    case "work_memory_graph": return "graph";
+    default: return source;
+  }
+}
+
 export class DefaultMemoryService implements MemoryService, AuthorityScopedForgetService {
   private readonly repository: MemoryRepository;
   private readonly embeddings: EmbeddingPort;
@@ -140,6 +166,8 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
   private readonly embeddingReadGuard?: EmbeddingReadGuard;
   private readonly embeddingWriteGuard?: EmbeddingWriteGuard;
   private readonly stampEmbeddingMetadata?: DefaultMemoryServiceOptions["stampEmbeddingMetadata"];
+  private readonly governedRetrieval?: DefaultMemoryServiceOptions["governedRetrieval"];
+  private readonly governedCandidateSource?: DefaultMemoryServiceOptions["governedCandidateSource"];
 
   constructor(options: DefaultMemoryServiceOptions) {
     this.repository = options.repository;
@@ -154,6 +182,8 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
     this.embeddingReadGuard = options.embeddingReadGuard;
     this.embeddingWriteGuard = options.embeddingWriteGuard;
     this.stampEmbeddingMetadata = options.stampEmbeddingMetadata;
+    this.governedRetrieval = options.governedRetrieval;
+    this.governedCandidateSource = options.governedCandidateSource;
   }
 
   async storeMemory(input: StoreMemoryInput): Promise<StoreMemoryResult> {
@@ -247,6 +277,13 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
   }
 
   async recall(input: RecallInput): Promise<EmbeddingRecallResult> {
+    return this.recallWithIntent(input, "lookup");
+  }
+
+  private async recallWithIntent(
+    input: RecallInput,
+    intent: "lookup" | "context",
+  ): Promise<EmbeddingRecallResult> {
     const scope = normalizeScope(input.scope);
     const embeddingDecision = this.embeddingReadGuard?.snapshot();
     if (embeddingDecision && !embeddingDecision.allowed) {
@@ -305,8 +342,9 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
     const records = await this.repository.query({
       query: input.query,
       vector,
-      limit: input.limit,
-      minScore: input.minScore,
+      // minScore/limit 属于最终六因子合同，不能提前作用于 provider 相似度。
+      limit: undefined,
+      minScore: undefined,
       filter,  // 含硬过滤内部 key（仅在 hard 模式且有值时不为 undefined）
       scope,
       tableName: input.tableName,
@@ -329,8 +367,48 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
       record.scope?.tenantId === scope.tenantId && record.scope?.userId === scope.userId,
     );
 
-    const hits: RecallHit[] = authorityRecords
-      .map((record) => {
+    const eligibleRecords = intent === "context"
+      ? filterContextEligibleRecords(authorityRecords, scope)
+      : filterRecallEligibleRecords(authorityRecords, scope);
+    const supplementalCandidates = this.governedRetrieval && this.governedCandidateSource &&
+        input.query.trim().length > 0
+      ? await this.governedCandidateSource.search({
+          query: input.query,
+          scope,
+          limit: 500,
+        })
+      : [];
+    const governedResult = this.governedRetrieval
+      ? await this.governedRetrieval.retrieve({
+          intent,
+          scope,
+          candidates: [
+            ...authorityRecords.map((record) => ({
+              candidateId: `vector:${record.id}`,
+              authoritativeRecordId: record.id,
+              scope: record.scope,
+              source: "vector" as const,
+              nodeType: "memory" as const,
+              relevance: record.score,
+              rawScore: record.score,
+              evidenceIds: [...(record.sourceNodeIds ?? [])],
+              navigation: { kind: "memory" as const, ref: record.id },
+            })),
+            ...supplementalCandidates,
+          ],
+          minScore: input.minScore,
+          limit: input.limit,
+        })
+      : undefined;
+    const hits: RecallHit[] = governedResult
+      ? governedResult.hits.map((hit) => ({
+          record: hit.record,
+          score: hit.score,
+          source: publicRecallSource(hit.matchedBy[0] ?? "vector"),
+          scoreBreakdown: hit.scoreBreakdown,
+          provenance: hit.record.provenance,
+        }))
+      : eligibleRecords.map((record) => {
         // authority 已硬隔离；同 tenant/user 内其它 scope 维度继续作为软排序信号。
         // 因此 profile 等既有跨 project 语义不受影响。
         const recordScope = (record as MemoryRecord).scope ?? scope;
@@ -338,20 +416,16 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
 
         // 用召回评分体系重算综合分：relevance 注入向量相似度，scopeFit 注入契合度。
         // 其余因子（importance/confidence/evidence/recency）由 record 字段近似。
-        const breakdown = computeNodeScoreWithBreakdown(record, undefined, {
+        const breakdown = computeRecallScoreBreakdown(record, {
           relevance: record.score,
           scopeFit,
-        });
+        }, ["vector"], { vector: record.score });
 
         const hit: RecallHit = {
           record,
           score: breakdown.score,
           source: "vector",
-          scoreBreakdown: {
-            vector: record.score,
-            scopeFit,
-            composite: breakdown.score,
-          },
+          scoreBreakdown: breakdown,
           provenance: record.provenance,
         };
         return hit;
@@ -360,13 +434,13 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
       // 综合分相同时按向量相似度兜底（保持相关性优先的稳定排序）。
       .sort((a, b) => {
         if (b.score !== a.score) return b.score - a.score;
-        const av = a.scoreBreakdown?.vector ?? 0;
-        const bv = b.scoreBreakdown?.vector ?? 0;
+        const av = a.scoreBreakdown?.sourceSignals?.vector ?? 0;
+        const bv = b.scoreBreakdown?.sourceSignals?.vector ?? 0;
         return bv - av;
       })
-      // Provider 应在 authority WHERE 后应用 LIMIT；后置 slice 是防御性保证，
-      // 避免违反合同的 repository 返回越界数量。
-      .slice(0, input.limit ?? authorityRecords.length);
+      .filter((hit) => input.minScore === undefined || hit.score >= input.minScore)
+      // 最终 limit 只能在 hard filter 与六因子门槛之后应用。
+      .slice(0, input.limit ?? eligibleRecords.length);
 
     // P2: 追踪 queryHits，递增被命中 entity 的 queryHits30d
     if (this.queryHitsTracker && hits.length > 0) {
@@ -380,6 +454,7 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
       scope,
       query: input.query,
       hits,
+      ...(governedResult === undefined ? {} : { filtered: governedResult.filtered }),
       ...(embeddingDecision?.allowed
         ? {
             retrievalMode: embeddingDecision.mode,
@@ -390,12 +465,17 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
   }
 
   async buildContext(input: BuildContextInput): Promise<ContextBlock> {
-    const recalled = await this.recall(input);
-    return packContext({
+    const recalled = await this.recallWithIntent({ ...input, limit: undefined }, "context");
+    const activeHits = recalled.hits.slice(0, input.limit ?? recalled.hits.length);
+    const packed = packContext({
       scope: recalled.scope,
       title: input.title ?? "Retrieved Context",
-      hits: recalled.hits,
+      hits: activeHits,
     });
+    return {
+      ...packed,
+      ...(recalled.filtered === undefined ? {} : { filtered: recalled.filtered }),
+    };
   }
 
   async delete(input: DeleteMemoryInput): Promise<DeleteMemoryResult> {

@@ -80,6 +80,7 @@ function command(
       namespace: scope.namespace,
     },
     text: "durable write",
+    kind: "preference",
     metadata,
   };
 }
@@ -130,6 +131,40 @@ describe("write kernel transaction identity", () => {
     expect(first).not.toBe(changedScope);
   });
 
+  test("fingerprint 覆盖原生 kind、可选 semanticType、evidence 与完整 scope", () => {
+    const base = command();
+    const first = createWriteCommandFingerprint(scope, {
+      ...base,
+      semanticType: "profile",
+      evidenceIds: ["event-1"],
+      provenance: { source: "user", sessionId: "session-a" },
+    });
+
+    expect(createWriteCommandFingerprint(scope, { ...base, kind: "fact" })).not.toBe(first);
+    expect(createWriteCommandFingerprint(scope, {
+      ...base,
+      semanticType: "rules",
+      evidenceIds: ["event-1"],
+      provenance: { source: "user", sessionId: "session-a" },
+    })).not.toBe(first);
+    expect(createWriteCommandFingerprint(scope, {
+      ...base,
+      semanticType: "profile",
+      evidenceIds: ["event-2"],
+      provenance: { source: "user", sessionId: "session-a" },
+    })).not.toBe(first);
+    expect(createWriteCommandFingerprint({
+      ...scope,
+      workspaceId: "workspace-a",
+      sessionId: "session-a",
+    }, {
+      ...base,
+      semanticType: "profile",
+      evidenceIds: ["event-1"],
+      provenance: { source: "user", sessionId: "session-a" },
+    })).not.toBe(first);
+  });
+
   test("fingerprint 拒绝循环 metadata，避免不可持久化 identity", () => {
     const metadata: Record<string, unknown> = {};
     metadata.self = metadata;
@@ -160,6 +195,73 @@ describe("write kernel transaction identity", () => {
       { ...scope, tenantId: "tenant-b" },
       "write-1",
     ))).toThrow(/identity mismatch/);
+  });
+
+  test("旧 receipt 会归一化 recordType，并为候选补齐 candidateId", () => {
+    const identity = createWriteIdempotencyIdentity(scope, "write-legacy-receipt");
+    const fingerprint = createWriteCommandFingerprint(scope, command());
+
+    const active = createMemoryWriteReceipt(identity, fingerprint, {
+      status: "persisted",
+      route: "active",
+      memoryId: "memory-legacy",
+      stored: true,
+    } as never);
+    const candidate = createMemoryWriteReceipt(identity, fingerprint, {
+      status: "persisted",
+      route: "candidate",
+      memoryId: "candidate-legacy",
+      stored: true,
+    } as never);
+    const lookupOnly = createMemoryWriteReceipt(identity, fingerprint, {
+      status: "persisted",
+      route: "lookup_only",
+      memoryId: "memory-lookup",
+      stored: true,
+    } as never);
+
+    expect(active.result).toEqual({
+      status: "persisted",
+      route: "active",
+      recordType: "memory",
+      memoryId: "memory-legacy",
+      stored: true,
+    });
+    expect(candidate.result).toEqual({
+      status: "persisted",
+      route: "candidate",
+      recordType: "candidate",
+      candidateId: "candidate-legacy",
+      memoryId: "candidate-legacy",
+      stored: true,
+    });
+    expect(lookupOnly.result).toEqual({
+      status: "persisted",
+      route: "lookup_only",
+      recordType: "memory",
+      memoryId: "memory-lookup",
+      stored: true,
+    });
+  });
+
+  test("receipt 兼容不会放宽未知字段或错误 recordType", () => {
+    const identity = createWriteIdempotencyIdentity(scope, "write-strict-receipt");
+    const fingerprint = createWriteCommandFingerprint(scope, command());
+
+    expect(() => createMemoryWriteReceipt(identity, fingerprint, {
+      status: "persisted",
+      route: "active",
+      recordType: "candidate",
+      memoryId: "memory-a",
+      stored: true,
+    } as never)).toThrow(/durable result shape/i);
+    expect(() => createMemoryWriteReceipt(identity, fingerprint, {
+      status: "persisted",
+      route: "active",
+      memoryId: "memory-a",
+      stored: true,
+      unexpected: "field",
+    } as never)).toThrow(/durable result shape/i);
   });
 });
 

@@ -14,8 +14,7 @@
       "model": "gpt-4o-mini",
       "baseURL": "https://api.openai.com/v1",
       "apiKey": "${OPENAI_API_KEY}",
-      "maxTokens": 512, // 可选，单次生成最大 token 数
-      "temperature": 0.3 // 可选，0-2 之间，越低越确定
+      "maxTokens": 512 // 可选，单次生成最大 token 数；temperature 由运行时固定为 0.0
     },
 
     // 数据库类型选择: "postgres" (推荐，共享 OpenClaw PostgreSQL + pgvector), "lancedb" (本地单机) 或 "supabase" (云端)
@@ -32,6 +31,20 @@
       "ssl": false
     },
 
+    // OpenClaw 本机可信边界。多 Agent 时 defaultAgentId 必填且必须属于 agentIds。
+    "authority": {
+      "tenantId": "local",
+      "userId": "owner",
+      "allow": {
+        "appIds": ["openclaw"],
+        "projectIds": ["default"],
+        "agentIds": ["main", "codex"],
+        "namespaces": ["default"],
+        "visibilities": ["private"]
+      }
+    },
+    "defaultAgentId": "main",
+
     // LanceDB 本地存储配置 (仅 dbType=lancedb 时需要)
     // "dbPath": "~/.mengshu/memory/lancedb",
 
@@ -46,6 +59,11 @@
     "autoRecall": true,
     "recallIncludeDocuments": false, // 自动召回是否包含扫描的文档数据
     "captureMaxChars": 500,
+
+    // Asset/Loadout 是原生 5 槽位之上的可选增强；升级后默认关闭，验证后再显式开启
+    "features": {
+      "assetInjection": false
+    },
 
     // 批量处理配置 (可选)
     "batchProcessing": {

@@ -273,7 +273,7 @@ plugins/codex/
 1. 开发期：调用全局 `ms mcp`，简单但依赖用户已安装 CLI。
 2. 发布期：直接 import `@mengshu/core` 的 MCP 启动器，自包含更好。
 
-首期建议先实现开发期启动器，并在 README 标注依赖；第二阶段改为自包含启动器。
+当前发布边界采用包内固定 runtime：launcher 通过当前 npm 包的 `dist/bin/ms.js` 启动 MCP，不回退到 PATH；开发或隔离测试可显式提供绝对路径 override。
 
 ### Skill 设计
 
@@ -392,7 +392,7 @@ openclaw agent --message "..." --no-deliver
 4. [x] 新建 `plugins/codex/skills/mengshu-memory/SKILL.md`。
 5. [x] 新建 `.agents/plugins/marketplace.json`。
 6. [x] 增加 Codex 插件校验脚本或复用 `plugin-creator` 的 `validate_plugin.py`。
-7. [ ] 发布期把 `plugins/codex/mcp/server.mjs` 从调用全局 `ms mcp` 改为自包含 MCP 启动器。
+7. [x] 发布期把 `plugins/codex/mcp/server.mjs` 改为使用当前包内固定 runtime，并对显式 override 做版本预检。
 
 验收：
 
@@ -476,4 +476,4 @@ npm pack --workspaces
 - OpenClaw 注册主实现已迁到 `plugins/openclaw/src/register.ts`，tools / hooks / `memory_context_fast` handler、scope、manifest 和 CLI 注册模块已迁到 `plugins/openclaw/src`；`adapters/openclaw/index.ts`、`tools.ts`、`hooks.ts`、`context-fast.ts`、`scope.ts`、`manifest.ts`、`cli-*.ts` 仅作为兼容 re-export。
 - OpenClaw manifest 的 canonical id 已切换为 `mengshu-openclaw`，并通过 `legacyPluginIds: ["memory-autodb", "mengshu"]` 兼容旧配置。
 - OpenClaw memory runtime bridge 已注册 prompt section / flush plan / runtime health manager；实际记忆召回和写入复用插件包内 tools、hooks、CLI、service。
-- Codex 插件包已包含 `.codex-plugin/plugin.json`、`.mcp.json`、`mcp/server.mjs`、skill 和仓库级 marketplace；`mcp/server.mjs` 首期调用全局 `ms mcp`，自包含 MCP 启动器留到下一阶段。
+- Codex 插件包已包含 `.codex-plugin/plugin.json`、`.mcp.json`、`mcp/server.mjs`、skill 和仓库级 marketplace；launcher 默认使用当前包内 `dist/bin/ms.js`，不回退到 PATH 中任意全局 `ms`。

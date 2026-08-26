@@ -11,6 +11,7 @@ import type {
   MemoryScopeInput,
   MemorySemanticType,
 } from "../../../../core/types.js";
+import type { CompleteRecallScoreBreakdown } from "./recall-scoring.js";
 
 export type { MemorySemanticType, MemoryScope, MemoryScopeInput };
 
@@ -22,9 +23,74 @@ export interface SlotContextBlock {
   question: string;
   content: string;
   sourceIds: string[];
+  /** 可回溯到 L0/R4 的真实 evidence 引用；不得用 sourceIds 代替。 */
+  evidenceRefs?: string[];
+  /** 与 sourceIds 同序的唯一六因子召回回执；legacy 裸记录路径可缺省。 */
+  recallReceipts?: Array<{
+    sourceId: string;
+    score: number;
+    source: "vector" | "text" | "recent" | "graph" | "tree";
+    scoreBreakdown: CompleteRecallScoreBreakdown;
+  }>;
   nodeCount: number;
   tokenEstimate?: number;
   warnings?: string[];
+}
+
+export type DisclosureLevel = "R0" | "R1" | "R2" | "R3" | "R4";
+
+export interface NavigationRef {
+  ref: string;
+  kind: "memory" | "source_tree" | "topic_tree" | "global_tree" | "asset" | "evidence" |
+    "knowledge";
+  level: DisclosureLevel;
+  semanticType?: MemorySemanticType;
+  /** Resource-provider revision pin; currently used by Knowledge R2 navigation. */
+  revision?: string;
+  /** Prompt-safe resource index title. */
+  title?: string;
+  /** Provider-owned evidence refs, not recall sourceIds. */
+  evidenceRefs?: string[];
+}
+
+export interface ContextAssemblyBlock {
+  ref: string;
+  semanticType: MemorySemanticType;
+  content: string;
+  evidenceRefs: string[];
+}
+
+export interface ContextAssetRef {
+  assetId: string;
+  version: number;
+}
+
+export interface SlotAssembly {
+  semanticType: MemorySemanticType;
+  mustRead: ContextAssemblyBlock[];
+  navigation: NavigationRef[];
+  assetRefs: ContextAssetRef[];
+  evidenceRefs: string[];
+  filtered: Array<{ ref: string; reason: string }>;
+  tokenBudget: number;
+}
+
+export interface ContextAssemblyPlan {
+  sessionId: string;
+  slots: Partial<Record<MemorySemanticType, SlotAssembly>>;
+  tools: Array<{ name: string; description?: string }>;
+  denied: Array<{ ref: string; reason: string }>;
+  versions: {
+    slotSnapshot: 2;
+    loadout?: number;
+    assetVersionSetHash?: string;
+    retrieval: string;
+    scoring: string;
+    promptPolicy: string;
+  };
+  stableContentHash: string;
+  dynamicContentHash: string;
+  expiresAt: string;
 }
 
 /**
@@ -37,6 +103,7 @@ export interface SlotContextBlock {
 export type FilteredReason =
   | "pending_candidate"
   | "raw_evidence"
+  | "lookup_only"
   | "lifecycle_stale"
   | "lifecycle_revoked"
   | "lifecycle_superseded"
@@ -53,7 +120,8 @@ export type FilteredReason =
   // 与已选中的更高分记忆近重复，被去重合并
   | "dedup_merged"
   // D-13 profile 分层过滤：同 profileDimension 被更高层覆盖
-  | "overridden_by_layer";
+  | "overridden_by_layer"
+  | "loadout_policy_excluded";
 
 /**
  * FilteredEntry: 单条被过滤记忆的解释。
@@ -141,6 +209,8 @@ export interface ContextFastResponse {
   };
   /** 拼装后的 prompt 注入文本（已转义） */
   content: string;
+  /** Additive V2 receipt；旧 SDK 可忽略。 */
+  assemblyPlan?: ContextAssemblyPlan;
   /** 任务相关的额外提示 */
   taskHints?: Array<{
     kind: "rule" | "experience" | "resource" | "warning";

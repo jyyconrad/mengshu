@@ -21,6 +21,8 @@ import { createExactRestAuthority } from "../packages/api/src/rest/authority.js"
 
 export interface StartMemoryServerOptions {
   service: MemoryService;
+  /** Runtime 持有的统一 Write Kernel 能力；缺失时 REST 写入保持 fail-closed。 */
+  memoryWrite?: RestRouterOptions["memoryWrite"];
   graph?: RestRouterOptions["graph"];
   console?: RestRouterOptions["console"];
   agentFastPath?: RestRouterOptions["agentFastPath"];
@@ -47,6 +49,10 @@ export interface StartMemoryServerOptions {
   /** daemon 内所有 lifecycle await 共用的单操作硬边界。 */
   lifecycleOperationTimeoutMs?: number;
   lifecycleScheduler?: MemoryServerLifecycleScheduler;
+  /** 仅记录脱敏后的请求失败分类；不得写入请求体或异常 message。 */
+  logger?: {
+    error(message: string): void;
+  };
 }
 
 export interface RunningMemoryServer {
@@ -407,10 +413,20 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
   }
 
   snapshot(): MemoryServerDaemonSnapshot {
+    const hostSnapshot = this.options.runtimeHost
+      ? readHostSnapshotData(this.options.runtimeHost)
+      : undefined;
+    const hostReady = !this.options.runtimeHost || (
+      hostSnapshot?.state === "ready" && hostSnapshot.ready === true &&
+      hostSnapshot.accepting === true &&
+      (this.ownedHostGeneration === undefined ||
+        hostSnapshot.generation === this.ownedHostGeneration)
+    );
+    const ready = this.state === "ready" && hostReady;
     return Object.freeze({
       state: this.state,
-      ready: this.state === "ready",
-      accepting: this.state === "ready" && this.listener?.listening === true,
+      ready,
+      accepting: ready && this.listener?.listening === true,
       mode: this.options.runtimeHost ? "runtime_host" : "legacy",
       ...(this.failureCode ? { failureCode: this.failureCode } : {}),
     });
@@ -472,6 +488,7 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
       const authority = this.options.authority ?? createExactRestAuthority(this.options.defaultScope!);
       const router = createRestRouter({
         service: this.options.service,
+        memoryWrite: this.options.memoryWrite,
         forgetService: typeof (this.options.service as unknown as { forget?: unknown }).forget === "function"
           ? this.options.service as never
           : undefined,
@@ -488,8 +505,9 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
         },
       });
       const requestListener: http.RequestListener = async (request, response) => {
+        const method = request.method ?? "UNKNOWN";
+        const pathname = requestPath(request.url);
         try {
-          const pathname = requestPath(request.url);
           if (request.method === "GET" && await serveConsoleAsset(pathname, response)) return;
           const body = request.method === "GET" ? undefined : await readBody(request);
           const restRequest: RestRequest = {
@@ -504,6 +522,26 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
           writeJson(response, restResponse.status, restResponse.body);
         } catch (error) {
           const invalidJson = error instanceof Error && error.message === "Invalid JSON body";
+          if (!invalidJson) {
+            const name = error instanceof Error && error.name.trim().length > 0
+              ? error.name
+              : "UnknownError";
+            const rawCode = error && typeof error === "object"
+              ? (error as { code?: unknown }).code
+              : undefined;
+            const code = typeof rawCode === "string" && /^[A-Z0-9_]{1,64}$/.test(rawCode)
+              ? ` code=${rawCode}`
+              : "";
+            const rawReason = error && typeof error === "object"
+              ? (error as { reason?: unknown }).reason
+              : undefined;
+            const reason = typeof rawReason === "string" && /^[A-Z0-9_]{1,64}$/.test(rawReason)
+              ? ` reason=${rawReason}`
+              : "";
+            this.options.logger?.error(
+              `REST request failed method=${method} path=${pathname} error=${name}${code}${reason}`,
+            );
+          }
           writeJson(response, invalidJson ? 400 : 500, {
             error: invalidJson ? "Invalid JSON body" : "Internal server error",
           });

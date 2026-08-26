@@ -1,23 +1,128 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const inlineAuthority = process.env.MENGSHU_AUTHORITY_JSON?.trim();
-const authorityFile = process.env.MENGSHU_AUTHORITY_FILE?.trim();
-const unresolvedPlaceholder = [inlineAuthority, authorityFile]
-  .some((value) => value?.includes("${"));
-if (unresolvedPlaceholder || (inlineAuthority ? 1 : 0) + (authorityFile ? 1 : 0) !== 1) {
-  console.error(
-    "Failed to start mengshu MCP: authority configuration requires exactly one host-owned source",
+class RuntimePreflightError extends Error {
+  constructor(code, description = "failed") {
+    super(`Failed to start mengshu MCP: runtime preflight ${description} (${code})`);
+    this.name = "RuntimePreflightError";
+  }
+}
+
+async function main() {
+  const inlineAuthority = process.env.MENGSHU_AUTHORITY_JSON?.trim();
+  const authorityFile = process.env.MENGSHU_AUTHORITY_FILE?.trim();
+  const unresolvedPlaceholder = [inlineAuthority, authorityFile]
+    .some((value) => value?.includes("${"));
+  if (unresolvedPlaceholder || (inlineAuthority ? 1 : 0) + (authorityFile ? 1 : 0) !== 1) {
+    console.error(
+      "Failed to start mengshu MCP: authority configuration requires exactly one host-owned source",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    await run();
+  } catch (error) {
+    if (error instanceof RuntimePreflightError) {
+      console.error(error.message);
+    } else {
+      console.error("Failed to start mengshu MCP: runtime preflight failed (UNEXPECTED_ERROR)");
+    }
+    process.exitCode = 1;
+  }
+}
+
+function pluginVersion() {
+  let manifest;
+  try {
+    manifest = JSON.parse(
+      readFileSync(new URL("../.codex-plugin/plugin.json", import.meta.url), "utf8"),
+    );
+  } catch {
+    throw new RuntimePreflightError("INVALID_PLUGIN_MANIFEST");
+  }
+  const version = manifest?.version;
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new RuntimePreflightError("INVALID_PLUGIN_VERSION");
+  }
+  return version;
+}
+
+function executableFile(candidate) {
+  try {
+    const resolved = realpathSync(candidate);
+    if (!statSync(resolved).isFile()) return undefined;
+    accessSync(resolved, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+    return resolved;
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeCommand(executable, prefixArgs = []) {
+  return Object.freeze({ executable, prefixArgs: Object.freeze(prefixArgs) });
+}
+
+function bundledRuntime() {
+  const bundled = fileURLToPath(
+    new URL("../runtime/node_modules/@mengshu/core/dist/bin/ms.js", import.meta.url),
   );
-  process.exitCode = 1;
-} else {
-  await run();
+  try {
+    const resolved = realpathSync(bundled);
+    if (!statSync(resolved).isFile()) return undefined;
+    accessSync(resolved, constants.R_OK);
+    return runtimeCommand(process.execPath, [resolved]);
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveRuntimeCommand() {
+  const override = process.env.MENGSHU_CODEX_MS_PATH?.trim();
+  if (override) {
+    if (!isAbsolute(override)) {
+      throw new RuntimePreflightError("INVALID_RUNTIME_OVERRIDE");
+    }
+    const executable = executableFile(override);
+    if (!executable) throw new RuntimePreflightError("RUNTIME_NOT_EXECUTABLE");
+    return runtimeCommand(executable);
+  }
+
+  const bundled = bundledRuntime();
+  if (!bundled) throw new RuntimePreflightError("BUNDLED_RUNTIME_NOT_FOUND");
+  return bundled;
+}
+
+function verifyRuntimeVersion(runtime, expectedVersion) {
+  const result = spawnSync(runtime.executable, [...runtime.prefixArgs, "--version"], {
+    encoding: "utf8",
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 5_000,
+    maxBuffer: 4_096,
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0 || result.signal !== null) {
+    throw new RuntimePreflightError("VERSION_PROCESS_FAILED");
+  }
+  const version = result.stdout.trim();
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new RuntimePreflightError("INVALID_VERSION_OUTPUT");
+  }
+  if (version !== expectedVersion) {
+    throw new RuntimePreflightError("VERSION_MISMATCH", "version mismatch");
+  }
 }
 
 async function run() {
+  const runtime = resolveRuntimeCommand();
+  verifyRuntimeVersion(runtime, pluginVersion());
   const useProcessGroup = process.platform !== "win32";
-  const child = spawn("ms", ["mcp"], {
+  const child = spawn(runtime.executable, [...runtime.prefixArgs, "mcp"], {
     stdio: "inherit",
     detached: useProcessGroup,
     env: {
@@ -107,3 +212,5 @@ async function run() {
     process.exitCode = 1;
   }
 }
+
+await main();

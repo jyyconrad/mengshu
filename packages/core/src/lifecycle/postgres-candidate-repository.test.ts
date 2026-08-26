@@ -47,6 +47,56 @@ function client(rowCounts: Array<0 | 1> = [1]) {
 }
 
 describe("PostgresCandidateRepository insert-only kernel", () => {
+  test("Write Kernel direct insert 不伪造 source job，并返回真实新 candidate id", async () => {
+    const query = vi.fn(async (sql: string, _params: readonly unknown[] = []) => {
+      if (sql.startsWith("INSERT INTO mengshu_candidates")) {
+        return { rows: [{ id: "candidate-1" }], rowCount: 1 };
+      }
+      throw new Error(`unexpected SQL: ${sql}`);
+    });
+    const repository = new PostgresCandidateRepository();
+
+    await expect(repository.insertKernelPendingWithClient(
+      { query: query as unknown as PostgresCandidateQueryClient["query"] },
+      scope,
+      input(),
+    )).resolves.toEqual({ inserted: true, candidateId: "candidate-1" });
+
+    const [sql, params] = query.mock.calls[0]!;
+    expect(sql).toContain("source_job_id");
+    expect(sql).toContain("RETURNING id");
+    expect(params?.[10]).toBeNull();
+  });
+
+  test("Write Kernel direct insert 冲突时同事务解析既有 candidate id", async () => {
+    const query = vi.fn(async (sql: string, _params: readonly unknown[] = []) => {
+      if (sql.startsWith("INSERT INTO mengshu_candidates")) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (sql.startsWith("SELECT id FROM mengshu_candidates")) {
+        return { rows: [{ id: "candidate-existing" }], rowCount: 1 };
+      }
+      throw new Error(`unexpected SQL: ${sql}`);
+    });
+
+    await expect(new PostgresCandidateRepository().insertKernelPendingWithClient(
+      { query: query as unknown as PostgresCandidateQueryClient["query"] }, scope, input(),
+    )).resolves.toEqual({ inserted: false, candidateId: "candidate-existing" });
+
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[1]?.[0]).toContain("active_content_hash = $10");
+  });
+
+  test("Write Kernel direct insert 对歧义冲突结果 fail-closed", async () => {
+    const query = vi.fn(async (sql: string, _params: readonly unknown[] = []) => sql.startsWith("INSERT")
+      ? { rows: [], rowCount: 0 }
+      : { rows: [{ id: "candidate-a" }, { id: "candidate-b" }], rowCount: 2 });
+
+    await expect(new PostgresCandidateRepository().insertKernelPendingWithClient(
+      { query: query as unknown as PostgresCandidateQueryClient["query"] }, scope, input(),
+    )).rejects.toThrow(/candidate insert result/i);
+  });
+
   test("uses full 9D scope, SHA-256 and exact deterministic conflict target", async () => {
     const work = client([1, 0]);
     const repository = new PostgresCandidateRepository();

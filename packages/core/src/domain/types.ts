@@ -308,23 +308,58 @@ export interface SummaryNode {
   updatedAt?: number;
 }
 
+import type { RecallScoreBreakdown } from "./recall-scoring.js";
+
 export interface RecallHit {
   record: MemoryRecord | ChunkRecord | SummaryNode;
   score: number;
   source: "vector" | "text" | "recent" | "graph" | "tree";
-  scoreBreakdown?: Record<string, number>;
+  scoreBreakdown?: RecallScoreBreakdown;
   provenance?: RecordProvenance;
+}
+
+export type RecallCandidateSource =
+  | "vector"
+  | "bm25"
+  /** Transitional producer name retained for non-PostgreSQL adapters. */
+  | "lexical"
+  | "recent"
+  | "entity_graph"
+  | "work_memory_graph"
+  | "tree";
+
+export type RecallFilteredReason =
+  | "authority_mismatch"
+  | "scope_mismatch"
+  | "lifecycle_ineligible"
+  | "risk_blocked"
+  | "conflict_unresolved"
+  | "hydration_unavailable"
+  | "governance_mismatch"
+  | "governed_identity_superseded"
+  | "evidence_unavailable"
+  | "score_breakdown_unavailable"
+  | "score_below_threshold";
+
+export interface RecallFilteredCandidate {
+  candidateId: string;
+  authoritativeRecordId: string;
+  source: RecallCandidateSource;
+  filteredReason: RecallFilteredReason;
 }
 
 export interface RecallResult {
   scope: MemoryScope;
   query: string;
   hits: RecallHit[];
+  /** Additive explanation receipt; callers may ignore it but must not synthesize replacements. */
+  filtered?: RecallFilteredCandidate[];
 }
 
 export interface ContextBlock {
   scope: MemoryScope;
   content: string;
   hits: RecallHit[];
+  filtered?: RecallFilteredCandidate[];
   tokenEstimate?: number;
 }

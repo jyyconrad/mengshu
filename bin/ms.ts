@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { runMengshuCli } from "../packages/api/src/cli/ms.js";
+import { formatCliError } from "../packages/api/src/cli/error-output.js";
 
 runMengshuCli().catch((error) => {
-  const message = error instanceof Error ? error.stack ?? error.message : String(error);
-  console.error(`Error: ${message}`);
-  process.exit(1);
+  console.error(formatCliError(error));
+  process.exitCode = 1;
 });

@@ -4,7 +4,7 @@
  * 本文件做什么：
  *   用真实 node:http daemon + in-memory 接线，验证 observe_light 到候选区
  *   pending 候选产出的完整异步链路：
- *     observe_light -> enqueue extract_candidate/build_tree/extract_graph jobs
+ *     observe_light -> enqueue extract_candidate job
  *     -> daemon worker loop drain -> createExtractCandidateHandler 经
  *     HeuristicTypeExtractor 抽取
  *     -> 写入候选区 pending（不污染主库）-> Console candidates API 可见。
@@ -31,11 +31,6 @@ import { InMemoryMemoryStore } from "../storage/repositories/in-memory.js";
 import { InMemoryCandidateRepository } from "../lifecycle/candidate-repository.js";
 import { createExtractCandidateHandler } from "../lifecycle/extract-candidate-handler.js";
 import { defaultTypeExtractor } from "../lifecycle/type-extractor.js";
-import { InMemoryTreeRepository } from "../tree/buffer.js";
-import { createBuildTreeHandler } from "../tree/build-tree-handler.js";
-import { InMemoryGraphRepository } from "../graph/repository.js";
-import { createExtractGraphHandler } from "../graph/extract-graph-handler.js";
-import { NullLlmClient } from "../processing/llm-client.js";
 
 const scope = {
   tenantId: "local",
@@ -119,15 +114,8 @@ async function startPipeline(): Promise<{
   const extractCandidateHandler = createExtractCandidateHandler({
     extractor: defaultTypeExtractor,
     candidates,
-  });
-
-  // observe 会派生三类任务，worker 必须注册完整 handler set 才能 drain。
-  const treeRepository = new InMemoryTreeRepository();
-  const buildTreeHandler = createBuildTreeHandler({ repository: treeRepository });
-  const graphRepository = new InMemoryGraphRepository();
-  const extractGraphHandler = createExtractGraphHandler({
-    llmClient: new NullLlmClient(),
-    graphRepository,
+    readEvidenceFacts: async ({ evidenceIds }) =>
+      evidenceIds.map((evidenceId) => ({ evidenceId, sourceKind: "session_user" as const })),
   });
 
   const agentFastPath = new AgentFastPathService({
@@ -169,8 +157,6 @@ async function startPipeline(): Promise<{
       intervalMs: 20,
       handlers: {
         extract_candidate: extractCandidateHandler,
-        build_tree: buildTreeHandler,
-        extract_graph: extractGraphHandler,
       },
     },
   });
@@ -208,7 +194,7 @@ describe("observe -> 候选区自动抽取链路 e2e", () => {
     expect(response.status).toBe(200);
     const ack = (await response.json()) as { ack: boolean; queuedJobs: string[] };
     expect(ack.ack).toBe(true);
-    expect(ack.queuedJobs.length).toBe(3);
+    expect(ack.queuedJobs).toHaveLength(1);
 
     // 轮询等待 worker drain 队列并写入候选。
     const appeared = await waitFor(async () => {
@@ -252,12 +238,12 @@ describe("observe -> 候选区自动抽取链路 e2e", () => {
     expect(response.status).toBe(200);
     const ack = (await response.json()) as { queuedJobs: string[] };
     // job 仍会入队，但 handler 经 extractor 过滤后不产出候选。
-    expect(ack.queuedJobs.length).toBe(3);
+    expect(ack.queuedJobs).toHaveLength(1);
 
     // 等待 job 被 worker 处理完（队列出现 completed），再断言候选为空。
     const processed = await waitFor(async () => {
       const completed = await pipeline.store.jobs.list("completed");
-      return completed.length >= 3;
+      return completed.length >= 1;
     });
     expect(processed).toBe(true);
 

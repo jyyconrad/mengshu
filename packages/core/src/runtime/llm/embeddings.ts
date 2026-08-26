@@ -2,6 +2,28 @@ import OpenAI from "openai";
 import pLimit from "p-limit";
 import retry from "p-retry";
 import type { MemoryConfig } from "../../../../../config.js";
+import {
+  UNSCOPED_RUNTIME_COST_FINGERPRINT,
+  UNPRICED_RUNTIME_PRICING_SNAPSHOT,
+  appendRuntimeCostSafely,
+  createRuntimeCostEvent,
+  type RuntimeCostContext,
+  type RuntimeCostEventSink,
+  type RuntimePricingSnapshot,
+} from "../../cost/runtime-cost.js";
+
+export interface EmbeddingClient {
+  embeddings: {
+    create(params: {
+      model: string;
+      input: string[];
+      encoding_format: "float";
+    }): Promise<{
+      data: Array<{ embedding: number[] }>;
+      usage?: { prompt_tokens?: number };
+    }>;
+  };
+}
 
 export interface EmbeddingsOptions {
   /** 最大并发请求数 */
@@ -10,11 +32,19 @@ export interface EmbeddingsOptions {
   maxRetries?: number;
   /** 每批最大处理文本数 */
   maxBatchSize?: number;
+  /** 测试或兼容 provider 注入的最小客户端。 */
+  client?: EmbeddingClient;
+  /** append-only 成本账本；production runtime 显式注入。 */
+  costLedger?: RuntimeCostEventSink;
+  pricingSnapshot?: RuntimePricingSnapshot;
+  costContext?: RuntimeCostContext;
+  onCostLedgerError?: (error: unknown) => void;
 }
 
 const DEFAULT_CONCURRENCY = 3;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_MAX_BATCH_SIZE = 20;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * 标记一类不应重试的 embedding 错误（鉴权失败、余额不足、参数错误）。
@@ -73,11 +103,15 @@ function extractErrorBody(error: unknown): { code?: number; message?: string } |
  * 支持批量向量化、并发控制、请求重试
  */
 export class Embeddings {
-  private client: OpenAI;
+  private client: EmbeddingClient;
   private limit: ReturnType<typeof pLimit>;
   private maxRetries: number;
   private maxBatchSize: number;
   private model: string;
+  private readonly costLedger?: RuntimeCostEventSink;
+  private readonly pricingSnapshot: RuntimePricingSnapshot;
+  private readonly costContext: RuntimeCostContext;
+  private readonly onCostLedgerError?: (error: unknown) => void;
 
   constructor(
     private readonly embeddingConfig: MemoryConfig["embedding"],
@@ -87,16 +121,26 @@ export class Embeddings {
     // 验证配置
     this.validateConfig(embeddingConfig);
 
-    this.client = new OpenAI({
-      apiKey: embeddingConfig.apiKey,
-      baseURL: embeddingConfig.baseURL,
-    });
+    this.client = options.client ?? (new OpenAI({
+        apiKey: embeddingConfig.apiKey,
+        baseURL: embeddingConfig.baseURL,
+        timeout: DEFAULT_REQUEST_TIMEOUT_MS,
+        // p-retry below is the single retry owner; SDK retries would multiply attempts.
+        maxRetries: 0,
+      }) as unknown as EmbeddingClient);
 
     this.model = embeddingConfig.model ?? "text-embedding-3-small";
 
     const concurrency = options.concurrency ?? batchConfig?.concurrency ?? DEFAULT_CONCURRENCY;
     this.maxRetries = options.maxRetries ?? batchConfig?.retryAttempts ?? DEFAULT_MAX_RETRIES;
     this.maxBatchSize = options.maxBatchSize ?? batchConfig?.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE;
+    this.costLedger = options.costLedger;
+    this.pricingSnapshot = options.pricingSnapshot ?? UNPRICED_RUNTIME_PRICING_SNAPSHOT;
+    this.costContext = options.costContext ?? {
+      category: "unknown",
+      scopeFingerprint: UNSCOPED_RUNTIME_COST_FINGERPRINT,
+    };
+    this.onCostLedgerError = options.onCostLedgerError;
 
     this.limit = pLimit(concurrency);
   }
@@ -219,7 +263,7 @@ export class Embeddings {
    */
   private async processBatch(batch: string[]): Promise<number[][]> {
     return retry(
-      async () => {
+      async (attemptNumber) => {
         try {
           const response = await this.client.embeddings.create({
             model: this.model,
@@ -227,9 +271,21 @@ export class Embeddings {
             encoding_format: "float",
           });
 
+          const promptTokens = typeof response.usage?.prompt_tokens === "number"
+            ? response.usage.prompt_tokens
+            : undefined;
+          // 先验证/映射 provider 响应，再写 succeeded；畸形响应不得产生一成一败两条记录。
+          const vectors = response.data.map(item => item.embedding);
+          await this.recordCostAttempt(
+            "succeeded",
+            attemptNumber,
+            promptTokens ?? batch.length,
+            promptTokens === undefined ? "inputs" : "tokens",
+          );
           // 按输入顺序返回结果
-          return response.data.map(item => item.embedding);
+          return vectors;
         } catch (error) {
+          await this.recordCostAttempt("failed", attemptNumber, null, null);
           throw this.explainEmbeddingError(error);
         }
       },
@@ -241,6 +297,32 @@ export class Embeddings {
         // 鉴权/余额/参数类错误重试无意义，命中即终止重试。
         shouldRetry: (error) => !(error instanceof NonRetryableEmbeddingError),
       }
+    );
+  }
+
+  private async recordCostAttempt(
+    status: "succeeded" | "failed",
+    attempt: number,
+    embeddingUnits: number | null,
+    embeddingUnitKind: "tokens" | "inputs" | null,
+  ): Promise<void> {
+    await appendRuntimeCostSafely(
+      this.costLedger,
+      createRuntimeCostEvent({
+        operation: this.costContext.operation ?? "embedding.batch",
+        category: this.costContext.category,
+        provider: this.embeddingConfig.provider,
+        model: this.model,
+        inputTokens: null,
+        outputTokens: null,
+        embeddingUnits,
+        embeddingUnitKind,
+        pricingSnapshot: this.pricingSnapshot,
+        status,
+        attempt,
+        scopeFingerprint: this.costContext.scopeFingerprint,
+      }),
+      this.onCostLedgerError,
     );
   }
 

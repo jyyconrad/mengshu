@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "createdAt": "2026-06-10",
-  "version": "v0.2-P0c",
-  "updatedAt": "2026-06-16",
+  "version": "v0.3-MG009",
+  "updatedAt": "2026-08-16",
   "suites": {
     "mengshu-v0.1": {
       "kind": "baseline",
@@ -178,12 +178,76 @@
         "no_executable_skill": 1.0
       },
       "notes": "P4 待扩充至 30 条"
+    },
+    "mengshu-progressive-disclosure": {
+      "kind": "extension",
+      "runner": "progressive-disclosure-v1",
+      "file": "mengshu-progressive-disclosure.jsonl",
+      "caseCount": 5,
+      "bytes": 476,
+      "sha256": "e708a790a528074018bb22bbc0b079342a9a21027bb1fa7d761594bb9f364b17",
+      "coverage": {
+        "must_read_escape": 1,
+        "navigation_R2": 1,
+        "tool_only_R3": 1,
+        "asset_off_fallback": 1,
+        "denied_no_injection": 1
+      },
+      "metrics": ["case_pass_rate"],
+      "description": "渐进披露 R1/R2/R3、prompt escape、拒绝资产和 asset-off 原生回退合同",
+      "phase": "F2",
+      "gate": {
+        "case_pass_rate": 1.0
+      }
+    },
+    "mengshu-asset-promotion": {
+      "kind": "extension",
+      "runner": "asset-promotion-v1",
+      "file": "mengshu-asset-promotion.jsonl",
+      "caseCount": 5,
+      "bytes": 445,
+      "sha256": "6aa22dbfe48de28e2d261fa165f73af12dbda150836dfd80da3afc1cb5bf0e71",
+      "coverage": {
+        "private_authority": 2,
+        "lifecycle": 1,
+        "evidence": 1,
+        "revoke_overrides_pin": 1
+      },
+      "metrics": ["case_pass_rate"],
+      "description": "MemoryView 发布门禁、authority、lifecycle、evidence 与 revoke 合同",
+      "phase": "F2",
+      "gate": {
+        "case_pass_rate": 1.0
+      }
+    },
+    "mengshu-slot-loadout": {
+      "kind": "extension",
+      "runner": "slot-loadout-v1",
+      "file": "mengshu-slot-loadout.jsonl",
+      "caseCount": 6,
+      "bytes": 514,
+      "sha256": "57f69c64cc933a0236ced62e223ca4c7274ac75b349143db9c8899e0269dc7ab",
+      "coverage": {
+        "asset_off_fallback": 1,
+        "authority": 1,
+        "declared_slot": 1,
+        "lifecycle": 1,
+        "revoke": 1,
+        "slot_budget": 1
+      },
+      "metrics": ["case_pass_rate"],
+      "description": "Loadout authority、槽位装配、lifecycle/revoke 拒绝、预算降级和关闭回退合同",
+      "phase": "F2",
+      "gate": {
+        "case_pass_rate": 1.0
+      }
     }
   },
   "notes": [
     "本 manifest 在每次黄金集变更时同步更新 sha256、bytes 与 caseCount。",
     "release gate：safety wrong_injection_rate=0；v0.1 pass rate>=80%。",
     "P0-c 新增 6 个 suite：extraction(100)、dedup(80)、recall-explain(60) 充分样例；conflict(10)、tree-summary(8)、skill-candidate(8) 骨架占位。",
+    "MG-009 新增 3 个 deterministic component suite：progressive-disclosure(5)、asset-promotion(5)、slot-loadout(6)。",
     "P0-c gate：extraction type precision>=0.85、extraction precision>=0.80、over-capture<=0.10；dedup duplicate precision>=0.90、false merge<=0.03；recall-explain breakdown 输出率=1.0。"
   ]
 }

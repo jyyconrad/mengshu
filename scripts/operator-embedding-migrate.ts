@@ -16,9 +16,12 @@ import { Embeddings } from "../packages/core/src/runtime/llm/embeddings.js";
 
 export const OPERATOR_EMBEDDING_APPLY_TOKEN =
   "APPLY-MENGSHU-EMBEDDING-V12" as const;
-const TARGET_MODEL = "Qwen/Qwen3-Embedding-0.6B";
+const QWEN_TARGET_MODEL = "Qwen/Qwen3-Embedding-0.6B";
+const BGE_TARGET_MODEL = "BAAI/bge-m3";
+const SUPPORTED_TARGET_MODELS = new Set([QWEN_TARGET_MODEL, BGE_TARGET_MODEL]);
 const TARGET_DIMENSIONS = 1024;
 const REQUIRED_CENTROID_MARGIN = 0.1;
+const EMBEDDING_API_CONCURRENCY = 3;
 const TABLES = ["memories", "knowledge"] as const;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const LEGACY_CONTENT_HASH_PATTERN = /^(?:[0-9a-f]{32}|[0-9a-f]{64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
@@ -54,7 +57,7 @@ export interface OperatorEmbeddingManifest {
   readonly centroidMargin: 0.1;
   /** PostgreSQL keyset page / bulk transaction size. */
   readonly scanBatchSize: number;
-  /** Remote OpenAI-compatible request size; hard capped at 20. */
+  /** Remote OpenAI-compatible request size; hard capped at the verified 128. */
   readonly apiBatchSize: number;
 }
 
@@ -138,6 +141,8 @@ interface Classification {
     | "knowledge-centroid-qwen"
     | "knowledge-centroid-ambiguous"
     | "knowledge-centroid-unavailable"
+    | "target-space-match"
+    | "target-space-reembed"
     | "existing-validated-receipt"
     | "existing-applied-receipt";
 }
@@ -247,12 +252,12 @@ export function loadOperatorEmbeddingManifest(
   }
   if (
     target.fingerprint.provider !== "openai" ||
-    target.fingerprint.model !== TARGET_MODEL ||
+    !SUPPORTED_TARGET_MODELS.has(target.fingerprint.model) ||
     target.fingerprint.dim !== TARGET_DIMENSIONS
   ) {
     fail(
       "INVALID_MANIFEST",
-      `target must use OpenAI-compatible ${TARGET_MODEL} with ${TARGET_DIMENSIONS} dimensions`,
+      `target must use a supported OpenAI-compatible 1024-dimension model (${[...SUPPORTED_TARGET_MODELS].join(" or ")})`,
     );
   }
   if (root.centroidMargin !== REQUIRED_CENTROID_MARGIN) {
@@ -263,8 +268,8 @@ export function loadOperatorEmbeddingManifest(
   if (scanBatchSize > 1_000) {
     fail("INVALID_MANIFEST", "manifest scanBatchSize must not exceed 1000");
   }
-  if (apiBatchSize > 20) {
-    fail("INVALID_MANIFEST", "manifest apiBatchSize must not exceed 20");
+  if (apiBatchSize > 128) {
+    fail("INVALID_MANIFEST", "manifest apiBatchSize must not exceed 128");
   }
 
   return Object.freeze({
@@ -315,12 +320,19 @@ export function classifyEmbeddingRow(
   row: OperatorEmbeddingRow,
   centroids: Centroids | null,
   centroidMargin: number,
+  target?: { readonly model: string; readonly embeddingSpaceId: string },
 ): Classification {
   if (row.receiptOperation === "validated") {
     return { operation: "validated", reason: "existing-validated-receipt" };
   }
   if (row.receiptOperation === "applied") {
     return { operation: "reembed", reason: "existing-applied-receipt" };
+  }
+  if (target?.model === BGE_TARGET_MODEL) {
+    return row.embeddingSpaceId === target.embeddingSpaceId &&
+      row.embeddingSpaceState === "known-queryable"
+      ? { operation: "validated", reason: "target-space-match" }
+      : { operation: "reembed", reason: "target-space-reembed" };
   }
   const model = metadataModel(row.metadata)?.toLowerCase() ?? "";
   const qwenModel = model.includes("qwen");
@@ -447,6 +459,8 @@ function sourceRowsSql(
     r.id,
     COALESCE(s.old_vector, r.vector) AS source_vector,
     COALESCE(s.old_metadata, r.metadata) AS source_metadata,
+    COALESCE(s.old_embedding_space_id, r.embedding_space_id) AS source_embedding_space_id,
+    COALESCE(s.old_embedding_space_state, r.embedding_space_state) AS source_embedding_space_state,
     (
       SELECT receipt.operation
       FROM mengshu_embedding_reembed_receipts receipt
@@ -497,6 +511,10 @@ memory_classified AS (
     CASE
       WHEN receipt_operation = 'validated' THEN 'validated'
       WHEN receipt_operation = 'applied' THEN 'reembed'
+      WHEN $3::text = '${BGE_TARGET_MODEL}' THEN
+        CASE WHEN source_embedding_space_id = $4::text
+                  AND source_embedding_space_state = 'known-queryable'
+             THEN 'validated' ELSE 'reembed' END
       WHEN model LIKE '%qwen%' THEN 'validated'
       ELSE 'reembed'
     END AS operation
@@ -513,6 +531,10 @@ knowledge_classified AS (
     CASE
       WHEN source.receipt_operation = 'validated' THEN 'validated'
       WHEN source.receipt_operation = 'applied' THEN 'reembed'
+      WHEN $3::text = '${BGE_TARGET_MODEL}' THEN
+        CASE WHEN source.source_embedding_space_id = $4::text
+                  AND source.source_embedding_space_state = 'known-queryable'
+             THEN 'validated' ELSE 'reembed' END
       WHEN source.model LIKE '%qwen%' THEN 'validated'
       WHEN source.model !~ '(openai|text-embedding)' THEN 'reembed'
       WHEN centroids.qwen_centroid IS NULL OR centroids.bge_centroid IS NULL THEN 'reembed'
@@ -537,7 +559,13 @@ SELECT
 FROM all_classified
 GROUP BY table_name
 ORDER BY table_name`;
-  const result = await client.query(sql, [migrationId, manifest.centroidMargin]);
+  const target = createEmbeddingSpace(manifest.target);
+  const result = await client.query(sql, [
+    migrationId,
+    manifest.centroidMargin,
+    target.fingerprint.model,
+    target.embeddingSpaceId,
+  ]);
   for (const row of result.rows) {
     const table = row.table_name;
     if (table !== "memories" && table !== "knowledge") {
@@ -561,7 +589,11 @@ function assertExpected(summary: ScanSummary, expected: OperatorEmbeddingManifes
     summary.memories !== expected.memories ||
     summary.knowledge !== expected.knowledge
   ) {
-    fail("EXPECTED_COUNTS_MISMATCH", "embedding migration actual counts do not match manifest");
+    fail(
+      "EXPECTED_COUNTS_MISMATCH",
+      `embedding migration counts differ: total=${summary.total}, validated=${summary.validated}, ` +
+        `reembed=${summary.reembed}, memories=${summary.memories}, knowledge=${summary.knowledge}`,
+    );
   }
 }
 
@@ -693,6 +725,8 @@ function classificationCtesForTable(
   table: MigrationTable,
   migrationParameter = "$1",
   marginParameter = "$2",
+  targetModelParameter = "$5",
+  targetSpaceParameter = "$3",
 ): string {
   const memory = `${sourceRowsSql("memories_source", "memories", migrationParameter)},
 memory_models AS MATERIALIZED (
@@ -716,6 +750,10 @@ classified AS MATERIALIZED (
     CASE
       WHEN receipt_operation = 'validated' THEN 'validated'
       WHEN receipt_operation = 'applied' THEN 'reembed'
+      WHEN ${targetModelParameter}::text = '${BGE_TARGET_MODEL}' THEN
+        CASE WHEN source_embedding_space_id = ${targetSpaceParameter}::text
+                  AND source_embedding_space_state = 'known-queryable'
+             THEN 'validated' ELSE 'reembed' END
       WHEN model LIKE '%qwen%' THEN 'validated'
       ELSE 'reembed'
     END AS operation
@@ -734,6 +772,10 @@ classified AS MATERIALIZED (
     CASE
       WHEN source.receipt_operation = 'validated' THEN 'validated'
       WHEN source.receipt_operation = 'applied' THEN 'reembed'
+      WHEN ${targetModelParameter}::text = '${BGE_TARGET_MODEL}' THEN
+        CASE WHEN source.source_embedding_space_id = ${targetSpaceParameter}::text
+                  AND source.source_embedding_space_state = 'known-queryable'
+             THEN 'validated' ELSE 'reembed' END
       WHEN source.model LIKE '%qwen%' THEN 'validated'
       WHEN source.model !~ '(openai|text-embedding)' THEN 'reembed'
       WHEN centroids.qwen_centroid IS NULL OR centroids.bge_centroid IS NULL THEN 'reembed'
@@ -771,7 +813,7 @@ async function applyValidatedBulk(
   try {
     const result = await client.query(`/* embedding-migrate:validated-bulk */
 WITH
-${classificationCtesForTable(table)},
+    ${classificationCtesForTable(table)},
 eligible AS MATERIALIZED (
   SELECT
     classified.id,
@@ -845,6 +887,7 @@ SELECT
       manifest.centroidMargin,
       target.embeddingSpaceId,
       migrationId,
+      target.fingerprint.model,
     ]);
     const row = result.rows[0];
     const eligible = persistedCount(row?.eligible_count);
@@ -876,10 +919,37 @@ async function* scanReembedRows(
 ): AsyncGenerator<OperatorEmbeddingRow[]> {
   let afterId: string | null = null;
   for (;;) {
-    const result: { readonly rows: Record<string, unknown>[]; readonly rowCount?: number | null } =
-      await client.query(`/* embedding-migrate:reembed-scan */
+    const bgeFastScan = manifest.target.model === BGE_TARGET_MODEL;
+    const scanSql = bgeFastScan
+      ? `/* embedding-migrate:reembed-scan */
+SELECT
+  record.id::text AS id,
+  record.text,
+  shadow.source_content_hash AS content_hash,
+  shadow.old_vector::text AS vector,
+  shadow.old_metadata AS metadata,
+  shadow.old_embedding_space_id AS embedding_space_id,
+  shadow.old_embedding_space_state AS embedding_space_state,
+  NULL::text AS receipt_operation
+FROM ${tableSql(table)} record
+JOIN mengshu_embedding_reembed_shadow shadow
+  ON shadow.migration_id = $1
+ AND shadow.table_name = '${table}'
+ AND shadow.record_id = record.id
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM mengshu_embedding_reembed_receipts receipt
+  WHERE receipt.migration_id = $1
+    AND receipt.table_name = '${table}'
+    AND receipt.record_id = record.id
+    AND receipt.operation IN ('validated', 'applied')
+)
+  AND ($2::uuid IS NULL OR record.id > $2::uuid)
+ORDER BY record.id
+LIMIT $3`
+      : `/* embedding-migrate:reembed-scan */
 WITH
-${classificationCtesForTable(table)}
+${classificationCtesForTable(table, "$1", "$2", "$5", "$6")}
 SELECT
   record.id::text AS id,
   record.text,
@@ -899,7 +969,19 @@ WHERE classified.receipt_operation IS NULL
   AND classified.operation = 'reembed'
   AND ($3::uuid IS NULL OR record.id > $3::uuid)
 ORDER BY record.id
-LIMIT $4`, [migrationId, manifest.centroidMargin, afterId, manifest.scanBatchSize]);
+LIMIT $4`;
+    const scanParams = bgeFastScan
+      ? [migrationId, afterId, manifest.scanBatchSize]
+      : [
+          migrationId,
+          manifest.centroidMargin,
+          afterId,
+          manifest.scanBatchSize,
+          manifest.target.model,
+          createEmbeddingSpace(manifest.target).embeddingSpaceId,
+        ];
+    const result: { readonly rows: Record<string, unknown>[]; readonly rowCount?: number | null } =
+      await client.query(scanSql, scanParams);
     const rows: OperatorEmbeddingRow[] = result.rows.map((row: Record<string, unknown>) =>
       decodeRow(table, row));
     if (rows.length === 0) return;
@@ -942,13 +1024,22 @@ async function applyBatch(
 ): Promise<number> {
   const reembedRows = rows.filter((_, index) => classifications[index]!.operation === "reembed");
   const embedded: (readonly number[])[] = [];
+  const apiBatches: OperatorEmbeddingRow[][] = [];
   for (let offset = 0; offset < reembedRows.length; offset += apiBatchSize) {
-    const apiRows = reembedRows.slice(offset, offset + apiBatchSize);
-    const vectors = await embedder.embedBatch(apiRows.map((row) => row.text));
-    if (vectors.length !== apiRows.length) {
-      fail("EMBEDDING_BATCH_INVALID", "configured embedding provider returned an invalid batch size");
+    apiBatches.push(reembedRows.slice(offset, offset + apiBatchSize));
+  }
+  for (let offset = 0; offset < apiBatches.length; offset += EMBEDDING_API_CONCURRENCY) {
+    const group = apiBatches.slice(offset, offset + EMBEDDING_API_CONCURRENCY);
+    const groupVectors = await Promise.all(group.map(async (apiRows) => {
+      const vectors = await embedder.embedBatch(apiRows.map((row) => row.text));
+      if (vectors.length !== apiRows.length) {
+        fail("EMBEDDING_BATCH_INVALID", "configured embedding provider returned an invalid batch size");
+      }
+      return vectors;
+    }));
+    for (const vectors of groupVectors) {
+      embedded.push(...vectors);
     }
-    embedded.push(...vectors);
   }
   if (embedded.length !== reembedRows.length) {
     fail("EMBEDDING_BATCH_INVALID", "configured embedding provider returned an invalid batch size");
@@ -1250,10 +1341,12 @@ export async function runOperatorEmbeddingMigration(
     assertExpected(capturedInspection.summary, normalized.expected);
 
     let updated = 0;
-    for (const table of TABLES) {
-      updated += await applyValidatedBulk(
-        client, table, normalized, manifestSha256, target,
-      );
+    if (normalized.expected.validated > 0) {
+      for (const table of TABLES) {
+        updated += await applyValidatedBulk(
+          client, table, normalized, manifestSha256, target,
+        );
+      }
     }
     updated += await applyRows(
       client,
@@ -1285,6 +1378,12 @@ export async function runOperatorEmbeddingMigration(
     };
   } catch (error) {
     if (error instanceof OperatorEmbeddingMigrationError) throw error;
+    if (error instanceof Error && error.message.startsWith("Embedding ")) {
+      throw new OperatorEmbeddingMigrationError(
+        "EMBEDDING_PROVIDER_FAILED",
+        "embedding provider failed after retries",
+      );
+    }
     throw new OperatorEmbeddingMigrationError(
       "MIGRATION_FAILED",
       "embedding migration failed without exposing record or connection data",
@@ -1344,7 +1443,7 @@ export function createOperatorEmbeddingBatchProvider(
     model: manifest.target.model,
   };
   const embeddings = new Embeddings(targetConfig, undefined, {
-    maxBatchSize: Math.min(manifest.apiBatchSize, 20),
+    maxBatchSize: Math.min(manifest.apiBatchSize, 128),
   });
   return {
     target: manifest.target,

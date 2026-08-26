@@ -32,10 +32,14 @@ import {
   startMcpStdioServer,
   waitForMcpServerShutdown,
   closeMcpServerAndRuntime,
+  type McpStdioServerOptions,
   type RunningMcpStdioServer,
 } from "../packages/mcp/src/stdio-server.js";
-import { loadMcpServerAuthorityFromEnv } from "../packages/mcp/src/server.js";
-import { createMengshuRuntime } from "../runtime.js";
+import {
+  loadMcpServerAuthorityFromEnv,
+  type McpServerAuthorityConfig,
+} from "../packages/mcp/src/server.js";
+import { createMengshuRuntime, type MengshuRuntime } from "../runtime.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -288,7 +292,31 @@ function createMcpFriendlyMemoryService(
   };
 }
 
-async function main(): Promise<void> {
+/** Standalone production composition：事件写入只暴露 Runtime 的统一 Write Kernel capability。 */
+export function createStandaloneMcpStdioServerOptions(
+  runtime: MengshuRuntime,
+  service: MemoryService,
+  authorityConfig: McpServerAuthorityConfig,
+): McpStdioServerOptions {
+  return {
+    service,
+    ...(runtime.executeMemoryWrite
+      ? { memoryWrite: { executeMemoryWrite: runtime.executeMemoryWrite } }
+      : {}),
+    forgetCapability: runtime.authorityScopedForgetCapability,
+    authority: authorityConfig.authority,
+    defaultScope: authorityConfig.defaultScope,
+    agentFastPath: runtime.agentFastPath,
+    memoryAssets: runtime.memoryViewAssets,
+    knowledgeResources: runtime.knowledgeResources,
+    sessionReceipts: runtime.contextAssemblyReceipts,
+    namespaces: ["memories", "knowledge"],
+    pipeline: runtime.ingestionPipeline,
+    llmClient: runtime.llmClient,
+  };
+}
+
+export async function runStandaloneMcpServer(): Promise<void> {
   process.chdir(path.resolve(__dirname, ".."));
 
   ensureLocalNoProxy();
@@ -336,16 +364,9 @@ async function main(): Promise<void> {
     });
 
     process.stderr.write(`mengshu MCP started (${configPath})\n`);
-    running = await startMcpStdioServer({
-      service,
-      forgetCapability: runtime.authorityScopedForgetCapability,
-      authority: authorityConfig.authority,
-      defaultScope: authorityConfig.defaultScope,
-      agentFastPath: runtime.agentFastPath,
-      namespaces: ["memories", "knowledge"],
-      pipeline: runtime.ingestionPipeline,
-      llmClient: runtime.llmClient,
-    });
+    running = await startMcpStdioServer(
+      createStandaloneMcpStdioServerOptions(runtime, service, authorityConfig),
+    );
     const reason = await waitForMcpServerShutdown(running);
     if (reason === "SIGINT") process.exitCode = 130;
     if (reason === "SIGTERM") process.exitCode = 143;
@@ -358,7 +379,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(() => {
-  process.stderr.write("mengshu MCP failed (STARTUP_OR_SHUTDOWN_ERROR)\n");
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  runStandaloneMcpServer().catch(() => {
+    process.stderr.write("mengshu MCP failed (STARTUP_OR_SHUTDOWN_ERROR)\n");
+    process.exitCode = 1;
+  });
+}

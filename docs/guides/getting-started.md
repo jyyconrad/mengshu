@@ -100,6 +100,10 @@ ms forget <记忆ID>
 
 # 导入 agent history
 ms project ingest-history --from codex --dry-run
+
+# 查看当前 scope 下的治理资产及其 evidence
+ms asset list
+ms asset explain <asset-id>
 ```
 
 ## 下一步

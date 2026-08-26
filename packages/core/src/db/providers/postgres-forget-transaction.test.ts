@@ -89,7 +89,8 @@ class FakeClient implements PostgresForgetPoolClient {
         producer_id: params[17],
         namespace: params[18],
         visibility: params[19],
-        lifecycle_status: params[20],
+        scope_key: params[20],
+        lifecycle_status: params[21],
       }];
       return { rows: [{ id: params[0] }] as unknown as Row[], rowCount: 1 };
     }
@@ -143,7 +144,8 @@ class StoreThenForgetPool implements PostgresForgetPool {
         producer_id: params[17],
         namespace: params[18],
         visibility: params[19],
-        lifecycle_status: params[20],
+        scope_key: params[20],
+        lifecycle_status: params[21],
       }];
     }
     return { rows: [], rowCount: 1 };
@@ -568,13 +570,14 @@ describe("PostgresForgetTransactionPort", () => {
     await provider.store([recordToMemoryEntry(record, [0.1, 0.2])]);
 
     const insert = pool.client.calls.find((call) => /INSERT INTO\s+"memories"/i.test(call.sql));
-    expect(insert?.params.slice(14, 21)).toEqual([
+    expect(insert?.params.slice(14, 22)).toEqual([
       scope.tenantId,
       scope.projectId,
       scope.appId,
       scope.agentId,
       scope.namespace,
       scope.visibility,
+      "tenant-a:codex:user-a:project-a:agent-a:memories",
       "active",
     ]);
 

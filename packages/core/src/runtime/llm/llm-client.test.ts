@@ -324,6 +324,27 @@ describe("OpenAiLlmClient.extractStructured", () => {
     expect(calls[0].response_format).toEqual({ type: "json_object" });
   });
 
+  test("production fixture contract: schema title is carried by the system message", async () => {
+    const titledSchema = { ...schema, title: "MemoryCandidateExtraction" };
+    const { client, calls } = makeFakeClient(JSON.stringify({ name: "Ada", age: 30 }));
+    const llm = new OpenAiLlmClient(llmConfig, { client, minTimeout: 1, maxTimeout: 5 });
+
+    await llm.extractStructured(
+      [{ role: "user", content: "extract" }],
+      titledSchema,
+    );
+
+    expect(calls[0].response_format).toEqual({ type: "json_object" });
+    const messages = calls[0].messages as Array<{ role: string; content: string }>;
+    expect(messages[0]).toMatchObject({
+      role: "system",
+      content: expect.stringContaining("MemoryCandidateExtraction"),
+    });
+    expect(messages[0]?.content).toContain(
+      "Respond with valid JSON matching this schema:",
+    );
+  });
+
   test("D-18: temperature is fixed to 0.0 regardless of config", async () => {
     const { client, calls } = makeFakeClient(JSON.stringify({ name: "Ada", age: 30 }));
     const llm = new OpenAiLlmClient(
@@ -1132,5 +1153,29 @@ describe("createLlmClient", () => {
     const llm = createLlmClient(undefined);
     expect(llm).toBeInstanceOf(NullLlmClient);
     expect(llm.available).toBe(false);
+  });
+
+  test("forwards an explicit bounded concurrency to the OpenAI client", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const releases: Array<() => void> = [];
+    const client: ChatCompletionClient = {
+      chat: { completions: { create: async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise<void>((resolve) => releases.push(resolve));
+        active -= 1;
+        return { choices: [{ message: { content: "ok" } }] };
+      } } },
+    };
+    const llm = createLlmClient(llmConfig, { client, concurrency: 2 });
+    const calls = [
+      llm.complete([{ role: "user", content: "one" }]),
+      llm.complete([{ role: "user", content: "two" }]),
+    ];
+    await vi.waitFor(() => expect(releases).toHaveLength(2));
+    releases.forEach((release) => release());
+    await Promise.all(calls);
+    expect(maxActive).toBe(2);
   });
 });

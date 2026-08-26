@@ -5,7 +5,13 @@
  * 操作台视图返回数据，并保留 scope/provenance 以支持追溯。
  */
 
-import type { MemoryScope, MemorySemanticType, RecallHit } from "../../../../core/types.js";
+import type {
+  MemoryScope,
+  MemorySemanticType,
+  RecallFilteredCandidate,
+  RecallHit,
+} from "../../../../core/types.js";
+import type { CompleteRecallScoreBreakdown } from "../../../../core/recall-scoring.js";
 import type { GraphQueryResult } from "../../../../graph/query.js";
 import type { JobRecord } from "../../../../storage/repositories/types.js";
 import type {
@@ -46,7 +52,7 @@ export interface ConsoleLookupResult {
   title: string;
   preview: string;
   score: number;
-  scoreBreakdown: Record<string, number>;
+  scoreBreakdown: CompleteRecallScoreBreakdown;
   sourceLabel: string;
   namespace: string;
   provenanceCount: number;
@@ -57,6 +63,7 @@ export interface ConsoleLookupResponse {
   scope: MemoryScope;
   query: string;
   results: ConsoleLookupResult[];
+  filtered?: RecallFilteredCandidate[];
 }
 
 export interface ConsoleGraphResponse extends GraphQueryResult {}

@@ -17,6 +17,8 @@ export function createExactMcpAuthority(scope: MemoryScope): AuthorityScope {
   return Object.freeze({
     tenantId: scope.tenantId,
     userId: scope.userId,
+    ...(scope.workspaceId === undefined ? {} : { workspaceId: scope.workspaceId }),
+    ...(scope.sessionId === undefined ? {} : { sessionId: scope.sessionId }),
     allow: Object.freeze({
       appIds: Object.freeze([scope.appId]),
       projectIds: Object.freeze([scope.projectId]),

@@ -45,6 +45,7 @@ export class RetrievalOrchestrator {
     const hits = fuseHits(sourceResults, {
       k: this.options.fusionK,
       limit: input.limit,
+      scope,
     });
 
     return {

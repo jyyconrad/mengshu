@@ -22,6 +22,7 @@ import {
   bindOpenClawPipelineAuthority,
 } from "./tools.js";
 import { createExactOpenClawAuthority } from "./authority.js";
+import { computeRecallScoreBreakdown } from "../../../core/recall-scoring.js";
 
 const scope = {
   tenantId: "local",
@@ -33,7 +34,7 @@ const scope = {
   visibility: "private" as const,
 };
 const authority = createExactOpenClawAuthority(scope);
-const authorityContext = { authority, defaultScope: scope };
+const authorityContext = { authority, defaultScope: scope, unsafeLegacyWrite: true as const };
 
 function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
   return {
@@ -52,6 +53,16 @@ function makeRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
     vector: [0.1, 0.2],
     ...overrides,
   };
+}
+
+function recallHit(record: MemoryRecord, relevance = 0.91, source: "vector" | "tree" = "vector") {
+  const scoreBreakdown = computeRecallScoreBreakdown(
+    record,
+    { relevance, scopeFit: 1 },
+    [source],
+    { [source]: relevance },
+  );
+  return { record, score: scoreBreakdown.score, source, scoreBreakdown };
 }
 
 class FakeMemoryService implements MemoryService, AuthorityScopedForgetService {
@@ -108,6 +119,58 @@ class FakeMemoryService implements MemoryService, AuthorityScopedForgetService {
 }
 
 describe("OpenClaw memory tool handlers", () => {
+  test("production store delegates to Runtime write capability without embedding or direct store", async () => {
+    const service = new FakeMemoryService();
+    const directStore = vi.spyOn(service, "storeMemory");
+    const executeMemoryWrite = vi.fn(async () => ({
+      status: "persisted" as const,
+      route: "active" as const,
+      recordType: "memory" as const,
+      memoryId: "kernel-memory",
+      stored: true,
+    }));
+
+    const result = await handleMemoryStore(
+      {
+        text: "The user prefers dark mode",
+        idempotencyKey: "openclaw-save-1",
+        category: "preference",
+      },
+      {
+        authority,
+        defaultScope: scope,
+        service,
+        memoryWrite: { executeMemoryWrite },
+      },
+    );
+
+    expect(result.details).toMatchObject({ action: "created", id: "kernel-memory" });
+    expect(directStore).not.toHaveBeenCalled();
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      type: "saveExplicit",
+      idempotencyKey: "openclaw-save-1",
+      serverAuthority: authority,
+      clientScope: scope,
+      text: "The user prefers dark mode",
+      kind: "preference",
+    }));
+  });
+
+  test("production store fails closed without write capability or idempotency key", async () => {
+    const service = new FakeMemoryService();
+    const directStore = vi.spyOn(service, "storeMemory");
+
+    await expect(handleMemoryStore(
+      { text: "The user prefers dark mode" },
+      { authority, defaultScope: scope, service },
+    )).rejects.toThrow(/idempotencyKey/);
+    await expect(handleMemoryStore(
+      { text: "The user prefers dark mode", idempotencyKey: "openclaw-save-2" },
+      { authority, defaultScope: scope, service },
+    )).rejects.toThrow(/write capability is unavailable/i);
+    expect(directStore).not.toHaveBeenCalled();
+  });
+
   test("stores new memory through MemoryService with enriched metadata", async () => {
     const service = new FakeMemoryService();
     const result = await handleMemoryStore(
@@ -279,17 +342,11 @@ describe("OpenClaw memory tool handlers", () => {
   });
 
   test("recalls memories through MemoryService and preserves legacy output shape", async () => {
+    const hit = recallHit(makeRecord({ score: undefined } as Partial<MemoryRecord>));
     const service = new FakeMemoryService({
       scope,
       query: "dark mode",
-      hits: [
-        {
-          record: makeRecord({ score: undefined } as Partial<MemoryRecord>),
-          score: 0.91,
-          source: "vector",
-          scoreBreakdown: { vector: 0.91 },
-        },
-      ],
+      hits: [hit],
     });
 
     const result = await handleMemoryRecall(
@@ -317,7 +374,7 @@ describe("OpenClaw memory tool handlers", () => {
     ]);
     expect(result.content[0].text).toContain("Found 1 memories");
     expect(result.details?.memories).toEqual([
-      {
+      expect.objectContaining({
         id: "mem-1",
         text: "The user prefers dark mode",
         category: "preference",
@@ -325,9 +382,30 @@ describe("OpenClaw memory tool handlers", () => {
         tableName: "memories",
         metadata: { source: "user" },
         importance: 0.8,
-        score: 0.91,
-      },
+        source: "vector",
+        scoreBreakdown: expect.objectContaining({
+          weights: expect.any(Object),
+          factors: expect.any(Object),
+          contributions: expect.any(Object),
+          matchedBy: ["vector"],
+          sourceSignals: { vector: 0.91 },
+        }),
+      }),
     ]);
+    expect((result.details?.memories as Array<{ scoreBreakdown: unknown }>)[0].scoreBreakdown)
+      .toBe(hit.scoreBreakdown);
+  });
+
+  test("recall fails closed instead of fabricating a missing breakdown", async () => {
+    const service = new FakeMemoryService({
+      scope,
+      query: "dark mode",
+      hits: [{ record: makeRecord(), score: 0.91, source: "vector" }],
+    });
+
+    await expect(
+      handleMemoryRecall({ query: "dark mode" }, { service, ...authorityContext }),
+    ).rejects.toThrow("RECALL_SCORE_BREAKDOWN_REQUIRED");
   });
 
   test("forgets by id, filter, or high-confidence query match", async () => {
@@ -652,12 +730,10 @@ describe("OpenClaw memory tool handlers", () => {
       scope: openClawRuntimeDefaultScope,
       query: "scope test",
       hits: [
-        {
-          record: makeRecord({ text: "OpenClaw scope test", scope: openClawRuntimeDefaultScope }),
-          score: 0.85,
-          source: "vector",
-          scoreBreakdown: { vector: 0.85 },
-        },
+        recallHit(
+          makeRecord({ text: "OpenClaw scope test", scope: openClawRuntimeDefaultScope }),
+          0.85,
+        ),
       ],
     });
 
@@ -672,6 +748,7 @@ describe("OpenClaw memory tool handlers", () => {
         authority: createExactOpenClawAuthority(openClawRuntimeDefaultScope),
         defaultScope: openClawRuntimeDefaultScope,
         service,
+        unsafeLegacyWrite: true,
         embed: async () => [0.5, 0.6],
         existsByContentHash: async () => [],
         embeddingModel: "test-model",
@@ -813,11 +890,7 @@ describe("OpenClaw memory tool handlers", () => {
       scope,
       query: "dark mode",
       hits: [
-        {
-          record: summaryRecord,
-          score: 0.88,
-          source: "tree" as const,
-        },
+        recallHit(summaryRecord as never, 0.88, "tree"),
       ],
     });
 
@@ -827,7 +900,11 @@ describe("OpenClaw memory tool handlers", () => {
     // Non-MemoryRecord hit uses summary field for display
     expect(result.content[0].text).toContain("Summary of dark mode preferences");
     expect(result.details?.memories).toMatchObject([
-      { id: "summary-1", score: 0.88, source: "tree" },
+      {
+        id: "summary-1",
+        source: "tree",
+        scoreBreakdown: expect.objectContaining({ matchedBy: ["tree"] }),
+      },
     ]);
   });
 

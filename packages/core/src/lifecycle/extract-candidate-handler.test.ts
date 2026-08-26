@@ -11,7 +11,10 @@
  */
 
 import { describe, expect, test, vi } from "vitest";
-import { createExtractCandidateHandler } from "./extract-candidate-handler.js";
+import {
+  createExtractCandidateHandler as createLegacyExtractCandidateHandler,
+  type ExtractCandidateHandlerDeps,
+} from "./extract-candidate-handler.js";
 import { InMemoryCandidateRepository } from "./candidate-repository.js";
 import { HeuristicTypeExtractor } from "./type-extractor.js";
 import type { JobRecord } from "../storage/repositories/types.js";
@@ -30,6 +33,15 @@ const scope = {
   agentId: "default",
   namespace: "memories",
 };
+
+function createExtractCandidateHandler(deps: ExtractCandidateHandlerDeps) {
+  return createLegacyExtractCandidateHandler({
+    readEvidenceFacts: async ({ evidenceIds }) =>
+      evidenceIds.map((evidenceId) => ({ evidenceId, sourceKind: "session_user" as const })),
+    resolveMaxSimilarity: async () => 0,
+    ...deps,
+  });
+}
 
 function job(payload: Record<string, unknown>): JobRecord {
   return {

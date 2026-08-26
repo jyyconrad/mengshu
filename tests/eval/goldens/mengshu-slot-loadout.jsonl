@@ -1,0 +1,6 @@
+{"id":"sl-001","suite":"mengshu-slot-loadout","scenario":"asset_off_fallback"}
+{"id":"sl-002","suite":"mengshu-slot-loadout","scenario":"authority_scope_rejected"}
+{"id":"sl-003","suite":"mengshu-slot-loadout","scenario":"published_asset_in_declared_slot"}
+{"id":"sl-004","suite":"mengshu-slot-loadout","scenario":"lifecycle_ineligible_denied"}
+{"id":"sl-005","suite":"mengshu-slot-loadout","scenario":"revoked_asset_denied"}
+{"id":"sl-006","suite":"mengshu-slot-loadout","scenario":"budget_downgrade_navigation"}

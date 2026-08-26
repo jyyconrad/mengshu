@@ -5,8 +5,8 @@
       "command": "node",
       "args": ["./mcp/server.mjs"],
       "env": {
-        "MENGSHU_HOME": "${MENGSHU_HOME}",
-        "MENGSHU_AUTHORITY_FILE": "${MENGSHU_AUTHORITY_FILE}"
+        "MENGSHU_HOME": "${HOME}/.mengshu",
+        "MENGSHU_AUTHORITY_FILE": "${HOME}/.mengshu/authority.json"
       }
     }
   }

@@ -1,4 +1,9 @@
 import { runCandidateExtractionSuite } from "./candidate-extraction.js";
+import {
+  runAssetPromotionSuite,
+  runProgressiveDisclosureSuite,
+  runSlotLoadoutSuite,
+} from "./capability-contracts.js";
 import { runConflictDetectionSuite } from "./conflict-detection.js";
 import { runRecallExplainSuite } from "./recall-explain.js";
 import { runSemanticDedupSuite } from "./semantic-dedup.js";
@@ -18,7 +23,7 @@ export interface HonestExtensionCaseResult {
   readonly failures: readonly string[];
 }
 
-/** 六个 honest component runner 共享的最小结构合同。 */
+/** Honest component runners 共享的最小结构合同。 */
 export interface HonestExtensionRun {
   readonly suite: string;
   readonly total: number;
@@ -103,4 +108,7 @@ export const EXTENSION_RUNNER_REGISTRY: ReadonlyMap<string, QuickEvalRunner> = n
   ["conflict-detection-v1", extensionRunner(runConflictDetectionSuite)],
   ["tree-summary-v1", extensionRunner(runTreeSummarySuite)],
   ["skill-candidate-v1", extensionRunner(runSkillCandidateSuite)],
+  ["progressive-disclosure-v1", extensionRunner(runProgressiveDisclosureSuite)],
+  ["asset-promotion-v1", extensionRunner(runAssetPromotionSuite)],
+  ["slot-loadout-v1", extensionRunner(runSlotLoadoutSuite)],
 ]);

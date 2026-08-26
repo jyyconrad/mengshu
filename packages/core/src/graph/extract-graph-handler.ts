@@ -5,7 +5,7 @@
 
 import type { JobRecord, JobRepository } from "../storage/repositories/types.js";
 import type { LlmClient } from "../runtime/llm/llm-client.js";
-import type { InMemoryGraphRepository } from "./repository.js";
+import type { EntityGraphRepository } from "./repository.js";
 import { extractGraphWithLlm } from "./llm-extractor.js";
 import type { MemoryScope } from "../domain/types.js";
 import { enqueueUniqueJob } from "../ingest/jobs.js";
@@ -50,7 +50,7 @@ export function enqueueExtractGraphJob(
 
 export interface ExtractGraphHandlerDeps {
   llmClient: LlmClient;
-  graphRepository: InMemoryGraphRepository;
+  graphRepository: EntityGraphRepository;
   /** 可选审计钩子：记录 LLM 提取失败事件。 */
   audit?(input: {
     scope: MemoryScope;

@@ -51,6 +51,8 @@ export function snapshotOpenClawAuthority(authority: AuthorityScope): AuthorityS
   return Object.freeze({
     tenantId: authority.tenantId,
     userId: authority.userId,
+    ...(authority.workspaceId === undefined ? {} : { workspaceId: authority.workspaceId }),
+    ...(authority.sessionId === undefined ? {} : { sessionId: authority.sessionId }),
     allow: Object.freeze({
       appIds: Object.freeze([...authority.allow.appIds]),
       projectIds: Object.freeze([...authority.allow.projectIds]),
@@ -61,17 +63,40 @@ export function snapshotOpenClawAuthority(authority: AuthorityScope): AuthorityS
   });
 }
 
-/** Exact local operator authority has one unambiguous runtime default. */
-export function defaultScopeFromExactOpenClawAuthority(
+/** Local operator authority has one explicit runtime default per dimension. */
+export function defaultScopeFromOpenClawAuthority(
   authority: AuthorityScope,
+  defaultAgentId?: string,
 ): MemoryScope {
   const snapshot = snapshotOpenClawAuthority(authority);
-  const lists = Object.values(snapshot.allow);
-  if (lists.some((values) => values.length !== 1)) {
+  const nonAgentLists = [
+    snapshot.allow.appIds,
+    snapshot.allow.projectIds,
+    snapshot.allow.namespaces,
+    snapshot.allow.visibilities,
+  ];
+  if (nonAgentLists.some((values) => values.length !== 1)) {
     throw new AuthorityScopeError(
       "AUTHORITY_ALLOWLIST_AMBIGUOUS",
-      "OpenClaw canonical plugin config requires exactly one default per authority allowlist",
+      "OpenClaw canonical plugin config requires exactly one default for every non-Agent authority allowlist",
       "authority",
+    );
+  }
+  const resolvedAgentId = defaultAgentId ?? (
+    snapshot.allow.agentIds.length === 1 ? snapshot.allow.agentIds[0] : undefined
+  );
+  if (!resolvedAgentId) {
+    throw new AuthorityScopeError(
+      "AUTHORITY_ALLOWLIST_AMBIGUOUS",
+      "OpenClaw canonical plugin config requires defaultAgentId when multiple agents are allowlisted",
+      "defaultAgentId",
+    );
+  }
+  if (!snapshot.allow.agentIds.includes(resolvedAgentId)) {
+    throw new AuthorityScopeError(
+      "CLIENT_VALUE_NOT_ALLOWED",
+      "OpenClaw defaultAgentId is not in the authority agentId allowlist",
+      "defaultAgentId",
     );
   }
   return Object.freeze({
@@ -79,10 +104,51 @@ export function defaultScopeFromExactOpenClawAuthority(
     userId: snapshot.userId,
     appId: snapshot.allow.appIds[0]!,
     projectId: snapshot.allow.projectIds[0]!,
-    agentId: snapshot.allow.agentIds[0]!,
+    agentId: resolvedAgentId,
     namespace: snapshot.allow.namespaces[0]!,
     visibility: snapshot.allow.visibilities[0]!,
+    ...(snapshot.workspaceId === undefined ? {} : { workspaceId: snapshot.workspaceId }),
+    ...(snapshot.sessionId === undefined ? {} : { sessionId: snapshot.sessionId }),
   });
+}
+
+/** @deprecated Use defaultScopeFromOpenClawAuthority for multi-Agent hosts. */
+export function defaultScopeFromExactOpenClawAuthority(
+  authority: AuthorityScope,
+): MemoryScope {
+  return defaultScopeFromOpenClawAuthority(authority);
+}
+
+export interface OpenClawHostScopeContext {
+  agentId?: string;
+  sessionId?: string;
+  sessionKey?: string;
+}
+
+/** Narrow a trusted OpenClaw host invocation to its actual Agent/session. */
+export function resolveOpenClawHostScope(
+  authority: AuthorityScope,
+  defaultScope: MemoryScope,
+  hostContext?: OpenClawHostScopeContext,
+): { authority: AuthorityScope; scope: MemoryScope } {
+  const hostSessionId = hostContext?.sessionId ?? hostContext?.sessionKey;
+  if (hostSessionId !== undefined &&
+      authority.sessionId !== undefined && authority.sessionId !== hostSessionId) {
+    throw new AuthorityScopeError(
+      "AUTHORITY_FIELD_INVALID",
+      "OpenClaw host session does not match server authority",
+      "sessionId",
+    );
+  }
+  const effectiveAuthority = hostSessionId === undefined
+    ? authority
+    : Object.freeze({ ...authority, sessionId: hostSessionId });
+  const scope = resolveOpenClawAuthorityScope(
+    effectiveAuthority,
+    defaultScope,
+    hostContext?.agentId === undefined ? undefined : { agentId: hostContext.agentId },
+  );
+  return { authority: createExactOpenClawAuthority(scope), scope };
 }
 
 /** Build the narrowest OpenClaw authority from the runtime/server default scope. */
@@ -90,6 +156,8 @@ export function createExactOpenClawAuthority(scope: MemoryScope): AuthorityScope
   return Object.freeze({
     tenantId: scope.tenantId,
     userId: scope.userId,
+    ...(scope.workspaceId === undefined ? {} : { workspaceId: scope.workspaceId }),
+    ...(scope.sessionId === undefined ? {} : { sessionId: scope.sessionId }),
     allow: Object.freeze({
       appIds: Object.freeze([scope.appId]),
       projectIds: Object.freeze([scope.projectId]),

@@ -9,12 +9,16 @@ import {
   type PostgresDurableJobV2RuntimeBundle,
 } from "../packages/core/src/db/providers/postgres.js";
 import { PostgresDurableJobV2Repository } from "../packages/core/src/storage/repositories/postgres-job-v2.js";
+import {
+  resolveAuthorityScope,
+  type AuthorityScope,
+  type ClientAuthorityScopeRequest,
+} from "../packages/core/src/domain/authority-scope.js";
 import { RuntimeHost } from "./runtime-host.js";
 import {
-  startDurableJobV2WorkerLoop,
+  startBroadAuthorityDurableJobV2Supervisor,
+  type BroadAuthorityDurableJobV2SupervisorOptions,
   type DurableJobV2AuthoritativeHandlerRegistry,
-  type DurableJobV2RepositoryPort,
-  type DurableJobV2WorkerLoopOptions,
 } from "./workers-v2.js";
 
 export type RuntimeHostFactoryErrorCode =
@@ -22,20 +26,24 @@ export type RuntimeHostFactoryErrorCode =
   | "DURABLE_JOB_V2_CAPABILITY_REQUIRED"
   | "DURABLE_JOB_V2_CAPABILITY_INVALID"
   | "DURABLE_JOB_V2_RUNTIME_BUNDLE_REQUIRED"
-  | "DURABLE_JOB_V2_RUNTIME_BUNDLE_INVALID";
+  | "DURABLE_JOB_V2_RUNTIME_BUNDLE_INVALID"
+  | "DURABLE_JOB_V2_AUTHORITY_REQUIRED"
+  | "DURABLE_JOB_V2_AUTHORITY_INVALID";
 
 export class RuntimeHostFactoryError extends Error {
   readonly code: RuntimeHostFactoryErrorCode;
 
   constructor(code: RuntimeHostFactoryErrorCode) {
-    super("Durable job v2 serve capability is unavailable");
+    super(code.startsWith("DURABLE_JOB_V2_AUTHORITY_")
+      ? "Durable job v2 serve authority is unavailable"
+      : "Durable job v2 serve capability is unavailable");
     this.name = "RuntimeHostFactoryError";
     this.code = code;
   }
 }
 
 /**
- * Runtime 必须原子公开 repository、与其配置一致的完整 handler registry 以及单一 worker scope。
+ * Runtime 必须原子公开 repository、与其配置一致的完整 handler registry 以及默认 scope。
  * 当前旧 MengshuRuntime 未公开该能力，因此 production serve 会明确 fail-closed；factory 不猜测
  * old JobRecord -> DurableJobV2 的 adapter，也不读取 ingestionStore.jobs 作为 fallback。
  */
@@ -63,16 +71,21 @@ export interface ServeRuntimeHostSource {
 }
 
 export interface ServeRuntimeHostFactoryOptions {
+  readonly authority?: AuthorityScope;
   readonly workerId?: string;
   readonly leaseMs?: number;
   readonly heartbeatIntervalMs?: number;
   readonly intervalMs?: number;
+  readonly maxScopesPerTick?: number;
+  readonly maxJobsPerTick?: number;
+  /** Legacy tuning alias retained for existing live-test configuration. */
   readonly maxPerTick?: number;
   readonly stopTimeoutMs?: number;
-  readonly startWorker?: typeof startDurableJobV2WorkerLoop;
+  readonly startSupervisor?: typeof startBroadAuthorityDurableJobV2Supervisor;
 }
 
 const REPOSITORY_METHODS = [
+  "listRunnableScopes",
   "reap",
   "quarantineUnknown",
   "lease",
@@ -80,6 +93,75 @@ const REPOSITORY_METHODS = [
   "complete",
   "fail",
 ] as const;
+
+function authoritySeed(raw: unknown): ClientAuthorityScopeRequest {
+  const allow = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as { readonly allow?: unknown }).allow
+    : undefined;
+  const record = allow && typeof allow === "object" && !Array.isArray(allow)
+    ? allow as Record<string, unknown>
+    : {};
+  const first = (field: string): unknown => {
+    const values = record[field];
+    return Array.isArray(values) ? values[0] : undefined;
+  };
+  return {
+    appId: first("appIds") as string,
+    projectId: first("projectIds") as string,
+    agentId: first("agentIds") as string,
+    namespace: first("namespaces") as string,
+    visibility: first("visibilities") as DurableJobV2Scope["visibility"],
+  };
+}
+
+function validateServeAuthority(
+  raw: unknown,
+  expectedScope?: DurableJobV2Scope,
+): AuthorityScope {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new RuntimeHostFactoryError("DURABLE_JOB_V2_AUTHORITY_REQUIRED");
+  }
+  try {
+    const authority = raw as AuthorityScope;
+    const request = expectedScope
+      ? {
+          appId: expectedScope.appId,
+          projectId: expectedScope.projectId,
+          agentId: expectedScope.agentId,
+          namespace: expectedScope.namespace,
+          visibility: expectedScope.visibility,
+        }
+      : authoritySeed(authority);
+    const resolved = resolveAuthorityScope(authority, request);
+    if (expectedScope && (
+      resolved.tenantId !== expectedScope.tenantId ||
+      resolved.userId !== expectedScope.userId ||
+      resolved.appId !== expectedScope.appId ||
+      resolved.projectId !== expectedScope.projectId ||
+      resolved.agentId !== expectedScope.agentId ||
+      resolved.namespace !== expectedScope.namespace ||
+      resolved.visibility !== expectedScope.visibility
+    )) {
+      throw new Error("default scope does not match authority");
+    }
+    return Object.freeze({
+      tenantId: resolved.tenantId,
+      userId: resolved.userId,
+      ...(resolved.workspaceId === undefined ? {} : { workspaceId: resolved.workspaceId }),
+      ...(resolved.sessionId === undefined ? {} : { sessionId: resolved.sessionId }),
+      allow: Object.freeze({
+        appIds: Object.freeze([...authority.allow.appIds]),
+        projectIds: Object.freeze([...authority.allow.projectIds]),
+        agentIds: Object.freeze([...authority.allow.agentIds]),
+        namespaces: Object.freeze([...authority.allow.namespaces]),
+        visibilities: Object.freeze([...authority.allow.visibilities]),
+      }),
+    });
+  } catch (error) {
+    if (error instanceof RuntimeHostFactoryError) throw error;
+    throw new RuntimeHostFactoryError("DURABLE_JOB_V2_AUTHORITY_INVALID");
+  }
+}
 
 // Module-private provenance marker prevents accidental structural wiring into serve.
 // It is not a security sandbox against code already executing in this JS process.
@@ -233,21 +315,25 @@ export function createServeRuntimeHost(
       typeof runtime.lifecycle?.snapshot !== "function") {
     throw new RuntimeHostFactoryError("DURABLE_JOB_V2_CAPABILITY_INVALID");
   }
+  // A supplied malformed authority is rejected before touching provider-owned composition.
+  if (options.authority !== undefined) validateServeAuthority(options.authority);
   const bundle = validateRuntimeBundle(runtime.db, runtime.durableJobV2RuntimeBundle);
   const capability = validateCapability(runtime.durableJobV2ServeCapability);
   if (capability.repository !== bundle.repository) {
     throw new RuntimeHostFactoryError("DURABLE_JOB_V2_RUNTIME_BUNDLE_INVALID");
   }
-  const startWorker = options.startWorker ?? startDurableJobV2WorkerLoop;
-  const workerOptions: DurableJobV2WorkerLoopOptions = {
-    scope: capability.scope,
+  const authority = validateServeAuthority(options.authority, capability.scope);
+  const startSupervisor = options.startSupervisor ?? startBroadAuthorityDurableJobV2Supervisor;
+  const supervisorOptions: BroadAuthorityDurableJobV2SupervisorOptions = {
+    authority,
     workerId: options.workerId ?? "mengshu-serve-worker",
     leaseMs: options.leaseMs ?? 30_000,
     heartbeatIntervalMs: options.heartbeatIntervalMs ?? 10_000,
     intervalMs: options.intervalMs ?? 1_000,
+    maxScopesPerTick: options.maxScopesPerTick ?? 100,
+    maxJobsPerTick: options.maxJobsPerTick ?? options.maxPerTick ?? 100,
     stopTimeoutMs: options.stopTimeoutMs ?? 5_000,
     registry: capability.registry,
-    ...(options.maxPerTick === undefined ? {} : { maxPerTick: options.maxPerTick }),
   };
 
   return new RuntimeHost({
@@ -273,9 +359,9 @@ export function createServeRuntimeHost(
       },
       stop: () => runtime.stop(),
     }],
-    startWorker: () => startWorker(capability.repository, workerOptions),
+    startWorker: () => startSupervisor(capability.repository, supervisorOptions),
     // production composition 不注入 probeWorker；RuntimeHost 严禁用 tick 做 readiness probe。
     workerProbeTimeoutMs: 5_000,
-    workerStopTimeoutMs: workerOptions.stopTimeoutMs,
+    workerStopTimeoutMs: supervisorOptions.stopTimeoutMs,
   });
 }

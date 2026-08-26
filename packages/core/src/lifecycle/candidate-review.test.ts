@@ -60,4 +60,94 @@ describe("CandidateReviewService approval capability", () => {
       });
     expect(setStatus).not.toHaveBeenCalled();
   });
+
+  test("provider-owned promotion 已原子提交治理副作用时不执行二次 setStatus/audit", async () => {
+    const setStatus = vi.fn(async () => undefined);
+    const audit = vi.fn(async () => undefined);
+    const service = new CandidateReviewService({
+      repository: {
+        get: vi.fn(async () => candidate),
+        list: vi.fn(async () => [candidate]),
+        setStatus,
+      },
+      promoteCandidate: vi.fn(async () => ({
+        memoryId: "11111111-1111-4111-8111-111111111111",
+        governanceCommitted: true as const,
+      })),
+      audit,
+    });
+
+    await expect(service.review({ action: "approve", ids: [candidate.id] }))
+      .resolves.toEqual({
+        affected: 1,
+        promoted: ["11111111-1111-4111-8111-111111111111"],
+        errors: [],
+      });
+    expect(setStatus).not.toHaveBeenCalled();
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  test("显式启用原子 receipt replay 时，approved candidate 可修补 promotion 后置派生", async () => {
+    const approved = Object.freeze({
+      ...candidate,
+      status: "approved" as const,
+      promotedToMemoryId: "11111111-1111-4111-8111-111111111111",
+    });
+    const promoteCandidate = vi.fn()
+      .mockRejectedValueOnce(new Error("temporary derivation failure"))
+      .mockResolvedValueOnce({
+        memoryId: approved.promotedToMemoryId,
+        governanceCommitted: true as const,
+      });
+    const setStatus = vi.fn(async () => undefined);
+    const service = new CandidateReviewService({
+      repository: {
+        get: vi.fn(async () => approved),
+        list: vi.fn(async () => [approved]),
+        setStatus,
+      },
+      promoteCandidate,
+      replayApprovedPromotion: true,
+    });
+
+    await expect(service.review({ action: "approve", ids: [approved.id] }))
+      .resolves.toEqual({
+        affected: 0,
+        promoted: [],
+        errors: [`promote_failed:${approved.id}:temporary derivation failure`],
+      });
+    await expect(service.review({ action: "approve", ids: [approved.id] }))
+      .resolves.toEqual({
+        affected: 1,
+        promoted: [approved.promotedToMemoryId],
+        errors: [],
+      });
+    expect(promoteCandidate).toHaveBeenCalledTimes(2);
+    expect(setStatus).not.toHaveBeenCalled();
+  });
+
+  test("普通兼容 promotion 不允许把 approved candidate 当作 replay", async () => {
+    const approved = Object.freeze({
+      ...candidate,
+      status: "approved" as const,
+      promotedToMemoryId: "11111111-1111-4111-8111-111111111111",
+    });
+    const promoteCandidate = vi.fn(async () => ({ memoryId: approved.promotedToMemoryId }));
+    const service = new CandidateReviewService({
+      repository: {
+        get: vi.fn(async () => approved),
+        list: vi.fn(async () => [approved]),
+        setStatus: vi.fn(async () => undefined),
+      },
+      promoteCandidate,
+    });
+
+    await expect(service.review({ action: "approve", ids: [approved.id] }))
+      .resolves.toEqual({
+        affected: 0,
+        promoted: [],
+        errors: [`not_pending:${approved.id}`],
+      });
+    expect(promoteCandidate).not.toHaveBeenCalled();
+  });
 });

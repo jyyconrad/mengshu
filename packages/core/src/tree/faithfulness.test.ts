@@ -5,6 +5,7 @@
 import { describe, expect, test } from "vitest";
 import {
   validateDeterministicEvidence,
+  isGovernedTreeSummaryForAsset,
   isHighRiskSummary,
   judgeFaithfulnessWithLlm,
   validateFaithfulness,
@@ -118,7 +119,64 @@ describe("isHighRiskSummary", () => {
 
   test("regular source summary is not high risk", () => {
     const node = createNode({ treeType: "source", treeKey: "docs", level: 1 });
-    expect(isHighRiskSummary(node)).toBe(false);
+    expect(isHighRiskSummary(node, [{ id: "leaf-1", importance: 0.84 }])).toBe(false);
+  });
+
+  test("more than 70% high-importance leaves is high risk", () => {
+    const leafIds = Array.from({ length: 10 }, (_, index) => `leaf-${index + 1}`);
+    const node = createNode({ leafIds });
+    const leaves = leafIds.map((id, index) => ({
+      id,
+      importance: index < 8 ? 0.85 : 0.2,
+    }));
+
+    expect(isHighRiskSummary(node, leaves)).toBe(true);
+  });
+
+  test("exactly 70% high-importance leaves is not high risk", () => {
+    const leafIds = Array.from({ length: 10 }, (_, index) => `leaf-${index + 1}`);
+    const node = createNode({ leafIds });
+    const leaves = leafIds.map((id, index) => ({
+      id,
+      importance: index < 7 ? 0.85 : 0.2,
+    }));
+
+    expect(isHighRiskSummary(node, leaves)).toBe(false);
+  });
+
+  test.each([
+    ["missing leaf evidence", undefined],
+    ["empty leaf evidence", []],
+    ["leaf id mismatch", [{ id: "other-leaf", importance: 0.2 }]],
+    ["NaN importance", [{ id: "leaf-1", importance: Number.NaN }]],
+    ["negative importance", [{ id: "leaf-1", importance: -0.1 }]],
+    ["importance above one", [{ id: "leaf-1", importance: 1.1 }]],
+  ])("fails closed for %s", (_label, leaves) => {
+    const node = createNode({ treeType: "source", treeKey: "docs", level: 1 });
+    expect(isHighRiskSummary(node, leaves)).toBe(true);
+  });
+});
+
+describe("isGovernedTreeSummaryForAsset", () => {
+  test("high-risk abstractive summaries require an LLM validation receipt", () => {
+    const highRisk = createNode({
+      treeType: "topic",
+      treeKey: "rules",
+      metadata: { summaryMode: "abstractive" },
+    });
+    expect(isGovernedTreeSummaryForAsset(highRisk, "high_risk")).toBe(false);
+    expect(isGovernedTreeSummaryForAsset({
+      ...highRisk,
+      metadata: { summaryMode: "abstractive", faithfulnessValidated: true },
+    }, "high_risk")).toBe(true);
+    expect(isGovernedTreeSummaryForAsset({ ...highRisk, metadata: {} }, "off")).toBe(false);
+  });
+
+  test("bounded extractive summaries pass without an LLM receipt", () => {
+    const extractive = createNode({ metadata: { summaryMode: "extractive" } });
+    expect(isGovernedTreeSummaryForAsset(extractive, "high_risk")).toBe(true);
+    expect(isGovernedTreeSummaryForAsset({ ...extractive, tokenCount: 501 }, "high_risk"))
+      .toBe(false);
   });
 });
 
@@ -270,6 +328,7 @@ describe("validateFaithfulness", () => {
     const regularNode = createNode({ treeType: "source", treeKey: "docs" });
     const regularResult = await validateFaithfulness({
       node: regularNode,
+      leaves: [{ id: "leaf-1", importance: 0.2 }],
       evidenceTexts: ["evidence"],
       config,
       llmClient: mockLlmClient,

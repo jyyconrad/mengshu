@@ -20,17 +20,41 @@ import { globalSlotContextBuilder, type SlotContextBuilder } from "../../../../c
 import type {
   AgentTaskContextRequest,
   ContextFastResponse,
+  DisclosureLevel,
+  NavigationRef,
 } from "../../../core/src/domain/semantic-types.js";
 import { DATABASE_STORE_CLEANUP_WARNING } from "../../../core/src/db/types.js";
 import type { MemoryRepository } from "../../../../core/service-types.js";
 import type {
+  AdmissionRoute,
   MemoryRecord,
   MemoryScope,
   MemoryScopeInput,
+  RecallFilteredCandidate,
   RecallHit,
   RecallResult,
 } from "../../../../core/types.js";
 import type { TreeSummaryNode } from "../../../../tree/types.js";
+import {
+  requireContextFastRecallReceipts,
+  requireRecallHitReceipt,
+} from "../../../core/src/domain/recall-receipt-validation.js";
+import { AgentLoadoutAssembler } from "../../../core/src/loadout/assembler.js";
+import { applyLoadoutAssemblyToContext } from
+  "../../../core/src/loadout/context-assembly.js";
+import type {
+  AgentLoadout,
+  LoadoutAssemblyResult,
+  LoadoutAssetCandidate,
+} from "../../../core/src/loadout/types.js";
+import {
+  createContextAssemblyReceipt,
+  type ContextAssemblyReceiptRepository,
+} from "../../../core/src/context/assembly-receipt.js";
+import type { KnowledgeResourceCapability } from
+  "../../../core/src/resources/knowledge-resource-capability.js";
+import { applyKnowledgeResourceIndexToContext } from
+  "../../../core/src/resources/knowledge-resource-context.js";
 
 export type { AgentTaskContextRequest };
 
@@ -39,6 +63,8 @@ export interface AgentObserveLightRequest {
   eventType: "user_input" | "tool_result" | "agent_output" | "system_event" | string;
   text: string;
   metadata?: Record<string, unknown>;
+  /** 调用方稳定请求标识；生产写内核用它实现跨重试幂等。 */
+  idempotencyKey?: string;
   /** 如果是显式保存请求 */
   intent?: "remember" | "ignore" | "auto";
 }
@@ -50,6 +76,10 @@ export interface AgentObserveLightResponse {
   traceId: string;
   /** Durable identity returned by the write kernel/provider. */
   persistedId?: string;
+  /** 区分候选治理记录与可进入 graph/tree 的 active/lookup/evidence memory。 */
+  recordType?: "memory" | "candidate";
+  /** 持久化后的原生准入路由；缺失时仅用于旧 adapter 兼容。 */
+  admissionRoute?: Exclude<AdmissionRoute, "drop">;
   /** Whether this request inserted a new durable observation. */
   stored?: boolean;
   /** Explicit duplicate acknowledgement; only native durable ensure may repair missing jobs. */
@@ -79,16 +109,52 @@ export interface AgentLookupResponse {
     id: string;
     preview: string;
     score: number;
+    /** recall/lookup/context/why/explain 共用的唯一六因子回执。 */
+    scoreBreakdown?: RecallHit["scoreBreakdown"];
     source: string;
     semanticType?: string;
     evidence: Array<{ id: string; preview: string }>;
     actions: Array<"open" | "copy_reference" | "drill_down" | "show_graph">;
   }>;
+  filtered?: RecallFilteredCandidate[];
   warnings?: string[];
   telemetry: {
     latencyMs: number;
     mode: "fast" | "deep";
   };
+}
+
+export interface AgentNavigateRequest {
+  scope: MemoryScopeInput;
+  ref: string;
+  level?: DisclosureLevel;
+  limit?: number;
+}
+
+export interface AgentNavigationItem extends NavigationRef {
+  title: string;
+  preview?: string;
+  evidenceRefs?: string[];
+}
+
+export interface AgentNavigateResponse {
+  ref: string;
+  items: AgentNavigationItem[];
+}
+
+export interface AgentEvidenceReadRequest {
+  scope: MemoryScopeInput;
+  refs: string[];
+}
+
+export interface AgentEvidenceItem {
+  ref: string;
+  preview: string;
+  source: "memory" | "chunk" | "document" | "message" | "resource";
+}
+
+export interface AgentEvidenceReadResponse {
+  evidence: AgentEvidenceItem[];
 }
 
 export interface AgentSessionCommitRequest {
@@ -108,8 +174,10 @@ export interface AgentSessionCommitResponse {
  * 任务调度依赖（外部注入）
  */
 export interface AgentFastPathDeps {
-  /** 通过 scope 加载相关记忆 */
-  loadRecordsForScope(scope: MemoryScope): Promise<MemoryRecord[]>;
+  /** F0 生产路径：按当前 task 在 scope 内加载带完整六因子回执的已治理命中。 */
+  loadRecallHitsForScope?(scope: MemoryScope, query: string): Promise<RecallHit[]>;
+  /** legacy adapter 降级路径；RuntimeHost 生产组合不得使用。 */
+  loadRecordsForScope?(scope: MemoryScope): Promise<MemoryRecord[]>;
   /** 普通召回（lookup 复用） */
   recall(
     scope: MemoryScope,
@@ -121,9 +189,13 @@ export interface AgentFastPathDeps {
     scope: MemoryScope;
     text: string;
     metadata: Record<string, unknown>;
+    intent: "remember" | "auto";
+    idempotencyKey?: string;
   }): Promise<{
     id: string;
     stored: boolean;
+    recordType?: "memory" | "candidate";
+    admissionRoute?: Exclude<AdmissionRoute, "drop">;
     warnings?: Array<typeof DATABASE_STORE_CLEANUP_WARNING>;
   }>;
   /** job 入队（observe / session_commit 异步处理） */
@@ -132,6 +204,24 @@ export interface AgentFastPathDeps {
   ensureJob?(input: { type: string; payload: Record<string, unknown> }): Promise<string>;
   /** lookup_deep 时加载记忆树摘要（source/topic/global），未注入则 deep 退化为 fast。 */
   loadTreeSummaries?(scope: MemoryScope, query: string): Promise<TreeSummaryNode[]>;
+  /** F1 authority-scoped progressive disclosure ports. */
+  navigate?(
+    scope: MemoryScope,
+    input: { ref: string; level?: DisclosureLevel; limit: number },
+  ): Promise<AgentNavigationItem[]>;
+  readEvidence?(scope: MemoryScope, refs: readonly string[]): Promise<AgentEvidenceItem[]>;
+  /** F3 optional overlay. Absence preserves the native five-slot response byte-for-byte. */
+  resolveLoadout?(scope: MemoryScope): Promise<AgentLoadout | undefined>;
+  resolveLoadoutAssetCandidates?(
+    scope: MemoryScope,
+    loadout: AgentLoadout,
+    governedHits: readonly RecallHit[],
+  ): Promise<readonly LoadoutAssetCandidate[]>;
+  loadoutAssembler?: AgentLoadoutAssembler;
+  /** Optional read-only Knowledge index/search/read provider for the resource slot. */
+  knowledgeResources?: Pick<KnowledgeResourceCapability, "index">;
+  /** F1 durable session explain path. Missing/failed persistence degrades to a warning. */
+  contextAssemblyReceipts?: ContextAssemblyReceiptRepository;
   /** 自定义 SlotContextBuilder（默认全局） */
   builder?: SlotContextBuilder;
   /** 默认 scope（兜底） */
@@ -142,8 +232,18 @@ export interface AgentFastPathDeps {
 interface ParsedStoreObservationOutcome {
   readonly id: string;
   readonly stored: boolean;
+  readonly recordType: "memory" | "candidate";
+  readonly admissionRoute?: Exclude<AdmissionRoute, "drop">;
   readonly warnings?: readonly (typeof DATABASE_STORE_CLEANUP_WARNING)[];
 }
+
+const PERSISTED_ADMISSION_ROUTES = new Set<Exclude<AdmissionRoute, "drop">>([
+  "candidate_low_priority",
+  "candidate",
+  "active",
+  "lookup_only",
+  "evidence_only",
+]);
 
 function parseStoreObservationOutcome(value: unknown): ParsedStoreObservationOutcome | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value) || nodeUtilTypes.isProxy(value)) {
@@ -153,7 +253,8 @@ function parseStoreObservationOutcome(value: unknown): ParsedStoreObservationOut
   if (prototype !== Object.prototype && prototype !== null) return undefined;
   const keys = Reflect.ownKeys(value);
   if (keys.some((key) => typeof key !== "string") ||
-      keys.some((key) => key !== "id" && key !== "stored" && key !== "warnings") ||
+      keys.some((key) => key !== "id" && key !== "stored" && key !== "recordType" &&
+        key !== "admissionRoute" && key !== "warnings") ||
       !keys.includes("id") || !keys.includes("stored")) {
     return undefined;
   }
@@ -171,6 +272,13 @@ function parseStoreObservationOutcome(value: unknown): ParsedStoreObservationOut
   const stored = snapshot.stored;
   if (typeof id !== "string" || id.length === 0 || id.length > 512 || id !== id.trim() ||
       /[\u0000-\u001f\u007f]/.test(id) || typeof stored !== "boolean") {
+    return undefined;
+  }
+  const recordType = snapshot.recordType ?? "memory";
+  if (recordType !== "memory" && recordType !== "candidate") return undefined;
+  const admissionRoute = snapshot.admissionRoute;
+  if (admissionRoute !== undefined &&
+      !PERSISTED_ADMISSION_ROUTES.has(admissionRoute as Exclude<AdmissionRoute, "drop">)) {
     return undefined;
   }
 
@@ -203,7 +311,15 @@ function parseStoreObservationOutcome(value: unknown): ParsedStoreObservationOut
       warnings = Object.freeze([]);
     }
   }
-  return Object.freeze({ id, stored, ...(warnings ? { warnings } : {}) });
+  return Object.freeze({
+    id,
+    stored,
+    recordType,
+    ...(admissionRoute === undefined
+      ? {}
+      : { admissionRoute: admissionRoute as Exclude<AdmissionRoute, "drop"> }),
+    ...(warnings ? { warnings } : {}),
+  });
 }
 
 /**
@@ -218,28 +334,144 @@ export class AgentFastPathService {
     this.builder = deps.builder ?? globalSlotContextBuilder;
   }
 
+  get assetEnhancementConfigured(): boolean {
+    return this.deps.resolveLoadout !== undefined &&
+      this.deps.resolveLoadoutAssetCandidates !== undefined;
+  }
+
+  invalidateContextCacheFingerprint(scopeFingerprint: string): void {
+    this.builder.invalidateCacheFingerprint(scopeFingerprint);
+  }
+
   /**
    * 任务启动：获取 5 槽位上下文
    */
   async context(request: AgentTaskContextRequest): Promise<ContextFastResponse> {
     const scope = normalizeScope(request.scope, this.deps.defaultScope);
-    const records = await this.deps.loadRecordsForScope(scope);
-
-    const response = await this.builder.buildSlotContext(scope, records, {
+    const productionRecallPath = Boolean(this.deps.loadRecallHitsForScope);
+    let selectedLoadout: AgentLoadout | undefined;
+    const preAssemblyWarnings: string[] = [];
+    if (productionRecallPath && this.deps.resolveLoadout) {
+      try {
+        selectedLoadout = await this.deps.resolveLoadout(scope);
+      } catch (error) {
+        preAssemblyWarnings.push(
+          `asset_enhancement_disabled: ${error instanceof Error ? error.message : "unavailable"}`,
+        );
+      }
+    }
+    let treeSummaries: readonly TreeSummaryNode[] | undefined;
+    if (productionRecallPath && this.deps.loadTreeSummaries) {
+      try {
+        treeSummaries = await this.deps.loadTreeSummaries(scope, request.task);
+      } catch (error) {
+        preAssemblyWarnings.push(
+          `tree_navigation_unavailable: ${error instanceof Error ? error.message : "unavailable"}`,
+        );
+      }
+    }
+    const requestedPerSlotBudget = request.tokenBudget
+      ? Math.floor(request.tokenBudget / 5)
+      : undefined;
+    const tokenBudgetBySlot = selectedLoadout
+      ? Object.fromEntries(Object.entries(selectedLoadout.nativeMemoryPolicy.tokenBudgets)
+          .map(([slot, budget]) => [slot, requestedPerSlotBudget === undefined
+            ? budget
+            : Math.min(budget, requestedPerSlotBudget)]))
+      : undefined;
+    const buildOptions = {
       latencyBudgetMs: request.latencyBudgetMs,
-      tokenBudgetPerSlot: request.tokenBudget
-        ? Math.floor(request.tokenBudget / 5)
-        : undefined,
+      tokenBudgetPerSlot: requestedPerSlotBudget,
+      tokenBudgetBySlot,
+      allowedSemanticTypes: selectedLoadout?.nativeMemoryPolicy.semanticTypes,
+      treeSummaries,
+      treeDepth: selectedLoadout?.nativeMemoryPolicy.treeDepth ?? "global" as const,
       task: request.task,
-    });
+    };
+    const governedHits = productionRecallPath
+      ? await this.deps.loadRecallHitsForScope!(scope, request.task)
+      : undefined;
+    let response = productionRecallPath
+      ? await this.builder.buildSlotContextFromRecallHits(scope, governedHits!, buildOptions)
+      : await this.builder.buildSlotContext(
+          scope,
+          await this.requireLegacyRecords(scope),
+          buildOptions,
+        );
+    if (productionRecallPath) requireContextFastRecallReceipts(response);
+    if (preAssemblyWarnings.length > 0) {
+      response.warnings = [...new Set([...(response.warnings ?? []), ...preAssemblyWarnings])];
+    }
 
-    // 附加任务相关 hints（首版从 records 中找 rules/experience top-1）
-    const hints = this.collectTaskHints(records, request.task);
+    let selectedAssembly: LoadoutAssemblyResult | undefined;
+    if (productionRecallPath && selectedLoadout) {
+      try {
+        if (!this.deps.resolveLoadoutAssetCandidates) {
+          throw new Error("asset resolver unavailable");
+        }
+        const candidates = await this.deps.resolveLoadoutAssetCandidates(
+          scope,
+          selectedLoadout,
+          governedHits!,
+        );
+        const assembly = (this.deps.loadoutAssembler ?? new AgentLoadoutAssembler())
+          .assemble(selectedLoadout, candidates, {
+            nativeTokenUsage: Object.fromEntries(Object.entries(response.slots)
+              .map(([slot, block]) => [slot, block?.tokenEstimate ?? 0])),
+          });
+        response = applyLoadoutAssemblyToContext(response, selectedLoadout, assembly, request.task);
+        requireContextFastRecallReceipts(response);
+        selectedAssembly = assembly;
+      } catch (error) {
+        // Asset/Loadout is an optional overlay. A required binding fails the
+        // overlay closed, but must never make native five-slot context unavailable.
+        response.warnings = [
+          ...(response.warnings ?? []),
+          `asset_enhancement_disabled: ${error instanceof Error ? error.message : "unavailable"}`,
+        ];
+      }
+    }
+
+    if (productionRecallPath && this.deps.knowledgeResources) {
+      try {
+        const index = await this.deps.knowledgeResources.index(scope);
+        response = applyKnowledgeResourceIndexToContext(response, index, request.task);
+        requireContextFastRecallReceipts(response);
+      } catch {
+        response.warnings = [...new Set([
+          ...(response.warnings ?? []),
+          "knowledge_resource_unavailable",
+        ])];
+      }
+    }
+
+    // hints 只能从最终已选槽位派生，不能绕过 lifecycle/container/预算治理。
+    const hints = this.collectTaskHints(response, request.task);
     if (hints && hints.length > 0) {
       response.taskHints = hints;
     }
 
-    response.actions = this.collectActions(scope, request.task);
+    response.actions = this.collectActions(scope, request.task, response);
+
+    if (productionRecallPath && response.assemblyPlan && scope.sessionId) {
+      try {
+        if (!this.deps.contextAssemblyReceipts) {
+          throw new Error("receipt repository unavailable");
+        }
+        const receipt = createContextAssemblyReceipt({
+          scope,
+          response,
+          ...(selectedLoadout === undefined ? {} : { loadout: selectedLoadout }),
+          ...(selectedAssembly === undefined ? {} : { assembly: selectedAssembly }),
+        });
+        await this.deps.contextAssemblyReceipts.append(scope, receipt);
+      } catch {
+        response.warnings = [...new Set([
+          ...(response.warnings ?? []),
+          "context_receipt_unavailable",
+        ])];
+      }
+    }
 
     return response;
   }
@@ -267,6 +499,8 @@ export class AgentFastPathService {
     let storeOutcome: {
       id: string;
       stored: boolean;
+      recordType: "memory" | "candidate";
+      admissionRoute?: Exclude<AdmissionRoute, "drop">;
       warnings?: readonly (typeof DATABASE_STORE_CLEANUP_WARNING)[];
     } | undefined;
 
@@ -275,6 +509,10 @@ export class AgentFastPathService {
         const outcome = await this.deps.storeObservation({
           scope,
           text: request.text,
+          intent: request.intent ?? "auto",
+          ...(request.idempotencyKey === undefined
+            ? {}
+            : { idempotencyKey: request.idempotencyKey }),
           metadata: {
             ...(request.metadata ?? {}),
             eventType: request.eventType,
@@ -314,68 +552,47 @@ export class AgentFastPathService {
     // separately injected native-v2 ensure capability.
     const jobWriter = this.deps.ensureJob ?? (storeOutcome.stored ? this.deps.enqueueJob : undefined);
     if (jobWriter) {
-      try {
-        const jobId = await jobWriter({
-          type: "extract_candidate",
-          payload: { scope, text: request.text, traceId: storeOutcome.id, intent: request.intent },
-        });
-        jobs.push(jobId);
-      } catch (err) {
-        warnings.push(`enqueue_failed: ${(err as Error).message}`);
+      // Candidate route 已经完成提取与准入，只保留候选治理链；不得把候选 ID
+      // 当作 active memory 再次触发树/图增强。
+      if (storeOutcome.recordType === "candidate") {
+        return {
+          ack: true,
+          traceId,
+          persistedId: storeOutcome.id,
+          recordType: storeOutcome.recordType,
+          admissionRoute: storeOutcome.admissionRoute,
+          stored: storeOutcome.stored,
+          duplicate: !storeOutcome.stored,
+          queuedJobs: [],
+          warnings: warnings.length > 0 ? warnings : undefined,
+        };
       }
 
-      // F3-2：observation 同时进入 source 树构建链路（按 session 分组）。
-      // 树构建失败不影响 observation ack；树是 in-memory 增强，非主链路。
-      try {
-        const treeKey = scope.sessionId ?? "default";
-        const treeJobId = await jobWriter({
-          type: "build_tree",
-          payload: {
-            scope,
-            traceId: storeOutcome.id,
-            treeType: "source",
-            treeKey,
-            leaf: {
-              id: storeOutcome.id,
-              chunkId: storeOutcome.id,
-              sourceId: scope.sessionId ?? scope.appId,
-              text: request.text,
-              eventAt: Date.now(),
-            },
-          },
-        });
-        jobs.push(treeJobId);
-      } catch (err) {
-        warnings.push(`tree_enqueue_failed: ${(err as Error).message}`);
+      // Raw evidence must be audited durably before candidate extraction.
+      // Graph/tree jobs are derived only from the committed-active receipt, where
+      // authoritative evidence and routing facts are available.
+      const shouldExtractCandidate = storeOutcome.admissionRoute === "evidence_only" ||
+        storeOutcome.admissionRoute === undefined;
+      if (shouldExtractCandidate) {
+        try {
+          const jobId = await jobWriter({
+            type: "extract_candidate",
+            payload: { scope, text: request.text, traceId: storeOutcome.id, intent: request.intent },
+          });
+          jobs.push(jobId);
+        } catch (err) {
+          warnings.push(`enqueue_failed: ${(err as Error).message}`);
+        }
       }
 
-      // 同一 durable observation 进入 graph 抽取；effect 在 worker 侧持久化到
-      // canonical PostgreSQL graph，失败不影响 observation ack。
-      try {
-        const graphJobId = await jobWriter({
-          type: "extract_graph",
-          payload: {
-            scope,
-            chunkId: storeOutcome.id,
-            text: request.text,
-            sourceId: scope.sessionId ?? scope.appId,
-            context: {
-              projectName: scope.projectId,
-              userName: scope.userId,
-              agentName: scope.agentId,
-            },
-          },
-        });
-        jobs.push(graphJobId);
-      } catch (err) {
-        warnings.push(`graph_enqueue_failed: ${(err as Error).message}`);
-      }
     }
 
     return {
       ack: true,
       traceId,
       persistedId: storeOutcome.id,
+      recordType: storeOutcome.recordType,
+      admissionRoute: storeOutcome.admissionRoute,
       stored: storeOutcome.stored,
       duplicate: !storeOutcome.stored,
       queuedJobs: jobs,
@@ -431,18 +648,19 @@ export class AgentFastPathService {
       };
     }
 
-    const hits = result.hits
-      .filter((hit): hit is RecallHit => Boolean(hit))
-      .map((hit) => this.shapeHit(hit));
+    const hits: AgentLookupResponse["hits"] = [];
+    for (const hit of result.hits.filter((item): item is RecallHit => Boolean(item))) {
+      hits.push(await this.shapeHit(scope, hit));
+    }
 
-    // F3-3：deep 模式融合记忆树摘要（source/topic/global），提供宏观追溯。
-    // loadTreeSummaries 未注入时 deep 退化为 fast（只返回向量召回）。
+    // F0：裸 SummaryNode 尚无完整六因子评分合同，不能以伪造 score 混入排序。
+    // 保留加载 seam 供后续接入 Retrieval Engine，当前明确降级为 fast。
     const warnings: string[] = [];
     if (mode === "deep" && this.deps.loadTreeSummaries) {
       try {
         const summaries = await this.deps.loadTreeSummaries(scope, request.query);
-        for (const node of summaries) {
-          hits.push(this.shapeTreeSummary(node));
+        if (summaries.length > 0) {
+          warnings.push("tree_recall_breakdown_unavailable");
         }
       } catch (err) {
         warnings.push(`tree_lookup_failed: ${(err as Error).message}`);
@@ -451,9 +669,37 @@ export class AgentFastPathService {
 
     return {
       hits,
+      ...(result.filtered === undefined ? {} : { filtered: result.filtered }),
       warnings: warnings.length > 0 ? warnings : undefined,
       telemetry: { latencyMs: Date.now() - startedAt, mode },
     };
+  }
+
+  async navigate(request: AgentNavigateRequest): Promise<AgentNavigateResponse> {
+    const scope = normalizeScope(request.scope, this.deps.defaultScope);
+    if (!this.deps.navigate) throw new Error("MEMORY_NAVIGATION_CAPABILITY_REQUIRED");
+    const ref = this.safeRef(request.ref);
+    const limit = request.limit ?? 20;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("MEMORY_NAVIGATION_INPUT_INVALID");
+    }
+    const items = await this.deps.navigate(scope, {
+      ref,
+      ...(request.level === undefined ? {} : { level: request.level }),
+      limit,
+    });
+    return { ref, items };
+  }
+
+  async evidenceRead(request: AgentEvidenceReadRequest): Promise<AgentEvidenceReadResponse> {
+    const scope = normalizeScope(request.scope, this.deps.defaultScope);
+    if (!this.deps.readEvidence) throw new Error("MEMORY_EVIDENCE_READ_CAPABILITY_REQUIRED");
+    if (!Array.isArray(request.refs) || request.refs.length < 1 || request.refs.length > 50) {
+      throw new Error("MEMORY_EVIDENCE_READ_INPUT_INVALID");
+    }
+    const refs = request.refs.map((ref) => this.safeRef(ref));
+    if (new Set(refs).size !== refs.length) throw new Error("MEMORY_EVIDENCE_READ_INPUT_INVALID");
+    return { evidence: await this.deps.readEvidence(scope, refs) };
   }
 
   /**
@@ -465,9 +711,10 @@ export class AgentFastPathService {
     const scope = normalizeScope(request.scope, this.deps.defaultScope);
     const traceId = randomUUID();
     const jobs: string[] = [];
+    this.builder.invalidateCache(scope);
 
     if (this.deps.enqueueJob) {
-      const jobTypes = ["refresh_slot_snapshot"];
+      const jobTypes: string[] = [];
       if (request.summary || request.transcriptRef) {
         jobTypes.push("extract_candidate");
       }
@@ -497,42 +744,49 @@ export class AgentFastPathService {
    * 提取任务相关 hints
    */
   private collectTaskHints(
-    records: MemoryRecord[],
+    response: ContextFastResponse,
     task?: string
   ): ContextFastResponse["taskHints"] {
     if (!task) return undefined;
 
     const lower = task.toLowerCase();
     const hits: NonNullable<ContextFastResponse["taskHints"]> = [];
+    const firstLine = (semanticType: "rules" | "experience") => {
+      const line = response.slots[semanticType]?.content.split("\n")[0];
+      return line?.replace(/^\s*-\s*/, "").trim();
+    };
+    const evidenceIds = (semanticType: "rules" | "experience") =>
+      response.slots[semanticType]?.evidenceRefs?.slice(0, 1) ?? [];
 
-    // 首版：从 rules 中选最重要 1 条作为 hint
-    const rules = records
-      .filter(
-        (r) =>
-          r.semanticType === "rules" && (r.lifecycleStatus ?? "active") === "active"
-      )
-      .sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0));
-    if (rules[0]) {
+    const rule = firstLine("rules");
+    if (rule) {
       hits.push({
         kind: "rule",
-        text: rules[0].text,
-        evidenceIds: [rules[0].id],
+        text: rule,
+        evidenceIds: evidenceIds("rules"),
       });
     }
 
-    // 任务相关 experience 简单关键词匹配
-    const experiences = records
-      .filter((r) => r.semanticType === "experience")
-      .filter((r) => r.text.toLowerCase().includes(lower.slice(0, 10)));
-    if (experiences[0]) {
+    const experience = response.slots.experience?.content
+      .split("\n")
+      .map((line) => line.replace(/^\s*-\s*/, "").trim())
+      .find((line) => line.toLowerCase().includes(lower.slice(0, 10)));
+    if (experience) {
       hits.push({
         kind: "experience",
-        text: experiences[0].text,
-        evidenceIds: [experiences[0].id],
+        text: experience,
+        evidenceIds: evidenceIds("experience"),
       });
     }
 
     return hits.length > 0 ? hits : undefined;
+  }
+
+  private async requireLegacyRecords(scope: MemoryScope): Promise<MemoryRecord[]> {
+    if (!this.deps.loadRecordsForScope) {
+      throw new Error("CONTEXT_RECALL_CAPABILITY_REQUIRED");
+    }
+    return this.deps.loadRecordsForScope(scope);
   }
 
   /**
@@ -540,7 +794,8 @@ export class AgentFastPathService {
    */
   private collectActions(
     scope: MemoryScope,
-    task?: string
+    task?: string,
+    response?: ContextFastResponse,
   ): ContextFastResponse["actions"] {
     const actions: NonNullable<ContextFastResponse["actions"]> = [];
     if (task) {
@@ -550,33 +805,47 @@ export class AgentFastPathService {
         input: { query: task, scope },
       });
     }
+    const evidenceRefs = Object.values(response?.slots ?? {})
+      .flatMap((slot) => slot?.evidenceRefs ?? []);
+    for (const ref of [...new Set(evidenceRefs)].slice(0, 5)) {
+      actions.push({
+        type: "drill_down",
+        label: "read_evidence",
+        input: { ref, level: "R4", scope },
+      });
+    }
     return actions;
   }
 
-  private shapeHit(hit: RecallHit): AgentLookupResponse["hits"][number] {
+  private async shapeHit(
+    scope: MemoryScope,
+    hit: RecallHit,
+  ): Promise<AgentLookupResponse["hits"][number]> {
+    const scoreBreakdown = requireRecallHitReceipt(hit);
     const record = hit.record as MemoryRecord;
     const preview = "text" in record ? record.text.slice(0, 240) : "";
+    const evidenceRefs = [...new Set(record.sourceNodeIds ?? [])];
+    const evidence = this.deps.readEvidence && evidenceRefs.length > 0
+      ? await this.deps.readEvidence(scope, evidenceRefs)
+      : [];
     return {
       id: record.id,
       preview,
       score: hit.score,
+      scoreBreakdown,
       source: hit.source,
       semanticType: "semanticType" in record ? record.semanticType : undefined,
-      evidence: [],
-      actions: ["copy_reference", "drill_down"],
+      evidence: evidence.map((item) => ({ id: item.ref, preview: item.preview })),
+      actions: evidence.length > 0 ? ["copy_reference", "drill_down"] : ["copy_reference"],
     };
   }
 
-  /** 把记忆树摘要节点转为 lookup hit（deep 模式融合用）。 */
-  private shapeTreeSummary(node: TreeSummaryNode): AgentLookupResponse["hits"][number] {
-    return {
-      id: node.id,
-      preview: node.summary.slice(0, 240),
-      score: 0,
-      source: `tree:${node.treeType}`,
-      evidence: node.evidenceChunkIds.slice(0, 5).map((id) => ({ id, preview: "" })),
-      actions: ["drill_down", "show_graph"],
-    };
+  private safeRef(value: unknown): string {
+    if (typeof value !== "string" || value.length < 1 || value.length > 512 ||
+        value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value)) {
+      throw new Error("MEMORY_REFERENCE_INVALID");
+    }
+    return value;
   }
 
   /**

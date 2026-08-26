@@ -26,6 +26,104 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 
+function completeRecallBreakdown() {
+  return {
+    score: 0.5,
+    weights: {
+      relevance: 0.4, scopeFit: 0.2, importance: 0.15,
+      confidence: 0.1, evidenceWeight: 0.1, recency: 0.05,
+    },
+    factors: {
+      relevance: 0.5, scopeFit: 0.5, importance: 0.5,
+      confidence: 0.5, evidenceWeight: 0.5, recency: 0.5,
+    },
+    contributions: {
+      relevance: 0.2, scopeFit: 0.1, importance: 0.075,
+      confidence: 0.05, evidenceWeight: 0.05, recency: 0.025,
+    },
+    importanceBreakdown: null,
+    matchedBy: ["vector"] as const,
+    sourceSignals: { vector: 0.5 },
+    scopeFit: 0.5,
+    composite: 0.5,
+  };
+}
+
+function productionPendingReceipt() {
+  const validationReceipt = {
+    version: 1 as const, policyVersion: "candidate-validator-v1" as const,
+    candidateOrdinal: 0, proposalHash: "a".repeat(64),
+    evidenceIds: ["pending-evidence-1"], outcome: "accepted" as const,
+    gates: Array.from({ length: 11 }, (_, index) => ({
+      gateId: `G${String(index + 1).padStart(2, "0")}` as
+        `G${"01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10" | "11"}`,
+      status: "passed" as const, reasonCode: "passed",
+      policyVersion: "candidate-validator-v1" as const,
+    })),
+  };
+  const candidate = {
+    candidateId: "pending-1",
+    scope: {
+      tenantId: "tenant-1", userId: "user-1", appId: "app-1", projectId: "project-1",
+      agentId: "agent-1", namespace: "namespace-1", visibility: "private" as const,
+      workspaceId: "workspace-1", sessionId: "session-1",
+    },
+    status: "pending" as const, promotedToMemoryId: null,
+    contentHash: "b".repeat(64), activeContentHash: "b".repeat(64),
+    evidenceIds: ["pending-evidence-1"], memoryKind: "other" as const,
+    semanticType: "rules" as const, admissionRoute: "candidate" as const,
+    valueScore: 0.687, importance: 0.7, confidence: 0.75, validationReceipt,
+  };
+  return {
+    executed: true as const,
+    receiptIds: ["pending-job-1", "extract_candidate.persist.v1", "pending-evidence-1", "pending-1"],
+    jobId: "pending-job-1", effectKey: "extract_candidate.persist.v1" as const,
+    evidenceId: "pending-evidence-1", candidate,
+    effectTrace: {
+      created: 1 as const, duplicateCount: 0 as const, capacityRejectedCount: 0 as const,
+      droppedCount: 0 as const, candidateIds: ["pending-1"], memoryIds: [], activeMemoryIds: [],
+    },
+    proposalReceipts: [{
+      version: 1 as const, candidateOrdinal: 0, outcome: "accepted" as const,
+      validation: validationReceipt,
+      admission: {
+        version: 1 as const, outcome: "accepted" as const, route: "candidate" as const,
+        valueScore: 0.687, reason: "fixture pending route", breakdown: { explicitness: 0.7 },
+      },
+    }],
+    derivationCounts: {
+      memories: 0 as const, graphJobs: 0 as const, treeJobs: 0 as const,
+      treeBuffers: 0 as const, workMemoryNodes: 0 as const, workMemoryEdges: 0 as const,
+      evidenceLinks: 0 as const,
+    },
+    visibility: { contextSourceIds: [], lookupHitIds: [], recallHitIds: [] },
+  };
+}
+
+function productionSealedSummaryReceipt() {
+  const leafIds = Array.from({ length: 20 }, (_, index) => `sealed-active-${index + 1}`);
+  const evidenceChunkIds = Array.from({ length: 20 }, (_, index) => `sealed-evidence-${index + 1}`);
+  return {
+    executed: true as const, jobId: "sealed-source-job-1",
+    effectKey: "build_tree.persist.v1" as const, requestFingerprint: "d".repeat(64),
+    leaseGeneration: 1, committedAt: 100, nodeId: "sealed-source-node-1",
+    treeType: "source" as const, treeKey: "sealed-session-1", level: 1 as const,
+    status: "sealed" as const, leafIds, evidenceChunkIds,
+    leafEvidenceBindings: leafIds.map((leafId, index) => ({
+      leafId, evidenceChunkId: evidenceChunkIds[index]!,
+      activeLifecycleStatus: "active" as const, activeAdmissionRoute: "active" as const,
+      evidenceLifecycleStatus: "archived" as const,
+      evidenceAdmissionRoute: "evidence_only" as const,
+      evidenceCommandType: "importEvidence" as const,
+    })),
+    summaryCount: 1 as const, leafCount: 20 as const, sourceBufferCount: 0 as const,
+    effectResult: {
+      leafId: leafIds.at(-1)!, sealed: true as const, bufferId: null,
+      nodeId: "sealed-source-node-1", foldedNodeIds: [],
+    },
+  };
+}
+
 import { loadEvalManifest, selectEvalSuites } from "./eval-manifest.js";
 import { buildReport, renderReport, runSuite } from "./quick-eval.js";
 import type { CaseResult } from "./types.js";
@@ -91,6 +189,8 @@ describe("T500-0 baseline gate 与报告兼容", async () => {
 
   test("production release 必须同时满足 quality gate 与完整 runtime-e2e metadata", () => {
     const first = baselineRuns[0]!;
+    const pending = productionPendingReceipt();
+    const sealedSummary = productionSealedSummaryReceipt();
     const runtimeSummary = {
       ...first.result.summary,
       execution: {
@@ -101,6 +201,199 @@ describe("T500-0 baseline gate 与报告兼容", async () => {
         version: "runtime-v1",
         fallback: false,
         degraded: false,
+        productionStageEvidence: {
+          write_observe: {
+            executed: true as const, receiptIds: ["trace-1", "storage-1", "evidence-1"],
+            traceId: "trace-1", storageKey: "storage-1", evidenceId: "evidence-1",
+            activeMemoryId: "active-1",
+          },
+          candidate: {
+            executed: true as const,
+            receiptIds: ["candidate-job-1", "extract_candidate.persist.v1", "evidence-1", "active-1"],
+            jobId: "candidate-job-1", effectKey: "extract_candidate.persist.v1" as const,
+            evidenceId: "evidence-1", activeMemoryId: "active-1",
+            memoryKind: "other" as const, semanticType: "rules" as const,
+            admissionRoute: "active" as const,
+            lifecycleStatus: "active" as const, contextEligible: true as const,
+            valueScore: 0.9, importance: 0.8, confidence: 0.85,
+            validatorAudit: {
+              semanticType: "rules", admission: "active", valueScore: 0.9,
+              confidenceBreakdown: { score: 0.85 },
+            },
+            dedupTrace: {
+              created: 1 as const, duplicateCount: 0, capacityRejectedCount: 0, droppedCount: 0,
+              candidateIds: [], memoryIds: ["active-1"], activeMemoryIds: ["active-1"],
+            },
+            pending,
+          },
+          graph: {
+            executed: true as const,
+            receiptIds: [
+              "graph-job-1", "extract_graph.persist.v1", "evidence-1", "active-1",
+              "entity-1", "relation-1", "memory-link-1", "entity-link-1", "relation-link-1",
+              "work-node-memory-1", "work-node-evidence-1", "work-edge-1",
+            ],
+            jobId: "graph-job-1", effectKey: "extract_graph.persist.v1" as const,
+            evidenceId: "evidence-1", activeMemoryId: "active-1",
+            entityIds: ["entity-1"], relationIds: ["relation-1"],
+            memoryEvidenceLinkIds: ["memory-link-1"],
+            entityEvidenceLinkIds: ["entity-link-1"],
+            relationEvidenceLinkIds: ["relation-link-1"],
+            memoryEvidenceBindings: [{
+              linkId: "memory-link-1", targetId: "active-1", evidenceId: "evidence-1",
+            }],
+            entityEvidenceBindings: [{
+              linkId: "entity-link-1", targetId: "entity-1", evidenceId: "evidence-1",
+            }],
+            relationEvidenceBindings: [{
+              linkId: "relation-link-1", targetId: "relation-1", evidenceId: "evidence-1",
+            }],
+            workMemoryNodeIds: ["work-node-memory-1", "work-node-evidence-1"],
+            workMemoryActiveNodeId: "work-node-memory-1",
+            workMemoryEvidenceNodeId: "work-node-evidence-1",
+            workMemoryEdgeIds: ["work-edge-1"],
+            workMemoryEdgeBindings: [{
+              edgeId: "work-edge-1", predicate: "grounded_by" as const,
+              sourceId: "work-node-memory-1", targetId: "work-node-evidence-1",
+              evidenceChunkIds: ["evidence-1"],
+            }],
+          },
+          tree: {
+            executed: true as const,
+            receiptIds: [
+              "build_tree.persist.v1", "source-job-1", "global-job-1", "topic-job-1", "active-1",
+              "source-buffer-1", "global-buffer-1", "topic-buffer-1",
+            ],
+            effectKey: "build_tree.persist.v1" as const, evidenceId: "evidence-1",
+            activeMemoryId: "active-1", sourceJobId: "source-job-1",
+            expectedTreeTypes: ["source", "global", "topic"] as
+              ("source" | "global" | "topic")[],
+            sourceTreeKey: "session-1",
+            globalJobId: "global-job-1", sourceLeafId: "active-1", globalLeafId: "active-1",
+            topicJobIds: ["topic-job-1"], topicLeafIds: ["active-1"],
+            topicTreeKeys: ["postgresql-validation"], coldTopicJobIds: [], coldTopicBufferIds: [],
+            bufferBindings: [
+              { jobId: "source-job-1", treeType: "source" as const, treeKey: "session-1",
+                bufferId: "source-buffer-1", leafId: "active-1" },
+              { jobId: "global-job-1", treeType: "global" as const, treeKey: "2026-08-13",
+                bufferId: "global-buffer-1", leafId: "active-1" },
+              { jobId: "topic-job-1", treeType: "topic" as const,
+                treeKey: "postgresql-validation", bufferId: "topic-buffer-1",
+                leafId: "active-1" },
+            ],
+            hotness: {
+              topicEntityId: "topic-entity-1", threshold: 6 as const,
+              beforeRecall: {
+                mentionCount30d: 1, distinctSourceCount: 1, lastSeenAt: 1,
+                recencyDecay: 1, graphCentrality: 0, queryHits30d: 1,
+                score: Math.log(2) + 0.5 + 1 + 2,
+              },
+              afterRecall: {
+                mentionCount30d: 1, distinctSourceCount: 1, lastSeenAt: 1,
+                recencyDecay: 1, graphCentrality: 0, queryHits30d: 3,
+                score: Math.log(2) + 0.5 + 1 + 6,
+              },
+            },
+            sealedSummary,
+          },
+          context_recall: {
+            executed: true as const, receiptIds: [
+              "active-1", "slot-profile-1", "slot-task-1", "slot-rules-1",
+              "slot-experience-1", "slot-resource-1",
+            ], evidenceId: "evidence-1",
+            activeMemoryId: "active-1", contextSourceIds: [
+              "active-1", "slot-profile-1", "slot-task-1", "slot-rules-1",
+              "slot-experience-1", "slot-resource-1",
+            ],
+            lookupHitIds: ["active-1"], recallHitIds: ["active-1"],
+            contextScoreBreakdown: completeRecallBreakdown(),
+            lookupScoreBreakdown: completeRecallBreakdown(),
+            recallScoreBreakdown: completeRecallBreakdown(),
+            slotActiveMemoryIds: {
+              profile: "slot-profile-1", task_context: "slot-task-1", rules: "slot-rules-1",
+              experience: "slot-experience-1", resource: "slot-resource-1",
+            },
+            slotSourceIds: {
+              profile: ["slot-profile-1"], task_context: ["slot-task-1"],
+              rules: ["active-1", "slot-rules-1"], experience: ["slot-experience-1"],
+              resource: ["slot-resource-1"],
+            },
+            slotScoreBreakdowns: {
+              profile: completeRecallBreakdown(), task_context: completeRecallBreakdown(),
+              rules: completeRecallBreakdown(), experience: completeRecallBreakdown(),
+              resource: completeRecallBreakdown(),
+            },
+          },
+        },
+        productionRestartReplayEvidence: {
+          restarted: true as const,
+          replayedCandidateJobId: "candidate-job-1",
+          effectReceiptIdsBeforeRestart: [
+            "candidate-job-1:extract_candidate.persist.v1", "graph-job-1:extract_graph.persist.v1",
+            "source-job-1:build_tree.persist.v1", "global-job-1:build_tree.persist.v1",
+            "topic-job-1:build_tree.persist.v1",
+          ],
+          effectReceiptIdsAfterRestart: [
+            "candidate-job-1:extract_candidate.persist.v1", "graph-job-1:extract_graph.persist.v1",
+            "source-job-1:build_tree.persist.v1", "global-job-1:build_tree.persist.v1",
+            "topic-job-1:build_tree.persist.v1",
+          ],
+          ledgerIdsBeforeRestart: [
+            "storage-1", "memory-link-1", "entity-link-1", "relation-link-1",
+            "work-node-memory-1", "work-node-evidence-1", "work-edge-1",
+          ],
+          ledgerIdsAfterRestart: [
+            "storage-1", "memory-link-1", "entity-link-1", "relation-link-1",
+            "work-node-memory-1", "work-node-evidence-1", "work-edge-1",
+          ],
+          effectReceiptCountBeforeRestart: 5,
+          effectReceiptCountAfterRestart: 5,
+          ledgerCountBeforeRestart: 7,
+          ledgerCountAfterRestart: 7,
+          contextSourceIdsBeforeRestart: [
+            "active-1", "slot-profile-1", "slot-task-1", "slot-rules-1",
+            "slot-experience-1", "slot-resource-1",
+          ],
+          contextSourceIdsAfterRestart: [
+            "active-1", "slot-profile-1", "slot-task-1", "slot-rules-1",
+            "slot-experience-1", "slot-resource-1",
+          ],
+          lookupHitIdsBeforeRestart: ["active-1"], lookupHitIdsAfterRestart: ["active-1"],
+          recallHitIdsBeforeRestart: ["active-1"], recallHitIdsAfterRestart: ["active-1"],
+          slotSourceIdsBeforeRestart: {
+            profile: ["slot-profile-1"], task_context: ["slot-task-1"],
+            rules: ["active-1", "slot-rules-1"], experience: ["slot-experience-1"],
+            resource: ["slot-resource-1"],
+          },
+          slotSourceIdsAfterRestart: {
+            profile: ["slot-profile-1"], task_context: ["slot-task-1"],
+            rules: ["active-1", "slot-rules-1"], experience: ["slot-experience-1"],
+            resource: ["slot-resource-1"],
+          },
+          contextScoreBreakdownBeforeRestart: completeRecallBreakdown(),
+          contextScoreBreakdownAfterRestart: completeRecallBreakdown(),
+          lookupScoreBreakdownBeforeRestart: completeRecallBreakdown(),
+          lookupScoreBreakdownAfterRestart: completeRecallBreakdown(),
+          recallScoreBreakdownBeforeRestart: completeRecallBreakdown(),
+          recallScoreBreakdownAfterRestart: completeRecallBreakdown(),
+          pending: {
+            replayedCandidateJobId: pending.jobId,
+            candidateBeforeRestart: pending.candidate,
+            candidateAfterRestart: pending.candidate,
+            effectTraceBeforeRestart: pending.effectTrace,
+            effectTraceAfterRestart: pending.effectTrace,
+            proposalReceiptsBeforeRestart: pending.proposalReceipts,
+            proposalReceiptsAfterRestart: pending.proposalReceipts,
+            derivationCountsBeforeRestart: pending.derivationCounts,
+            derivationCountsAfterRestart: pending.derivationCounts,
+            visibilityBeforeRestart: pending.visibility,
+            visibilityAfterRestart: pending.visibility,
+          },
+          sealedSummaryBeforeRestart: sealedSummary,
+          sealedSummaryAfterRestart: sealedSummary,
+          sealedSummaryAttemptsBeforeRestart: 1,
+          sealedSummaryAttemptsAfterRestart: 2,
+        },
       },
     };
     const report = buildReport([runtimeSummary], [], [first.plan]);
@@ -122,7 +415,7 @@ describe("T500-0 baseline gate 与报告兼容", async () => {
     expect(markdown).toContain("numerator=");
     expect(markdown).toContain("direction=");
     expect(markdown).toContain("manifest schema：1");
-    expect(markdown).toContain("manifest version：v0.2-P0c");
+    expect(markdown).toContain("manifest version：v0.3-MG009");
     expect(report.manifest.suites).toEqual(expect.arrayContaining([
       expect.objectContaining({
         name: "mengshu-v0.1",

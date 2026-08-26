@@ -36,6 +36,7 @@ const baseCommand = {
     visibility: "private",
   },
   text: "User explicitly prefers concise answers",
+  kind: "preference" as const,
   metadata: { source: "user" },
 } as const;
 
@@ -85,6 +86,10 @@ function harness(
       calls.push("scoreAdmission");
       return { route: "active", valueScore: 0.95 };
     },
+    scoreImportance: async () => {
+      calls.push("scoreImportance");
+      return 0.73;
+    },
     exactDedup: async () => {
       calls.push("exactDedup");
       return { duplicate: false };
@@ -117,10 +122,11 @@ function harness(
             if (transactionFaults.receipt) throw transactionFaults.receipt;
             stagedReceipt = receipt;
           },
-          writeMemory: async () => {
+          writeMemory: async (memory: { id: string }) => {
             expect(inTransaction).toBe(true);
             calls.push("memory");
             stagedMutations.push("memory");
+            return { memoryId: memory.id, stored: true };
           },
           appendAudit: async () => {
             expect(inTransaction).toBe(true);
@@ -177,6 +183,7 @@ describe("MemoryWriteKernel", () => {
       "embed",
       "validator",
       "scoreAdmission",
+      "scoreImportance",
       "exactDedup",
       "semanticDedup",
       "transaction:start",
@@ -188,6 +195,162 @@ describe("MemoryWriteKernel", () => {
       "transaction:end",
       "ack",
     ]);
+  });
+
+  test("computes importance independently from valueScore and persists both scores", async () => {
+    const writeMemory = vi.fn(async (memory: { id: string }) => ({
+      memoryId: memory.id,
+      stored: true,
+    }));
+    const { kernel } = harness({
+      scoreAdmission: async () => ({ route: "active", valueScore: 0.91 }),
+      scoreImportance: async () => 0.37,
+      transaction: async (work) => work({
+        getReceipt: async () => undefined,
+        saveReceipt: async () => undefined,
+        writeMemory,
+        appendAudit: async () => undefined,
+        appendOutbox: async () => undefined,
+      }),
+      ack: async () => undefined,
+    });
+
+    await kernel.execute(saveCommand());
+
+    expect(writeMemory).toHaveBeenCalledWith(expect.objectContaining({
+      valueScore: 0.91,
+      importance: 0.37,
+    }));
+  });
+
+  test("candidate persistence returns candidateId while preserving memoryId compatibility", async () => {
+    const appendAudit = vi.fn(async () => undefined);
+    const appendOutbox = vi.fn(async () => undefined);
+    const { kernel } = harness({
+      scoreAdmission: async () => ({ route: "candidate", valueScore: 0.71 }),
+      transaction: async (work) => work({
+        getReceipt: async () => undefined,
+        saveReceipt: async () => undefined,
+        writeMemory: async (memory) => ({
+          recordType: "candidate",
+          candidateId: memory.id,
+          memoryId: memory.id,
+          stored: true,
+        }),
+        appendAudit,
+        appendOutbox,
+      }),
+      ack: async () => undefined,
+    });
+
+    await expect(kernel.execute(saveCommand())).resolves.toMatchObject({
+      status: "persisted",
+      route: "candidate",
+      recordType: "candidate",
+      candidateId: "memory-1",
+      memoryId: "memory-1",
+    });
+    expect(appendAudit).toHaveBeenCalledWith(expect.objectContaining({
+      action: "candidate.write",
+      recordType: "candidate",
+      memoryId: "memory-1",
+    }));
+    expect(appendOutbox).toHaveBeenCalledWith(expect.objectContaining({
+      topic: "candidate.written",
+      recordType: "candidate",
+      memoryId: "memory-1",
+    }));
+  });
+
+  test.each(["lookup_only", "evidence_only"] as const)(
+    "%s persists as recordType memory",
+    async (route) => {
+      const { kernel } = harness({
+        scoreAdmission: async () => ({ route, valueScore: 0.6 }),
+      });
+      await expect(kernel.execute(saveCommand())).resolves.toMatchObject({
+        status: "persisted",
+        route,
+        recordType: "memory",
+        memoryId: "memory-1",
+      });
+    },
+  );
+
+  test("persists the validated governance snapshot instead of discarding native memory semantics", async () => {
+    const writeMemory = vi.fn(async (memory: { id: string }) => ({
+      memoryId: memory.id,
+      stored: true,
+    }));
+    const governance = Object.freeze({
+      text: baseCommand.text,
+      semanticType: "rules",
+      kind: "preference",
+      confidence: 0.91,
+      evidenceIds: Object.freeze(["event-1"]),
+      riskFlags: Object.freeze(["sensitive"]),
+      profileDimension: undefined,
+      targetScope: "project",
+    });
+    const { kernel } = harness({
+      validate: async () => ({ accepted: true, candidate: governance }),
+      scoreAdmission: async () => ({
+        route: "candidate",
+        valueScore: 0.72,
+        reason: "medium_value_score",
+        breakdown: Object.freeze({ explicitness: 0.8, durability: 0.7 }),
+      }),
+      transaction: async (work) => work({
+        getReceipt: async () => undefined,
+        saveReceipt: async () => undefined,
+        writeMemory,
+        appendAudit: async () => undefined,
+        appendOutbox: async () => undefined,
+      }),
+      ack: async () => undefined,
+    });
+
+    await kernel.execute(saveCommand());
+
+    expect(writeMemory).toHaveBeenCalledTimes(1);
+    expect(writeMemory).toHaveBeenCalledWith(expect.objectContaining({
+      governance: {
+        candidate: governance,
+        admissionReason: "medium_value_score",
+        admissionBreakdown: { explicitness: 0.8, durability: 0.7 },
+      },
+    }));
+  });
+
+  test("uses the provider-resolved duplicate id and does not fabricate a second audit/outbox event", async () => {
+    const appendAudit = vi.fn(async () => undefined);
+    const appendOutbox = vi.fn(async () => undefined);
+    let committedReceipt: MemoryWriteReceipt | undefined;
+    const { kernel } = harness({
+      transaction: async (work) => work({
+        getReceipt: async () => undefined,
+        saveReceipt: async (receipt) => {
+          committedReceipt = receipt;
+        },
+        writeMemory: async () => ({ memoryId: "existing-memory", stored: false }),
+        appendAudit,
+        appendOutbox,
+      }),
+      ack: async () => undefined,
+    });
+
+    await expect(kernel.execute(saveCommand())).resolves.toMatchObject({
+      status: "persisted",
+      route: "active",
+      memoryId: "existing-memory",
+      stored: false,
+    });
+    expect(committedReceipt?.result).toMatchObject({
+      memoryId: "existing-memory",
+      stored: false,
+    });
+    expect(appendAudit).not.toHaveBeenCalled();
+    expect(appendOutbox).not.toHaveBeenCalled();
   });
 
   test("rejects attacker tenant/user before embedding or persistence", async () => {
@@ -275,6 +438,23 @@ describe("MemoryWriteKernel", () => {
     });
     expect(calls).not.toContain("semanticDedup");
     expect(calls.filter((call) => call === "transaction:start")).toHaveLength(1);
+    expect(calls).not.toContain("memory");
+  });
+
+  test("dedup result preserves a lexical layer instead of reporting it as exact", async () => {
+    const { kernel, calls } = harness({
+      exactDedup: async () => {
+        calls.push("exactDedup");
+        return { duplicate: true, duplicateOf: "existing-lexical", layer: "lexical" };
+      },
+    });
+
+    await expect(kernel.execute(saveCommand())).resolves.toEqual({
+      status: "duplicate",
+      kind: "lexical",
+      duplicateOf: "existing-lexical",
+    });
+    expect(calls).not.toContain("semanticDedup");
     expect(calls).not.toContain("memory");
   });
 

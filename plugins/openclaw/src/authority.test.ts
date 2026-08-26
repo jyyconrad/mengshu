@@ -6,6 +6,7 @@ import {
   createExactOpenClawAuthority,
   defaultScopeFromExactOpenClawAuthority,
   resolveOpenClawAuthorityScope,
+  resolveOpenClawHostScope,
   snapshotOpenClawAuthority,
 } from "./authority.js";
 
@@ -120,6 +121,34 @@ describe("OpenClaw server-owned authority", () => {
       namespace: "knowledge",
       visibility: "team",
     });
+  });
+
+  test("host scope 在选定 Agent 后收窄 authority，参数不能切换到其他已授权 Agent", () => {
+    const boundary = resolveOpenClawHostScope(authority, defaultScope, {
+      agentId: "agent-b",
+      sessionKey: "agent:agent-b:main",
+    });
+
+    expect(boundary.authority).toEqual({
+      tenantId: "server-tenant",
+      userId: "server-user",
+      sessionId: "agent:agent-b:main",
+      allow: {
+        appIds: ["openclaw"],
+        projectIds: ["project-a"],
+        agentIds: ["agent-b"],
+        namespaces: ["memories"],
+        visibilities: ["private"],
+      },
+    });
+    expect(() => resolveOpenClawAuthorityScope(
+      boundary.authority,
+      boundary.scope,
+      { agentId: "agent-a" },
+    )).toThrow(expect.objectContaining({
+      code: "CLIENT_VALUE_NOT_ALLOWED",
+      field: "agentId",
+    }));
   });
 
   test("100 组顶层/envelope tenant/user claim 均 fail-closed，永不覆盖 server identity", () => {

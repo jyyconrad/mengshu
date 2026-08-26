@@ -12,6 +12,10 @@ import { registerRecallCliCommands } from "./recall.js";
 import type { CommanderLike } from "./index.js";
 import type { MemoryService } from "../../../../core/service-types.js";
 import type { MemoryScope, MemoryRecord, RecallResult } from "../../../../core/types.js";
+import {
+  computeNodeScoreWithBreakdown,
+  computeRecallScoreBreakdown,
+} from "../../../../core/recall-scoring.js";
 
 interface FakeCommand {
   name: string;
@@ -83,9 +87,15 @@ function makeFakeService(
     query: "q",
     hits: recordsWithScore.map((r) => ({
       record: r.record,
-      score: r.score,
+      score: computeRecallScoreBreakdown(r.record, {
+        relevance: r.score,
+        scopeFit: 1,
+      }, ["vector"], { vector: r.score }).score,
       source: "vector" as const,
-      scoreBreakdown: { vector: r.score },
+      scoreBreakdown: computeRecallScoreBreakdown(r.record, {
+        relevance: r.score,
+        scopeFit: 1,
+      }, ["vector"], { vector: r.score }),
     })),
   }));
   return { recall } as unknown as MemoryService;
@@ -156,6 +166,55 @@ describe("registerRecallCliCommands", () => {
     expect(out).toMatch(/total|综合分|score/i);
   });
 
+  test("--explain 原样消费服务六因子回执，不把最终 score 再当 relevance", async () => {
+    const { commander, commands } = makeFakeCommander();
+    const record = makeRecord("authoritative", { text: "authoritative-breakdown" });
+    const breakdown = computeNodeScoreWithBreakdown(record, undefined, {
+      relevance: 0.1,
+      scopeFit: 1,
+    });
+    const service = {
+      recall: vi.fn(async () => ({
+        scope,
+        query: "q",
+        hits: [{
+          record,
+          score: breakdown.score,
+          source: "vector" as const,
+          scoreBreakdown: {
+            ...breakdown,
+            matchedBy: ["vector" as const],
+            sourceSignals: { vector: 0.1 },
+          },
+        }],
+      })),
+    } as unknown as MemoryService;
+    registerRecallCliCommands(commander, { service, defaultScope: scope });
+
+    await commands.find((c) => c.name.startsWith("recall"))!
+      .action!("q", { limit: "10", minScore: "0", explain: true });
+
+    expect(loggedOutput()).toContain("relevance      value=0.100");
+  });
+
+  test.each([false, true])("explain=%s 时缺少完整回执都 fail-closed", async (explain) => {
+    const { commander, commands } = makeFakeCommander();
+    const record = makeRecord("invalid", { text: "must not be recomputed" });
+    const service = {
+      recall: vi.fn(async () => ({
+        scope,
+        query: "q",
+        hits: [{ record, score: 0.9, source: "vector" as const }],
+      })),
+    } as unknown as MemoryService;
+    registerRecallCliCommands(commander, { service, defaultScope: scope });
+
+    await expect(commands.find((c) => c.name.startsWith("recall"))!
+      .action!("q", { limit: "10", minScore: "0", explain }))
+      .rejects.toThrow("RECALL_SCORE_BREAKDOWN_REQUIRED");
+    expect(loggedOutput()).not.toContain("must not be recomputed");
+  });
+
   test("--explain 对低于 min-score 的候选给出 filteredReason", async () => {
     const { commander, commands } = makeFakeCommander();
     registerRecallCliCommands(commander, {
@@ -170,6 +229,29 @@ describe("registerRecallCliCommands", () => {
     const out = loggedOutput();
     expect(out).toContain("drop-me");
     expect(out).toMatch(/filteredReason|min-score|过滤/i);
+  });
+
+  test("--explain 原样展示 governed retrieval filteredReason", async () => {
+    const { commander, commands } = makeFakeCommander();
+    const service = {
+      recall: vi.fn(async (): Promise<RecallResult> => ({
+        scope,
+        query: "q",
+        hits: [],
+        filtered: [{
+          candidateId: "graph:blocked",
+          authoritativeRecordId: "memory-blocked",
+          source: "entity_graph",
+          filteredReason: "evidence_unavailable",
+        }],
+      })),
+    } as unknown as MemoryService;
+    registerRecallCliCommands(commander, { service, defaultScope: scope });
+
+    await commands.find((c) => c.name.startsWith("recall"))!
+      .action!("q", { limit: "10", minScore: "0", explain: true });
+
+    expect(loggedOutput()).toContain("memory-blocked [entity_graph] filteredReason: evidence_unavailable");
   });
 
   test("P1-Q4: --explain 展示 importance 4 项明细（含 metadata.salience）", async () => {

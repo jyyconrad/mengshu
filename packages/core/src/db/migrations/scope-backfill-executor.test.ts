@@ -97,6 +97,19 @@ function row(id: string, metadata: unknown): Record<string, unknown> {
   };
 }
 
+function canonicalRow(id: string, metadata: unknown): Record<string, unknown> {
+  return {
+    ...row(id, metadata),
+    tenant_id: "tenant:a",
+    user_id: "user/a",
+    canonical_project_id: "project alpha",
+    product_id: "app-a",
+    producer_id: "agent-a",
+    namespace: "working-context",
+    visibility: "private",
+  };
+}
+
 describe("executePostgresScopeBackfill / contract", () => {
   test("默认 dry-run：分页规划并统计 resolved/quarantined/conflict，数据库零写", async () => {
     const rows = [
@@ -165,6 +178,53 @@ describe("executePostgresScopeBackfill / contract", () => {
 });
 
 describe("executePostgresScopeBackfill / apply", () => {
+  test("canonical 列齐全时只按列值 CAS 修复 scope_key，不重写身份或 metadata", async () => {
+    let selected = false;
+    const client = new FakeClient((sql, params) => {
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return commandResult();
+      if (/^SELECT COUNT/.test(sql)) return noRemainingRows();
+      if (/^SELECT /.test(sql)) {
+        expect(sql).toContain("tenant_id");
+        expect(sql).toContain("canonical_project_id");
+        if (selected) return { rows: [], rowCount: 0 };
+        selected = true;
+        return { rows: [canonicalRow(ID_1, { unrelated: true })], rowCount: 1 };
+      }
+      if (/^UPDATE /.test(sql)) {
+        expect(sql).toMatch(/SET scope_key = staged\.scope_key/);
+        expect(sql).not.toMatch(/SET tenant_id|metadata\s*=/);
+        expect(sql).toContain("target.tenant_id = staged.tenant_id");
+        expect(sql).toContain("target.scope_key IS NULL");
+        const payload = JSON.parse(String(params[0])) as Array<Record<string, unknown>>;
+        expect(payload).toEqual([{
+          id: ID_1,
+          tenant_id: "tenant:a",
+          user_id: "user/a",
+          canonical_project_id: "project alpha",
+          product_id: "app-a",
+          producer_id: "agent-a",
+          namespace: "working-context",
+          visibility: "private",
+          scope_key: "tenant%3Aa:app-a:user%2Fa:project%20alpha:agent-a:working-context",
+        }]);
+        return { rows: [{ id: ID_1 }], rowCount: 1 };
+      }
+      throw new Error(`unexpected SQL: ${sql}`);
+    });
+
+    const result = await executePostgresScopeBackfill(client, {
+      table: "memories",
+      registry,
+      mode: "apply",
+      maintenance: true,
+      quiescenceConfirmed: true,
+      batchSize: 1,
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 1, quarantined: 0, conflict: 0 });
+    expect(client.calls.filter(({ sql }) => /^UPDATE /.test(sql))).toHaveLength(1);
+  });
+
   test("500 resolved 行每批固定单次 bulk UPDATE，不产生逐行 roundtrip", async () => {
     const rows = Array.from({ length: 500 }, (_, index) =>
       row(`00000000-0000-4000-8${String(index).padStart(3, "0")}-${String(index + 1).padStart(12, "0")}`, completeMetadata));

@@ -17,7 +17,6 @@ const baseConfig = {
     summarizationModel: "gpt-summary",
     reasoningModel: "gpt-reason",
     maxTokens: 2048,
-    temperature: 0,
     apiKey: "fake-llm-secret",
   },
   dbType: "postgres",
@@ -41,6 +40,7 @@ const baseConfig = {
     graph: true,
     summaryTree: true,
     webConsole: false,
+    assetInjection: false,
   },
   autoCapture: true,
   autoRecall: true,
@@ -121,9 +121,9 @@ describe("createConfigFingerprint", () => {
     ["embedding baseURL", { embedding: { ...baseConfig.embedding, baseURL: "https://other.example/v1" } }],
     ["LLM model", { llm: { ...baseConfig.llm, model: "gpt-other" } }],
     ["LLM maxTokens", { llm: { ...baseConfig.llm, maxTokens: 4096 } }],
-    ["LLM temperature", { llm: { ...baseConfig.llm, temperature: 0.2 } }],
     ["dbType", { dbType: "lancedb", dbPath: "/tmp/mengshu" }],
     ["features", { features: { ...baseConfig.features, graph: false } }],
+    ["assetInjection", { features: { ...baseConfig.features, assetInjection: true } }],
     ["autoCapture", { autoCapture: false }],
     ["autoRecall", { autoRecall: false }],
     ["recallIncludeDocuments", { recallIncludeDocuments: true }],
@@ -173,6 +173,13 @@ describe("createConfigFingerprint", () => {
     expect(createConfigFingerprint({ ...baseConfig, ...change })).not.toBe(
       createConfigFingerprint(baseConfig),
     );
+  });
+
+  test("忽略运行时强制为 0.0 的遗留 temperature 字段", () => {
+    expect(createConfigFingerprint({
+      ...baseConfig,
+      llm: { ...baseConfig.llm, temperature: 0.9 },
+    })).toBe(createConfigFingerprint(baseConfig));
   });
 
   test("credential 从未配置变为已配置会改变指纹，但不记录 credential 内容", () => {

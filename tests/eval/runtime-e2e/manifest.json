@@ -1,14 +1,14 @@
 {
   "schemaVersion": 1,
-  "version": "v1-runtime-e2e",
+  "version": "v3-runtime-e2e",
   "suites": {
     "mengshu-runtime-rest": {
       "kind": "extension",
-      "runner": "production-rest-runtime-host-v1",
+      "runner": "production-rest-runtime-host-v3",
       "file": "mengshu-runtime-rest.jsonl",
       "caseCount": 1,
-      "bytes": 372,
-      "sha256": "32ae8427661d2f92fb548f1f554e404de0d70e02c9df9adee87a5e9850ca0bc7",
+      "bytes": 6452,
+      "sha256": "bddae6ce4435fbdacdb7f53ea0eec5b44f3afb4ac642d019a3044ee0d8bad9ec",
       "metrics": ["case_pass_rate"],
       "gate": {
         "case_pass_rate": 1
@@ -17,7 +17,14 @@
       "liveGate": "MENGSHU_RUN_LIVE_TESTS=1",
       "transport": "rest-http",
       "composition": "ms-serve-runtime-host",
-      "description": "隔离 PostgreSQL 上从生产 ms serve 入口验证 RuntimeHost、durable exact-three worker 与 REST health。"
+      "requiredProductionStages": [
+        "write_observe",
+        "candidate",
+        "graph",
+        "tree",
+        "context_recall"
+      ],
+      "description": "复用全局 PostgreSQL、embedding 与 LLM 配置，在唯一测试 schema 上从生产 ms serve 入口执行 active 五阶段主链与独立 auto pending candidate，验证 candidate 零派生、不可见和 restart replay；production gate 只接受 runner 实际观察到的 receipts/ledgers。"
     }
   }
 }

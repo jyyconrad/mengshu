@@ -1,6 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import { isAbsolute } from "node:path";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
@@ -21,9 +21,11 @@ import {
   handleMemoryStore,
   bindOpenClawPipelineAuthority,
   resolveOpenClawAllowedTables,
+  type OpenClawAuthorityContext,
 } from "./tools.js";
 import { handleMemoryContextFast } from "./context-fast.js";
 import {
+  createOpenClawRecallTurnGuard,
   detectCategory,
   handleAgentEndCapture,
   handleBeforeAgentStartRecall,
@@ -53,11 +55,13 @@ import type { MemoryScope } from "../../../core/types.js";
 import {
   snapshotOpenClawAuthority,
   resolveOpenClawAuthorityScope,
+  resolveOpenClawHostScope,
 } from "./authority.js";
 import { createServeRuntimeHost } from "../../../server/runtime-host-factory.js";
 import { PostgresProvider } from "../../../packages/core/src/db/providers/postgres.js";
 import { readRegistry } from "../../../packages/core/src/runtime/registry.js";
 import { createPostgresSchemaCutoverPort } from "./cli/migrate-v10.js";
+import { runtimeMemoryWriteCapability } from "./memory-write.js";
 
 export {
   OPENCLAW_LEGACY_MEMORY_PLUGIN_IDS,
@@ -72,6 +76,25 @@ export interface RegisterOpenClawAdapterOptions {
   authority?: AuthorityScope;
   /** Test/composition seam；production 默认仍使用 daemon startMemoryServer。 */
   startServer?: RegisterMemoryServerCliOptions["startServer"];
+}
+
+interface OpenClawToolHostContext {
+  agentId?: string;
+  sessionKey?: string;
+}
+
+function createAuthorityScopedOpenClawTool(
+  authority: AuthorityScope,
+  defaultScope: MemoryScope,
+  build: (context: OpenClawAuthorityContext) => AnyAgentTool,
+): Parameters<OpenClawPluginApi["registerTool"]>[0] {
+  return ((hostContext: OpenClawToolHostContext) => {
+    const boundary = resolveOpenClawHostScope(authority, defaultScope, hostContext);
+    return build({
+      authority: boundary.authority,
+      defaultScope: boundary.scope,
+    });
+  }) as Parameters<OpenClawPluginApi["registerTool"]>[0];
 }
 
 type OpenClawMemoryPromptSectionBuilder = (params: {
@@ -137,16 +160,17 @@ export function registerOpenClawAdapter(
     resolveOpenClawAuthorityScope(authority, runtime.defaultScope);
     bindOpenClawPipelineAuthority(runtime.ingestionPipeline, authority, runtime.defaultScope);
     const forgetService = transactionalForgetCapability(runtime);
+    const memoryWrite = runtimeMemoryWriteCapability(runtime);
     if (!forgetService) {
       api.logger.warn?.(
         "mengshu: transactional forget capability unavailable; memory_forget, memory_cleanup and ms mcp are disabled",
       );
     }
 
-    registerOpenClawTools(api, runtime, authority, forgetService);
+    registerOpenClawTools(api, runtime, authority, forgetService, memoryWrite);
     registerOpenClawCli(api, runtime, authority, forgetService, options.startServer);
-    registerOpenClawHooks(api, runtime, authority);
-    registerOpenClawService(api, runtime);
+    registerOpenClawHooks(api, runtime, authority, memoryWrite);
+    registerOpenClawService(api, runtime, authority);
     registerOpenClawMemoryRuntime(api, runtime);
     return runtime;
   } catch (error) {
@@ -159,17 +183,13 @@ function registerOpenClawTools(
   runtime: MengshuRuntime,
   authority: AuthorityScope,
   forgetService: MemoryServiceWithForget | undefined,
+  memoryWrite: ReturnType<typeof runtimeMemoryWriteCapability>,
 ): void {
-  const { config, db, embeddings, memoryService, ingestionPipeline, routingEngine } = runtime;
+  const { config, memoryService, ingestionPipeline, routingEngine } = runtime;
   const allowedTables = resolveOpenClawAllowedTables(config.knowledgeBases);
-  const authorityContext = {
-    authority,
-    defaultScope: runtime.defaultScope,
-    allowedTables,
-  };
 
   api.registerTool(
-    {
+    createAuthorityScopedOpenClawTool(authority, runtime.defaultScope, (hostAuthority) => ({
       name: "memory_recall",
       label: "Memory Recall",
       description:
@@ -183,19 +203,20 @@ function registerOpenClawTools(
         category: Type.Optional(Type.String({ description: "Storage category: 核心记忆，用户偏好，事实，决策，定时任务，长期规划，知识库，etc." })),
         searchAll: Type.Optional(Type.Boolean({ description: "Search across all categories (default: false)" })),
         knowledgeBase: Type.Optional(Type.String({ description: "Specific knowledge base to search: knowledge_personal, knowledge_work, etc." })),
-      }),
+      }, { additionalProperties: false }),
       async execute(_toolCallId, params) {
         return handleMemoryRecall(params as Parameters<typeof handleMemoryRecall>[0], {
-          ...authorityContext,
+          ...hostAuthority,
+          allowedTables,
           service: memoryService,
         });
       },
-    },
+    })),
     { name: "memory_recall" },
   );
 
   api.registerTool(
-    {
+    createAuthorityScopedOpenClawTool(authority, runtime.defaultScope, (hostAuthority) => ({
       name: "memory_store",
       label: "Memory Store",
       description:
@@ -211,25 +232,28 @@ function registerOpenClawTools(
         ),
         metadata: Type.Optional(Type.Record(Type.String(), Type.Unsafe<unknown>({}), { description: "Custom metadata" })),
         storageCategory: Type.Optional(Type.String({ description: "Storage category: 核心记忆 | 用户偏好 | 事实 | 决策 | 定时任务 | 长期规划 | 知识库 (default: 核心记忆)" })),
-      }),
-      async execute(_toolCallId, params) {
-        return handleMemoryStore(params as Parameters<typeof handleMemoryStore>[0], {
-          ...authorityContext,
+      }, { additionalProperties: false }),
+      async execute(toolCallId, params) {
+        return handleMemoryStore({
+          ...(params as Parameters<typeof handleMemoryStore>[0]),
+          idempotencyKey: toolCallId,
+        }, {
+          ...hostAuthority,
+          allowedTables,
           service: memoryService,
-          embed: (text) => embeddings.embed(text),
-          existsByContentHash: (hashes) => db.existsByContentHash(hashes),
+          memoryWrite,
           embeddingModel: config.embedding.model,
           routingEngine,
           logger: api.logger,
         });
       },
-    },
+    })),
     { name: "memory_store" },
   );
 
   if (forgetService) {
     api.registerTool(
-      {
+      createAuthorityScopedOpenClawTool(authority, runtime.defaultScope, (hostAuthority) => ({
         name: "memory_forget",
         label: "Memory Forget",
         description: "Delete specific memories. GDPR-compliant.",
@@ -237,21 +261,22 @@ function registerOpenClawTools(
           query: Type.Optional(Type.String({ description: "Search to find memory" })),
           memoryId: Type.Optional(Type.String({ description: "Specific memory ID" })),
           filter: Type.Optional(Type.Record(Type.String(), Type.Unsafe<unknown>({}), { description: "Filter conditions for bulk delete" })),
-        }),
+        }, { additionalProperties: false }),
         async execute(_toolCallId, params) {
           return handleMemoryForget(params as Parameters<typeof handleMemoryForget>[0], {
-            ...authorityContext,
+            ...hostAuthority,
+            allowedTables,
             service: memoryService,
             forgetService,
           });
         },
-      },
+      })),
       { name: "memory_forget" },
     );
   }
 
   api.registerTool(
-    {
+    createAuthorityScopedOpenClawTool(authority, runtime.defaultScope, (hostAuthority) => ({
       name: "memory_scan_directory",
       label: "Memory Scan Directory",
       description:
@@ -262,12 +287,13 @@ function registerOpenClawTools(
         ignoreRules: Type.Optional(Type.Array(Type.String(), { description: "Additional gitignore-style rules" })),
         targetTable: Type.Optional(Type.String({ description: "Target table name (default: knowledge)" })),
         autoEnrichMetadata: Type.Optional(Type.Boolean({ description: "Auto-enrich metadata (default: true)" })),
-      }),
+      }, { additionalProperties: false }),
       async execute(_toolCallId, params) {
         return handleMemoryScanDirectory(
           params as Parameters<typeof handleMemoryScanDirectory>[0],
           {
-            ...authorityContext,
+            ...hostAuthority,
+            allowedTables,
             pipeline: ingestionPipeline,
             resolvePath: (path) => api.resolvePath(path),
             defaultIgnorePaths: config.scanner?.defaultIgnorePaths,
@@ -277,13 +303,13 @@ function registerOpenClawTools(
           },
         );
       },
-    },
+    })),
     { name: "memory_scan_directory" },
   );
 
   if (forgetService) {
     api.registerTool(
-      {
+      createAuthorityScopedOpenClawTool(authority, runtime.defaultScope, (hostAuthority) => ({
         name: "memory_cleanup",
         label: "Memory Cleanup",
         description:
@@ -292,21 +318,22 @@ function registerOpenClawTools(
           dataType: Type.Optional(Type.String({ description: "Data type to delete: 'memory' or 'document'" })),
           olderThanDays: Type.Optional(Type.Number({ description: "Delete entries older than N days" })),
           filter: Type.Optional(Type.Record(Type.String(), Type.Unsafe<unknown>({}), { description: "Additional filter conditions" })),
-        }),
+        }, { additionalProperties: false }),
         async execute(_toolCallId, params) {
           return handleMemoryCleanup(params as Parameters<typeof handleMemoryCleanup>[0], {
-            ...authorityContext,
+            ...hostAuthority,
+            allowedTables,
             service: memoryService,
             forgetService,
           });
         },
-      },
+      })),
       { name: "memory_cleanup" },
     );
   }
 
   api.registerTool(
-    {
+    createAuthorityScopedOpenClawTool(authority, runtime.defaultScope, (hostAuthority) => ({
       name: "memory_context_fast",
       label: "Memory Context (Fast)",
       description:
@@ -315,19 +342,23 @@ function registerOpenClawTools(
         task: Type.String({ description: "Current task description" }),
         tokenBudget: Type.Optional(Type.Number({ description: "Total token budget (default: 4000)" })),
         latencyBudgetMs: Type.Optional(Type.Number({ description: "Latency budget in ms (default: 80)" })),
-      }),
+      }, { additionalProperties: false }),
       async execute(_toolCallId, params) {
-        const scope = resolveOpenClawAuthorityScope(authority, runtime.defaultScope, params);
+        const scope = resolveOpenClawAuthorityScope(
+          hostAuthority.authority!,
+          hostAuthority.defaultScope!,
+          params,
+        );
         return handleMemoryContextFast({
           ...(params as Parameters<typeof handleMemoryContextFast>[0]),
           scope,
         }, {
-          service: memoryService,
+          agentFastPath: runtime.agentFastPath,
           defaultScope: scope,
           logger: api.logger,
         });
       },
-    },
+    })),
     { name: "memory_context_fast" },
   );
 }
@@ -373,7 +404,7 @@ function registerOpenClawCli(
         startServer,
         console: runtime.consoleApi,
         agentFastPath: runtime.agentFastPath,
-        runtimeHostFactory: () => createServeRuntimeHost(runtime),
+        runtimeHostFactory: () => createServeRuntimeHost(runtime, { authority }),
         getTableStats: runtime.db.getTableStats ? () => runtime.db.getTableStats!() : undefined,
         schemaCutover: runtime.db instanceof PostgresProvider
           ? {
@@ -444,45 +475,116 @@ async function probeCliEmbeddingStatus(runtime: MengshuRuntime) {
   }
 }
 
+type OpenClawRecallHook = "before_prompt_build" | "before_agent_start";
+
+function parseOpenClawVersion(version: unknown): readonly [number, number, number] | undefined {
+  if (typeof version !== "string") return undefined;
+  const match = /^(\d{4})\.(\d{1,2})\.(\d{1,2})$/.exec(version);
+  if (!match) return undefined;
+  const parsed = [Number(match[1]), Number(match[2]), Number(match[3])] as const;
+  if (parsed.some((part) => !Number.isSafeInteger(part)) ||
+      parsed[1] < 1 || parsed[1] > 12 || parsed[2] < 1 || parsed[2] > 31) {
+    return undefined;
+  }
+  return parsed;
+}
+
+function compareOpenClawVersion(
+  left: readonly [number, number, number],
+  right: readonly [number, number, number],
+): number {
+  for (let index = 0; index < left.length; index += 1) {
+    const difference = left[index]! - right[index]!;
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+function resolveOpenClawRecallHook(version: unknown): OpenClawRecallHook | undefined {
+  const parsed = parseOpenClawVersion(version);
+  if (!parsed) return undefined;
+  if (compareOpenClawVersion(parsed, [2026, 2, 25]) >= 0) return "before_prompt_build";
+  if (compareOpenClawVersion(parsed, [2026, 2, 21]) >= 0 &&
+      compareOpenClawVersion(parsed, [2026, 2, 24]) <= 0) return "before_agent_start";
+  return undefined;
+}
+
 function registerOpenClawHooks(
   api: OpenClawPluginApi,
   runtime: MengshuRuntime,
   authority: AuthorityScope,
+  memoryWrite: ReturnType<typeof runtimeMemoryWriteCapability>,
 ): void {
   const authorityContext = { authority, defaultScope: runtime.defaultScope };
+  const turnGuard = createOpenClawRecallTurnGuard();
+  let recallGuardActive = false;
   if (runtime.config.autoRecall) {
-    api.on("before_agent_start", async (event) => {
-      return handleBeforeAgentStartRecall(event, {
-        ...authorityContext,
-        service: runtime.memoryService,
-        recallIncludeDocuments: runtime.config.recallIncludeDocuments,
-        logger: api.logger,
+    const recallHook = resolveOpenClawRecallHook(api.runtime?.version);
+    if (recallHook === "before_prompt_build") {
+      recallGuardActive = true;
+      api.on("before_prompt_build", async (event, hostContext) => {
+        return handleBeforeAgentStartRecall(event, {
+          ...authorityContext,
+          agentFastPath: runtime.agentFastPath,
+          hostContext,
+          turnGuard,
+          recallIncludeDocuments: runtime.config.recallIncludeDocuments,
+          logger: api.logger,
+        });
       });
-    });
+    } else if (recallHook === "before_agent_start") {
+      recallGuardActive = true;
+      api.on("before_agent_start", async (event, hostContext) => {
+        return handleBeforeAgentStartRecall(event, {
+          ...authorityContext,
+          agentFastPath: runtime.agentFastPath,
+          hostContext,
+          turnGuard,
+          recallIncludeDocuments: runtime.config.recallIncludeDocuments,
+          logger: api.logger,
+        });
+      });
+    } else {
+      api.logger.warn(
+        "mengshu: automatic recall disabled [UNSUPPORTED_OPENCLAW_HOOK_VERSION]",
+      );
+    }
   }
 
-  if (runtime.config.autoCapture) {
-    api.on("agent_end", async (event) => {
-      return handleAgentEndCapture(event, {
-        ...authorityContext,
-        service: runtime.memoryService,
-        embedBatch: (texts) => runtime.embeddings.embedBatch(texts),
-        existsByContentHash: (hashes) => runtime.db.existsByContentHash(hashes),
-        shouldCapture,
-        detectCategory,
-        captureMaxChars: runtime.config.captureMaxChars,
-        embeddingModel: runtime.config.embedding.model,
-        logger: api.logger,
-      });
+  if (runtime.config.autoCapture || recallGuardActive) {
+    api.on("agent_end", async (event, hostContext) => {
+      try {
+        if (!runtime.config.autoCapture) return;
+        return await handleAgentEndCapture(event, {
+          ...authorityContext,
+          service: runtime.memoryService,
+          memoryWrite,
+          hostContext,
+          shouldCapture,
+          detectCategory,
+          captureMaxChars: runtime.config.captureMaxChars,
+          embeddingModel: runtime.config.embedding.model,
+          logger: api.logger,
+        });
+      } finally {
+        turnGuard.clear(hostContext);
+      }
     });
   }
 }
 
-function registerOpenClawService(api: OpenClawPluginApi, runtime: MengshuRuntime): void {
+function registerOpenClawService(
+  api: OpenClawPluginApi,
+  runtime: MengshuRuntime,
+  authority: AuthorityScope,
+): void {
+  const serviceHost = runtime.config.dbType === "postgres" && runtime.db instanceof PostgresProvider
+    ? createServeRuntimeHost(runtime, { authority })
+    : runtime;
   api.registerService({
     id: OPENCLAW_MEMORY_PLUGIN_ID,
     start: async () => {
-      await runtime.start();
+      await serviceHost.start();
       const embeddingStatus = describeOpenClawEmbeddingStatus(
         runtime.config.dbType,
         runtime.embeddingWriteGuard.snapshot(),
@@ -506,7 +608,7 @@ function registerOpenClawService(api: OpenClawPluginApi, runtime: MengshuRuntime
       }
     },
     stop: async () => {
-      await runtime.stop();
+      await serviceHost.stop();
       api.logger.info?.(`${OPENCLAW_MEMORY_PLUGIN_ID}: stopped`);
     },
   });

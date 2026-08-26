@@ -134,6 +134,31 @@ describe.skipIf(!lancedbAvailable)("LanceDB scope 维度列", () => {
     expect(results[0]).toMatchObject({ tenantId: "tenant-a", userId: "alice" });
   });
 
+  it("ANN candidateLimit 独立于 final limit，缺省不会只返回 5 条", async () => {
+    const entries = Array.from({ length: 8 }, (_, index) => baseEntry({
+      id: `candidate-pool-${index}`,
+      text: `候选池记忆 ${index}`,
+      contentHash: `candidate-pool-hash-${index}`,
+      vector: makeVector(6),
+      tenantId: "tenant-candidate-pool",
+      userId: "user-candidate-pool",
+      canonicalProjectId: "project-candidate-pool",
+      productId: "app-candidate-pool",
+      producerId: "agent-candidate-pool",
+    }));
+    await provider.store(entries);
+
+    const results = await provider.query({
+      vector: makeVector(6),
+      candidateLimit: 8,
+      tenantId: "tenant-candidate-pool",
+      userId: "user-candidate-pool",
+    });
+
+    expect(results).toHaveLength(8);
+    expect(results.map(({ id }) => id)).toEqual(expect.arrayContaining(entries.map(({ id }) => id)));
+  });
+
   it("同 authority/contentHash 串行写入返回真实 duplicate id", async () => {
     const first = await provider.store([
       baseEntry({

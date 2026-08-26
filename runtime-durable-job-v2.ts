@@ -15,6 +15,10 @@ import {
   assertProviderOwnedPostgresDurableJobV2RuntimeBundle,
   type PostgresDurableJobV2RuntimeBundle,
 } from "./packages/core/src/db/providers/postgres.js";
+import {
+  planTreeFanOut,
+  type TreeFanOutRoutingInput,
+} from "./packages/core/src/tree/tree-fan-out.js";
 
 export type RuntimeDurableJobV2Type = (typeof DURABLE_JOB_V2_AUTHORITATIVE_TYPES)[number];
 
@@ -57,6 +61,34 @@ export interface RuntimeDurableJobV2EnqueueCapability {
 const EXTRACT_CANDIDATE_DEDUPE_PREFIX = "extract_candidate:";
 const EXTRACT_CANDIDATE_TRACE_ID_MAX_LENGTH =
   DURABLE_JOB_V2_SAFE_IDENTIFIER_MAX_LENGTH - EXTRACT_CANDIDATE_DEDUPE_PREFIX.length;
+const BUILD_TREE_PAYLOAD_REQUIRED = Object.freeze([
+  "scope", "traceId", "treeType", "treeKey", "leaf",
+] as const);
+const BUILD_TREE_PAYLOAD_OPTIONAL = Object.freeze([
+  "routing", "targetIdempotencyKey",
+] as const);
+const BUILD_TREE_LEAF_REQUIRED = Object.freeze([
+  "id", "chunkId", "sourceId", "text", "eventAt",
+] as const);
+const BUILD_TREE_LEAF_OPTIONAL = Object.freeze(["entityIds"] as const);
+const BUILD_TREE_ROUTING_REQUIRED = Object.freeze([
+  "valueScore", "importance", "semanticType", "scopeVisibility", "riskFlags",
+  "topicHotnessEligible",
+] as const);
+const BUILD_TREE_ROUTING_OPTIONAL = Object.freeze([
+  "topicLabels", "explicitGlobal", "isWorkspaceRule",
+] as const);
+const BUILD_TREE_SEMANTIC_TYPES = new Set([
+  "profile", "task_context", "rules", "experience", "resource",
+]);
+const BUILD_TREE_SCOPE_VISIBILITIES = new Set([
+  "session", "project", "workspace", "app", "user", "global",
+]);
+const BUILD_TREE_TYPES = new Set(["source", "topic", "global"]);
+const BUILD_TREE_MAX_TEXT_LENGTH = 100_000;
+const BUILD_TREE_UNSAFE_TEXT = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u;
+const BUILD_TREE_UNPAIRED_SURROGATE =
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
 
 function runtimeError(code: RuntimeDurableJobV2ErrorCode): never {
   throw new RuntimeDurableJobV2Error(code);
@@ -215,6 +247,162 @@ function requiredIdentity(
   return value;
 }
 
+function exactRecord(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): Record<string, unknown> {
+  if (!plainRecord(value)) runtimeError("JOB_PAYLOAD_INVALID");
+  const allowed = new Set([...required, ...optional]);
+  const keys = Object.keys(value);
+  if (keys.length < required.length || keys.some((key) => !allowed.has(key)) ||
+      required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+    runtimeError("JOB_PAYLOAD_INVALID");
+  }
+  return value;
+}
+
+function buildTreeText(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 &&
+    value.length <= BUILD_TREE_MAX_TEXT_LENGTH && !BUILD_TREE_UNSAFE_TEXT.test(value) &&
+    !BUILD_TREE_UNPAIRED_SURROGATE.test(value);
+}
+
+function buildTreeScore(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function buildTreeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((item) => !buildTreeText(item))) {
+    runtimeError("JOB_PAYLOAD_INVALID");
+  }
+  return value as string[];
+}
+
+function buildTreeIdArray(value: unknown): string[] {
+  if (!Array.isArray(value)) runtimeError("JOB_PAYLOAD_INVALID");
+  const ids = value.map((item) => requiredIdentity(item));
+  if (new Set(ids).size !== ids.length) runtimeError("JOB_PAYLOAD_INVALID");
+  return ids;
+}
+
+function buildTreeRouting(value: unknown): TreeFanOutRoutingInput {
+  const routing = exactRecord(
+    value,
+    BUILD_TREE_ROUTING_REQUIRED,
+    BUILD_TREE_ROUTING_OPTIONAL,
+  );
+  if (!buildTreeScore(routing.valueScore) || !buildTreeScore(routing.importance) ||
+      typeof routing.semanticType !== "string" ||
+      !BUILD_TREE_SEMANTIC_TYPES.has(routing.semanticType) ||
+      typeof routing.scopeVisibility !== "string" ||
+      !BUILD_TREE_SCOPE_VISIBILITIES.has(routing.scopeVisibility) ||
+      typeof routing.topicHotnessEligible !== "boolean") {
+    runtimeError("JOB_PAYLOAD_INVALID");
+  }
+  for (const field of ["explicitGlobal", "isWorkspaceRule"] as const) {
+    if (Object.prototype.hasOwnProperty.call(routing, field) &&
+        typeof routing[field] !== "boolean") {
+      runtimeError("JOB_PAYLOAD_INVALID");
+    }
+  }
+  const riskFlags = buildTreeStringArray(routing.riskFlags);
+  const topicLabels = Object.prototype.hasOwnProperty.call(routing, "topicLabels")
+    ? buildTreeStringArray(routing.topicLabels)
+    : undefined;
+  return {
+    valueScore: routing.valueScore,
+    importance: routing.importance,
+    semanticType: routing.semanticType,
+    scopeVisibility: routing.scopeVisibility,
+    riskFlags,
+    topicHotnessEligible: routing.topicHotnessEligible,
+    ...(topicLabels === undefined ? {} : { topicLabels }),
+    ...(routing.explicitGlobal === undefined
+      ? {}
+      : { explicitGlobal: routing.explicitGlobal }),
+    ...(routing.isWorkspaceRule === undefined
+      ? {}
+      : { isWorkspaceRule: routing.isWorkspaceRule }),
+  } as TreeFanOutRoutingInput;
+}
+
+function canonicalizeBuildTreePayload(
+  cloned: Record<string, unknown>,
+  scope: DurableJobV2Scope,
+): { readonly payload: Record<string, unknown>; readonly identity: string } {
+  exactRecord(cloned, BUILD_TREE_PAYLOAD_REQUIRED, BUILD_TREE_PAYLOAD_OPTIONAL);
+  const traceId = requiredIdentity(cloned.traceId);
+  if (typeof cloned.treeType !== "string" || !BUILD_TREE_TYPES.has(cloned.treeType)) {
+    runtimeError("JOB_PAYLOAD_INVALID");
+  }
+  const treeKey = requiredIdentity(cloned.treeKey);
+  const leaf = exactRecord(cloned.leaf, BUILD_TREE_LEAF_REQUIRED, BUILD_TREE_LEAF_OPTIONAL);
+  if (requiredIdentity(leaf.id) !== traceId) {
+    runtimeError("JOB_PAYLOAD_INVALID");
+  }
+  const chunkId = requiredIdentity(leaf.chunkId);
+  const sourceId = requiredIdentity(leaf.sourceId);
+  const entityIds = Object.prototype.hasOwnProperty.call(leaf, "entityIds")
+    ? buildTreeIdArray(leaf.entityIds)
+    : [];
+  if (!buildTreeText(leaf.text) || !Number.isSafeInteger(leaf.eventAt) ||
+      (leaf.eventAt as number) < 0) {
+    runtimeError("JOB_PAYLOAD_INVALID");
+  }
+
+  const hasRouting = Object.prototype.hasOwnProperty.call(cloned, "routing");
+  const hasTargetIdempotencyKey = Object.prototype.hasOwnProperty.call(
+    cloned,
+    "targetIdempotencyKey",
+  );
+  if (hasRouting !== hasTargetIdempotencyKey) runtimeError("JOB_PAYLOAD_INVALID");
+  if (!hasRouting) {
+    if (cloned.treeType !== "source" || treeKey !== sourceId) {
+      runtimeError("JOB_PAYLOAD_INVALID");
+    }
+    return { payload: cloned, identity: traceId };
+  }
+
+  const targetIdempotencyKey = requiredIdentity(cloned.targetIdempotencyKey);
+  const routing = buildTreeRouting(cloned.routing);
+  const payloadScope = cloned.scope as Record<string, unknown>;
+  const fullScope: MemoryScope = {
+    ...scope,
+    ...(typeof payloadScope.workspaceId === "string"
+      ? { workspaceId: payloadScope.workspaceId }
+      : {}),
+    ...(typeof payloadScope.sessionId === "string"
+      ? { sessionId: payloadScope.sessionId }
+      : {}),
+  };
+  try {
+    const matchingTargets = planTreeFanOut({
+      scope: fullScope,
+      leaf: {
+        id: traceId,
+        scope: fullScope,
+        chunkId,
+        sourceId,
+        entityIds,
+        importance: routing.importance,
+        eventAt: leaf.eventAt as number,
+        createdAt: leaf.eventAt as number,
+        text: leaf.text as string,
+        tokenCount: Math.max(1, Math.ceil((leaf.text as string).length / 4)),
+      },
+      routing,
+    }).targets.filter((target) =>
+      target.treeType === cloned.treeType && target.treeKey === treeKey &&
+      target.idempotencyKey === targetIdempotencyKey
+    );
+    if (matchingTargets.length !== 1) runtimeError("JOB_PAYLOAD_INVALID");
+  } catch {
+    runtimeError("JOB_PAYLOAD_INVALID");
+  }
+  return { payload: cloned, identity: targetIdempotencyKey };
+}
+
 function supportedType(type: string): type is RuntimeDurableJobV2Type {
   return (DURABLE_JOB_V2_AUTHORITATIVE_TYPES as readonly string[]).includes(type);
 }
@@ -237,17 +425,7 @@ function canonicalizePayload(
     return { payload: cloned, identity };
   }
   if (type === "build_tree") {
-    const identity = requiredIdentity(cloned.traceId);
-    if (cloned.treeType !== "source" && cloned.treeType !== "topic" && cloned.treeType !== "global") {
-      runtimeError("JOB_PAYLOAD_INVALID");
-    }
-    requiredIdentity(cloned.treeKey);
-    if (!plainRecord(cloned.leaf) || requiredIdentity(cloned.leaf.id) !== identity ||
-        requiredIdentity(cloned.leaf.chunkId) !== identity) {
-      runtimeError("JOB_PAYLOAD_INVALID");
-    }
-    requiredIdentity(cloned.leaf.sourceId);
-    return { payload: cloned, identity };
+    return canonicalizeBuildTreePayload(cloned, scope);
   }
   const identity = requiredIdentity(cloned.chunkId);
   if (typeof cloned.text !== "string" || cloned.text.trim().length === 0) {
@@ -274,6 +452,9 @@ export function createRuntimeDurableJobV2Enqueuer(
       readonly payload: Record<string, unknown>;
     }) => {
       if (!supportedType(type)) runtimeError("JOB_TYPE_UNSUPPORTED");
+      // Entity Graph work is minted only by committed-active derivation after
+      // provider-owned evidence reads; transport callers cannot submit graph text.
+      if (type === "extract_graph") runtimeError("JOB_TYPE_UNSUPPORTED");
       const canonical = canonicalizePayload(type, payload, capability.scope);
       const canonicalPayloadScope = canonical.payload.scope as Record<string, unknown>;
       const dedupeKey = deriveDurableJobV2DomainDedupeKey(type, canonical.identity, {

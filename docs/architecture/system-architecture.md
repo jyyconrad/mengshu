@@ -1,7 +1,7 @@
 # 系统架构
 
 > **状态**: 架构演进记录（2026-07-12 运行态校准）
-> **当前版本**: v1.0.6（算法资产较完整，生产主链升级中；不可按 P0-P4 全量运行态理解）
+> **当前版本**: v1.0.7（算法资产较完整，生产主链升级中；不可按 P0-P4 全量运行态理解）
 > **单一事实来源**: 算法层设计见 [memory-system-unified-design.md](../design/memory-system-unified-design.md) (v2.0)
 > **架构路线**: 本文只描述当前公开边界；未接入生产主链的能力不按已交付计算
 
@@ -14,11 +14,11 @@
 | Phase | 范围 | 当前状态 | 说明 |
 |-------|------|------------|------|
 | Phase 0 | 架构收口与兼容契约 | ✅ 已实施 | `packages/core/src/service/memory-service.ts`、`packages/core/src/domain/scope.ts`、`packages/core/src/storage/legacy-database-adapter.ts` |
-| Phase 1 | Server + REST + MCP | 🚧 安全组合中 | transport 与 RuntimeHost 已实现；默认 production `serve` 在 native fenced handlers 缺失时 fail-closed |
-| Phase 2 | Scope/Namespace/Pipeline | 🚧 主链接入中 | AuthorityScope 已接主要入口；历史 scope backfill 与真实数据库迁移尚未执行 |
-| Phase 3 | 混合检索 | 🧩 代码资产 | orchestrator、fusion、BM25/vector 模块存在；不能据此认定所有真实召回入口均走该链路 |
-| Phase 4 | 图谱与生命周期 | 🧩 代码资产 | validator、semantic dedup、graph 模块存在；native durable handlers 与统一写入事务尚未完成 |
-| Phase 5 | Memory Tree | 🚧 baseline | `tree/build-tree-handler.ts`、L0-L3 摘要（已有 baseline，待完整 seal/routing） |
+| Phase 1 | Server + REST + MCP | ✅ PostgreSQL 安全组合 | RuntimeHost 使用 provider-owned durable capability；缺失时在监听前 fail-closed |
+| Phase 2 | Scope/Namespace/Pipeline | ✅ 合同与迁移工具 | AuthorityScope 已接主要入口；scope/semantic type 迁移均为 dry-run 优先并支持 quarantine |
+| Phase 3 | 混合检索 | ✅ governed 主链 | vector/BM25/graph/tree 候选统一经过 hard filter 和 6 因子 receipt |
+| Phase 4 | 图谱与生命周期 | ✅ native durable 组合 | Write Kernel、candidate、active derivation、Entity/Work Memory Graph 和 evidence link 已接线 |
+| Phase 5 | Memory Tree 与上下文装配 | ✅ 渐进披露与 private overlay | source/topic/global、SlotSnapshotV2、R0-R4、private Asset/Loadout 和 durable invalidation 已接线 |
 | Phase 6 | 产品化与团队部署 | 📋 规划中 | Python SDK、多租户、Connector sync（未启动） |
 
 LLM 结构化提取、11 闸门 validator、4 套评分、语义去重、L0-L3 树摘要、6 因子召回和 5 槽位注入均有代码资产；其运行态接入程度不同。算法规格见 [memory-system-unified-design.md](../design/memory-system-unified-design.md)（D-01~D-23 决策）。
@@ -104,17 +104,27 @@ memory_recall / REST / MCP
 
 混合检索模块已实现；真实入口仍需逐一验证是否实例化 orchestrator、是否执行 authority/scope 与 embedding-space guard。
 
-### Agent 快路径（已实施 5 槽位注入）
+### Agent 快路径（5 槽位与渐进披露）
 
 ```text
 memory_context_fast / POST /v1/agent/context
   -> packages/api/src/agent-fast-path/index.ts
   -> packages/core/src/context/slot-context-builder.ts（5 问题语义协议）
-  -> packages/core/src/context/slot-snapshot.ts
-  -> 5 slot context（profile/task_context/rules/experience/resource）+ telemetry
+  -> packages/core/src/context/slot-snapshot.ts（SlotSnapshotV2）
+  -> exact-scope AgentLoadout + private memory_view（可选增强）
+  -> 5 slot context（profile/task_context/rules/experience/resource）
+  -> source/topic/global navigation -> L0 evidence
 ```
 
-已实现 5 问题语义协议（MemorySemanticType）的快路径注入；异步增强仍受 native handler 可用性约束。
+5 type 是面向 Agent 上下文的语义视图，不能替代通用 MemoryKind。历史数据只有显式合法或高置信映射才进入 5 槽位；其余记录保留为 kind-only/lookup-only。Asset/Loadout 是可独立关闭的增强层，不能越过 scope、lifecycle、risk/conflict、召回门槛和 token budget。
+
+上下文采用 R0-R4 渐进披露：R0 为 5 槽位必读，R1/R2 为 source/topic/global 与资产导航，R3 为受控资源读取，R4 回到原始 evidence。Asset/Loadout 版本变更通过 durable outbox 按 scope fingerprint 失效缓存，读取时仍再次校验 revoked/stale 状态。
+
+最终装配按槽位累计消费预算：先扣除原生正文，再按 6 因子分数选择 Asset；binding priority 仅用于同分排序，超预算内容降级为导航引用。每个 slot 的历史内容通过统一 prompt safety 转义，并声明为不可信数据，不能构造 developer/assistant/tool 指令。
+
+PostgreSQL v22 将最终 `ContextAssemblyReceipt` 持久化，记录 plan、Loadout/binding、过滤与降级、memory/tree/asset/evidence 引用、warning、稳定/动态 hash 和 expiry。CLI/MCP 只能在 host-owned exact private session 读取；receipt 缺失或写失败不阻断原生 5 槽位，只返回显式 warning。
+
+Tree 到 Asset 的晋升继续执行 D-07：extractive 摘要受 500 token deterministic gate 限制，高风险 abstractive 摘要必须已有 faithfulness 验证，旧节点缺证明时 fail-closed。
 
 ### 目录扫描与 agent-history 预览
 
@@ -172,12 +182,12 @@ LLM 结构化图谱抽取采用 JSON Schema 约束输出 + 三级实体匹配；
 | OpenClaw hooks | `plugins/openclaw/src/hooks.ts` | ✅ 自动召回和自动捕获（autoRecall/autoCapture；`adapters/openclaw/hooks.ts` 兼容转发） |
 | CLI（`ms` 命令组） | `packages/api/src/cli/ms.ts`、`plugins/openclaw/src/cli/*` | 部分可用；短命令有生命周期清理，production `serve` 受 native capability 门禁保护 |
 | REST API | `packages/api/src/rest/router.ts`、`server/daemon.ts` | router/daemon 已实现；是否可监听取决于 RuntimeHost 安全组合 |
-| MCP Server | `packages/mcp/src/server.ts`、`packages/mcp/src/stdio-server.ts`、`packages/mcp/src/tools.ts` | ✅ stdio 可用（8 个核心工具） |
+| MCP Server | `packages/mcp/src/server.ts`、`packages/mcp/src/stdio-server.ts`、`packages/mcp/src/tools.ts` | ✅ stdio 可用，含 5 槽位、tree/evidence 导航和只读 Asset 工具 |
 | JS SDK | `packages/api/src/sdk/client.ts` | ✅ REST client baseline（`adapters/sdk/*`、`sdk/js/*` 兼容旧路径） |
 | Web Console | `packages/ui/src/console/api.ts`、`packages/ui/src/web/` | ✅ baseline（Overview/Lookup/Graph/Jobs 4 个视图） |
-| Eval 框架 | `tests/eval/runners/`、`tests/eval/goldens/` | 8 套 suite 均已登记；当前 release 与 production gate 诚实失败，不代表质量达标 |
+| Eval 框架 | `tests/eval/runners/`、`tests/eval/goldens/` | 11 套 deterministic suite 已登记；离线 release gate 通过不代表 production gate 已验收 |
 
-CLI 使用 `ms` 命令组（与 `mengshu` 别名），支持配置向导、诊断、评分追溯、召回解释、agent-history dry-run 预览和项目管理；具体命令以 `ms --help` 为准。
+CLI 使用 `ms` 命令组（与 `mengshu` 别名），支持配置向导、诊断、评分追溯、召回解释、agent-history dry-run、历史 5 type 漏斗迁移，以及 private Asset 的 list/explain/deprecate/revoke；具体命令以 `ms --help` 为准。
 
 ## 架构决策（当前确认状态）
 
@@ -229,7 +239,7 @@ Agent 启动上下文优先走缓存和轻量构建（`packages/api/src/agent-fa
 7. **5 槽位注入**：`packages/core/src/context/slot-context-builder.ts`，5 问题语义协议（profile/task_context/rules/experience/resource）快路径注入（`packages/api/src/agent-fast-path/index.ts`）
 8. **Scope 隔离**：`packages/core/src/domain/scope.ts`，6 档 targetScope（message/turn/session/project/app/global），运行时按 scope 策略过滤
 9. **Agent-history 导入**：`packages/core/src/ingest/agent-history/`，含 redaction（`redaction.ts`）和批量去重
-10. **Eval 评估体系**：`tests/eval/runners/`、`tests/eval/goldens/` 登记 8 套 suite；当前 70/336 case 通过，release 与 production gate 均失败
+10. **Eval 评估体系**：`tests/eval/runners/`、`tests/eval/goldens/` 登记 11 套 suite；当前离线 quick eval 全绿，production gate 必须显式 live opt-in，未执行时不得标为生产验收
 
 ### 未来规划（Phase 5-6）
 
@@ -246,4 +256,4 @@ Agent 启动上下文优先走缓存和轻量构建（`packages/api/src/agent-fa
 ---
 
 **创建日期**：2026-05-30（v4 架构方案）  
-**最后更新**：2026-07-15（v1.0.6 运行态校准）
+**最后更新**：2026-08-16（v1.0.7 运行态校准）

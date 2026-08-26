@@ -6,19 +6,41 @@
  * 使 hotness 评分生效，topic tree 开始创建。
  */
 
-import type { InMemoryGraphRepository } from "./repository.js";
+import type { EntityGraphRepository } from "./repository.js";
 import type { MemoryScope } from "../domain/types.js";
 import type { RecallHit } from "../domain/types.js";
 
 export interface QueryHitsTrackerOptions {
-  graphRepo: InMemoryGraphRepository;
+  graphRepo?: EntityGraphRepository;
+  entityGraphQueryHits?: EntityGraphQueryHitsPort;
+}
+
+export interface EntityGraphQueryHitsInput {
+  readonly memoryIds: readonly string[];
+  readonly scope: MemoryScope;
+  readonly occurredAt: number;
+}
+
+export interface EntityGraphQueryHitsResult {
+  readonly updatedEntityIds: readonly string[];
+}
+
+/** Production feedback capability; implementations resolve entities from authoritative ledgers. */
+export interface EntityGraphQueryHitsPort {
+  incrementRecallHits(input: EntityGraphQueryHitsInput): Promise<EntityGraphQueryHitsResult>;
 }
 
 export class QueryHitsTracker {
-  private readonly graphRepo: InMemoryGraphRepository;
+  private readonly graphRepo?: EntityGraphRepository;
+  private readonly entityGraphQueryHits?: EntityGraphQueryHitsPort;
 
   constructor(options: QueryHitsTrackerOptions) {
+    if ((!options.graphRepo && !options.entityGraphQueryHits) ||
+        (options.graphRepo && options.entityGraphQueryHits)) {
+      throw new Error("QueryHitsTracker requires exactly one Entity Graph feedback capability");
+    }
     this.graphRepo = options.graphRepo;
+    this.entityGraphQueryHits = options.entityGraphQueryHits;
   }
 
   /**
@@ -29,6 +51,16 @@ export class QueryHitsTracker {
    */
   async trackRecallHits(hits: RecallHit[], scope: MemoryScope): Promise<void> {
     if (hits.length === 0) {
+      return;
+    }
+
+    if (this.entityGraphQueryHits) {
+      const memoryIds = [...new Set(hits.map((hit) => hit.record.id))].sort();
+      await this.entityGraphQueryHits.incrementRecallHits({
+        memoryIds,
+        scope,
+        occurredAt: Date.now(),
+      });
       return;
     }
 
@@ -56,17 +88,22 @@ export class QueryHitsTracker {
     // 逐个递增 queryHits30d
     const now = Date.now();
     for (const entityId of entityIds) {
-      const entity = await this.graphRepo.getEntity(entityId);
+      const entity = await this.graphRepo!.getEntity(entityId, scope);
       if (!entity) {
         continue;
       }
 
       // 递增 queryHits30d：注意 repository.upsertEntities 会累加，
       // 所以这里只传 +1 的增量，不是设置绝对值
-      await this.graphRepo.upsertEntities([{
+      await this.graphRepo!.upsertEntities([{
         ...entity,
+        aliases: [],
+        mentionCount: 0,
+        mentionCount30d: 0,
+        distinctSourceCount: 0,
         queryHits30d: 1, // 增量值，repository 会累加到现有值
-        hotness: entity.hotness, // hotness 会在下次 tree routing 时重新计算
+        hotness: 0, // hotness 会在下次 tree routing 时按权威计数重新计算
+        metadata: {},
         updatedAt: now,
       }]);
     }

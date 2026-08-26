@@ -12,6 +12,10 @@ import {
   assertPostgresProviderOwnsDurableJobV2RuntimeBundle,
   assertProviderOwnedPostgresDurableJobV2RuntimeBundle,
 } from "./postgres.js";
+import type { WriteMemoryRecord } from "../../service/write-kernel.js";
+import type { CandidateProposalReceiptV1 } from
+  "../../lifecycle/candidate-spec-computation.js";
+import { CANDIDATE_GATE_IDS } from "../../lifecycle/candidate-validation-receipt.js";
 
 const scope: DurableJobV2Scope = {
   tenantId: "tenant-a",
@@ -30,6 +34,74 @@ const semanticRequest = Object.freeze({
   traceId: "observation-1",
   intent: "remember",
 });
+
+const acceptedProposalReceipt: CandidateProposalReceiptV1 = Object.freeze({
+  version: 1 as const,
+  candidateOrdinal: 0,
+  outcome: "accepted" as const,
+  validation: Object.freeze({
+    version: 1 as const,
+    policyVersion: "candidate-validator-v1" as const,
+    candidateOrdinal: 0,
+    proposalHash: "a".repeat(64),
+    evidenceIds: Object.freeze(["observation-1"]),
+    outcome: "accepted" as const,
+    gates: Object.freeze(CANDIDATE_GATE_IDS.map((gateId, index) => Object.freeze({
+      gateId,
+      status: index === 5 ? "not_applicable" as const : "passed" as const,
+      reasonCode: index === 5 ? "semantic_type_not_profile" : "passed",
+      policyVersion: "candidate-validator-v1" as const,
+    }))),
+  }),
+  admission: Object.freeze({
+    version: 1 as const,
+    outcome: "accepted" as const,
+    route: "active" as const,
+    valueScore: 0.91,
+    reason: "explicit_remember_fast_track",
+    breakdown: Object.freeze({ explicitness: 1 }),
+    valueSignalProvenance: Object.freeze({
+      mode: "legacy_unknown" as const,
+      evidence: "unknown" as const,
+      novelty: "unknown" as const,
+    }),
+  }),
+});
+
+function writeRecord(
+  route: "drop" | "candidate" | "candidate_low_priority" | "active" | "lookup_only" | "evidence_only",
+  id: string,
+): WriteMemoryRecord {
+  return {
+    id,
+    commandType: "observeAuto",
+    mutation: "content",
+    scope: { ...scope, workspaceId: "workspace-a", sessionId: "session-a" },
+    text: `Verified TypeScript rule ${id}`,
+    metadata: {
+      source: "native-extract",
+      embeddingSpaceId: `embedding-space:v1:${"a".repeat(64)}`,
+      embeddingSpaceState: "known-queryable",
+    },
+    vector: [0.1, 0.2],
+    route,
+    valueScore: route === "active" ? 0.91 : 0.64,
+    importance: 0.37,
+    kind: "decision",
+    semanticType: "rules",
+    confidence: 0.82,
+    category: "decision",
+    dataType: "memory",
+    tableName: "memories",
+    provenance: { source: "agent", sourceId: "observation-1" },
+    evidenceIds: ["observation-1"],
+    governance: {
+      candidate: { confidence: 0.82, extractor: "native-fixture" },
+      admissionReason: "fixture",
+    },
+    createdAt: 100,
+  };
+}
 
 function effectInput(overrides: Record<string, unknown> = {}) {
   return {
@@ -224,6 +296,138 @@ function candidateCapacityHarness() {
 }
 
 describe("PostgresProvider durable job v2 capability", () => {
+  test("route-aware batch 与 job fence/receipt 同事务，且仅 active 进入派生集合", async () => {
+    const calls: Array<{ sql: string; params: readonly unknown[] }> = [];
+    let prior: Record<string, unknown> | undefined;
+    const client = {
+      release: vi.fn(),
+      query: vi.fn(async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string, params: readonly unknown[] = [],
+      ) => {
+        const normalized = sql.trim().replace(/\s+/g, " ");
+        calls.push({ sql: normalized, params });
+        if (["BEGIN", "COMMIT", "ROLLBACK"].includes(normalized)) return { rows: [] as Row[], rowCount: 0 };
+        if (/SELECT id FROM mengshu_jobs_v2/.test(normalized)) return { rows: [{ id: "job-1" } as unknown as Row], rowCount: 1 };
+        if (/SELECT job_id, effect_key/.test(normalized)) {
+          return { rows: (prior ? [prior] : []) as Row[], rowCount: prior ? 1 : 0 };
+        }
+        if (/SELECT pg_advisory_xact_lock/.test(normalized)) return { rows: [{ pg_advisory_xact_lock: null } as unknown as Row], rowCount: 1 };
+        if (/SELECT COUNT\(\*\).*FROM mengshu_candidates/.test(normalized)) return { rows: [{ pending_count: "0" } as unknown as Row], rowCount: 1 };
+        if (/INSERT INTO mengshu_candidates/.test(normalized)) return { rows: [] as Row[], rowCount: 1 };
+        if (/INSERT INTO "memories"/.test(normalized)) return { rows: [{ id: String(params[0]) } as unknown as Row], rowCount: 1 };
+        if (/INSERT INTO mengshu_job_v2_effect_receipts/.test(normalized)) {
+          const row = { job_id: "job-1", effect_key: String(params[1]), request_fingerprint: String(params[2]), lease_generation: 1, result: JSON.parse(String(params[4])), committed_at: 100 };
+          prior = row;
+          return { rows: [row as unknown as Row], rowCount: 1 };
+        }
+        throw new Error(`unexpected SQL: ${normalized}`);
+      }),
+    };
+    const pool = { query: vi.fn(), connect: vi.fn(async () => client), end: vi.fn() };
+    const provider = new PostgresProvider({ host: "unused", port: 5432, database: "unused", user: "unused", password: "unused" }, "text-embedding-3-small");
+    Object.assign(provider as unknown as Record<string, unknown>, { pool, schemaVersion: 14, schemaContractState: "ready" });
+    const ids = [
+      "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002",
+      "00000000-0000-4000-8000-000000000003", "00000000-0000-4000-8000-000000000004",
+      "00000000-0000-4000-8000-000000000005",
+    ];
+    const effect = await candidateBundle(provider).executeCandidateEffect({
+      effectInput: effectInput(), context: { workspaceId: "workspace-a", sessionId: "session-a" }, semanticRequest,
+      proposalReceipts: [acceptedProposalReceipt],
+      records: [writeRecord("candidate", ids[0]!), writeRecord("active", ids[1]!), writeRecord("lookup_only", ids[2]!), writeRecord("evidence_only", ids[3]!), writeRecord("drop", ids[4]!)],
+    });
+    expect(effect).toMatchObject({ status: "applied", receipt: { result: {
+      created: 4, candidateIds: [ids[0]], memoryIds: [ids[1], ids[2], ids[3]], activeMemoryIds: [ids[1]], droppedCount: 1,
+      proposalReceipts: [acceptedProposalReceipt],
+    } } });
+    expect(calls.filter(({ sql }) => sql === "BEGIN")).toHaveLength(1);
+    expect(calls.filter(({ sql }) => sql === "COMMIT")).toHaveLength(1);
+
+    delete (prior!.result as Record<string, unknown>).proposalReceipts;
+    const replayRecords = [
+      writeRecord("candidate", ids[0]!),
+      {
+        ...writeRecord("active", ids[1]!),
+        valueScore: 0.73,
+        importance: 0.42,
+      },
+      writeRecord("lookup_only", ids[2]!),
+      writeRecord("evidence_only", ids[3]!),
+      writeRecord("drop", ids[4]!),
+    ];
+    const replay = await candidateBundle(provider).executeCandidateEffect({
+      effectInput: effectInput(), context: { workspaceId: "workspace-a", sessionId: "session-a" }, semanticRequest,
+      proposalReceipts: [acceptedProposalReceipt],
+      records: replayRecords,
+    });
+    expect(replay).toMatchObject({ status: "replayed", receipt: { result: {
+      created: 4, candidateIds: [ids[0]], memoryIds: [ids[1], ids[2], ids[3]],
+      activeMemoryIds: [ids[1]], droppedCount: 1,
+    } } });
+    expect((replay as { receipt: { result: Record<string, unknown> } }).receipt.result)
+      .not.toHaveProperty("proposalReceipts");
+  });
+
+  test("proposal receipt 非法或夹带原文字段时在 connect 前 fail-closed", async () => {
+    const pool = { query: vi.fn(), connect: vi.fn(), end: vi.fn() };
+    const provider = new PostgresProvider({ host: "unused", port: 5432, database: "unused", user: "unused", password: "unused" }, "text-embedding-3-small");
+    Object.assign(provider as unknown as Record<string, unknown>, { pool, schemaVersion: 14, schemaContractState: "ready" });
+
+    await expect(candidateBundle(provider).executeCandidateEffect({
+      effectInput: effectInput(), context: { workspaceId: "workspace-a", sessionId: "session-a" }, semanticRequest,
+      proposalReceipts: [{ ...acceptedProposalReceipt, rawText: "不得进入 receipt 的原文" }],
+      records: [writeRecord("active", "00000000-0000-4000-8000-000000000007")],
+    } as never)).rejects.toThrow(/candidate effect|proposal receipt/i);
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  test("route-aware memory 缺独立 importance 时在 connect 前 fail-closed", async () => {
+    const pool = { query: vi.fn(), connect: vi.fn(), end: vi.fn() };
+    const provider = new PostgresProvider({ host: "unused", port: 5432, database: "unused", user: "unused", password: "unused" }, "text-embedding-3-small");
+    Object.assign(provider as unknown as Record<string, unknown>, { pool, schemaVersion: 14, schemaContractState: "ready" });
+    const incomplete = writeRecord("active", "00000000-0000-4000-8000-000000000006") as Extract<WriteMemoryRecord, { mutation: "content" }>;
+    await expect(candidateBundle(provider).executeCandidateEffect({
+      effectInput: effectInput(), context: { workspaceId: "workspace-a", sessionId: "session-a" }, semanticRequest,
+      records: [{ ...incomplete, importance: undefined }],
+    })).rejects.toThrow(/importance|write record/i);
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  test("route-aware mixed batch 中途失败时 candidate/memory/effect receipt 整体回滚", async () => {
+    const calls: string[] = [];
+    const client = {
+      release: vi.fn(),
+      query: vi.fn(async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string, params: readonly unknown[] = [],
+      ) => {
+        const normalized = sql.trim().replace(/\s+/g, " ");
+        calls.push(normalized);
+        if (["BEGIN", "ROLLBACK"].includes(normalized)) return { rows: [] as Row[], rowCount: 0 };
+        if (/SELECT id FROM mengshu_jobs_v2/.test(normalized)) return { rows: [{ id: "job-1" } as unknown as Row], rowCount: 1 };
+        if (/SELECT job_id, effect_key/.test(normalized)) return { rows: [] as Row[], rowCount: 0 };
+        if (/SELECT pg_advisory_xact_lock/.test(normalized)) return { rows: [{ pg_advisory_xact_lock: null } as unknown as Row], rowCount: 1 };
+        if (/SELECT COUNT\(\*\).*FROM mengshu_candidates/.test(normalized)) return { rows: [{ pending_count: "0" } as unknown as Row], rowCount: 1 };
+        if (/INSERT INTO mengshu_candidates/.test(normalized)) return { rows: [] as Row[], rowCount: 1 };
+        if (/INSERT INTO "memories"/.test(normalized)) throw new Error("injected memory failure");
+        throw new Error(`unexpected SQL: ${normalized} ${String(params.length)}`);
+      }),
+    };
+    const pool = { query: vi.fn(), connect: vi.fn(async () => client), end: vi.fn() };
+    const provider = new PostgresProvider({ host: "unused", port: 5432, database: "unused", user: "unused", password: "unused" }, "text-embedding-3-small");
+    Object.assign(provider as unknown as Record<string, unknown>, { pool, schemaVersion: 14, schemaContractState: "ready" });
+
+    await expect(candidateBundle(provider).executeCandidateEffect({
+      effectInput: effectInput(), context: { workspaceId: "workspace-a", sessionId: "session-a" }, semanticRequest,
+      records: [
+        writeRecord("candidate", "00000000-0000-4000-8000-000000000007"),
+        writeRecord("active", "00000000-0000-4000-8000-000000000008"),
+      ],
+    })).rejects.toThrow();
+    expect(calls).toContain("ROLLBACK");
+    expect(calls).not.toContain("COMMIT");
+    expect(calls.some((sql) => /INSERT INTO mengshu_job_v2_effect_receipts/.test(sql))).toBe(false);
+  });
+
   test("provider 不暴露 per-call clock direct effect；过期 lease 经 bundle stale 且零写", async () => {
     const h = candidateCapacityHarness();
     h.database.jobs.set("job-expired", 50);

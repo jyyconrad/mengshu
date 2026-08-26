@@ -171,6 +171,7 @@ describe("PostgresGraphRepository transaction kernel", () => {
     expect(entityUpdateSql).toContain("UPDATE mengshu_graph_entities SET");
     expect(entityUpdateSql).toContain("jsonb_array_elements_text");
     expect(entityUpdateSql).toContain("mention_count = mention_count + $16");
+    expect(entityUpdateSql).toContain("WHEN $19::bigint IS NULL THEN last_seen_at");
     expect(entityUpdateSql).toContain("metadata = metadata || $27::jsonb");
     expect(entityUpdateSql).toContain("RETURNING id");
     expect(entityUpdateParams?.[0]).toBe("entity-2");
@@ -179,6 +180,9 @@ describe("PostgresGraphRepository transaction kernel", () => {
     expect(relationUpdateSql).toContain("UPDATE mengshu_graph_relations SET");
     expect(relationUpdateSql).toContain("evidence_count = (");
     expect(relationUpdateSql).toContain("source_kinds = (");
+    expect(relationUpdateSql).toContain(
+      "AND $17::bigint = jsonb_array_length($16::jsonb)",
+    );
   });
 
   test("accepts relations referencing existing same-scope entities", async () => {

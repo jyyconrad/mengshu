@@ -4,8 +4,44 @@ import type {
   EvalMetricDirection,
   EvalMetricResult,
   GoldenCase,
+  ProductionRuntimeStage,
+  ProductionStageEvidence,
   SuiteSummary,
 } from "./types.js";
+import type {
+  MemoryKind,
+  MemorySemanticType,
+} from "../../../packages/core/src/domain/types.js";
+import type { MemoryTreeType } from "../../../packages/core/src/tree/types.js";
+import { isRecallScoreBreakdown } from
+  "../../../packages/core/src/domain/recall-scoring.js";
+
+export const REQUIRED_PRODUCTION_STAGES: readonly ProductionRuntimeStage[] = Object.freeze([
+  "write_observe",
+  "candidate",
+  "graph",
+  "tree",
+  "context_recall",
+]);
+
+const MEMORY_KINDS = new Set<MemoryKind>([
+  "preference", "decision", "entity", "fact", "task", "plan", "goal",
+  "document", "knowledge", "observation", "other",
+]);
+const SEMANTIC_TYPES = [
+  "profile", "task_context", "rules", "experience", "resource",
+] as const;
+const TREE_TYPES = ["source", "topic", "global"] as const;
+
+function isMemorySemanticType(value: unknown): value is MemorySemanticType {
+  return typeof value === "string" &&
+    (SEMANTIC_TYPES as readonly string[]).includes(value);
+}
+
+function isMemoryTreeType(value: unknown): value is MemoryTreeType {
+  return typeof value === "string" &&
+    (TREE_TYPES as readonly string[]).includes(value);
+}
 
 export interface MetricInput {
   name: string;
@@ -263,7 +299,523 @@ export function evaluateSuiteGate(
   return { passed: failures.length === 0, failures };
 }
 
-/** 只有真实宿主 E2E、无 fallback、无 degraded 才具备 production release 资格。 */
+function validProductionReceiptId(value: unknown): value is string {
+  return typeof value === "string" && value === value.trim() && value.length > 0 &&
+    value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function denseProductionIds(value: unknown, minimum = 1): value is string[] {
+  return Array.isArray(value) && value.length >= minimum &&
+    value.every(validProductionReceiptId) && new Set(value).size === value.length;
+}
+
+function receiptContains(receiptIds: readonly string[], required: readonly string[]): boolean {
+  const identities = new Set(receiptIds);
+  return required.every((identity) => identities.has(identity));
+}
+
+function score01(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function plainRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  if (plainRecord(value)) {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function sameCompleteRecallBreakdowns(values: readonly unknown[]): boolean {
+  if (values.length < 2 || values.some((value) => !isRecallScoreBreakdown(value))) {
+    return false;
+  }
+  const expected = canonicalJson(values[0]);
+  return values.slice(1).every((value) => canonicalJson(value) === expected);
+}
+
+function validHotnessEvidence(value: unknown): boolean {
+  if (!plainRecord(value)) return false;
+  const expected = Math.log(Number(value.mentionCount30d) + 1) +
+    0.5 * Number(value.distinctSourceCount) + Number(value.recencyDecay) +
+    Number(value.graphCentrality) + 2 * Number(value.queryHits30d);
+  return nonNegativeInteger(value.mentionCount30d) &&
+    nonNegativeInteger(value.distinctSourceCount) && nonNegativeInteger(value.lastSeenAt) &&
+    typeof value.recencyDecay === "number" && Number.isFinite(value.recencyDecay) &&
+    value.recencyDecay >= 0 && typeof value.graphCentrality === "number" &&
+    Number.isFinite(value.graphCentrality) && value.graphCentrality >= 0 &&
+    nonNegativeInteger(value.queryHits30d) && typeof value.score === "number" &&
+    Number.isFinite(value.score) && Math.abs(value.score - expected) <= 1e-9;
+}
+
+function validProductionSealedSummary(value: unknown): boolean {
+  if (!plainRecord(value) || value.executed !== true ||
+      !validProductionReceiptId(value.jobId) || value.effectKey !== "build_tree.persist.v1" ||
+      typeof value.requestFingerprint !== "string" || !/^[0-9a-f]{64}$/.test(value.requestFingerprint) ||
+      !nonNegativeInteger(value.leaseGeneration) || Number(value.leaseGeneration) < 1 ||
+      !nonNegativeInteger(value.committedAt) || !validProductionReceiptId(value.nodeId) ||
+      value.treeType !== "source" || !validProductionReceiptId(value.treeKey) ||
+      value.level !== 1 || value.status !== "sealed" ||
+      !denseProductionIds(value.leafIds, 20) || !denseProductionIds(value.evidenceChunkIds, 20) ||
+      value.summaryCount !== 1 || value.leafCount !== 20 || value.sourceBufferCount !== 0 ||
+      !Array.isArray(value.leafEvidenceBindings) || value.leafEvidenceBindings.length !== 20 ||
+      !plainRecord(value.effectResult)) return false;
+  const leafIds = value.leafIds as string[];
+  const evidenceChunkIds = value.evidenceChunkIds as string[];
+  const bindings = value.leafEvidenceBindings as unknown[];
+  if (bindings.some((binding) => !plainRecord(binding) ||
+      !validProductionReceiptId(binding.leafId) || !leafIds.includes(binding.leafId as string) ||
+      !validProductionReceiptId(binding.evidenceChunkId) ||
+      !evidenceChunkIds.includes(binding.evidenceChunkId as string) ||
+      binding.activeLifecycleStatus !== "active" || binding.activeAdmissionRoute !== "active" ||
+      binding.evidenceLifecycleStatus !== "archived" ||
+      binding.evidenceAdmissionRoute !== "evidence_only" ||
+      binding.evidenceCommandType !== "importEvidence")) return false;
+  const bindingRecords = bindings as ReadonlyArray<Readonly<Record<string, unknown>>>;
+  if (!sameIds(bindingRecords.map((binding) => binding.leafId as string), leafIds) ||
+      !sameIds(bindingRecords.map((binding) => binding.evidenceChunkId as string), evidenceChunkIds)) {
+    return false;
+  }
+  return exactKeys(value.effectResult, [
+    "leafId", "sealed", "bufferId", "nodeId", "foldedNodeIds",
+  ]) &&
+    validProductionReceiptId(value.effectResult.leafId) && value.effectResult.sealed === true &&
+    value.effectResult.bufferId === null && value.effectResult.nodeId === value.nodeId &&
+    Array.isArray(value.effectResult.foldedNodeIds) &&
+    value.effectResult.foldedNodeIds.length === 0 &&
+    leafIds.includes(value.effectResult.leafId as string);
+}
+
+function sameIds(left: readonly string[], right: readonly string[]): boolean {
+  return JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
+}
+
+function validEvidenceBindings(
+  value: unknown,
+  linkIds: readonly string[],
+  targetIds: readonly string[],
+  evidenceId: string,
+): boolean {
+  if (!Array.isArray(value) || value.length === 0 || value.some((item) =>
+    !plainRecord(item) || !validProductionReceiptId(item.linkId) ||
+    !validProductionReceiptId(item.targetId) || item.evidenceId !== evidenceId ||
+    !targetIds.includes(item.targetId as string))) return false;
+  const bindingIds = value.map((item) => (item as { linkId: string }).linkId);
+  return new Set(bindingIds).size === bindingIds.length && sameIds(bindingIds, linkIds);
+}
+
+function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  return plainRecord(value) && sameIds(Object.keys(value), keys);
+}
+
+const CANDIDATE_GATE_IDS = [
+  "G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08", "G09", "G10", "G11",
+] as const;
+const PENDING_DERIVATION_KEYS = [
+  "memories", "graphJobs", "treeJobs", "treeBuffers", "workMemoryNodes", "workMemoryEdges",
+  "evidenceLinks",
+] as const;
+const PENDING_VISIBILITY_KEYS = ["contextSourceIds", "lookupHitIds", "recallHitIds"] as const;
+const CANDIDATE_SCOPE_KEYS = [
+  "tenantId", "userId", "appId", "projectId", "agentId", "namespace", "visibility",
+  "workspaceId", "sessionId",
+] as const;
+
+function validAcceptedCandidateValidationReceipt(value: unknown, evidenceId: string): boolean {
+  if (!plainRecord(value) || value.version !== 1 ||
+      value.policyVersion !== "candidate-validator-v1" ||
+      !Number.isSafeInteger(value.candidateOrdinal) || Number(value.candidateOrdinal) < 0 ||
+      typeof value.proposalHash !== "string" || !/^[0-9a-f]{64}$/.test(value.proposalHash) ||
+      value.outcome !== "accepted" || !Array.isArray(value.evidenceIds) ||
+      !sameIds(value.evidenceIds as string[], [evidenceId]) ||
+      !Array.isArray(value.gates) || value.gates.length !== CANDIDATE_GATE_IDS.length) return false;
+  return value.gates.every((gate, index) => plainRecord(gate) &&
+    gate.gateId === CANDIDATE_GATE_IDS[index] &&
+    (gate.status === "passed" || gate.status === "not_applicable") &&
+    typeof gate.reasonCode === "string" && gate.reasonCode.length > 0 &&
+    gate.policyVersion === "candidate-validator-v1");
+}
+
+function validProductionPendingCandidate(value: unknown): boolean {
+  if (!plainRecord(value) || value.executed !== true ||
+      !denseProductionIds(value.receiptIds) || !validProductionReceiptId(value.jobId) ||
+      value.effectKey !== "extract_candidate.persist.v1" ||
+      !validProductionReceiptId(value.evidenceId) || !plainRecord(value.candidate) ||
+      !plainRecord(value.effectTrace) || !Array.isArray(value.proposalReceipts) ||
+      value.proposalReceipts.length !== 1 || !plainRecord(value.derivationCounts) ||
+      !plainRecord(value.visibility)) return false;
+  const candidate = value.candidate;
+  const scope = candidate.scope;
+  const validationReceipt = candidate.validationReceipt;
+  if (!validProductionReceiptId(candidate.candidateId) || !exactKeys(scope, CANDIDATE_SCOPE_KEYS) ||
+      Object.values(scope).some((item) => !validProductionReceiptId(item)) ||
+      candidate.status !== "pending" || candidate.promotedToMemoryId !== null ||
+      typeof candidate.contentHash !== "string" || !/^[0-9a-f]{64}$/.test(candidate.contentHash) ||
+      candidate.activeContentHash !== candidate.contentHash ||
+      !Array.isArray(candidate.evidenceIds) ||
+      !sameIds(candidate.evidenceIds as string[], [value.evidenceId as string]) ||
+      !MEMORY_KINDS.has(candidate.memoryKind as MemoryKind) ||
+      candidate.semanticType !== "rules" ||
+      (candidate.admissionRoute !== "candidate" &&
+        candidate.admissionRoute !== "candidate_low_priority") ||
+      !score01(candidate.valueScore) || !score01(candidate.importance) ||
+      !score01(candidate.confidence) ||
+      !validAcceptedCandidateValidationReceipt(validationReceipt, value.evidenceId as string)) return false;
+  const effect = value.effectTrace;
+  if (effect.created !== 1 || effect.duplicateCount !== 0 ||
+      effect.capacityRejectedCount !== 0 || effect.droppedCount !== 0 ||
+      !Array.isArray(effect.candidateIds) ||
+      !sameIds(effect.candidateIds as string[], [candidate.candidateId as string]) ||
+      !Array.isArray(effect.memoryIds) || effect.memoryIds.length !== 0 ||
+      !Array.isArray(effect.activeMemoryIds) || effect.activeMemoryIds.length !== 0) return false;
+  const proposal = value.proposalReceipts[0];
+  if (!plainRecord(proposal) || proposal.version !== 1 ||
+      !plainRecord(validationReceipt) ||
+      proposal.candidateOrdinal !== validationReceipt.candidateOrdinal ||
+      proposal.outcome !== "accepted" ||
+      JSON.stringify(proposal.validation) !== JSON.stringify(validationReceipt) ||
+      !plainRecord(proposal.admission) || proposal.admission.version !== 1 ||
+      proposal.admission.outcome !== "accepted" ||
+      proposal.admission.route !== candidate.admissionRoute ||
+      proposal.admission.valueScore !== candidate.valueScore ||
+      typeof proposal.admission.reason !== "string" || proposal.admission.reason.length === 0 ||
+      !plainRecord(proposal.admission.breakdown)) return false;
+  const derivationCounts = value.derivationCounts;
+  const visibility = value.visibility;
+  if (!exactKeys(derivationCounts, PENDING_DERIVATION_KEYS) ||
+      PENDING_DERIVATION_KEYS.some((key) => derivationCounts[key] !== 0) ||
+      !exactKeys(visibility, PENDING_VISIBILITY_KEYS) ||
+      PENDING_VISIBILITY_KEYS.some((key) =>
+        !Array.isArray(visibility[key]) ||
+        (visibility[key] as unknown[]).some((id: unknown) => !validProductionReceiptId(id) ||
+          id === candidate.candidateId))) return false;
+  return receiptContains(value.receiptIds, [
+    value.jobId as string, value.effectKey as string, value.evidenceId as string,
+    candidate.candidateId as string,
+  ]);
+}
+
+function validProductionStage(
+  stage: ProductionRuntimeStage,
+  evidence: ProductionStageEvidence | undefined,
+): boolean {
+  const validBase = (receipt: ProductionStageEvidence[ProductionRuntimeStage]): boolean =>
+    receipt?.executed === true && denseProductionIds(receipt.receiptIds) &&
+    validProductionReceiptId(receipt.evidenceId) &&
+    validProductionReceiptId(receipt.activeMemoryId);
+
+  switch (stage) {
+    case "write_observe": {
+      const receipt = evidence?.write_observe;
+      if (!receipt || !validBase(receipt)) return false;
+      return validProductionReceiptId(receipt.traceId) &&
+        validProductionReceiptId(receipt.storageKey) &&
+        receiptContains(receipt.receiptIds, [receipt.traceId, receipt.storageKey, receipt.evidenceId]);
+    }
+    case "candidate": {
+      const receipt = evidence?.candidate;
+      if (!receipt || !validBase(receipt)) return false;
+      const governance = receipt.validatorAudit;
+      const dedup = receipt.dedupTrace;
+      return validProductionReceiptId(receipt.jobId) &&
+        receipt.effectKey === "extract_candidate.persist.v1" &&
+        MEMORY_KINDS.has(receipt.memoryKind) &&
+        isMemorySemanticType(receipt.semanticType) && receipt.admissionRoute === "active" &&
+        receipt.lifecycleStatus === "active" && receipt.contextEligible === true &&
+        score01(receipt.valueScore) && score01(receipt.importance) &&
+        score01(receipt.confidence) && plainRecord(governance) &&
+        governance.semanticType === receipt.semanticType && governance.admission === "active" &&
+        governance.valueScore === receipt.valueScore && plainRecord(governance.confidenceBreakdown) &&
+        dedup?.created === 1 && dedup.duplicateCount === 0 &&
+        dedup.capacityRejectedCount === 0 && dedup.droppedCount === 0 &&
+        denseProductionIds(dedup.memoryIds) && dedup.memoryIds.length === 1 &&
+        Array.isArray(dedup?.candidateIds) && dedup.candidateIds.length === 0 &&
+        denseProductionIds(dedup.activeMemoryIds) && dedup.activeMemoryIds.length === 1 &&
+        dedup.activeMemoryIds[0] === receipt.activeMemoryId &&
+        dedup.memoryIds[0] === receipt.activeMemoryId &&
+        validProductionPendingCandidate(receipt.pending) &&
+        receiptContains(receipt.receiptIds, [
+          receipt.jobId, receipt.effectKey, receipt.evidenceId, receipt.activeMemoryId,
+        ]);
+    }
+    case "graph": {
+      const receipt = evidence?.graph;
+      if (!receipt || !validBase(receipt)) return false;
+      return validProductionReceiptId(receipt.jobId) &&
+        receipt.effectKey === "extract_graph.persist.v1" &&
+        denseProductionIds(receipt.entityIds) && denseProductionIds(receipt.relationIds) &&
+        denseProductionIds(receipt.memoryEvidenceLinkIds) &&
+        denseProductionIds(receipt.entityEvidenceLinkIds) &&
+        denseProductionIds(receipt.relationEvidenceLinkIds) &&
+        validEvidenceBindings(receipt.memoryEvidenceBindings,
+          receipt.memoryEvidenceLinkIds, [receipt.activeMemoryId], receipt.evidenceId) &&
+        validEvidenceBindings(receipt.entityEvidenceBindings,
+          receipt.entityEvidenceLinkIds, receipt.entityIds, receipt.evidenceId) &&
+        validEvidenceBindings(receipt.relationEvidenceBindings,
+          receipt.relationEvidenceLinkIds, receipt.relationIds, receipt.evidenceId) &&
+        denseProductionIds(receipt.workMemoryNodeIds, 2) &&
+        validProductionReceiptId(receipt.workMemoryActiveNodeId) &&
+        validProductionReceiptId(receipt.workMemoryEvidenceNodeId) &&
+        receipt.workMemoryActiveNodeId !== receipt.workMemoryEvidenceNodeId &&
+        receipt.workMemoryNodeIds.includes(receipt.workMemoryActiveNodeId) &&
+        receipt.workMemoryNodeIds.includes(receipt.workMemoryEvidenceNodeId) &&
+        denseProductionIds(receipt.workMemoryEdgeIds) &&
+        Array.isArray(receipt.workMemoryEdgeBindings) &&
+        receipt.workMemoryEdgeBindings.length === receipt.workMemoryEdgeIds.length &&
+        sameIds(receipt.workMemoryEdgeBindings.map(({ edgeId }) => edgeId),
+          receipt.workMemoryEdgeIds) &&
+        receipt.workMemoryEdgeBindings.every(({ edgeId, predicate, sourceId, targetId,
+          evidenceChunkIds }) => validProductionReceiptId(edgeId) &&
+          predicate === "grounded_by" && sourceId === receipt.workMemoryActiveNodeId &&
+          targetId === receipt.workMemoryEvidenceNodeId &&
+          denseProductionIds(evidenceChunkIds) && evidenceChunkIds.includes(receipt.evidenceId)) &&
+        receiptContains(receipt.receiptIds, [
+          receipt.jobId, receipt.effectKey, receipt.evidenceId, receipt.activeMemoryId,
+          ...receipt.entityIds, ...receipt.relationIds, ...receipt.memoryEvidenceLinkIds,
+          ...receipt.entityEvidenceLinkIds, ...receipt.relationEvidenceLinkIds,
+          ...receipt.workMemoryNodeIds, ...receipt.workMemoryEdgeIds,
+        ]);
+    }
+    case "tree": {
+      const receipt = evidence?.tree;
+      if (!receipt || !validBase(receipt)) return false;
+      if (!Array.isArray(receipt.expectedTreeTypes) ||
+          receipt.expectedTreeTypes.some((treeType) => !isMemoryTreeType(treeType)) ||
+          new Set(receipt.expectedTreeTypes).size !== receipt.expectedTreeTypes.length ||
+          !receipt.expectedTreeTypes.includes("source")) return false;
+      if (!Array.isArray(receipt.bufferBindings) ||
+          !Array.isArray(receipt.topicJobIds) ||
+          !Array.isArray(receipt.topicLeafIds) ||
+          !Array.isArray(receipt.topicTreeKeys)) return false;
+      const expectsGlobal = receipt.expectedTreeTypes.includes("global");
+      const expectsTopic = receipt.expectedTreeTypes.includes("topic");
+      const globalBindings = receipt.bufferBindings.filter(({ treeType }) => treeType === "global");
+      const topicBindings = receipt.bufferBindings.filter(({ treeType }) => treeType === "topic");
+      const expectedBindingCount = 1 + (expectsGlobal ? 1 : 0) +
+        (expectsTopic ? receipt.topicJobIds.length : 0);
+      const requiredReceiptIds = [
+        receipt.effectKey,
+        receipt.sourceJobId,
+        receipt.sourceLeafId,
+        ...(expectsGlobal
+          ? [receipt.globalJobId as string, receipt.globalLeafId as string]
+          : []),
+        ...receipt.topicJobIds,
+        ...receipt.bufferBindings.map(({ bufferId }) => bufferId),
+      ];
+      return receipt.effectKey === "build_tree.persist.v1" &&
+        validProductionReceiptId(receipt.sourceJobId) &&
+        validProductionReceiptId(receipt.sourceTreeKey) &&
+        (expectsGlobal
+          ? validProductionReceiptId(receipt.globalJobId) &&
+            validProductionReceiptId(receipt.globalLeafId) &&
+            receipt.sourceJobId !== receipt.globalJobId && globalBindings.length === 1
+          : receipt.globalJobId === null && receipt.globalLeafId === null &&
+            globalBindings.length === 0) &&
+        (expectsTopic
+          ? denseProductionIds(receipt.topicJobIds) &&
+            denseProductionIds(receipt.topicLeafIds) &&
+            denseProductionIds(receipt.topicTreeKeys) &&
+            receipt.topicJobIds.length === receipt.topicLeafIds.length &&
+            receipt.topicJobIds.length === receipt.topicTreeKeys.length
+          : Array.isArray(receipt.topicJobIds) && receipt.topicJobIds.length === 0 &&
+            Array.isArray(receipt.topicLeafIds) && receipt.topicLeafIds.length === 0 &&
+            Array.isArray(receipt.topicTreeKeys) && receipt.topicTreeKeys.length === 0 &&
+            topicBindings.length === 0) &&
+        receipt.bufferBindings.length === expectedBindingCount &&
+        new Set(receipt.bufferBindings.map(({ jobId }) => jobId)).size ===
+          receipt.bufferBindings.length &&
+        new Set(receipt.bufferBindings.map(({ bufferId }) => bufferId)).size ===
+          receipt.bufferBindings.length &&
+        receipt.bufferBindings.every(({ leafId, bufferId, treeKey }) =>
+          leafId === receipt.activeMemoryId && validProductionReceiptId(bufferId) &&
+          validProductionReceiptId(treeKey)) &&
+        receipt.bufferBindings.some(({ jobId, treeType, treeKey }) =>
+          jobId === receipt.sourceJobId && treeType === "source" &&
+          treeKey === receipt.sourceTreeKey) &&
+        (!expectsGlobal || globalBindings.some(({ jobId, treeKey }) =>
+          jobId === receipt.globalJobId && /^\d{4}-\d{2}-\d{2}$/.test(treeKey))) &&
+        topicBindings.length === receipt.topicJobIds.length &&
+        topicBindings.every(
+          ({ jobId, treeKey }) => receipt.topicJobIds.includes(jobId) &&
+            receipt.topicTreeKeys.includes(treeKey),
+        ) &&
+        Array.isArray(receipt.coldTopicJobIds) && receipt.coldTopicJobIds.length === 0 &&
+        Array.isArray(receipt.coldTopicBufferIds) && receipt.coldTopicBufferIds.length === 0 &&
+        validProductionReceiptId(receipt.hotness?.topicEntityId) &&
+        receipt.hotness.threshold === 6 && validHotnessEvidence(receipt.hotness.beforeRecall) &&
+        validHotnessEvidence(receipt.hotness.afterRecall) &&
+        receipt.hotness.beforeRecall.score < receipt.hotness.threshold &&
+        receipt.hotness.afterRecall.score >= receipt.hotness.threshold &&
+        receipt.hotness.afterRecall.queryHits30d > receipt.hotness.beforeRecall.queryHits30d &&
+        validProductionSealedSummary(receipt.sealedSummary) &&
+        receipt.topicJobIds.every((jobId) =>
+          jobId !== receipt.sourceJobId && (!expectsGlobal || jobId !== receipt.globalJobId)) &&
+        receipt.sourceLeafId === receipt.activeMemoryId &&
+        (!expectsGlobal || receipt.globalLeafId === receipt.activeMemoryId) &&
+        receipt.topicLeafIds.every((leafId) => leafId === receipt.activeMemoryId) &&
+        sameIds(
+          Array.from(new Set(receipt.bufferBindings.map(({ treeType }) => treeType))),
+          receipt.expectedTreeTypes,
+        ) && receiptContains(receipt.receiptIds, requiredReceiptIds);
+    }
+    case "context_recall": {
+      const receipt = evidence?.context_recall;
+      if (!receipt || !validBase(receipt)) return false;
+      if (!exactKeys(receipt.slotActiveMemoryIds, SEMANTIC_TYPES) ||
+          !exactKeys(receipt.slotSourceIds, SEMANTIC_TYPES) ||
+          !exactKeys(receipt.slotScoreBreakdowns, SEMANTIC_TYPES)) return false;
+      const slotActiveMemoryIds = SEMANTIC_TYPES.map((semanticType) =>
+        receipt.slotActiveMemoryIds[semanticType]);
+      if (!denseProductionIds(slotActiveMemoryIds, SEMANTIC_TYPES.length)) return false;
+      const slotsAreIsolated = SEMANTIC_TYPES.every((semanticType) => {
+        const ownId = receipt.slotActiveMemoryIds[semanticType];
+        const sourceIds = receipt.slotSourceIds[semanticType];
+        const foreignIds = slotActiveMemoryIds.filter((id) => id !== ownId);
+        return denseProductionIds(sourceIds) && sourceIds.includes(ownId) &&
+          foreignIds.every((foreignId) => !sourceIds.includes(foreignId)) &&
+          isRecallScoreBreakdown(receipt.slotScoreBreakdowns[semanticType]);
+      });
+      return denseProductionIds(receipt.contextSourceIds) &&
+        denseProductionIds(receipt.lookupHitIds) && denseProductionIds(receipt.recallHitIds) &&
+        receipt.contextSourceIds.includes(receipt.activeMemoryId) &&
+        receipt.lookupHitIds.includes(receipt.activeMemoryId) &&
+        receipt.recallHitIds.includes(receipt.activeMemoryId) &&
+        sameCompleteRecallBreakdowns([
+          receipt.contextScoreBreakdown,
+          receipt.lookupScoreBreakdown,
+          receipt.recallScoreBreakdown,
+        ]) &&
+        slotsAreIsolated && slotActiveMemoryIds.every((id) => receipt.contextSourceIds.includes(id)) &&
+        receiptContains(receipt.receiptIds, [receipt.activeMemoryId, ...slotActiveMemoryIds]);
+    }
+  }
+}
+
+function linkedProductionStages(evidence: ProductionStageEvidence | undefined): boolean {
+  const stages = REQUIRED_PRODUCTION_STAGES.map((stage) => evidence?.[stage]);
+  if (stages.some((stage) => stage === undefined)) return false;
+  return new Set(stages.map((stage) => stage!.evidenceId)).size === 1 &&
+    new Set(stages.map((stage) => stage!.activeMemoryId)).size === 1;
+}
+
+export function hasValidProductionRestartReplayEvidence(
+  summary: SuiteSummary,
+): boolean {
+  const execution = summary.execution;
+  const restart = execution?.productionRestartReplayEvidence;
+  const stages = execution?.productionStageEvidence;
+  if (restart?.restarted !== true || !stages?.write_observe || !stages.candidate ||
+      !stages.graph || !stages.tree || !stages.context_recall ||
+      restart.replayedCandidateJobId !== stages.candidate.jobId ||
+      !denseProductionIds(restart.effectReceiptIdsBeforeRestart, 3) ||
+      !denseProductionIds(restart.effectReceiptIdsAfterRestart, 3) ||
+      !denseProductionIds(restart.ledgerIdsBeforeRestart, 4) ||
+      !denseProductionIds(restart.ledgerIdsAfterRestart, 4) ||
+      restart.effectReceiptCountBeforeRestart !== restart.effectReceiptIdsBeforeRestart.length ||
+      restart.effectReceiptCountAfterRestart !== restart.effectReceiptIdsAfterRestart.length ||
+      restart.ledgerCountBeforeRestart !== restart.ledgerIdsBeforeRestart.length ||
+      restart.ledgerCountAfterRestart !== restart.ledgerIdsAfterRestart.length ||
+      JSON.stringify(restart.effectReceiptIdsBeforeRestart) !==
+        JSON.stringify(restart.effectReceiptIdsAfterRestart) ||
+      JSON.stringify(restart.ledgerIdsBeforeRestart) !==
+        JSON.stringify(restart.ledgerIdsAfterRestart) ||
+      !sameIds(restart.contextSourceIdsBeforeRestart, restart.contextSourceIdsAfterRestart) ||
+      !sameIds(restart.lookupHitIdsBeforeRestart, restart.lookupHitIdsAfterRestart) ||
+      !sameIds(restart.recallHitIdsBeforeRestart, restart.recallHitIdsAfterRestart) ||
+      !restart.contextSourceIdsAfterRestart.includes(stages.context_recall.activeMemoryId) ||
+      !restart.lookupHitIdsAfterRestart.includes(stages.context_recall.activeMemoryId) ||
+      !restart.recallHitIdsAfterRestart.includes(stages.context_recall.activeMemoryId) ||
+      !exactKeys(restart.slotSourceIdsBeforeRestart, SEMANTIC_TYPES) ||
+      !exactKeys(restart.slotSourceIdsAfterRestart, SEMANTIC_TYPES) ||
+      SEMANTIC_TYPES.some((semanticType) => !sameIds(
+        restart.slotSourceIdsBeforeRestart[semanticType],
+        restart.slotSourceIdsAfterRestart[semanticType],
+      )) ||
+      !sameCompleteRecallBreakdowns([
+        stages.context_recall.contextScoreBreakdown,
+        stages.context_recall.lookupScoreBreakdown,
+        stages.context_recall.recallScoreBreakdown,
+        restart.contextScoreBreakdownBeforeRestart,
+        restart.lookupScoreBreakdownBeforeRestart,
+        restart.recallScoreBreakdownBeforeRestart,
+        restart.contextScoreBreakdownAfterRestart,
+        restart.lookupScoreBreakdownAfterRestart,
+        restart.recallScoreBreakdownAfterRestart,
+      ]) ||
+      !plainRecord(restart.pending) ||
+      !stages.candidate.pending ||
+      restart.pending.replayedCandidateJobId !== stages.candidate.pending.jobId ||
+      JSON.stringify(restart.pending.candidateBeforeRestart) !==
+        JSON.stringify(stages.candidate.pending.candidate) ||
+      JSON.stringify(restart.pending.candidateAfterRestart) !==
+        JSON.stringify(stages.candidate.pending.candidate) ||
+      JSON.stringify(restart.pending.effectTraceBeforeRestart) !==
+        JSON.stringify(stages.candidate.pending.effectTrace) ||
+      JSON.stringify(restart.pending.effectTraceAfterRestart) !==
+        JSON.stringify(stages.candidate.pending.effectTrace) ||
+      JSON.stringify(restart.pending.proposalReceiptsBeforeRestart) !==
+        JSON.stringify(stages.candidate.pending.proposalReceipts) ||
+      JSON.stringify(restart.pending.proposalReceiptsAfterRestart) !==
+        JSON.stringify(stages.candidate.pending.proposalReceipts) ||
+      JSON.stringify(restart.pending.derivationCountsBeforeRestart) !==
+        JSON.stringify(stages.candidate.pending.derivationCounts) ||
+      JSON.stringify(restart.pending.derivationCountsAfterRestart) !==
+        JSON.stringify(stages.candidate.pending.derivationCounts) ||
+      JSON.stringify(restart.pending.visibilityBeforeRestart) !==
+        JSON.stringify(stages.candidate.pending.visibility) ||
+      JSON.stringify(restart.pending.visibilityAfterRestart) !==
+        JSON.stringify(stages.candidate.pending.visibility) ||
+      !validProductionSealedSummary(restart.sealedSummaryBeforeRestart) ||
+      !validProductionSealedSummary(restart.sealedSummaryAfterRestart) ||
+      JSON.stringify(restart.sealedSummaryBeforeRestart) !==
+        JSON.stringify(stages.tree.sealedSummary) ||
+      JSON.stringify(restart.sealedSummaryAfterRestart) !==
+        JSON.stringify(stages.tree.sealedSummary) ||
+      !nonNegativeInteger(restart.sealedSummaryAttemptsBeforeRestart) ||
+      !nonNegativeInteger(restart.sealedSummaryAttemptsAfterRestart) ||
+      restart.sealedSummaryAttemptsBeforeRestart < 1 ||
+      restart.sealedSummaryAttemptsAfterRestart <=
+        restart.sealedSummaryAttemptsBeforeRestart) return false;
+  const topicJobIds = stages.tree.topicJobIds;
+  return receiptContains(restart.effectReceiptIdsAfterRestart, [
+    `${stages.candidate.jobId}:${stages.candidate.effectKey}`,
+    `${stages.graph.jobId}:${stages.graph.effectKey}`,
+    `${stages.tree.sourceJobId}:${stages.tree.effectKey}`,
+    ...(stages.tree.globalJobId === null
+      ? []
+      : [`${stages.tree.globalJobId}:${stages.tree.effectKey}`]),
+    ...topicJobIds.map((jobId) => `${jobId}:${stages.tree!.effectKey}`),
+  ]) && receiptContains(restart.ledgerIdsAfterRestart, [
+    stages.write_observe!.storageKey,
+    ...stages.graph.memoryEvidenceLinkIds,
+    ...stages.graph.entityEvidenceLinkIds,
+    ...stages.graph.relationEvidenceLinkIds,
+    ...stages.graph.workMemoryNodeIds,
+    ...stages.graph.workMemoryEdgeIds,
+  ]);
+}
+
+export function findMissingProductionStageEvidence(
+  evidence: ProductionStageEvidence | undefined,
+  requiredStages: readonly ProductionRuntimeStage[] = REQUIRED_PRODUCTION_STAGES,
+): ProductionRuntimeStage[] {
+  if (!linkedProductionStages(evidence)) return [...requiredStages];
+  return requiredStages.filter((stage) => !validProductionStage(stage, evidence));
+}
+
+/** 只有真实宿主 E2E、无降级且五阶段 receipt 齐全才具备 production release 资格。 */
 export function isProductionReleaseEligible(
   summaries: readonly SuiteSummary[],
 ): boolean {
@@ -277,7 +829,11 @@ export function isProductionReleaseEligible(
         validExecutionIdentity(summary.execution.prompt, 2_048) &&
         validExecutionIdentity(summary.execution.version, 256) &&
         summary.execution.fallback === false &&
-        summary.execution.degraded === false,
+        summary.execution.degraded === false &&
+        findMissingProductionStageEvidence(
+          summary.execution.productionStageEvidence,
+        ).length === 0 &&
+        hasValidProductionRestartReplayEvidence(summary),
     )
   );
 }

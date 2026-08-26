@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { afterEach, describe, expect, test } from "vitest";
 import type { MemoryService } from "../../core/service-types.js";
@@ -8,6 +8,12 @@ import { createMcpStdioServer } from "../../packages/mcp/src/stdio-server.js";
 import { createExactMcpAuthority } from "../../packages/mcp/src/authority.js";
 
 const rootDir = process.cwd();
+const codexPluginDir = join(rootDir, "plugins/codex");
+const codexPluginVersion = (
+  JSON.parse(readFileSync(join(codexPluginDir, ".codex-plugin/plugin.json"), "utf8")) as {
+    version: string;
+  }
+).version;
 const children: ChildProcessWithoutNullStreams[] = [];
 const mcpScope = {
   tenantId: "smoke-tenant",
@@ -34,6 +40,59 @@ function makeMsShim(dir: string): void {
     ].join("\n"),
     { mode: 0o755 },
   );
+}
+
+function makeVersionedMsShim(
+  dir: string,
+  options: {
+    readonly versionOutput?: string;
+    readonly versionExitCode?: number;
+  } = {},
+): string {
+  const shim = join(dir, "ms");
+  const versionOutput = options.versionOutput ?? codexPluginVersion;
+  const versionExitCode = options.versionExitCode ?? 0;
+  writeFileSync(
+    shim,
+    [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"--version\" ]; then",
+      `  printf '%s\\n' ${JSON.stringify(versionOutput)}`,
+      `  exit ${versionExitCode}`,
+      "fi",
+      "if [ \"$1\" = \"mcp\" ]; then",
+      "  if [ -n \"$MENGSHU_TEST_MCP_MARKER\" ]; then : > \"$MENGSHU_TEST_MCP_MARKER\"; fi",
+      "  exit 0",
+      "fi",
+      "exit 64",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return shim;
+}
+
+async function runCodexWrapper(
+  env: NodeJS.ProcessEnv,
+): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> {
+  const child = spawn(process.execPath, ["mcp/server.mjs"], {
+    cwd: codexPluginDir,
+    env: {
+      ...process.env,
+      MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
+      MENGSHU_AUTHORITY_FILE: "",
+      ...env,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  children.push(child);
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+    child.once("exit", (code) => resolve({ code, stdout, stderr }));
+  });
 }
 
 function readJsonResponse(child: ChildProcessWithoutNullStreams, id: number): Promise<Record<string, unknown>> {
@@ -94,12 +153,155 @@ afterEach(() => {
 });
 
 describe("Codex MCP plugin smoke", () => {
-  test("Codex manifest declares the host-owned 0600 authority file boundary", () => {
+  test("Codex manifest resolves the global Mengshu home and 0600 authority file from HOME", () => {
     const manifest = JSON.parse(
       readFileSync(join(rootDir, "plugins/codex/.mcp.json"), "utf8"),
     ) as { mcpServers?: { mengshu?: { env?: Record<string, string> } } };
-    expect(manifest.mcpServers?.mengshu?.env?.MENGSHU_AUTHORITY_FILE)
-      .toBe("${MENGSHU_AUTHORITY_FILE}");
+    expect(manifest.mcpServers?.mengshu?.env).toMatchObject({
+      MENGSHU_HOME: "${HOME}/.mengshu",
+      MENGSHU_AUTHORITY_FILE: "${HOME}/.mengshu/authority.json",
+    });
+  });
+
+  test("runtime preflight executes mcp only after an explicit runtime matches the plugin version", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-version-match-"));
+    try {
+      const binDir = join(temp, "bin");
+      const marker = join(temp, "mcp-started");
+      mkdirSync(binDir, { recursive: true });
+      makeVersionedMsShim(binDir);
+
+      const result = await runCodexWrapper({
+        PATH: binDir,
+        MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
+        MENGSHU_TEST_MCP_MARKER: marker,
+      });
+
+      expect(result).toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test("runtime preflight does not consult PATH when an absolute runtime override is provided", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-no-path-"));
+    try {
+      const executable = makeVersionedMsShim(temp);
+      const result = await runCodexWrapper({ PATH: "", MENGSHU_CODEX_MS_PATH: executable });
+
+      expect(result).toEqual({ code: 0, stdout: "", stderr: "" });
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test("runtime preflight rejects an old selected ms without executing mcp", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-version-old-"));
+    try {
+      const binDir = join(temp, "bin");
+      const marker = join(temp, "mcp-started");
+      mkdirSync(binDir, { recursive: true });
+      makeVersionedMsShim(binDir, { versionOutput: "1.0.6" });
+
+      const result = await runCodexWrapper({
+        PATH: binDir,
+        MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
+        MENGSHU_TEST_MCP_MARKER: marker,
+      });
+
+      expect(result.code).not.toBe(0);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(/version mismatch/i);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test("runtime preflight ignores PATH ordering and uses only the explicit runtime override", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-version-order-"));
+    try {
+      const oldBinDir = join(temp, "old-bin");
+      const newBinDir = join(temp, "new-bin");
+      const marker = join(temp, "mcp-started");
+      mkdirSync(oldBinDir, { recursive: true });
+      mkdirSync(newBinDir, { recursive: true });
+      makeVersionedMsShim(oldBinDir, { versionOutput: "1.0.6" });
+      makeVersionedMsShim(newBinDir);
+
+      const result = await runCodexWrapper({
+        PATH: oldBinDir,
+        MENGSHU_CODEX_MS_PATH: join(newBinDir, "ms"),
+        MENGSHU_TEST_MCP_MARKER: marker,
+      });
+
+      expect(result).toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    { name: "unparseable output", versionOutput: "mengshu development build", versionExitCode: 0 },
+    { name: "failed process", versionOutput: codexPluginVersion, versionExitCode: 23 },
+  ])("runtime preflight rejects $name without executing mcp", async ({ versionOutput, versionExitCode }) => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-version-invalid-"));
+    try {
+      const binDir = join(temp, "bin");
+      const marker = join(temp, "mcp-started");
+      mkdirSync(binDir, { recursive: true });
+      makeVersionedMsShim(binDir, { versionOutput, versionExitCode });
+
+      const result = await runCodexWrapper({
+        PATH: binDir,
+        MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
+        MENGSHU_TEST_MCP_MARKER: marker,
+      });
+
+      expect(result.code).not.toBe(0);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(/runtime preflight/i);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    { name: "relative", value: "./ms" },
+    { name: "missing", value: "/definitely/missing/mengshu-ms" },
+  ])("runtime preflight rejects $name explicit runtime paths", async ({ value }) => {
+    const result = await runCodexWrapper({
+      PATH: process.env.PATH ?? "",
+      MENGSHU_CODEX_MS_PATH: value,
+    });
+
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toMatch(/runtime preflight/i);
+  });
+
+  test("runtime preflight accepts a matching executable absolute override with an empty PATH", async () => {
+    const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-version-override-"));
+    try {
+      const binDir = join(temp, "bin");
+      const marker = join(temp, "mcp-started");
+      mkdirSync(binDir, { recursive: true });
+      const executable = makeVersionedMsShim(binDir);
+
+      const result = await runCodexWrapper({
+        PATH: "",
+        MENGSHU_CODEX_MS_PATH: executable,
+        MENGSHU_TEST_MCP_MARKER: marker,
+      });
+
+      expect(result).toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
   });
 
   test("starts through plugins/codex/mcp/server.mjs and lists mengshu tools", async () => {
@@ -130,7 +332,8 @@ describe("Codex MCP plugin smoke", () => {
           MENGSHU_HOME: homeDir,
           MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
           MENGSHU_AUTHORITY_FILE: "",
-          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          PATH: process.env.PATH ?? "",
+          MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
         },
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -174,7 +377,7 @@ describe("Codex MCP plugin smoke", () => {
     } finally {
       rmSync(temp, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("missing authority rejects before config/runtime and does not echo raw config", async () => {
     const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-mcp-no-auth-"));
@@ -192,7 +395,8 @@ describe("Codex MCP plugin smoke", () => {
           MENGSHU_HOME: homeDir,
           MENGSHU_AUTHORITY_JSON: "",
           MENGSHU_AUTHORITY_FILE: "",
-          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          PATH: process.env.PATH ?? "",
+          MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
         },
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -228,7 +432,8 @@ describe("Codex MCP plugin smoke", () => {
           MENGSHU_AUTHORITY_JSON: "",
           MENGSHU_AUTHORITY_FILE: "\${MENGSHU_AUTHORITY_FILE}",
           MENGSHU_TEST_SPAWN_MARKER: marker,
-          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          PATH: process.env.PATH ?? "",
+          MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
         },
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -287,6 +492,8 @@ describe("Codex MCP plugin smoke", () => {
         [
           "#!/usr/bin/env node",
           "const fs = require('node:fs');",
+          `if (process.argv[2] === '--version') { console.log(${JSON.stringify(codexPluginVersion)}); process.exit(0); }`,
+          "if (process.argv[2] !== 'mcp') process.exit(64);",
           "fs.writeFileSync(process.env.MENGSHU_TEST_CHILD_PID_FILE, String(process.pid));",
           "const timer = setInterval(() => {}, 1000);",
           "process.on('SIGTERM', () => { process.exitCode = 0; clearInterval(timer); });",
@@ -302,12 +509,13 @@ describe("Codex MCP plugin smoke", () => {
           MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
           MENGSHU_AUTHORITY_FILE: "",
           MENGSHU_TEST_CHILD_PID_FILE: pidFile,
-          PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+          PATH: process.env.PATH ?? "",
+          MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
         },
         stdio: ["pipe", "pipe", "pipe"],
       });
       children.push(wrapper);
-      const deadline = Date.now() + 3_000;
+      const deadline = Date.now() + 10_000;
       while (!existsSync(pidFile) || !readFileSync(pidFile, "utf8").trim()) {
         if (Date.now() >= deadline) throw new Error("wrapper child pid was not written");
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -345,6 +553,8 @@ describe("Codex MCP plugin smoke", () => {
             "#!/usr/bin/env node",
             "const { spawn } = require('node:child_process');",
             "const fs = require('node:fs');",
+            `if (process.argv[2] === '--version') { console.log(${JSON.stringify(codexPluginVersion)}); process.exit(0); }`,
+            "if (process.argv[2] !== 'mcp') process.exit(64);",
             "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
             "fs.writeFileSync(process.env.MENGSHU_TEST_PROCESS_FILE, JSON.stringify({ child: process.pid, grandchild: grandchild.pid }));",
             "const timer = setInterval(() => {}, 1000);",
@@ -361,14 +571,15 @@ describe("Codex MCP plugin smoke", () => {
             MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
             MENGSHU_AUTHORITY_FILE: "",
             MENGSHU_TEST_PROCESS_FILE: pidFile,
-            PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+            PATH: process.env.PATH ?? "",
+            MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
           },
           stdio: ["pipe", "pipe", "pipe"],
         });
         children.push(wrapper);
         let stderr = "";
         wrapper.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
-        const deadline = Date.now() + 3_000;
+        const deadline = Date.now() + 10_000;
         while (!existsSync(pidFile) || !readFileSync(pidFile, "utf8").trim()) {
           if (Date.now() >= deadline) throw new Error("wrapper process group pids were not written");
           await new Promise((resolve) => setTimeout(resolve, 20));
@@ -417,6 +628,8 @@ describe("Codex MCP plugin smoke", () => {
             "#!/usr/bin/env node",
             "const { spawn } = require('node:child_process');",
             "const fs = require('node:fs');",
+            `if (process.argv[2] === '--version') { console.log(${JSON.stringify(codexPluginVersion)}); process.exit(0); }`,
+            "if (process.argv[2] !== 'mcp') process.exit(64);",
             "const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
             "fs.writeFileSync(process.env.MENGSHU_TEST_GRANDCHILD_FILE, String(grandchild.pid));",
             "process.stdin.resume();",
@@ -432,14 +645,15 @@ describe("Codex MCP plugin smoke", () => {
             MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
             MENGSHU_AUTHORITY_FILE: "",
             MENGSHU_TEST_GRANDCHILD_FILE: pidFile,
-            PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+            PATH: process.env.PATH ?? "",
+            MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
           },
           stdio: ["pipe", "pipe", "pipe"],
         });
         children.push(wrapper);
         let stderr = "";
         wrapper.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
-        const deadline = Date.now() + 3_000;
+        const deadline = Date.now() + 10_000;
         while (!existsSync(pidFile) || !readFileSync(pidFile, "utf8").trim()) {
           if (Date.now() >= deadline) throw new Error("EOF grandchild pid was not written");
           await new Promise((resolve) => setTimeout(resolve, 20));

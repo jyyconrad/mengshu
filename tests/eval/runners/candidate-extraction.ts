@@ -90,6 +90,12 @@ interface SourceEvent {
   role: ExtractionMessage["role"] | "document";
 }
 
+function sourceKind(role: SourceEvent["role"]) {
+  if (role === "document") return "document" as const;
+  if (role === "assistant") return "agent_output" as const;
+  return "session_user" as const;
+}
+
 function sourceEvents(goldenCase: CandidateExtractionCase): SourceEvent[] {
   const conversation = (goldenCase.input.conversation ?? []).map(
     (message, index): SourceEvent => ({
@@ -259,6 +265,7 @@ async function evaluateCase(
       text: event.text,
       traceId: event.traceId,
       intent: goldenCase.input.hints?.explicitSave ? "remember" : "auto",
+      evidenceFacts: [{ evidenceId: event.traceId, sourceKind: sourceKind(event.role) }],
     });
     for (const [specIndex, spec] of computed.specs.entries()) {
       actualCandidates.push(normalizeSpec(

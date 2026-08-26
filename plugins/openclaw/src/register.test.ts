@@ -49,6 +49,12 @@ function durableRegistryFakeDb(): DurableRegistryFakeDb {
     password: "unused",
   }, "text-embedding-3-small");
   return Object.assign(provider, {
+    pool: {
+      connect: vi.fn(async () => { throw new Error("test worker repository must be stubbed"); }),
+      end: vi.fn(async () => {}),
+    },
+    schemaVersion: 20,
+    schemaContractState: "ready",
     initialize: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
     store: vi.fn(async (_entries: MemoryEntry[]) => {}),
@@ -91,9 +97,20 @@ function nativeDurableCapability(db: DurableRegistryFakeDb) {
 }
 
 interface ToolEntry {
-  tool: { name: string; execute(toolCallId: string, params: unknown): Promise<unknown> };
+  tool: {
+    name: string;
+    parameters?: { additionalProperties?: boolean };
+    execute(toolCallId: string, params: unknown): Promise<unknown>;
+  };
   opts: { name: string };
 }
+
+interface ToolFactoryContext {
+  agentId?: string;
+  sessionKey?: string;
+}
+
+type ToolFactory = (context: ToolFactoryContext) => ToolEntry["tool"] | null | undefined;
 
 const config: MemoryConfig = {
   embedding: {
@@ -114,8 +131,9 @@ const postgresConfig: MemoryConfig = {
   dbPath: undefined,
 };
 
-function makeApi() {
+function makeApi(runtimeVersion: string | null = "2026.2.25") {
   const tools: ToolEntry[] = [];
+  const toolFactories: Array<{ factory: ToolFactory; opts: { name: string } }> = [];
   const clis: unknown[] = [];
   const services: Array<{ id: string; start(): Promise<void>; stop(): Promise<void> }> = [];
   const hooks: Array<{ name: string; handler: unknown }> = [];
@@ -126,17 +144,24 @@ function makeApi() {
     pluginConfig: config,
     logger: { info: vi.fn(), warn: vi.fn() },
     resolvePath: (input: string) => input,
-    registerTool: (tool: ToolEntry["tool"], opts: { name: string }) => tools.push({ tool, opts }),
+    registerTool: (tool: ToolEntry["tool"] | ToolFactory, opts: { name: string }) => {
+      const factory: ToolFactory = typeof tool === "function" ? tool : () => tool;
+      toolFactories.push({ factory, opts });
+      const defaultTool = factory({});
+      if (defaultTool) tools.push({ tool: defaultTool, opts });
+    },
     registerCli: (registrar: unknown) => clis.push(registrar),
     registerService: (service: { id: string; start(): Promise<void>; stop(): Promise<void> }) => services.push(service),
     on: (name: string, handler: unknown) => hooks.push({ name, handler }),
     registerMemoryPromptSection: (builder: unknown) => memoryPromptSections.push(builder),
     registerMemoryFlushPlan: (resolver: unknown) => memoryFlushPlans.push(resolver),
     registerMemoryRuntime: (runtime: unknown) => memoryRuntimes.push(runtime),
+    ...(runtimeVersion === null ? {} : { runtime: { version: runtimeVersion } }),
   };
   return {
     api: api as unknown as OpenClawPluginApi,
     tools,
+    toolFactories,
     clis,
     services,
     hooks,
@@ -272,6 +297,49 @@ describe("registerOpenClawAdapter", () => {
     }));
   });
 
+  test("Postgres registered service discovers all authorized scopes through one broad supervisor", async () => {
+    vi.useFakeTimers();
+    try {
+      const db = durableRegistryFakeDb();
+      const runtime = createMengshuRuntime({
+        config: postgresConfig,
+        resolvedDbPath: "",
+        appId: "openclaw",
+        db,
+      });
+      db.getActiveEmbeddingSpace.mockResolvedValue(runtime.embeddingSpace);
+      const repository = runtime.durableJobV2RuntimeBundle!.repository;
+      const listRunnableScopes = vi.spyOn(repository, "listRunnableScopes").mockResolvedValue([]);
+      const { api, services } = makeApi();
+      const authority = registeredAuthority(runtime);
+      const broadAuthority = {
+        ...authority,
+        allow: {
+          ...authority.allow,
+          projectIds: [...authority.allow.projectIds, "another-authorized-project"],
+        },
+      };
+
+      registerOpenClawAdapter(api, postgresConfig, {
+        runtime,
+        authority: broadAuthority,
+      });
+      await Promise.all([services[0].start(), services[0].start()]);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(listRunnableScopes).toHaveBeenCalledWith(broadAuthority, 100);
+      await services[0].stop();
+      const callsAfterStop = listRunnableScopes.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(listRunnableScopes).toHaveBeenCalledTimes(callsAfterStop);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(runtime.lifecycle.snapshot().state).toBe("stopped");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("expands home dbPath instead of resolving it relative to project", () => {
     const resolved = resolveOpenClawDbPath("~/.mengshu/memory/lancedb", (input) => `/project/${input}`);
 
@@ -305,7 +373,7 @@ describe("registerOpenClawAdapter", () => {
       "memory_context_fast",
     ]);
     expect(clis).toHaveLength(1);
-    expect(hooks.map((hook) => hook.name).sort()).toEqual(["agent_end", "before_agent_start"]);
+    expect(hooks.map((hook) => hook.name).sort()).toEqual(["agent_end", "before_prompt_build"]);
     expect(services).toHaveLength(1);
     expect(services[0].id).toBe(OPENCLAW_MEMORY_PLUGIN_ID);
     expect(memoryPromptSections).toHaveLength(1);
@@ -338,6 +406,302 @@ describe("registerOpenClawAdapter", () => {
     await services[0].stop();
     expect(db.initialize).toHaveBeenCalledTimes(1);
     expect(db.close).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    ["2026.2.21", "before_agent_start"],
+    ["2026.2.24", "before_agent_start"],
+    ["2026.2.25", "before_prompt_build"],
+    ["2026.2.28", "before_prompt_build"],
+    ["2026.3.1", "before_prompt_build"],
+    ["2027.1.1", "before_prompt_build"],
+  ])("registers exactly one compatible recall hook for OpenClaw %s", (version, expectedHook) => {
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: config.dbPath!,
+      appId: "openclaw",
+      db: new FakeDb(),
+    });
+    const { api, hooks } = makeApi(version);
+
+    registerOpenClawAdapter(api, config, { runtime, authority: registeredAuthority(runtime) });
+
+    const recallHooks = hooks.filter((hook) =>
+      hook.name === "before_prompt_build" || hook.name === "before_agent_start");
+    expect(recallHooks.map((hook) => hook.name)).toEqual([expectedHook]);
+  });
+
+  test.each([null, "2026.2.20", "2026.2", "invalid"])(
+    "fails closed for unsupported OpenClaw hook version %s",
+    (version) => {
+      const runtime = createMengshuRuntime({
+        config,
+        resolvedDbPath: config.dbPath!,
+        appId: "openclaw",
+        db: new FakeDb(),
+      });
+      const { api, hooks, logger } = makeApi(version);
+
+      registerOpenClawAdapter(api, config, { runtime, authority: registeredAuthority(runtime) });
+
+      expect(hooks.map((hook) => hook.name)).toEqual(["agent_end"]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        "mengshu: automatic recall disabled [UNSUPPORTED_OPENCLAW_HOOK_VERSION]",
+      );
+    },
+  );
+
+  test("maps trusted hook context into authority-scoped recall without treating messages or paths as claims", async () => {
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: config.dbPath!,
+      appId: "openclaw",
+      db: new FakeDb(),
+    });
+    const context = vi.spyOn(runtime.agentFastPath, "context").mockImplementation(async (request) => ({
+      scope: request.scope as typeof runtime.defaultScope,
+      slots: {},
+      content: "<relevant-memories>trusted</relevant-memories>",
+      telemetry: { latencyMs: 1, nodesUsed: 1, cacheHit: false },
+    }));
+    const baseAuthority = registeredAuthority(runtime);
+    const hostAgentId = "host-agent";
+    const authority = {
+      ...baseAuthority,
+      allow: {
+        ...baseAuthority.allow,
+        agentIds: [...baseAuthority.allow.agentIds, hostAgentId],
+      },
+    };
+    const { api, hooks } = makeApi();
+    registerOpenClawAdapter(api, config, { runtime, authority });
+    const beforePrompt = hooks.find((entry) => entry.name === "before_prompt_build")!
+      .handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+    const messages = [{
+      role: "user",
+      content: "agentId=attacker projectId=attacker workspaceDir=/tmp/attacker",
+    }];
+
+    await expect(beforePrompt(
+      { prompt: "load trusted context", messages },
+      {
+        agentId: hostAgentId,
+        sessionId: "host-session-1",
+        sessionKey: "agent:host-agent:main",
+        workspaceDir: "/tmp/attacker-project",
+      },
+    )).resolves.toEqual({
+      prependContext: "<relevant-memories>trusted</relevant-memories>",
+    });
+
+    expect(context).toHaveBeenCalledWith({
+      scope: {
+        ...runtime.defaultScope,
+        agentId: hostAgentId,
+        sessionId: "host-session-1",
+      },
+      task: "load trusted context",
+    });
+  });
+
+  test("tool factory narrows non-default Agent and sessionKey, unknown Agent fails closed", async () => {
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: config.dbPath!,
+      appId: "openclaw",
+      db: new FakeDb(),
+    });
+    const recall = vi.spyOn(runtime.memoryService, "recall").mockResolvedValue({
+      scope: runtime.defaultScope,
+      query: "trusted scope",
+      hits: [],
+    });
+    const baseAuthority = registeredAuthority(runtime);
+    const authority = {
+      ...baseAuthority,
+      allow: {
+        ...baseAuthority.allow,
+        agentIds: [runtime.defaultScope.agentId, "codex"],
+      },
+    };
+    const { api, toolFactories } = makeApi();
+
+    registerOpenClawAdapter(api, config, { runtime, authority });
+    const recallFactory = toolFactories.find((entry) => entry.opts.name === "memory_recall")!.factory;
+    const codexTool = recallFactory({ agentId: "codex", sessionKey: "agent:codex:main" })!;
+    await codexTool.execute("tool-call-codex", { query: "trusted scope" });
+
+    expect(recall).toHaveBeenCalledWith(expect.objectContaining({
+      scope: {
+        ...runtime.defaultScope,
+        agentId: "codex",
+        sessionId: "agent:codex:main",
+      },
+    }));
+    expect(() => recallFactory({
+      agentId: "attacker",
+      sessionKey: "agent:attacker:main",
+    })).toThrow(/agentId.*allowlist|not allowlisted/i);
+  });
+
+  test("tool factory 绑定 codex 后，五个工具参数均不能切换到默认 Agent", async () => {
+    const db = new TransactionalRegistryFakeDb();
+    const runtime = createMengshuRuntime({
+      config: postgresConfig,
+      resolvedDbPath: "",
+      appId: "openclaw",
+      db,
+    });
+    const recall = vi.spyOn(runtime.memoryService, "recall");
+    const store = vi.spyOn(runtime.memoryService, "storeMemory");
+    const fastContext = vi.spyOn(runtime.agentFastPath, "context");
+    const baseAuthority = registeredAuthority(runtime);
+    const authority = {
+      ...baseAuthority,
+      allow: {
+        ...baseAuthority.allow,
+        agentIds: [runtime.defaultScope.agentId, "codex"],
+      },
+    };
+    const { api, toolFactories } = makeApi();
+    registerOpenClawAdapter(api, postgresConfig, { runtime, authority });
+
+    const attacks = [
+      ["memory_recall", { query: "cross-agent", agentId: runtime.defaultScope.agentId }],
+      ["memory_store", { text: "cross-agent", agentId: runtime.defaultScope.agentId }],
+      ["memory_forget", { memoryId: "memory-1", agentId: runtime.defaultScope.agentId }],
+      ["memory_scan_directory", { directory: "/tmp/docs", agentId: runtime.defaultScope.agentId }],
+      ["memory_context_fast", { task: "cross-agent", agentId: runtime.defaultScope.agentId }],
+    ] as const;
+
+    for (const [name, params] of attacks) {
+      const factory = toolFactories.find((entry) => entry.opts.name === name)!.factory;
+      const tool = factory({ agentId: "codex", sessionKey: "agent:codex:main" })!;
+      expect(tool.parameters?.additionalProperties).toBe(false);
+      await expect(tool.execute(`attack-${name}`, params)).rejects.toMatchObject({
+        code: "CLIENT_VALUE_NOT_ALLOWED",
+        field: "agentId",
+      });
+    }
+    expect(recall).not.toHaveBeenCalled();
+    expect(store).not.toHaveBeenCalled();
+    expect(fastContext).not.toHaveBeenCalled();
+    expect(db.store).not.toHaveBeenCalled();
+    expect(db.query).not.toHaveBeenCalled();
+    expect(db.delete).not.toHaveBeenCalled();
+  });
+
+  test("rejects a host agent outside the authority allowlist before recall", async () => {
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: config.dbPath!,
+      appId: "openclaw",
+      db: new FakeDb(),
+    });
+    const context = vi.spyOn(runtime.agentFastPath, "context");
+    const { api, hooks } = makeApi();
+    registerOpenClawAdapter(api, config, { runtime, authority: registeredAuthority(runtime) });
+    const beforePrompt = hooks.find((entry) => entry.name === "before_prompt_build")!
+      .handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+
+    await expect(beforePrompt(
+      { prompt: "load secure context", messages: [] },
+      { agentId: "attacker", sessionId: "host-session-1" },
+    )).rejects.toMatchObject({ code: "CLIENT_VALUE_NOT_ALLOWED" });
+    expect(context).not.toHaveBeenCalled();
+  });
+
+  test("injects at most once per turn across concurrent and tool re-entry prompt builds", async () => {
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: config.dbPath!,
+      appId: "openclaw",
+      db: new FakeDb(),
+    });
+    const context = vi.spyOn(runtime.agentFastPath, "context").mockImplementation(async (request) => ({
+      scope: request.scope as typeof runtime.defaultScope,
+      slots: {},
+      content: "<relevant-memories>once</relevant-memories>",
+      telemetry: { latencyMs: 1, nodesUsed: 1, cacheHit: false },
+    }));
+    const { api, hooks } = makeApi();
+    registerOpenClawAdapter(api, config, { runtime, authority: registeredAuthority(runtime) });
+    const beforePrompt = hooks.find((entry) => entry.name === "before_prompt_build")!
+      .handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+    const agentEnd = hooks.find((entry) => entry.name === "agent_end")!
+      .handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+    const ctx = {
+      agentId: runtime.defaultScope.agentId,
+      sessionId: "host-session-1",
+      sessionKey: "agent:default:main",
+    };
+
+    const firstTurn = await Promise.all([
+      beforePrompt({ prompt: "same turn prompt", messages: [] }, ctx),
+      beforePrompt({
+        prompt: "same turn prompt",
+        messages: [{ role: "tool", content: "tool result" }],
+      }, ctx),
+    ]);
+    expect(firstTurn.filter((result) => result !== undefined)).toHaveLength(1);
+    expect(context).toHaveBeenCalledTimes(1);
+
+    await expect(beforePrompt({ prompt: "next turn prompt", messages: [] }, ctx))
+      .resolves.toBeDefined();
+    await expect(beforePrompt({
+      prompt: "next turn prompt",
+      messages: [{ role: "tool", content: "re-entry" }],
+    }, ctx)).resolves.toBeUndefined();
+    expect(context).toHaveBeenCalledTimes(2);
+
+    await agentEnd({ success: false, messages: [] }, ctx);
+    await expect(beforePrompt({ prompt: "next turn prompt", messages: [] }, ctx))
+      .resolves.toBeDefined();
+    expect(context).toHaveBeenCalledTimes(3);
+
+    await expect(beforePrompt({ prompt: "", messages: [] }, ctx)).resolves.toBeUndefined();
+    expect(context).toHaveBeenCalledTimes(3);
+  });
+
+  test("clears recall turn state on agent_end even when auto-capture is disabled", async () => {
+    const recallOnlyConfig = { ...config, autoCapture: false };
+    const db = new FakeDb();
+    const runtime = createMengshuRuntime({
+      config: recallOnlyConfig,
+      resolvedDbPath: recallOnlyConfig.dbPath!,
+      appId: "openclaw",
+      db,
+    });
+    const context = vi.spyOn(runtime.agentFastPath, "context").mockImplementation(async (request) => ({
+      scope: request.scope as typeof runtime.defaultScope,
+      slots: {},
+      content: "<relevant-memories>once per turn</relevant-memories>",
+      telemetry: { latencyMs: 1, nodesUsed: 1, cacheHit: false },
+    }));
+    const { api, hooks } = makeApi();
+    registerOpenClawAdapter(api, recallOnlyConfig, {
+      runtime,
+      authority: registeredAuthority(runtime),
+    });
+    const beforePrompt = hooks.find((entry) => entry.name === "before_prompt_build")!
+      .handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+    const agentEnd = hooks.find((entry) => entry.name === "agent_end")!
+      .handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+    const ctx = { agentId: runtime.defaultScope.agentId, sessionId: "recall-only-session" };
+
+    await expect(beforePrompt({ prompt: "repeat across turns", messages: [] }, ctx))
+      .resolves.toBeDefined();
+    await expect(beforePrompt({ prompt: "repeat across turns", messages: [] }, ctx))
+      .resolves.toBeUndefined();
+    await agentEnd({
+      success: true,
+      messages: [{ role: "user", content: "I prefer no automatic capture" }],
+    }, ctx);
+    await expect(beforePrompt({ prompt: "repeat across turns", messages: [] }, ctx))
+      .resolves.toBeDefined();
+
+    expect(context).toHaveBeenCalledTimes(2);
+    expect(db.store).not.toHaveBeenCalled();
   });
 
   test("非 Postgres runtime 不暴露运行后才失败的 forget/cleanup 工具", () => {
@@ -708,6 +1072,64 @@ describe("registerOpenClawAdapter", () => {
     expect(db.store).not.toHaveBeenCalled();
   });
 
+  test("registered memory_store delegates to the Runtime write capability", async () => {
+    const db = new FakeDb();
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: config.dbPath!,
+      appId: "openclaw",
+      db,
+    });
+    const executeMemoryWrite = vi.fn(async () => ({
+      status: "persisted" as const,
+      route: "active" as const,
+      recordType: "memory" as const,
+      memoryId: "kernel-memory",
+      stored: true,
+    }));
+    Object.assign(runtime, { executeMemoryWrite });
+    const directStore = vi.spyOn(runtime.memoryService, "storeMemory");
+    const embed = vi.spyOn(runtime.embeddings, "embed");
+    const { api, tools } = makeApi();
+
+    registerOpenClawAdapter(api, config, { runtime, authority: registeredAuthority(runtime) });
+    const tool = tools.find((entry) => entry.opts.name === "memory_store")!;
+    await expect(tool.tool.execute("tool-call-1", {
+      text: "I prefer Runtime-owned writes",
+      category: "preference",
+    })).resolves.toMatchObject({ details: { id: "kernel-memory", action: "created" } });
+
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      type: "saveExplicit",
+      idempotencyKey: "tool-call-1",
+      text: "I prefer Runtime-owned writes",
+    }));
+    expect(directStore).not.toHaveBeenCalled();
+    expect(embed).not.toHaveBeenCalled();
+    expect(db.existsByContentHash).not.toHaveBeenCalled();
+  });
+
+  test("registered memory_store fails closed when Runtime lacks write capability", async () => {
+    const db = new FakeDb();
+    const runtime = createMengshuRuntime({
+      config,
+      resolvedDbPath: config.dbPath!,
+      appId: "openclaw",
+      db,
+    });
+    const directStore = vi.spyOn(runtime.memoryService, "storeMemory");
+    const { api, tools } = makeApi();
+
+    registerOpenClawAdapter(api, config, { runtime, authority: registeredAuthority(runtime) });
+    const tool = tools.find((entry) => entry.opts.name === "memory_store")!;
+    await expect(tool.tool.execute("tool-call-2", {
+      text: "I prefer fail-closed writes",
+    })).rejects.toThrow(/write capability is unavailable/i);
+
+    expect(directStore).not.toHaveBeenCalled();
+    expect(db.store).not.toHaveBeenCalled();
+  });
+
   test("registered memory_context_fast rejects client identity scope before recall", async () => {
     const runtime = createMengshuRuntime({
       config,
@@ -751,7 +1173,7 @@ describe("registerOpenClawAdapter", () => {
     expect(db.store).not.toHaveBeenCalled();
     expect(db.delete).not.toHaveBeenCalled();
 
-    const beforeStart = hooks.find((entry) => entry.name === "before_agent_start")!
+    const beforeStart = hooks.find((entry) => entry.name === "before_prompt_build")!
       .handler as (event: unknown) => Promise<unknown>;
     const agentEnd = hooks.find((entry) => entry.name === "agent_end")!
       .handler as (event: unknown) => Promise<unknown>;

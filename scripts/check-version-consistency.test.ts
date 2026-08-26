@@ -12,9 +12,10 @@ import { checkVersionConsistency } from "./check-version-consistency.mjs";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const tempDirs: string[] = [];
-const VERSION = "1.0.6";
+const VERSION = "1.0.7";
 
 const ACTIVE_SOURCES = [
+  "openclaw.plugin.json",
   "plugins/openclaw/package.json",
   "plugins/openclaw/openclaw.plugin.json",
   "plugins/codex/.codex-plugin/plugin.json",
@@ -36,6 +37,7 @@ function createFixture(): string {
   const root = mkdtempSync(path.join(os.tmpdir(), "mengshu-version-gate-"));
   tempDirs.push(root);
   writeJson(root, "package.json", { name: "fixture", version: VERSION });
+  writeJson(root, "openclaw.plugin.json", { version: VERSION });
   writeJson(root, "plugins/openclaw/package.json", { version: VERSION });
   writeJson(root, "plugins/openclaw/openclaw.plugin.json", { version: VERSION });
   writeJson(root, "plugins/codex/.codex-plugin/plugin.json", { version: VERSION });

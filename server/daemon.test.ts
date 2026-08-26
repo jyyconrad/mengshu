@@ -3,6 +3,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import type { MemoryService } from "../core/service-types.js";
 import type { ContextBlock, MemoryRecord, RecallResult } from "../core/types.js";
+import { computeRecallScoreBreakdown } from "../core/recall-scoring.js";
 import type { JobRecord, JobRepository } from "../storage/repositories/types.js";
 import {
   MemoryServerDaemonError,
@@ -21,6 +22,7 @@ const scope = {
   projectId: "project-1",
   agentId: "agent-1",
   namespace: "memories",
+  visibility: "private" as const,
 };
 
 const record: MemoryRecord = {
@@ -44,7 +46,17 @@ class FakeMemoryService implements MemoryService {
   }
 
   async recall(): Promise<RecallResult> {
-    return { scope, query: "concise", hits: [{ record, score: 0.9, source: "vector" }] };
+    const scoreBreakdown = computeRecallScoreBreakdown(
+      record,
+      { relevance: 0.9, scopeFit: 1 },
+      ["vector"],
+      { vector: 0.9 },
+    );
+    return {
+      scope,
+      query: "concise",
+      hits: [{ record, score: scoreBreakdown.score, source: "vector", scoreBreakdown }],
+    };
   }
 
   async buildContext(): Promise<ContextBlock> {
@@ -305,6 +317,81 @@ describe("memory server daemon", () => {
     });
   });
 
+  test("routes production memory writes through the injected Runtime Write Kernel capability", async () => {
+    const executeMemoryWrite = vi.fn(async () => ({
+      status: "persisted" as const,
+      route: "active" as const,
+      recordType: "memory" as const,
+      memoryId: "memory-write-1",
+      stored: true,
+    }));
+    running = await startMemoryServer({
+      service: new FakeMemoryService(),
+      memoryWrite: { executeMemoryWrite },
+      defaultScope: { ...scope, visibility: "private" },
+      host: "127.0.0.1",
+      port: 0,
+    });
+
+    const response = await fetch(`${running.url}/v1/memories`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "daemon-save-explicit-1",
+        record: {
+          text: "默认使用 TypeScript 严格模式进行开发",
+          kind: "preference",
+          semanticType: "profile",
+          scope,
+        },
+      }),
+    });
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toMatchObject({
+      id: "memory-write-1",
+      stored: true,
+      status: "persisted",
+      route: "active",
+      recordType: "memory",
+    });
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      type: "saveExplicit",
+      idempotencyKey: "daemon-save-explicit-1",
+      serverAuthority: expect.objectContaining({ tenantId: "local", userId: "user-1" }),
+      clientScope: scope,
+      text: "默认使用 TypeScript 严格模式进行开发",
+      kind: "preference",
+      semanticType: "profile",
+    }));
+  });
+
+  test("keeps production memory writes fail-closed when Runtime Write Kernel is absent", async () => {
+    const service = new FakeMemoryService();
+    const storeMemory = vi.spyOn(service, "storeMemory");
+    running = await startMemoryServer({
+      service,
+      defaultScope: { ...scope, visibility: "private" },
+      host: "127.0.0.1",
+      port: 0,
+    });
+
+    const response = await fetch(`${running.url}/v1/memories`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        idempotencyKey: "daemon-save-explicit-without-capability",
+        record: { text: "必须保持生产写入 fail-closed", kind: "decision", scope },
+      }),
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Memory write capability is unavailable",
+    });
+    expect(storeMemory).not.toHaveBeenCalled();
+  });
+
   test("returns JSON bad request for malformed JSON", async () => {
     running = await startMemoryServer({
       service: new FakeMemoryService(),
@@ -340,6 +427,32 @@ describe("memory server daemon", () => {
       mode: "runtime_host",
     });
     expect(server.url).toBe("http://127.0.0.1:43847");
+    await daemon.stop();
+  });
+
+  test("运行中的 Host readiness 降级会立即反映到 daemon snapshot", async () => {
+    const host = new FakeLifecycleHost();
+    const listener = new FakeListener();
+    const daemon = createMemoryServerDaemon(daemonOptions(host, listener));
+    await daemon.start();
+
+    host.state = "degraded";
+    host.ready = false;
+    expect(daemon.snapshot()).toEqual({
+      state: "ready",
+      ready: false,
+      accepting: false,
+      mode: "runtime_host",
+    });
+
+    host.state = "ready";
+    host.ready = true;
+    expect(daemon.snapshot()).toEqual({
+      state: "ready",
+      ready: true,
+      accepting: true,
+      mode: "runtime_host",
+    });
     await daemon.stop();
   });
 
@@ -1274,16 +1387,52 @@ describe("memory server daemon", () => {
   test("非 JSON 请求内部错误返回固定响应，不泄露 service raw secret", async () => {
     const service = new FakeMemoryService();
     service.health = async () => { throw new Error("database-url-secret"); };
+    const error = vi.fn();
     running = await startMemoryServer({
       service,
       defaultScope: { ...scope, visibility: "private" },
       host: "127.0.0.1",
       port: 0,
+      logger: { error },
     });
 
     const response = await fetch(`${running.url}/v1/health`);
     expect(response.status).toBe(500);
     await expect(response.json()).resolves.toEqual({ error: "Internal server error" });
+    expect(error).toHaveBeenCalledWith(
+      "REST request failed method=GET path=/v1/health error=Error",
+    );
+    expect(error.mock.calls.flat().join(" ")).not.toContain("database-url-secret");
+  });
+
+  test("内部错误只记录白名单诊断 reason，不写入任意错误内容", async () => {
+    const service = new FakeMemoryService();
+    service.health = async () => {
+      const failure = new Error("memory-content-secret") as Error & {
+        code: string;
+        reason: string;
+      };
+      failure.code = "SAFE_FAILURE";
+      failure.reason = "ROW_SCOPE_MISMATCH";
+      throw failure;
+    };
+    const error = vi.fn();
+    running = await startMemoryServer({
+      service,
+      defaultScope: { ...scope, visibility: "private" },
+      host: "127.0.0.1",
+      port: 0,
+      logger: { error },
+    });
+
+    const response = await fetch(`${running.url}/v1/health`);
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({ error: "Internal server error" });
+    expect(error).toHaveBeenCalledWith(
+      "REST request failed method=GET path=/v1/health error=Error code=SAFE_FAILURE " +
+      "reason=ROW_SCOPE_MISMATCH",
+    );
+    expect(error.mock.calls.flat().join(" ")).not.toContain("memory-content-secret");
   });
 
   test("console 静态资产、无扩展 TS fallback、CSS 与 404 均正常", async () => {

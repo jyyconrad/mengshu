@@ -335,6 +335,20 @@ private 内容不会返回 raw，只显示 `[private]` 预览。
 | `memory_observe_light` | 运行中轻量观察提交 → `AgentFastPathService.observeLight()` |
 | `memory_lookup` | 运行中按需速查 → `AgentFastPathService.lookup()` |
 
+### 渐进披露与治理工具
+
+| MCP tool | 说明 |
+|----------|------|
+| `memory_navigate` | 在 5 槽位及 source/topic/global tree 中导航，返回受 AuthorityScope 约束的引用 |
+| `memory_evidence_read` | 读取允许范围内的 L0 evidence，核验摘要和资产来源 |
+| `memory_asset_list` | 列出 exact scope 下可发现的 private `memory_view` 资产 |
+| `memory_asset_read` | 读取一个资产描述符和实时 stale 状态 |
+| `memory_asset_search` | 按 `query` 搜索资产，可选 `limit` 和 5 type `semanticType` |
+| `memory_asset_explain` | 返回资产版本、memory/tree/evidence 引用和质量快照 |
+| `memory_session_explain` | 仅按 `sessionId` 读取 server-owned exact private session 的最新 v22 receipt |
+
+`memory_asset_search` 不接受客户端 scope、SQL、路径或 URL，只能使用 `query/limit/semanticType`。`memory_session_explain` 不接受 scope 覆盖；`sessionId` 限 1-256 个字符，必须为 NFKC 且不含空白、控制字符或路径分隔符，session 还必须匹配 server authority，底层 scope 必须是 exact private。相关 PostgreSQL capability 未安装时工具不会注册；原生 `memory_context_fast` 仍可工作。
+
 ### memory_ingest 用法
 
 注入 `pipeline`（`runtime.ingestionPipeline`）后启用。入参：
@@ -428,6 +442,10 @@ CLI 入口为 `ms`（全局安装后可用），命令注册在 `bin/ms.ts`。
 | `ms forget` | 交互式删除记忆 |
 | `ms recall <query>` | 快速召回并显示结果 |
 | `ms migrate-home` | 迁移旧版 home 目录到新路径 |
+| `ms migrate-semantic-types` | 以 dry-run 优先的漏斗迁移整理历史 5 type |
+| `ms asset list/explain` | 查看当前 exact scope 的 private 治理资产 |
+| `ms asset deprecate/revoke` | 以 CAS、幂等 receipt 和 outbox 追加资产状态版本 |
+| `ms session explain <sessionId>` | 读取 PostgreSQL v22 中当前 exact private session 的最新装配 receipt |
 
 ## 错误格式
 

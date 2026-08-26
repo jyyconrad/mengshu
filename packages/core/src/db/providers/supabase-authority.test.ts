@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
+import { DEFAULT_VECTOR_CANDIDATE_LIMIT } from "../types.js";
 import type { MemoryEntry } from "../types.js";
 
 const mockState = vi.hoisted(() => ({
@@ -12,6 +13,7 @@ const mockState = vi.hoisted(() => ({
   }>,
   rpcRows: [] as Record<string, unknown>[],
   rpcError: null as { message: string } | null,
+  respectRpcMatchCount: false,
 }));
 
 vi.mock("@supabase/supabase-js", () => {
@@ -41,13 +43,18 @@ vi.mock("@supabase/supabase-js", () => {
       rpc: async (name: string, args: Record<string, unknown>) => {
         mockState.calls.push({ method: "rpc", args: [name, args] });
         if (name === "exec_sql") return { data: null, error: null };
-        return { data: mockState.rpcRows, error: mockState.rpcError };
+        const data = mockState.respectRpcMatchCount
+          ? mockState.rpcRows.slice(0, Number(args.match_count))
+          : mockState.rpcRows;
+        return { data, error: mockState.rpcError };
       },
     }),
   };
 });
 
 import { SupabaseProvider } from "./supabase.js";
+import { LegacyDatabaseAdapter } from "../../storage/legacy-database-adapter.js";
+import { DefaultMemoryService } from "../../service/memory-service.js";
 
 const config = ["https://example.supabase.co", "service-key", "text-embedding-3-small"] as const;
 
@@ -76,6 +83,7 @@ describe("SupabaseProvider recall authority", () => {
     mockState.directResponses = [];
     mockState.rpcRows = [];
     mockState.rpcError = null;
+    mockState.respectRpcMatchCount = false;
   });
 
   test("non-vector query 在 limit 前对 canonical tenant/user 独立列 exact eq，并隐藏 NULL/alien", async () => {
@@ -118,9 +126,151 @@ describe("SupabaseProvider recall authority", () => {
     const matchCall = mockState.calls.find(({ method, args }) =>
       method === "rpc" && args[0] === "match_memories");
     expect(matchCall?.args[1]).toMatchObject({
-      match_count: 5,
+      match_count: DEFAULT_VECTOR_CANDIDATE_LIMIT,
+      min_similarity: -1,
       filter_tenant_id: "tenant-a",
       filter_user_id: "user-a",
+    });
+  });
+
+  test("vector RPC 的候选池独立于 legacy final limit，允许第 6 条以后返回 core", async () => {
+    mockState.respectRpcMatchCount = true;
+    mockState.rpcRows = Array.from({ length: 8 }, (_, index) =>
+      row(`allowed-${index}`, "tenant-a", "user-a"));
+    const provider = new SupabaseProvider(...config);
+
+    const result = await provider.query({
+      vector: [0.1, 0.2],
+      tenantId: "tenant-a",
+      userId: "user-a",
+    });
+
+    expect(result).toHaveLength(8);
+    expect(result.at(5)?.id).toBe("allowed-5");
+    const matchCall = mockState.calls.find(({ method, args }) =>
+      method === "rpc" && args[0] === "match_memories");
+    expect(matchCall?.args[1]).toMatchObject({
+      match_count: DEFAULT_VECTOR_CANDIDATE_LIMIT,
+      min_similarity: -1,
+    });
+  });
+
+  test("RPC 返回过量数据时 provider 在 authority 后收敛到 candidateLimit", async () => {
+    mockState.rpcRows = Array.from({ length: 12 }, (_, index) =>
+      row(`allowed-${index}`, "tenant-a", "user-a"));
+    const provider = new SupabaseProvider(...config);
+
+    const result = await provider.query({
+      vector: [0.1, 0.2],
+      tenantId: "tenant-a",
+      userId: "user-a",
+      candidateLimit: 8,
+    });
+
+    expect(result).toHaveLength(8);
+  });
+
+  test("candidateLimit 可配置，final limit 只在 RPC 候选取回后应用", async () => {
+    mockState.respectRpcMatchCount = true;
+    mockState.rpcRows = Array.from({ length: 20 }, (_, index) =>
+      row(`allowed-${index}`, "tenant-a", "user-a"));
+    const provider = new SupabaseProvider(...config);
+
+    const result = await provider.query({
+      vector: [0.1, 0.2],
+      tenantId: "tenant-a",
+      userId: "user-a",
+      candidateLimit: 8,
+      limit: 5,
+    });
+
+    expect(result).toHaveLength(5);
+    const matchCall = mockState.calls.find(({ method, args }) =>
+      method === "rpc" && args[0] === "match_memories");
+    expect(matchCall?.args[1]).toMatchObject({ match_count: 8, min_similarity: -1 });
+  });
+
+  test("legacy minScore 只在 RPC 候选取回后应用，不下推为 min_similarity", async () => {
+    mockState.rpcRows = [
+      { ...row("below", "tenant-a", "user-a"), similarity: 0.6 },
+      { ...row("above", "tenant-a", "user-a"), similarity: 0.8 },
+    ];
+    const provider = new SupabaseProvider(...config);
+
+    const result = await provider.query({
+      vector: [0.1, 0.2],
+      tenantId: "tenant-a",
+      userId: "user-a",
+      minScore: 0.7,
+    });
+
+    expect(result.map(({ id }) => id)).toEqual(["above"]);
+    const matchCall = mockState.calls.find(({ method, args }) =>
+      method === "rpc" && args[0] === "match_memories");
+    expect(matchCall?.args[1]).toMatchObject({ min_similarity: -1 });
+  });
+
+  test("第 6 条以后候选仍进入 core 六因子排序，final minScore/limit 不下推 RPC", async () => {
+    mockState.respectRpcMatchCount = true;
+    const scope = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      projectId: "project-a",
+      appId: "openclaw",
+      agentId: "agent-a",
+      namespace: "memories",
+    } as const;
+    const governedRow = (
+      id: string,
+      similarity: number,
+      importance: number,
+      confidence: number,
+      createdAt: number,
+    ): Record<string, unknown> => ({
+      ...row(id, scope.tenantId, scope.userId),
+      similarity,
+      importance,
+      created_at: new Date(createdAt).toISOString(),
+      canonical_project_id: scope.projectId,
+      product_id: scope.appId,
+      producer_id: scope.agentId,
+      namespace: scope.namespace,
+      visibility: "private",
+      lifecycle_status: "active",
+      metadata: {
+        semanticType: "rules",
+        admissionRoute: "active",
+        memoryContainer: "project",
+        confidence,
+        sourceNodeIds: confidence === 1 ? ["e1", "e2", "e3", "e4", "e5"] : [],
+      },
+    });
+    mockState.rpcRows = [
+      ...Array.from({ length: 5 }, (_, index) =>
+        governedRow(`vector-top-${index}`, 0.9 - index * 0.01, 0, 0, 0)),
+      governedRow("core-winner-after-five", 0.6, 1, 1, Date.now()),
+      governedRow("vector-tail-1", 0.5, 0, 0, 0),
+      governedRow("vector-tail-2", 0.4, 0, 0, 0),
+    ];
+    const provider = new SupabaseProvider(...config);
+    const service = new DefaultMemoryService({
+      repository: new LegacyDatabaseAdapter(provider, scope),
+      embeddings: { embed: async () => [0.1, 0.2] },
+    });
+
+    const result = await service.recall({
+      query: "governed candidate pool",
+      scope,
+      limit: 1,
+      minScore: 0.7,
+    });
+
+    expect(result.hits.map((hit) => hit.record.id)).toEqual(["core-winner-after-five"]);
+    const matchCall = mockState.calls.find(({ method, args }) =>
+      method === "rpc" && args[0] === "match_memories");
+    expect(matchCall?.args[1]).toMatchObject({
+      match_count: DEFAULT_VECTOR_CANDIDATE_LIMIT,
+      min_similarity: -1,
     });
   });
 
@@ -138,11 +288,32 @@ describe("SupabaseProvider recall authority", () => {
     const lastTenantEq = mockState.calls.findIndex(({ method, args }) => method === "eq" && args[0] === "tenant_id");
     const lastUserEq = mockState.calls.findIndex(({ method, args }) => method === "eq" && args[0] === "user_id");
     const idIn = mockState.calls.findIndex(({ method, args }) => method === "in" && args[0] === "id");
-    const limit = methods.lastIndexOf("limit");
     expect(lastTenantEq).toBeGreaterThan(-1);
     expect(lastUserEq).toBeGreaterThan(lastTenantEq);
     expect(idIn).toBeGreaterThan(lastUserEq);
-    expect(limit).toBeGreaterThan(idIn);
+    // direct computed-query fallback 没有可靠的数据库 alias ordering；必须取回后
+    // 按 similarity 排序再裁 candidateLimit，不能先按行序截断。
+    expect(methods).not.toContain("limit");
+  });
+
+  test("RPC fallback 先按相似度排序再裁候选池，第 6 条不会被旧缺省 5 丢弃", async () => {
+    mockState.rpcError = { message: "rpc unavailable" };
+    mockState.directRows = Array.from({ length: 8 }, (_, index) => ({
+      ...row(`allowed-${index}`, "tenant-a", "user-a"),
+      similarity: index === 5 ? 1 : 0.9 - index * 0.01,
+    }));
+    const provider = new SupabaseProvider(...config);
+
+    const result = await provider.query({
+      vector: [0.1, 0.2],
+      tenantId: "tenant-a",
+      userId: "user-a",
+      candidateLimit: 8,
+    });
+
+    expect(result).toHaveLength(8);
+    expect(result[0]?.id).toBe("allowed-5");
+    expect(mockState.calls.filter(({ method }) => method === "limit")).toHaveLength(0);
   });
 
   test("fallback 失败进入 alternative 时仍保持 authority/ID 预选并隐藏污染行", async () => {

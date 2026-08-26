@@ -13,6 +13,22 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { MemoryService } from "../../../core/service-types.js";
 import {
+  DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
+  completeDurableJobV2,
+  createDurableJobHandlerRegistry,
+  createDurableJobV2,
+  leaseDurableJobV2,
+  type DurableJobV2,
+  type DurableJobV2Scope,
+} from "../../core/src/storage/repositories/job-v2.js";
+import { PostgresDurableJobV2Repository } from
+  "../../core/src/storage/repositories/postgres-job-v2.js";
+import {
+  createAuthoritativeDurableJobV2WorkerHandlerRegistry,
+  startBroadAuthorityDurableJobV2Supervisor,
+  type DurableJobV2Scheduler,
+} from "../../../server/workers-v2.js";
+import {
   buildCallToolHandler,
   buildListToolsResult,
   closeMcpServerAndRuntime,
@@ -84,6 +100,122 @@ class FakeTransport implements Transport {
 
   disconnect(): void {
     this.onclose?.();
+  }
+}
+
+class ManualScheduler implements DurableJobV2Scheduler {
+  #now = 0;
+  #nextId = 1;
+  #tasks = new Map<number, { at: number; callback: () => void }>();
+
+  setTimeout(callback: () => void, delayMs: number): number {
+    const id = this.#nextId++;
+    this.#tasks.set(id, { at: this.#now + delayMs, callback });
+    return id;
+  }
+
+  clearTimeout(handle: unknown): void {
+    this.#tasks.delete(handle as number);
+  }
+
+  advanceBy(ms: number): void {
+    this.#now += ms;
+    const due = [...this.#tasks.entries()]
+      .filter(([, task]) => task.at <= this.#now)
+      .sort((left, right) => left[1].at - right[1].at);
+    for (const [id, task] of due) {
+      this.#tasks.delete(id);
+      task.callback();
+    }
+  }
+
+  get pending(): number {
+    return this.#tasks.size;
+  }
+}
+
+async function flush(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+class FakeMcpPostgresJobRepository extends PostgresDurableJobV2Repository {
+  readonly discoveredScope: DurableJobV2Scope;
+  readonly listCalls: Array<{ authority: unknown; limit: number }> = [];
+  readonly leasedScopes: DurableJobV2Scope[] = [];
+  #issued = false;
+  #running?: DurableJobV2;
+
+  constructor(discoveredScope: DurableJobV2Scope) {
+    const contract = createDurableJobHandlerRegistry(DURABLE_JOB_V2_AUTHORITATIVE_TYPES);
+    super({
+      connect: async () => { throw new Error("fake repository must not connect"); },
+    }, {
+      registry: contract,
+      clock: () => 100,
+      tokenFactory: () => "f".repeat(32),
+      backoffMs: () => 100,
+    });
+    this.discoveredScope = discoveredScope;
+  }
+
+  override async listRunnableScopes(authorityInput: typeof authority, limit: number) {
+    this.listCalls.push({ authority: authorityInput, limit });
+    return [this.discoveredScope];
+  }
+
+  override async reap() {
+    return { applied: 0 as const };
+  }
+
+  override async quarantineUnknown() {
+    return { applied: 0 as const };
+  }
+
+  override async lease(input: Parameters<PostgresDurableJobV2Repository["lease"]>[0]) {
+    this.leasedScopes.push(input.scope);
+    if (this.#issued) return { applied: 0 as const };
+    this.#issued = true;
+    const queued = createDurableJobV2({
+      id: "job-non-default-scope",
+      type: "build_tree",
+      payload: { treeKey: "project-2" },
+      dedupeKey: "build_tree:project-2",
+      scope: input.scope,
+      maxAttempts: 3,
+    }, {
+      registry: createDurableJobHandlerRegistry(DURABLE_JOB_V2_AUTHORITATIVE_TYPES),
+      now: 100,
+    });
+    this.#running = leaseDurableJobV2(queued, {
+      owner: input.owner,
+      now: 100,
+      leaseMs: input.leaseMs,
+      tokenFactory: () => "a".repeat(32),
+    }).job;
+    return { applied: 1 as const, job: this.#running };
+  }
+
+  override async renew() {
+    return { applied: 0 as const };
+  }
+
+  override async complete(input: Parameters<PostgresDurableJobV2Repository["complete"]>[0]) {
+    const running = this.#running!;
+    return {
+      applied: 1 as const,
+      job: completeDurableJobV2(running, {
+        owner: input.owner,
+        leaseToken: input.leaseToken,
+        leaseGeneration: input.leaseGeneration,
+        now: 150,
+      }).job,
+    };
+  }
+
+  override async fail() {
+    return { applied: 0 as const };
   }
 }
 
@@ -326,6 +458,138 @@ describe("createMcpStdioServer", () => {
 
     expect(closed).toBe(true);
     await expect(running.close()).resolves.toBeUndefined();
+  });
+
+  test("broad authority MCP supervisor 自动消费非 default scope，并在 close 后清空 scheduler", async () => {
+    const broadAuthority = {
+      tenantId: defaultScope.tenantId,
+      userId: defaultScope.userId,
+      allow: {
+        appIds: [defaultScope.appId],
+        projectIds: [defaultScope.projectId, "project-2"],
+        agentIds: [defaultScope.agentId],
+        namespaces: [defaultScope.namespace],
+        visibilities: [defaultScope.visibility],
+      },
+    } as const;
+    const nonDefaultScope: DurableJobV2Scope = {
+      ...defaultScope,
+      projectId: "project-2",
+    };
+    const repository = new FakeMcpPostgresJobRepository(nonDefaultScope);
+    const buildTree = vi.fn(async () => undefined);
+    const registry = createAuthoritativeDurableJobV2WorkerHandlerRegistry({
+      build_tree: buildTree,
+      extract_candidate: async () => undefined,
+      extract_graph: async () => undefined,
+    });
+    const scheduler = new ManualScheduler();
+    const startSupervisor: typeof startBroadAuthorityDurableJobV2Supervisor = (
+      target,
+      options,
+    ) => startBroadAuthorityDurableJobV2Supervisor(target, {
+      ...options,
+      scheduler,
+      intervalMs: 10,
+      maxScopesPerTick: 5,
+      maxJobsPerTick: 5,
+    });
+    const running = await startMcpStdioServer({
+      authority: broadAuthority,
+      defaultScope,
+      service: new FakeMemoryService(),
+      durableJobV2: { repository, registry },
+    }, {
+      transport: new FakeTransport(),
+      startDurableJobV2Supervisor: startSupervisor,
+    });
+
+    scheduler.advanceBy(10);
+    await flush();
+    await flush();
+
+    expect(buildTree).toHaveBeenCalledTimes(1);
+    expect(repository.leasedScopes.length).toBeGreaterThan(0);
+    expect(repository.leasedScopes.every(
+      (leased) => leased.projectId === nonDefaultScope.projectId,
+    )).toBe(true);
+    expect(repository.leasedScopes).not.toContainEqual(defaultScope);
+    expect(repository.listCalls[0]?.authority).toMatchObject({
+      tenantId: defaultScope.tenantId,
+      userId: defaultScope.userId,
+      allow: { projectIds: [defaultScope.projectId, "project-2"] },
+    });
+    expect(scheduler.pending).toBe(1);
+
+    await expect(running.close()).resolves.toBeUndefined();
+    expect(scheduler.pending).toBe(0);
+  });
+
+  test("transport EOF 也会等待 durable supervisor stop；无 capability 的非 Postgres composition 不启动 worker", async () => {
+    const transport = new FakeTransport();
+    const stop = vi.fn(async () => ({ status: "stopped" as const }));
+    const starter = vi.fn<typeof startBroadAuthorityDurableJobV2Supervisor>((_target, _options) => ({
+      tick: async () => [],
+      stop,
+      snapshot: () => ({
+        state: "healthy",
+        ready: true,
+        consecutiveFailures: 0,
+        failingScopes: 0,
+      }),
+    }));
+    const repository = new FakeMcpPostgresJobRepository(defaultScope);
+    const registry = createAuthoritativeDurableJobV2WorkerHandlerRegistry({
+      build_tree: async () => undefined,
+      extract_candidate: async () => undefined,
+      extract_graph: async () => undefined,
+    });
+    const running = await startMcpStdioServer({
+      authority,
+      defaultScope,
+      service: new FakeMemoryService(),
+      durableJobV2: { repository, registry },
+    }, {
+      transport,
+      startDurableJobV2Supervisor: starter,
+    });
+
+    transport.disconnect();
+    await running.closed;
+
+    expect(starter).toHaveBeenCalledTimes(1);
+    expect(starter.mock.calls[0]?.[0]).toBe(repository);
+    expect(stop).toHaveBeenCalledTimes(1);
+
+    const noWorkerStarter = vi.fn();
+    const withoutCapability = await startMcpStdioServer({
+      authority,
+      defaultScope,
+      service: new FakeMemoryService(),
+    }, {
+      transport: new FakeTransport(),
+      startDurableJobV2Supervisor: noWorkerStarter,
+    });
+    expect(noWorkerStarter).not.toHaveBeenCalled();
+    await withoutCapability.close();
+  });
+
+  test("Postgres durable capability 缺少完整 authoritative registry 时在 transport 前 fail-closed", async () => {
+    const transport = new FakeTransport();
+    const startTransport = vi.spyOn(transport, "start");
+    const repository = new FakeMcpPostgresJobRepository(defaultScope);
+    const partialRegistry = createAuthoritativeDurableJobV2WorkerHandlerRegistry({
+      build_tree: async () => undefined,
+    });
+
+    await expect(startMcpStdioServer({
+      authority,
+      defaultScope,
+      service: new FakeMemoryService(),
+      durableJobV2: { repository, registry: partialRegistry },
+    }, { transport })).rejects.toThrow(/durable job.*invalid/i);
+
+    expect(startTransport).not.toHaveBeenCalled();
   });
 
   test("signal shutdown closes transport and resolves without process.exit", async () => {

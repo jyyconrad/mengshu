@@ -7,6 +7,10 @@
 
 import type { MemoryService } from "../../../../core/service-types.js";
 import type { MemoryScope, RecallHit } from "../../../../core/types.js";
+import {
+  type CompleteRecallScoreBreakdown,
+} from "../../../../core/recall-scoring.js";
+import { requireRecallHitReceipt } from "../../../core/src/domain/recall-receipt-validation.js";
 import type { GraphQueryService } from "../../../../graph/query.js";
 import type { ChunkRepository, JobRepository } from "../../../../storage/repositories/types.js";
 import type { TreeRepository } from "../../../../tree/types.js";
@@ -74,6 +78,7 @@ function isPrivate(hit: RecallHit): boolean {
 }
 
 function toLookupResult(hit: RecallHit): ConsoleLookupResult {
+  const scoreBreakdown = requireRecallHitReceipt(hit);
   const text = hitText(hit);
   const privateContent = isPrivate(hit);
   return {
@@ -83,7 +88,7 @@ function toLookupResult(hit: RecallHit): ConsoleLookupResult {
     preview: privateContent ? "[private]" : text.slice(0, 240),
     raw: privateContent ? undefined : text,
     score: hit.score,
-    scoreBreakdown: hit.scoreBreakdown ?? {},
+    scoreBreakdown: scoreBreakdown as CompleteRecallScoreBreakdown,
     sourceLabel: sourceLabel(hit),
     namespace: hit.record.scope.namespace,
     provenanceCount: hit.provenance ? 1 : 0,
@@ -170,6 +175,7 @@ export function createConsoleApi(options: CreateConsoleApiOptions): ConsoleApi {
         scope: recalled.scope,
         query: recalled.query,
         results: recalled.hits.map(toLookupResult),
+        ...(recalled.filtered === undefined ? {} : { filtered: recalled.filtered }),
       };
     },
 

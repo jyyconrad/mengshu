@@ -10,10 +10,21 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ASSET_LOADOUT_OVERLAY_REQUIRED_COLUMNS,
+  CANONICAL_ENTITY_RESOLUTION_REQUIRED_COLUMNS,
+  CANDIDATE_WRITE_JOURNAL_REQUIRED_COLUMNS,
+  CONTEXT_ASSEMBLY_RECEIPT_REQUIRED_COLUMNS,
   DURABLE_DOMAIN_REQUIRED_COLUMNS,
   EMBEDDING_REEMBED_REQUIRED_COLUMNS,
+  EVIDENCE_LINK_LEDGER_REQUIRED_COLUMNS,
+  HISTORY_REBUILD_LEDGER_REQUIRED_COLUMNS,
+  HISTORY_REBUILD_MODEL_ATTEMPT_REQUIRED_COLUMNS,
+  LOADOUT_EVENT_LEDGER_REQUIRED_COLUMNS,
+  TOPIC_TREE_ALIAS_REQUIRED_COLUMNS,
   WRITE_JOURNAL_REQUIRED_COLUMNS,
+  WORK_MEMORY_GRAPH_REQUIRED_COLUMNS,
 } from "../migrations/postgres-ledger.js";
+import { CURRENT_SCHEMA_VERSION } from "../migrations/schema-migrations.js";
 
 // 捕获所有 pool.query 调用的 SQL 与参数
 const queryCalls: Array<{ sql: string; params?: unknown[] }> = [];
@@ -229,6 +240,597 @@ function createEmbeddingReembedCatalogRows(): Record<string, unknown>[] {
   return rows;
 }
 
+function appendCatalogConstraints(
+  rows: Record<string, unknown>[],
+  constraints: Record<string, readonly string[]>,
+): void {
+  for (const [tableName, definitions] of Object.entries(constraints)) {
+    definitions.forEach((definition, index) => rows.push({
+      kind: "constraint",
+      table_name: tableName,
+      object_name: `${tableName}_constraint_${index}`,
+      definition,
+      is_nullable: null,
+      is_valid: true,
+      is_ready: true,
+    }));
+  }
+}
+
+function appendCatalogIndexes(
+  rows: Record<string, unknown>[],
+  indexNames: readonly string[],
+  definitionFor: (indexName: string) => string = (indexName) => `CREATE INDEX ${indexName}`,
+): void {
+  for (const indexName of indexNames) {
+    rows.push({
+      kind: "index",
+      table_name: "unused",
+      object_name: indexName,
+      definition: definitionFor(indexName),
+      is_nullable: null,
+      is_valid: true,
+      is_ready: true,
+    });
+  }
+}
+
+function createWorkMemoryCatalogRows(): Record<string, unknown>[] {
+  const nullable = new Map<string, readonly string[]>([
+    ["mengshu_work_memory_nodes", [
+      "evidence_kind", "semantic_type", "lifecycle_status", "tree_type", "level",
+      "skill_candidate_status", "updated_at",
+    ]],
+    ["mengshu_work_memory_edges", ["reason", "updated_at"]],
+  ]);
+  const rows: Record<string, unknown>[] = Object.entries(WORK_MEMORY_GRAPH_REQUIRED_COLUMNS)
+    .flatMap(([tableName, columns]) => columns.map((column) => ({
+      kind: "column",
+      table_name: tableName,
+      object_name: column,
+      definition: "text",
+      default_definition: null,
+      is_nullable: nullable.get(tableName)?.includes(column) ? "YES" : "NO",
+      is_valid: true,
+      is_ready: true,
+    })));
+  appendCatalogConstraints(rows, {
+    mengshu_work_memory_nodes: [
+      "PRIMARY KEY (scope_fingerprint, id)",
+      "UNIQUE (scope_fingerprint, node_type, record_id)",
+      "CHECK (node_type = ANY (ARRAY['evidence', 'memory', 'summary', 'skill_candidate']))",
+    ],
+    mengshu_work_memory_edges: [
+      "PRIMARY KEY (scope_fingerprint, id)",
+      "FOREIGN KEY (scope_fingerprint, source_id) REFERENCES mengshu_work_memory_nodes(scope_fingerprint, id)",
+      "FOREIGN KEY (scope_fingerprint, target_id) REFERENCES mengshu_work_memory_nodes(scope_fingerprint, id)",
+      "CHECK (predicate = ANY (ARRAY['grounded_by', 'derives_from', 'contradicts', 'supersedes', 'promoted_to']))",
+    ],
+  });
+  appendCatalogIndexes(rows, [
+    "mengshu_work_memory_nodes_scope_type_idx",
+    "mengshu_work_memory_edges_scope_source_idx",
+    "mengshu_work_memory_edges_scope_target_idx",
+  ]);
+  return rows;
+}
+
+function createCandidateWriteCatalogRows(): Record<string, unknown>[] {
+  const timestampColumns = new Set(["created_at", "occurred_at", "published_at"]);
+  const rows: Record<string, unknown>[] = Object.entries(CANDIDATE_WRITE_JOURNAL_REQUIRED_COLUMNS)
+    .flatMap(([tableName, columns]) => columns.map((column) => ({
+      kind: "column",
+      table_name: tableName,
+      object_name: column,
+      definition: column === "audit_id"
+        ? "bigint"
+        : column === "result"
+          ? "jsonb"
+          : timestampColumns.has(column)
+            ? "timestamp with time zone"
+            : "text",
+      default_definition: column === "audit_id"
+        ? "nextval('mengshu_candidate_write_audit_audit_id_seq'::regclass)"
+        : tableName === "mengshu_candidate_write_receipts" && column === "created_at"
+          ? "now()"
+          : column === "workspace_id" || column === "session_id"
+            ? "''::text"
+            : null,
+      is_nullable: tableName === "mengshu_candidate_write_outbox" && column === "published_at"
+        ? "YES"
+        : "NO",
+      is_valid: true,
+      is_ready: true,
+    })));
+  const routeConstraint = "CHECK (route = ANY (ARRAY['candidate_low_priority', 'candidate']))";
+  appendCatalogConstraints(rows, {
+    mengshu_candidate_write_receipts: [
+      "PRIMARY KEY (storage_key)",
+      "FOREIGN KEY (candidate_id) REFERENCES mengshu_candidates(id)",
+      "CHECK (storage_key ~ '^[0-9a-f]{64}$')",
+      "CHECK (request_fingerprint ~ '^[0-9a-f]{64}$')",
+      "CHECK (visibility = ANY (ARRAY['private', 'workspace', 'team', 'public']))",
+      routeConstraint,
+      "CHECK (jsonb_typeof(result) = 'object')",
+    ],
+    mengshu_candidate_write_audit: [
+      "PRIMARY KEY (audit_id)",
+      "FOREIGN KEY (candidate_id) REFERENCES mengshu_candidates(id)",
+      "UNIQUE (storage_key, candidate_id, action)",
+      "CHECK (storage_key ~ '^[0-9a-f]{64}$')",
+      "CHECK (request_fingerprint ~ '^[0-9a-f]{64}$')",
+      "CHECK (action = 'candidate.store')",
+      "CHECK (visibility = ANY (ARRAY['private', 'workspace', 'team', 'public']))",
+      routeConstraint,
+    ],
+    mengshu_candidate_write_outbox: [
+      "PRIMARY KEY (event_id)",
+      "FOREIGN KEY (candidate_id) REFERENCES mengshu_candidates(id)",
+      "UNIQUE (storage_key, topic, candidate_id)",
+      "CHECK (event_id ~ '^[0-9a-f]{64}$')",
+      "CHECK (storage_key ~ '^[0-9a-f]{64}$')",
+      "CHECK (request_fingerprint ~ '^[0-9a-f]{64}$')",
+      "CHECK (topic = 'candidate.written')",
+      "CHECK (visibility = ANY (ARRAY['private', 'workspace', 'team', 'public']))",
+      routeConstraint,
+    ],
+  });
+  appendCatalogIndexes(rows, [
+    "mengshu_candidate_write_audit_scope_candidate_idx",
+    "mengshu_candidate_write_outbox_pending_idx",
+    "mengshu_candidate_write_receipts_created_idx",
+  ]);
+  return rows;
+}
+
+function createEvidenceLinkCatalogRows(): Record<string, unknown>[] {
+  const rows: Record<string, unknown>[] = Object.entries(EVIDENCE_LINK_LEDGER_REQUIRED_COLUMNS)
+    .flatMap(([tableName, columns]) => columns.map((column) => ({
+      kind: "column",
+      table_name: tableName,
+      object_name: column,
+      definition: column === "created_at" ? "bigint" : "text",
+      default_definition: column === "workspace_id" || column === "session_id"
+        ? "''::text"
+        : null,
+      is_nullable: "NO",
+      is_valid: true,
+      is_ready: true,
+    })));
+  appendCatalogConstraints(rows, {
+    mengshu_memory_evidence_links: [
+      "PRIMARY KEY (link_id)",
+      "UNIQUE (scope_fingerprint, target_memory_id, evidence_memory_id, link_kind, source)",
+      "CHECK (link_kind = ANY (ARRAY['grounded_by', 'duplicate_evidence', 'supersession_evidence', 'conflict_evidence']))",
+    ],
+    mengshu_graph_entity_evidence: [
+      "PRIMARY KEY (link_id)",
+      "FOREIGN KEY (scope_fingerprint, entity_id) REFERENCES mengshu_graph_entities(scope_fingerprint, id)",
+      "UNIQUE (scope_fingerprint, entity_id, evidence_memory_id, source_id, source_kind)",
+    ],
+    mengshu_graph_relation_evidence: [
+      "PRIMARY KEY (link_id)",
+      "FOREIGN KEY (scope_fingerprint, relation_id) REFERENCES mengshu_graph_relations(scope_fingerprint, id)",
+      "UNIQUE (scope_fingerprint, relation_id, evidence_memory_id, source_id, source_kind)",
+    ],
+    mengshu_graph_entity_aliases: [
+      "PRIMARY KEY (alias_id)",
+      "FOREIGN KEY (scope_fingerprint, entity_id) REFERENCES mengshu_graph_entities(scope_fingerprint, id)",
+      "UNIQUE (scope_fingerprint, entity_id, normalized_alias)",
+    ],
+  });
+  appendCatalogIndexes(rows, [
+    "mengshu_memory_evidence_links_scope_target_idx",
+    "mengshu_graph_entity_evidence_scope_evidence_idx",
+    "mengshu_graph_relation_evidence_scope_evidence_idx",
+    "mengshu_graph_entity_aliases_scope_alias_idx",
+  ]);
+  return rows;
+}
+
+function createTopicTreeAliasCatalogRows(): Record<string, unknown>[] {
+  const rows: Record<string, unknown>[] = Object.entries(TOPIC_TREE_ALIAS_REQUIRED_COLUMNS)
+    .flatMap(([tableName, columns]) => columns.map((column) => ({
+      kind: "column",
+      table_name: tableName,
+      object_name: column,
+      definition: column === "merged_from"
+        ? "jsonb"
+        : ["created_at", "updated_at", "superseded_at", "archived_at"].includes(column)
+          ? "bigint"
+          : "text",
+      default_definition: column === "workspace_id" || column === "session_id"
+        ? "''::text"
+        : column === "status"
+          ? "'active'::text"
+          : null,
+      is_nullable: ["sealed_node_id", "superseded_at", "archived_at"].includes(column)
+        ? "YES"
+        : "NO",
+      is_valid: true,
+      is_ready: true,
+    })));
+  appendCatalogConstraints(rows, {
+    mengshu_topic_tree_aliases: [
+      "PRIMARY KEY (scope_fingerprint, legacy_tree_key)",
+      "CHECK (status = ANY (ARRAY['active', 'superseded', 'archived']))",
+      "CHECK (jsonb_typeof(merged_from) = 'array')",
+      "CHECK (merged_from @> jsonb_build_array(legacy_tree_key))",
+    ],
+  });
+  appendCatalogIndexes(rows, [
+    "mengshu_topic_tree_aliases_scope_canonical_idx",
+    "mengshu_topic_tree_aliases_scope_status_idx",
+  ]);
+  return rows;
+}
+
+function createCanonicalEntityResolutionCatalogRows(): Record<string, unknown>[] {
+  const nullable = new Map<string, readonly string[]>([
+    ["mengshu_graph_entity_alias_bindings", ["retired_at"]],
+    ["mengshu_graph_entity_resolution_ledger", ["similarity", "rolled_back_at"]],
+    ["mengshu_graph_relation_resolution_ledger", ["canonical_relation_id"]],
+    ["mengshu_graph_entity_embeddings", []],
+  ]);
+  const typeFor = (column: string): string => {
+    if (["created_at", "updated_at", "retired_at", "rolled_back_at"].includes(column)) {
+      return "bigint";
+    }
+    if (column === "similarity") return "double precision";
+    if (column === "can_rollback") return "boolean";
+    if (["raw_entity", "observed_aliases", "raw_relation"].includes(column)) return "jsonb";
+    if (column === "vector") return "vector";
+    return "text";
+  };
+  const rows: Record<string, unknown>[] = Object.entries(
+    CANONICAL_ENTITY_RESOLUTION_REQUIRED_COLUMNS,
+  ).flatMap(([tableName, columns]) => columns.map((column) => ({
+    kind: "column",
+    table_name: tableName,
+    object_name: column,
+    definition: typeFor(column),
+    default_definition: column === "workspace_id" || column === "session_id"
+      ? "''::text"
+      : null,
+    is_nullable: nullable.get(tableName)?.includes(column) ? "YES" : "NO",
+    is_valid: true,
+    is_ready: true,
+  })));
+  appendCatalogConstraints(rows, {
+    mengshu_graph_entity_alias_bindings: [
+      "PRIMARY KEY (alias_binding_id)",
+      "FOREIGN KEY (scope_fingerprint, canonical_entity_id) REFERENCES mengshu_graph_entities(scope_fingerprint, id)",
+      "CHECK (status = ANY (ARRAY['active', 'retired']))",
+    ],
+    mengshu_graph_entity_resolution_ledger: [
+      "PRIMARY KEY (resolution_id)",
+      "FOREIGN KEY (job_id) REFERENCES mengshu_jobs_v2(id)",
+      "FOREIGN KEY (scope_fingerprint, canonical_entity_id) REFERENCES mengshu_graph_entities(scope_fingerprint, id)",
+      "UNIQUE (scope_fingerprint, job_id, evidence_memory_id, raw_entity_id)",
+      "CHECK (method = ANY (ARRAY['exact', 'alias', 'semantic', 'create']))",
+      "CHECK (status = ANY (ARRAY['applied', 'rolled_back']))",
+      "CHECK (jsonb_typeof(raw_entity) = 'object')",
+      "CHECK (jsonb_typeof(observed_aliases) = 'array')",
+      "CHECK (((method = 'semantic') AND similarity IS NOT NULL AND can_rollback = true) OR ((method <> 'semantic') AND similarity IS NULL AND can_rollback = false))",
+    ],
+    mengshu_graph_relation_resolution_ledger: [
+      "PRIMARY KEY (resolution_id)",
+      "FOREIGN KEY (job_id) REFERENCES mengshu_jobs_v2(id)",
+      "FOREIGN KEY (scope_fingerprint, canonical_relation_id) REFERENCES mengshu_graph_relations(scope_fingerprint, id)",
+      "FOREIGN KEY (scope_fingerprint, canonical_subject_id) REFERENCES mengshu_graph_entities(scope_fingerprint, id)",
+      "FOREIGN KEY (scope_fingerprint, canonical_object_id) REFERENCES mengshu_graph_entities(scope_fingerprint, id)",
+      "UNIQUE (scope_fingerprint, job_id, evidence_memory_id, raw_relation_id)",
+      "CHECK (outcome = ANY (ARRAY['canonicalized', 'dropped_self']))",
+      "CHECK (jsonb_typeof(raw_relation) = 'object')",
+      "CHECK (((outcome = 'canonicalized') AND canonical_relation_id IS NOT NULL AND canonical_subject_id <> canonical_object_id) OR ((outcome = 'dropped_self') AND canonical_relation_id IS NULL AND canonical_subject_id = canonical_object_id))",
+    ],
+    mengshu_graph_entity_embeddings: [
+      "PRIMARY KEY (scope_fingerprint, entity_id, embedding_space_id)",
+      "FOREIGN KEY (scope_fingerprint, entity_id) REFERENCES mengshu_graph_entities(scope_fingerprint, id)",
+      "FOREIGN KEY (embedding_space_id) REFERENCES mengshu_embedding_spaces(embedding_space_id)",
+      "CHECK (embedding_space_state = ANY (ARRAY['known-queryable', 'unknown-unqueryable']))",
+    ],
+  });
+  appendCatalogIndexes(rows, [
+    "mengshu_graph_entity_alias_bindings_active_uidx",
+    "mengshu_graph_entity_alias_bindings_entity_idx",
+    "mengshu_graph_entity_resolution_scope_evidence_idx",
+    "mengshu_graph_entity_resolution_rollback_idx",
+    "mengshu_graph_relation_resolution_scope_evidence_idx",
+    "mengshu_graph_entity_embeddings_queryable_idx",
+  ], (indexName) => {
+    if (indexName === "mengshu_graph_entity_alias_bindings_active_uidx") {
+      return `CREATE UNIQUE INDEX ${indexName} ON mengshu_graph_entity_alias_bindings USING btree (scope_fingerprint, entity_type, normalized_alias) WHERE (status = 'active'::text)`;
+    }
+    if (indexName === "mengshu_graph_entity_embeddings_queryable_idx") {
+      return `CREATE INDEX ${indexName} ON mengshu_graph_entity_embeddings USING btree (scope_fingerprint, entity_type, embedding_space_id, entity_id) WHERE (embedding_space_state = 'known-queryable'::text)`;
+    }
+    return `CREATE INDEX ${indexName}`;
+  });
+  return rows;
+}
+
+function createAssetLoadoutCatalogRows(
+  columnsByTable: Readonly<Record<string, readonly string[]>>,
+): Record<string, unknown>[] {
+  const integerColumns = new Set(["version", "latest_version", "asset_version", "loadout_version"]);
+  const bigintColumns = new Set([
+    "audit_id", "created_at", "changed_at", "occurred_at", "published_at",
+  ]);
+  const jsonColumns = new Set(["descriptor", "receipt", "payload"]);
+  const rows = Object.entries(columnsByTable).flatMap(([tableName, columns]) =>
+    columns.map((column) => ({
+      kind: "column",
+      table_name: tableName,
+      object_name: column,
+      definition: integerColumns.has(column)
+        ? "integer"
+        : bigintColumns.has(column)
+          ? "bigint"
+          : jsonColumns.has(column) ? "jsonb" : "text",
+      default_definition: column === "audit_id"
+        ? `nextval('${tableName}_audit_id_seq'::regclass)`
+        : null,
+      is_nullable: column === "published_at" ||
+          (tableName === "mengshu_loadout_versions" && column === "project_id")
+        ? "YES"
+        : "NO",
+      is_valid: true,
+      is_ready: true,
+    })),
+  );
+  const loadoutEventLedger = Object.hasOwn(columnsByTable, "mengshu_loadout_audit");
+  appendCatalogConstraints(rows, loadoutEventLedger
+    ? {
+        mengshu_loadout_audit: [
+          "PRIMARY KEY (audit_id)",
+          "FOREIGN KEY (scope_fingerprint, loadout_id, loadout_version) REFERENCES mengshu_loadout_versions",
+          "FOREIGN KEY (scope_fingerprint, request_key) REFERENCES mengshu_loadout_receipts",
+          "CHECK (event_type = 'version_created')",
+        ],
+        mengshu_loadout_outbox: [
+          "PRIMARY KEY (event_id)",
+          "FOREIGN KEY (scope_fingerprint, loadout_id, loadout_version) REFERENCES mengshu_loadout_versions",
+          "CHECK (event_type = 'loadout.version.created')",
+          "CHECK (jsonb_typeof(payload) = 'object')",
+        ],
+      }
+    : {
+        mengshu_asset_versions: [
+          "PRIMARY KEY (scope_fingerprint, asset_id, version)",
+          "CHECK (kind = 'memory_view')",
+          "CHECK (status = ANY (ARRAY['draft', 'review', 'published', 'deprecated', 'revoked']))",
+          "CHECK (visibility = 'private')",
+          "CHECK (jsonb_typeof(descriptor) = 'object')",
+        ],
+        mengshu_asset_heads: [
+          "PRIMARY KEY (scope_fingerprint, asset_id)",
+          "FOREIGN KEY (scope_fingerprint, asset_id, latest_version) REFERENCES mengshu_asset_versions",
+        ],
+        mengshu_asset_promotion_receipts: [
+          "PRIMARY KEY (receipt_id)",
+          "UNIQUE (scope_fingerprint, request_key)",
+          "FOREIGN KEY (scope_fingerprint, asset_id, asset_version) REFERENCES mengshu_asset_versions",
+          "CHECK (jsonb_typeof(receipt) = 'object')",
+        ],
+        mengshu_asset_audit: [
+          "PRIMARY KEY (audit_id)",
+          "FOREIGN KEY (receipt_id) REFERENCES mengshu_asset_promotion_receipts",
+          "FOREIGN KEY (scope_fingerprint, asset_id, asset_version) REFERENCES mengshu_asset_versions",
+          "CHECK (event_type = ANY (ARRAY['version_created', 'status_changed']))",
+        ],
+        mengshu_asset_outbox: [
+          "PRIMARY KEY (event_id)",
+          "FOREIGN KEY (scope_fingerprint, asset_id, asset_version) REFERENCES mengshu_asset_versions",
+          "CHECK (event_type = ANY (ARRAY['asset.version.created', 'asset.status.changed']))",
+          "CHECK (jsonb_typeof(payload) = 'object')",
+        ],
+        mengshu_loadout_versions: [
+          "PRIMARY KEY (scope_fingerprint, loadout_id, version)",
+          "CHECK (visibility = 'private')",
+          "CHECK (jsonb_typeof(descriptor) = 'object')",
+        ],
+        mengshu_loadout_heads: [
+          "PRIMARY KEY (scope_fingerprint, loadout_id)",
+          "FOREIGN KEY (scope_fingerprint, loadout_id, latest_version) REFERENCES mengshu_loadout_versions",
+        ],
+        mengshu_loadout_receipts: [
+          "PRIMARY KEY (scope_fingerprint, request_key)",
+          "FOREIGN KEY (scope_fingerprint, loadout_id, loadout_version) REFERENCES mengshu_loadout_versions",
+          "CHECK (jsonb_typeof(receipt) = 'object')",
+        ],
+      });
+  appendCatalogIndexes(rows, loadoutEventLedger
+    ? ["mengshu_loadout_outbox_pending_idx"]
+    : [
+        "mengshu_asset_versions_status_idx",
+        "mengshu_asset_outbox_pending_idx",
+        "mengshu_loadout_identity_idx",
+      ], (indexName) => indexName.includes("outbox_pending")
+      ? `CREATE INDEX ${indexName} WHERE (published_at IS NULL)`
+      : `CREATE INDEX ${indexName}`);
+  return rows;
+}
+
+function createContextAssemblyReceiptCatalogRows(): Record<string, unknown>[] {
+  const bigintColumns = new Set(["created_at", "expires_at"]);
+  const rows = Object.entries(CONTEXT_ASSEMBLY_RECEIPT_REQUIRED_COLUMNS)
+    .flatMap(([tableName, columns]) => columns.map((column) => ({
+      kind: "column",
+      table_name: tableName,
+      object_name: column,
+      definition: bigintColumns.has(column) ? "bigint" : column === "receipt" ? "jsonb" : "text",
+      default_definition: null,
+      is_nullable: "NO",
+      is_valid: true,
+      is_ready: true,
+    })));
+  appendCatalogConstraints(rows, {
+    mengshu_context_assembly_receipts: [
+      "PRIMARY KEY (receipt_id)",
+      "CHECK (receipt_id ~ '^[0-9a-f]{64}$')",
+      "CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$')",
+      "CHECK (stable_content_hash ~ '^[0-9a-f]{64}$')",
+      "CHECK (dynamic_content_hash ~ '^[0-9a-f]{64}$')",
+      "CHECK (jsonb_typeof(receipt) = 'object')",
+      "CHECK (created_at >= 0)",
+      "CHECK (expires_at >= created_at)",
+      "CHECK (char_length(session_id) >= 1 AND char_length(session_id) <= 256 AND session_id !~ '[[:space:][:cntrl:]]')",
+    ],
+  });
+  appendCatalogIndexes(rows, ["mengshu_context_assembly_receipts_session_idx"],
+    (indexName) => `CREATE INDEX ${indexName} ON mengshu_context_assembly_receipts ` +
+      "(scope_fingerprint, session_id, created_at DESC, receipt_id DESC)");
+  return rows;
+}
+
+function createHistoryRebuildLedgerCatalogRows(): Record<string, unknown>[] {
+  const uuidColumns = new Set(["source_upper_bound", "record_id", "after_id"]);
+  const bigintColumns = new Set([
+    "created_at", "updated_at", "captured_at", "source_count", "checkpoint_version",
+  ]);
+  const integerColumns = new Set(["proposal_count", "input_tokens", "output_tokens"]);
+  const jsonColumns = new Set([
+    "source_row", "original_metadata", "counts", "topic_labels", "tree_eligibility",
+  ]);
+  const nullable = new Set([
+    "mengshu_history_rebuild_source_snapshots.source_upper_bound",
+    "mengshu_history_rebuild_checkpoints.after_id",
+    "mengshu_history_rebuild_source_rows.original_lifecycle_status",
+    "mengshu_history_rebuild_shadow_plans.semantic_type",
+    "mengshu_history_rebuild_operation_receipts.drift_hash",
+  ]);
+  const rows = Object.entries(HISTORY_REBUILD_LEDGER_REQUIRED_COLUMNS)
+    .flatMap(([tableName, columns]) => columns.map((column) => ({
+      kind: "column",
+      table_name: tableName,
+      object_name: column,
+      definition: uuidColumns.has(column) ? "uuid"
+        : bigintColumns.has(column) ? "bigint"
+        : integerColumns.has(column) ? "integer"
+        : jsonColumns.has(column) ? "jsonb"
+        : column === "context_eligible" ? "boolean"
+        : column === "confidence" ? "double precision"
+        : "text",
+      default_definition: tableName === "mengshu_history_rebuild_runs" &&
+          (column === "workspace_id" || column === "session_id")
+        ? "''::text"
+        : tableName === "mengshu_history_rebuild_checkpoints" &&
+            column === "checkpoint_version"
+        ? "0"
+        : null,
+      is_nullable: nullable.has(`${tableName}.${column}`) ? "YES" : "NO",
+      is_valid: true,
+      is_ready: true,
+    })));
+  const constraints: Record<string, readonly string[]> = {
+    mengshu_history_rebuild_runs: [
+      "PRIMARY KEY (run_id)", "UNIQUE (migration_id, scope_fingerprint, attempt_hash)",
+      "scope_fingerprint ~ '^[0-9a-f]{64}$'", "visibility = ANY", "state = ANY",
+    ],
+    mengshu_history_rebuild_source_snapshots: [
+      "PRIMARY KEY (run_id, source_table)", "FOREIGN KEY (run_id)",
+      "REFERENCES mengshu_history_rebuild_runs", "source_table = ANY",
+      "source_count = 0", "source_upper_bound IS NULL",
+    ],
+    mengshu_history_rebuild_source_rows: [
+      "PRIMARY KEY (run_id, source_table, record_id)",
+      "UNIQUE (run_id, source_table, source_hash)",
+      "FOREIGN KEY (run_id, source_table)",
+      "REFERENCES mengshu_history_rebuild_source_snapshots", "source_table = ANY",
+      "jsonb_typeof(source_row) = 'object'", "jsonb_typeof(original_metadata) = 'object'",
+    ],
+    mengshu_history_rebuild_checkpoints: [
+      "PRIMARY KEY (run_id, source_table)", "FOREIGN KEY (run_id, source_table)",
+      "REFERENCES mengshu_history_rebuild_source_snapshots",
+      "jsonb_typeof(counts) = 'object'", "state = ANY",
+    ],
+    mengshu_history_rebuild_shadow_plans: [
+      "PRIMARY KEY (run_id, source_table, record_id)",
+      "UNIQUE (run_id, plan_receipt_hash)", "FOREIGN KEY (run_id, source_table)",
+      "REFERENCES mengshu_history_rebuild_source_snapshots", "disposition = ANY",
+      "semantic_type IS NULL", "jsonb_typeof(topic_labels) = 'array'",
+      "jsonb_typeof(tree_eligibility) = 'object'", "source_table <> 'knowledge'",
+    ],
+    mengshu_history_rebuild_model_receipts: [
+      "PRIMARY KEY (receipt_hash)", "UNIQUE (run_id, source_table, record_id)",
+      "FOREIGN KEY (run_id, source_table, record_id)",
+      "REFERENCES mengshu_history_rebuild_shadow_plans", "confidence >=", "confidence <=",
+    ],
+    mengshu_history_rebuild_operation_receipts: [
+      "PRIMARY KEY (receipt_hash)", "FOREIGN KEY (run_id)",
+      "REFERENCES mengshu_history_rebuild_runs", "operation = ANY", "status = ANY",
+      "jsonb_typeof(counts) = 'object'", "drift_hash IS NULL",
+    ],
+    mengshu_history_rebuild_artifacts: [
+      "PRIMARY KEY (run_id, artifact_type, artifact_id)",
+      "FOREIGN KEY (run_id, source_table, record_id)",
+      "REFERENCES mengshu_history_rebuild_source_rows", "source_table = ANY",
+      "artifact_type = ANY", "artifact_role = ANY", "source_hash ~ '^[0-9a-f]{64}$'",
+      "char_length(artifact_id) >= 1", "char_length(artifact_id) <= 256",
+      "artifact_id !~ '[[:space:][:cntrl:]]'",
+    ],
+  };
+  appendCatalogConstraints(rows, constraints);
+  appendCatalogIndexes(rows, [
+    "mengshu_history_rebuild_shadow_disposition_idx",
+    "mengshu_history_rebuild_operations_idx",
+    "mengshu_history_rebuild_artifacts_source_idx",
+  ], (indexName) => {
+    const columns = indexName === "mengshu_history_rebuild_shadow_disposition_idx"
+      ? "run_id, source_table, disposition, record_id"
+      : indexName === "mengshu_history_rebuild_operations_idx"
+      ? "run_id, source_table, operation, created_at, receipt_hash"
+      : "run_id, source_table, record_id, artifact_type, artifact_role";
+    return `CREATE INDEX ${indexName} ON history (${columns})`;
+  });
+  return rows;
+}
+
+function createHistoryRebuildModelAttemptCatalogRows(): Record<string, unknown>[] {
+  const nullable = new Set([
+    "output", "output_hash", "actual_input_tokens", "actual_output_tokens",
+    "actual_cost_minor_units", "completed_at",
+  ]);
+  const integerColumns = new Set([
+    "attempt", "reserved_input_tokens", "reserved_output_tokens",
+    "actual_input_tokens", "actual_output_tokens",
+  ]);
+  const bigintColumns = new Set([
+    "reserved_cost_minor_units", "actual_cost_minor_units", "reserved_at", "completed_at",
+  ]);
+  const rows = Object.entries(HISTORY_REBUILD_MODEL_ATTEMPT_REQUIRED_COLUMNS)
+    .flatMap(([tableName, columns]) => columns.map((column) => ({
+      kind: "column",
+      table_name: tableName,
+      object_name: column,
+      definition: column === "record_id" ? "uuid"
+        : integerColumns.has(column) ? "integer"
+        : bigintColumns.has(column) ? "bigint"
+        : column === "output" ? "jsonb" : "text",
+      default_definition: null,
+      is_nullable: nullable.has(column) ? "YES" : "NO",
+      is_valid: true,
+      is_ready: true,
+    })));
+  appendCatalogConstraints(rows, {
+    mengshu_history_rebuild_model_attempts: [
+      "PRIMARY KEY (run_id, source_table, record_id, attempt)",
+      "FOREIGN KEY (run_id) REFERENCES mengshu_history_rebuild_runs(run_id)",
+      "CHECK (source_table = ANY)", "CHECK (state = ANY)",
+      "CHECK (attempt >= 0 AND attempt < 2)",
+      "CHECK ((state = 'reserved' AND output IS NULL) OR (state = 'completed' AND " +
+        "jsonb_typeof(output) = 'object' AND actual_input_tokens = reserved_input_tokens AND " +
+        "actual_output_tokens <= reserved_output_tokens AND " +
+        "actual_cost_minor_units <= reserved_cost_minor_units))",
+    ],
+  });
+  appendCatalogIndexes(rows, ["mengshu_history_rebuild_model_attempts_budget_idx"],
+    (indexName) => `CREATE INDEX ${indexName} ON mengshu_history_rebuild_model_attempts ` +
+      "(migration_id, manifest_hash, state)");
+  return rows;
+}
+
 const mockQuery = vi.fn(async (sql: string, params?: unknown[]) => {
   queryCalls.push({ sql, params });
   if (sql === "BEGIN") {
@@ -252,11 +854,31 @@ const mockQuery = vi.fn(async (sql: string, params?: unknown[]) => {
   }
   if (/FROM information_schema\.columns/.test(sql)) {
     const requestedTables = Array.isArray(params?.[0]) ? params[0] as string[] : [];
-    const rows = requestedTables.includes("mengshu_embedding_reembed_shadow")
-      ? createEmbeddingReembedCatalogRows()
-      : requestedTables.includes("mengshu_write_receipts")
-        ? createWriteJournalCatalogRows()
-        : createDurableDomainCatalogRows();
+    const rows = requestedTables.includes("mengshu_history_rebuild_model_attempts")
+      ? createHistoryRebuildModelAttemptCatalogRows()
+      : requestedTables.includes("mengshu_history_rebuild_runs")
+      ? createHistoryRebuildLedgerCatalogRows()
+      : requestedTables.includes("mengshu_context_assembly_receipts")
+      ? createContextAssemblyReceiptCatalogRows()
+      : requestedTables.includes("mengshu_asset_versions")
+      ? createAssetLoadoutCatalogRows(ASSET_LOADOUT_OVERLAY_REQUIRED_COLUMNS)
+      : requestedTables.includes("mengshu_loadout_audit")
+        ? createAssetLoadoutCatalogRows(LOADOUT_EVENT_LEDGER_REQUIRED_COLUMNS)
+        : requestedTables.includes("mengshu_graph_entity_resolution_ledger")
+      ? createCanonicalEntityResolutionCatalogRows()
+      : requestedTables.includes("mengshu_topic_tree_aliases")
+        ? createTopicTreeAliasCatalogRows()
+        : requestedTables.includes("mengshu_memory_evidence_links")
+          ? createEvidenceLinkCatalogRows()
+          : requestedTables.includes("mengshu_candidate_write_receipts")
+            ? createCandidateWriteCatalogRows()
+            : requestedTables.includes("mengshu_work_memory_nodes")
+              ? createWorkMemoryCatalogRows()
+              : requestedTables.includes("mengshu_embedding_reembed_shadow")
+                ? createEmbeddingReembedCatalogRows()
+                : requestedTables.includes("mengshu_write_receipts")
+                  ? createWriteJournalCatalogRows()
+                  : createDurableDomainCatalogRows();
     return { rows, rowCount: rows.length };
   }
   if (/FROM pg_constraint AS constraint_meta/.test(sql) && /mengshu_jobs_v2/.test(sql)) {
@@ -271,6 +893,9 @@ const mockQuery = vi.fn(async (sql: string, params?: unknown[]) => {
     const contractDdlApplied = queryCalls.some(({ sql: callSql }) =>
       /CREATE UNIQUE INDEX memories_authority_content_hash_uidx/.test(callSql),
     );
+    const activeMemoryDedupeApplied = queryCalls.some(({ sql: callSql }) =>
+      /CREATE UNIQUE INDEX memories_active_authority_content_hash_uidx/.test(callSql),
+    );
     const rows = catalogRows ?? ["memories", "knowledge"].flatMap((table) => [
       {
         table_name: table, index_name: `${table}_pkey`, is_unique: true,
@@ -279,7 +904,10 @@ const mockQuery = vi.fn(async (sql: string, params?: unknown[]) => {
       contractDdlApplied
         ? {
             table_name: table, index_name: `${table}_authority_content_hash_uidx`, is_unique: true,
-            is_valid: true, is_ready: true, predicate: null,
+            is_valid: true, is_ready: true,
+            predicate: activeMemoryDedupeApplied && table === "memories"
+              ? "(lifecycle_status = 'active'::text)"
+              : null,
             index_columns: [
               "tenant_id", "user_id", "canonical_project_id", "product_id",
               "producer_id", "namespace", "visibility", "content_hash",
@@ -353,6 +981,7 @@ vi.mock("pg", () => {
 });
 
 import { PostgresProvider } from "./postgres";
+import { DEFAULT_VECTOR_CANDIDATE_LIMIT } from "../types";
 import type { MemoryEntry, MemoryQueryOptions } from "../types";
 import type { MemoryRecord } from "../../domain/types.js";
 
@@ -438,21 +1067,24 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
 
       await expect(provider.getSchemaContractStatus()).resolves.toEqual({
         currentVersion: 5,
-        targetVersion: 12,
+        targetVersion: CURRENT_SCHEMA_VERSION,
         scopeContentHashDedupe: "pending",
       });
       expect(queryCalls.some(({ sql }) => /CREATE UNIQUE INDEX memories_authority_content_hash_uidx/.test(sql)))
         .toBe(false);
     });
 
-    it("显式 maintenance/quiescence 路径连续应用 v6-v11 并切换 ready", async () => {
+    it("显式 maintenance/quiescence 路径连续应用至当前 schema 并切换 ready", async () => {
       const provider = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
       await provider.initialize();
 
       await expect(provider.applyScopeContentHashDedupeContract({
         maintenance: true,
         quiescenceConfirmed: true,
-      })).resolves.toMatchObject({ scopeContentHashDedupe: "ready", currentVersion: 12 });
+      })).resolves.toMatchObject({
+        scopeContentHashDedupe: "ready",
+        currentVersion: CURRENT_SCHEMA_VERSION,
+      });
 
       expect(queryCalls.some(({ sql }) => /CREATE UNIQUE INDEX memories_authority_content_hash_uidx/.test(sql)))
         .toBe(true);
@@ -536,6 +1168,7 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
       expect(insert!.sql).toContain("project_name");
       expect(insert!.sql).toContain("app_name");
       expect(insert!.sql).toContain("workspace_id");
+      expect(insert!.sql).toContain("scope_key");
       // 参数顺序：[..., project_name, app_name, user_id, agent_id, workspace_id]
       const params = insert!.params!;
       expect(params).toContain("memory-autodb");
@@ -543,18 +1176,19 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
       expect(params).toContain("user-1");
       expect(params).toContain("agent-1");
       expect(params).toContain("ws-1");
-      expect(params.slice(14, 21)).toEqual([
+      expect(params.slice(14, 22)).toEqual([
         "tenant-a",
         "memory-autodb",
         "claude-code",
         "agent-1",
         "memories",
         "private",
+        "tenant-a:claude-code:user-1:memory-autodb:agent-1:memories",
         null,
       ]);
       expect(insert!.sql).toContain("embedding_space_id");
       expect(insert!.sql).toContain("embedding_space_state");
-      expect(params.slice(21, 23)).toEqual([
+      expect(params.slice(22, 24)).toEqual([
         TEST_EMBEDDING_SPACE_ID,
         "known-queryable",
       ]);
@@ -652,7 +1286,7 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
       const inserts = queryCalls.filter((c) => /INSERT INTO\s+"memories"/.test(c.sql));
       expect(inserts).toHaveLength(2);
       expect(inserts[0]!.sql).toMatch(
-        /ON CONFLICT \(tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, visibility, content_hash\) DO NOTHING/i,
+        /ON CONFLICT \(tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, visibility, content_hash\) WHERE lifecycle_status = 'active' DO NOTHING/i,
       );
     });
 
@@ -677,6 +1311,7 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
       });
       const lookup = queryCalls.find((c) => /SELECT\s+id\s+FROM\s+"memories"/i.test(c.sql));
       expect(lookup?.sql).toMatch(/tenant_id = \$1[\s\S]+content_hash = \$8/i);
+      expect(lookup?.sql).toMatch(/lifecycle_status = 'active'/i);
       expect(lookup?.sql).toMatch(/legacy_quarantine_reason IS NULL/i);
       expect(lookup?.params).toEqual([
         "tenant-1", "user-1", "project-1", "product-1", "producer-1", "memories", "private", "hash-1",
@@ -696,18 +1331,60 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
       expect(insert?.sql).not.toMatch(/ON CONFLICT\s*\(/i);
     });
 
-    it("v6 ready 后 store 使用精确完整 authority conflict target", async () => {
+    it("ready 后 memories 仅用 active partial authority conflict target", async () => {
       const provider = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
       await provider.initialize();
       await provider.applyScopeContentHashDedupeContract({ maintenance: true, quiescenceConfirmed: true });
       queryCalls.length = 0;
 
-      await provider.store([makeEntry()]);
+      await provider.store([makeEntry({ lifecycleStatus: "active" })]);
 
       const insert = queryCalls.find(({ sql }) => /INSERT INTO\s+"memories"/.test(sql));
       expect(insert?.sql).toMatch(
+        /ON CONFLICT \(tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, visibility, content_hash\) WHERE lifecycle_status = 'active' DO NOTHING/i,
+      );
+    });
+
+    it("evidence-only archived 写入使用 active partial arbiter，不与同文本 active 共享唯一身份", async () => {
+      const provider = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
+      await provider.initialize();
+      await provider.applyScopeContentHashDedupeContract({ maintenance: true, quiescenceConfirmed: true });
+      queryCalls.length = 0;
+
+      const result = await provider.store([makeEntry({
+        lifecycleStatus: "archived",
+        metadata: {
+          ...TEST_EMBEDDING_FILTER,
+          admissionRoute: "evidence_only",
+          contextEligible: false,
+        },
+      })]);
+
+      expect(result.inserted).toBe(1);
+      const insert = queryCalls.find(({ sql }) => /INSERT INTO\s+"memories"/.test(sql));
+      expect(insert?.sql).toMatch(
+        /ON CONFLICT \(tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, visibility, content_hash\) WHERE lifecycle_status = 'active' DO NOTHING/i,
+      );
+      expect(insert?.params?.[21]).toBe("archived");
+    });
+
+    it("knowledge 保持 authority hash 全量唯一合同，不继承 memories lifecycle predicate", async () => {
+      const provider = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
+      await provider.initialize();
+      await provider.applyScopeContentHashDedupeContract({ maintenance: true, quiescenceConfirmed: true });
+      queryCalls.length = 0;
+
+      await provider.store([makeEntry({
+        tableName: "knowledge",
+        dataType: "knowledge",
+        namespace: "knowledge",
+      })]);
+
+      const insert = queryCalls.find(({ sql }) => /INSERT INTO\s+"knowledge"/.test(sql));
+      expect(insert?.sql).toMatch(
         /ON CONFLICT \(tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, visibility, content_hash\) DO NOTHING/i,
       );
+      expect(insert?.sql).not.toMatch(/WHERE lifecycle_status = 'active'/i);
     });
 
     it("v6 后旧 binary 重建 global unique 时跨 scope 冲突转换为稳定 schema error", async () => {
@@ -783,6 +1460,35 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
         .toBeLessThan(select!.sql.indexOf("ORDER BY vector <=>"));
     });
 
+    it("ANN 缺省候选池大于 5，且 legacy final limit 不下推到 SQL", async () => {
+      const provider = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
+      await provider.query({
+        vector: [0.1, 0.2],
+        limit: 5,
+        minScore: undefined,
+        filter: TEST_EMBEDDING_FILTER,
+      });
+
+      const select = queryCalls.find((call) => /vector <=>/.test(call.sql));
+      expect(select?.params?.at(-1)).toBe(DEFAULT_VECTOR_CANDIDATE_LIMIT);
+      expect(select?.params).not.toContain(5);
+      expect(select?.sql).not.toMatch(/similarity\s*>=/i);
+    });
+
+    it("ANN candidateLimit 可显式配置且不复用 legacy final limit", async () => {
+      const provider = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
+      await provider.query({
+        vector: [0.1, 0.2],
+        candidateLimit: 23,
+        limit: 5,
+        filter: TEST_EMBEDDING_FILTER,
+      });
+
+      const select = queryCalls.find((call) => /vector <=>/.test(call.sql));
+      expect(select?.params?.at(-1)).toBe(23);
+      expect(select?.params).not.toContain(5);
+    });
+
     it("tenant/user authority 使用独立列参数化并在 LIMIT 前硬过滤", async () => {
       const provider = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
       const maliciousTenant = "tenant' OR '1'='1";
@@ -798,7 +1504,11 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
       expect(select).toBeDefined();
       expect(select!.sql).toMatch(/tenant_id = \$\d+[\s\S]+user_id = \$\d+[\s\S]+LIMIT \$\d+/);
       expect(select!.sql).not.toContain(maliciousTenant);
-      expect(select!.params).toEqual(expect.arrayContaining([maliciousTenant, "user-authority", 5]));
+      expect(select!.params).toEqual(expect.arrayContaining([
+        maliciousTenant,
+        "user-authority",
+        DEFAULT_VECTOR_CANDIDATE_LIMIT,
+      ]));
     });
 
     it("tenant/user authority 必须成对提供", async () => {

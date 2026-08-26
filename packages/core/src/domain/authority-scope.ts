@@ -46,6 +46,10 @@ export interface AuthorityScope {
   tenantId: string;
   /** Authenticated user. Never sourced from client input. */
   userId: string;
+  /** Optional server-owned workspace coordinate. Never client requestable. */
+  workspaceId?: string;
+  /** Optional server-owned session coordinate. Never client requestable. */
+  sessionId?: string;
   allow: AuthorityScopeAllowlist;
 }
 
@@ -182,6 +186,23 @@ function authorityField(authority: Record<string, unknown>, field: "tenantId" | 
   return value;
 }
 
+function optionalAuthorityField(
+  authority: Record<string, unknown>,
+  field: "workspaceId" | "sessionId",
+): string | undefined {
+  const value = authority[field];
+  if (value === undefined) return undefined;
+  if (!hasValidStringShape(value) || value.normalize("NFKC") !== value ||
+      hasIdentifierPathConfusion(value)) {
+    throw new AuthorityScopeError(
+      "AUTHORITY_FIELD_INVALID",
+      `server authority field ${field} is not canonical`,
+      field,
+    );
+  }
+  return value;
+}
+
 function validateAllowlist(
   allow: Record<string, unknown>,
   field: ClientField,
@@ -230,6 +251,8 @@ function validateAllowlist(
 function validatedAuthority(authority: AuthorityScope): {
   tenantId: string;
   userId: string;
+  workspaceId?: string;
+  sessionId?: string;
   allowlists: Readonly<Record<ClientField, readonly string[]>>;
 } {
   if (!isRecord(authority)) {
@@ -241,6 +264,8 @@ function validatedAuthority(authority: AuthorityScope): {
   }
   const tenantId = authorityField(authority, "tenantId");
   const userId = authorityField(authority, "userId");
+  const workspaceId = optionalAuthorityField(authority, "workspaceId");
+  const sessionId = optionalAuthorityField(authority, "sessionId");
   if (!isRecord(authority.allow)) {
     throw new AuthorityScopeError(
       "AUTHORITY_ALLOWLIST_MISSING",
@@ -252,6 +277,8 @@ function validatedAuthority(authority: AuthorityScope): {
   return {
     tenantId,
     userId,
+    ...(workspaceId === undefined ? {} : { workspaceId }),
+    ...(sessionId === undefined ? {} : { sessionId }),
     allowlists: {
       appId: validateAllowlist(authority.allow, "appId"),
       projectId: validateAllowlist(authority.allow, "projectId"),
@@ -349,5 +376,7 @@ export function resolveAuthorityScope(
     agentId: requested.agentId,
     namespace: requested.namespace,
     visibility: requested.visibility,
+    ...(trusted.workspaceId === undefined ? {} : { workspaceId: trusted.workspaceId }),
+    ...(trusted.sessionId === undefined ? {} : { sessionId: trusted.sessionId }),
   };
 }

@@ -28,6 +28,10 @@ import {
   RuntimeDurableJobV2Error,
   createRuntimeDurableJobV2Enqueuer,
 } from "./runtime-durable-job-v2.js";
+import {
+  planTreeFanOut,
+  type TreeFanOutInput,
+} from "./packages/core/src/tree/tree-fan-out.js";
 
 const scope: DurableJobV2Scope = {
   tenantId: "tenant-a",
@@ -115,6 +119,76 @@ function extractPayload(metadata?: unknown) {
   };
 }
 
+function legacyGraphPayload() {
+  return {
+    scope: { ...scope },
+    chunkId: "evidence-1",
+    text: "Caller supplied graph text must not enter the production worker.",
+    sourceId: "session-1",
+  };
+}
+
+const routedTreeInput: TreeFanOutInput = {
+  scope: {
+    ...scope,
+    workspaceId: "workspace-a",
+    sessionId: "session-a",
+  },
+  leaf: {
+    id: "active-memory-1",
+    scope: {
+      ...scope,
+      workspaceId: "workspace-a",
+      sessionId: "session-a",
+    },
+    chunkId: "evidence-active-memory-1",
+    sourceId: "session-a",
+    entityIds: ["entity-deploy-policy"],
+    importance: 0.9,
+    eventAt: 90,
+    createdAt: 90,
+    text: "所有部署都必须先完成测试验证。",
+    tokenCount: 9,
+  },
+  routing: {
+    valueScore: 0.9,
+    importance: 0.9,
+    semanticType: "rules",
+    scopeVisibility: "workspace",
+    riskFlags: [],
+    topicLabels: [" Deploy Rules "],
+    topicHotnessEligible: true,
+    isWorkspaceRule: true,
+  },
+};
+
+function buildTreePayload(treeType: "source" | "topic" | "global") {
+  const target = planTreeFanOut(routedTreeInput).targets.find(
+    (candidate) => candidate.treeType === treeType,
+  );
+  if (!target) throw new Error(`missing ${treeType} test target`);
+  return {
+    scope: { ...routedTreeInput.scope },
+    traceId: routedTreeInput.leaf.id,
+    treeType: target.treeType,
+    treeKey: target.treeKey,
+    targetIdempotencyKey: target.idempotencyKey,
+    routing: {
+      ...routedTreeInput.routing,
+      riskFlags: [...routedTreeInput.routing.riskFlags],
+      topicLabels: [...(routedTreeInput.routing.topicLabels ?? [])],
+    },
+    leaf: {
+      id: routedTreeInput.leaf.id,
+      chunkId: routedTreeInput.leaf.chunkId,
+      sourceId: routedTreeInput.leaf.sourceId,
+      entityIds: [...routedTreeInput.leaf.entityIds],
+      text: routedTreeInput.leaf.text,
+      eventAt: routedTreeInput.leaf.eventAt,
+    },
+  };
+}
+
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
@@ -177,6 +251,114 @@ describe("runtime durable job v2 enqueue boundary", () => {
       sessionCommit: "unsupported_v2_job_types_fail_closed",
       nativeHandlers: "required_for_production_serve",
       providerBinding: "trusted_composition_must_bind_runtime_db",
+    });
+  });
+
+  test("production enqueue boundary 拒绝调用方投递 legacy extract_graph 正文", async () => {
+    const composition = nativeComposition();
+    const enqueuer = createRuntimeDurableJobV2Enqueuer(composition.capability, {
+      defaultScope: scope,
+    });
+
+    await expect(enqueuer.enqueue({
+      type: "extract_graph",
+      payload: legacyGraphPayload(),
+    })).rejects.toEqual(new RuntimeDurableJobV2Error("JOB_TYPE_UNSUPPORTED"));
+    expect(composition.repository.enqueueInputs).toEqual([]);
+  });
+
+  test.each(["source", "topic", "global"] as const)(
+    "routed build_tree %s 保留严格 routing，并以 target identity 生成 domain dedupe",
+    async (treeType) => {
+      const composition = nativeComposition();
+      const enqueuer = createRuntimeDurableJobV2Enqueuer(composition.capability, {
+        defaultScope: scope,
+        idFactory: () => `job-${treeType}`,
+      });
+      const payload = buildTreePayload(treeType);
+
+      await expect(enqueuer.enqueue({ type: "build_tree", payload }))
+        .resolves.toBe(`job-${treeType}`);
+
+      expect(composition.repository.enqueueInputs).toHaveLength(1);
+      expect(composition.repository.enqueueInputs[0]).toMatchObject({
+        type: "build_tree",
+        dedupeKey: deriveDurableJobV2DomainDedupeKey(
+          "build_tree",
+          payload.targetIdempotencyKey,
+          { workspaceId: "workspace-a", sessionId: "session-a" },
+        ),
+        payload,
+      });
+      expect(composition.repository.enqueueInputs[0]!.payload).toMatchObject({
+        traceId: "active-memory-1",
+        leaf: {
+          id: "active-memory-1",
+          chunkId: "evidence-active-memory-1",
+          entityIds: ["entity-deploy-policy"],
+        },
+      });
+    },
+  );
+
+  test("routed build_tree 的 routing 与 targetIdempotencyKey 必须成对且不接受未知字段", async () => {
+    const composition = nativeComposition();
+    const enqueuer = createRuntimeDurableJobV2Enqueuer(composition.capability, {
+      defaultScope: scope,
+    });
+    const payload = buildTreePayload("topic");
+
+    for (const invalid of [
+      { ...payload, routing: undefined },
+      { ...payload, targetIdempotencyKey: undefined },
+      { ...payload, targetIdempotencyKey: "tree-fan-out:forged" },
+      { ...payload, treeKey: "entity-id-is-not-a-topic-label" },
+      {
+        ...payload,
+        routing: Object.fromEntries(
+          Object.entries(payload.routing).filter(([key]) => key !== "importance"),
+        ),
+      },
+      { ...payload, routing: { ...payload.routing, extra: true } },
+      { ...payload, extra: true },
+    ]) {
+      const candidate = Object.fromEntries(
+        Object.entries(invalid).filter(([, value]) => value !== undefined),
+      );
+      await expect(enqueuer.enqueue({ type: "build_tree", payload: candidate }))
+        .rejects.toMatchObject({ code: "JOB_PAYLOAD_INVALID" });
+    }
+    expect(composition.repository.enqueueInputs).toEqual([]);
+  });
+
+  test("legacy build_tree 无 routing 时只兼容 source 且 treeKey 必须等于 leaf.sourceId", async () => {
+    const composition = nativeComposition();
+    let id = 0;
+    const enqueuer = createRuntimeDurableJobV2Enqueuer(composition.capability, {
+      defaultScope: scope,
+      idFactory: () => `legacy-job-${++id}`,
+    });
+    const routed = buildTreePayload("source");
+    const { routing: _routing, targetIdempotencyKey: _target, ...legacy } = routed;
+
+    await expect(enqueuer.enqueue({ type: "build_tree", payload: legacy }))
+      .resolves.toBe("legacy-job-1");
+    for (const invalid of [
+      { ...legacy, treeType: "topic" },
+      { ...legacy, treeType: "global" },
+      { ...legacy, treeKey: "another-source" },
+    ]) {
+      await expect(enqueuer.enqueue({ type: "build_tree", payload: invalid }))
+        .rejects.toMatchObject({ code: "JOB_PAYLOAD_INVALID" });
+    }
+
+    expect(composition.repository.enqueueInputs).toHaveLength(1);
+    expect(composition.repository.enqueueInputs[0]).toMatchObject({
+      dedupeKey: deriveDurableJobV2DomainDedupeKey(
+        "build_tree",
+        legacy.traceId,
+        { workspaceId: "workspace-a", sessionId: "session-a" },
+      ),
     });
   });
 

@@ -78,6 +78,11 @@ const INSERT_PENDING_SQL = `INSERT INTO ${MENGSHU_CANDIDATE_RELATION} (
   $15, $16, $17, $18, $19::jsonb, $20, $21, $22, $23::jsonb, $24, $25, $26, $27
 )
 ON CONFLICT (tenant_id, user_id, app_id, project_id, agent_id, namespace, visibility, workspace_id, session_id, active_content_hash) DO NOTHING`;
+const INSERT_KERNEL_PENDING_SQL = `${INSERT_PENDING_SQL} RETURNING id`;
+const SELECT_ACTIVE_ID_SQL = `SELECT id FROM ${MENGSHU_CANDIDATE_RELATION}
+WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3 AND project_id = $4
+  AND agent_id = $5 AND namespace = $6 AND visibility = $7
+  AND workspace_id = $8 AND session_id = $9 AND active_content_hash = $10`;
 
 function invalid(label = "Postgres candidate input is invalid"): Error {
   return new Error(label);
@@ -288,6 +293,56 @@ function queryParams(
   return Object.freeze({ id: input.id, sourceJobId: binding.sourceJobId, scope, params });
 }
 
+function kernelQueryParams(
+  scopeValue: unknown,
+  inputValue: unknown,
+): {
+  readonly id: string;
+  readonly conflictParams: readonly unknown[];
+  readonly params: readonly unknown[];
+} {
+  const scope = canonicalScope(scopeValue);
+  const input = canonicalInput(inputValue);
+  const hash = createHash("sha256").update(input.text.trim()).digest("hex");
+  const conflictParams = Object.freeze([
+    scope.tenantId,
+    scope.userId,
+    scope.appId,
+    scope.projectId,
+    scope.agentId,
+    scope.namespace,
+    scope.visibility,
+    scope.workspaceId ?? "",
+    scope.sessionId ?? "",
+    hash,
+  ]);
+  return Object.freeze({
+    id: input.id,
+    conflictParams,
+    params: Object.freeze([
+      input.id,
+      ...conflictParams.slice(0, 9),
+      null,
+      hash,
+      hash,
+      input.text,
+      input.semanticType ?? null,
+      input.kind,
+      input.confidence,
+      input.reason ?? null,
+      JSON.stringify(input.evidenceIds),
+      input.extractor ?? null,
+      "pending",
+      0,
+      JSON.stringify(input.metadata),
+      input.createdAt,
+      null,
+      null,
+      null,
+    ]),
+  });
+}
+
 function readQuery(client: unknown): PostgresCandidateQueryClient["query"] {
   if (!client || typeof client !== "object" || nodeUtilTypes.isProxy(client)) throw invalid();
   const descriptor = Object.getOwnPropertyDescriptor(client, "query");
@@ -306,6 +361,31 @@ function decodeInsertResult(value: unknown): 0 | 1 {
   return result.rowCount;
 }
 
+function decodeKernelInsertResult(
+  value: unknown,
+  requestedId: string,
+): { readonly inserted: boolean; readonly candidateId?: string } {
+  const result = exactRecord(value, ["rows", "rowCount"]);
+  if (!Array.isArray(result.rows) || (result.rowCount !== 0 && result.rowCount !== 1) ||
+      result.rows.length !== result.rowCount) {
+    throw invalid("Postgres candidate insert result is invalid");
+  }
+  if (result.rowCount === 0) return Object.freeze({ inserted: false });
+  const row = exactRecord(result.rows[0], ["id"]);
+  if (row.id !== requestedId) throw invalid("Postgres candidate insert result is invalid");
+  return Object.freeze({ inserted: true, candidateId: requestedId });
+}
+
+function decodeExistingCandidateId(value: unknown): string {
+  const result = exactRecord(value, ["rows", "rowCount"]);
+  if (!Array.isArray(result.rows) || result.rowCount !== 1 || result.rows.length !== 1) {
+    throw invalid("Postgres candidate insert result is invalid");
+  }
+  const row = exactRecord(result.rows[0], ["id"]);
+  if (!safeId(row.id)) throw invalid("Postgres candidate insert result is invalid");
+  return row.id;
+}
+
 /**
  * Narrow T408-A persistence kernel. It intentionally does not implement CandidateRepository:
  * review/list/update/delete remain unavailable until a server-owned authority contract exists.
@@ -320,6 +400,27 @@ export class PostgresCandidateRepository {
 
   snapshotPendingCandidates(value: unknown): readonly Readonly<PostgresPendingCandidateInput>[] {
     return canonicalBatch(value);
+  }
+
+  async insertKernelPendingWithClient(
+    client: PostgresCandidateQueryClient,
+    scope: MemoryScope,
+    input: PostgresPendingCandidateInput,
+  ): Promise<{ readonly inserted: boolean; readonly candidateId: string }> {
+    const canonical = kernelQueryParams(scope, input);
+    this.#assertReady();
+    const query = readQuery(client);
+    const inserted = decodeKernelInsertResult(
+      await query.call(client, INSERT_KERNEL_PENDING_SQL, canonical.params),
+      canonical.id,
+    );
+    if (inserted.inserted) {
+      return Object.freeze({ inserted: true, candidateId: canonical.id });
+    }
+    const candidateId = decodeExistingCandidateId(
+      await query.call(client, SELECT_ACTIVE_ID_SQL, canonical.conflictParams),
+    );
+    return Object.freeze({ inserted: false, candidateId });
   }
 
   async insertPendingWithClient(

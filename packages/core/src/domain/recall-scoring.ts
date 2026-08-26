@@ -29,6 +29,7 @@ import type { MemoryRecord, MemorySemanticType } from "./types.js";
 import {
   computeImportance,
   computeImportanceWithBreakdown,
+  detectExplicitSave,
   type ImportanceSignals,
   type SourceKind,
 } from "../scoring/importance-score.js";
@@ -150,7 +151,8 @@ function saturate(value: number, saturation: number): number {
  */
 export function computeImportanceForRecord(meta: ImportanceMetadata): number {
   // 缺失必要字段时返回中性默认值
-  if (!meta.salience || !meta.sourceKind || !meta.semanticType) {
+  if (typeof meta.salience !== "number" || !Number.isFinite(meta.salience) ||
+      !meta.sourceKind || !meta.semanticType) {
     return 0.5;
   }
 
@@ -177,7 +179,8 @@ export function computeImportanceForRecordWithBreakdown(
   meta: ImportanceMetadata,
 ): ImportanceResult {
   // 缺失必要字段时返回中性默认值，无法反推明细
-  if (!meta.salience || !meta.sourceKind || !meta.semanticType) {
+  if (typeof meta.salience !== "number" || !Number.isFinite(meta.salience) ||
+      !meta.sourceKind || !meta.semanticType) {
     return { importance: 0.5, breakdown: null };
   }
 
@@ -267,6 +270,136 @@ export interface NodeScoreBreakdown {
   };
   /** importance 的 4 项明细（salience_llm/sourceAuthority/explicitnessBonus/typePrior） */
   importanceBreakdown: ImportanceBreakdown | null;
+}
+
+export type RecallMatchedBy = "vector" | "text" | "recent" | "graph" | "tree";
+
+/**
+ * 所有 recall/lookup/context/why/explain 共用的唯一排序回执。
+ * sourceSignals 仅记录底层检索信号；最终 score 始终由 6 因子公式产生。
+ */
+export interface RecallScoreBreakdown {
+  score?: number;
+  weights?: RecallWeights;
+  factors?: NodeScoreBreakdown["factors"];
+  contributions?: NodeScoreBreakdown["contributions"];
+  importanceBreakdown?: ImportanceBreakdown | null;
+  matchedBy?: readonly RecallMatchedBy[];
+  sourceSignals?: Readonly<Record<string, number>>;
+  /** Legacy/source-stage aliases retained only while adapters migrate. */
+  vector?: number;
+  text?: number;
+  recent?: number;
+  graph?: number;
+  tree?: number;
+  rrf?: number;
+  scopeFit?: number;
+  composite?: number;
+}
+
+export interface CompleteRecallScoreBreakdown extends NodeScoreBreakdown {
+  matchedBy: readonly RecallMatchedBy[];
+  sourceSignals: Readonly<Record<string, number>>;
+  /** Transitional read alias; factors.scopeFit remains authoritative. */
+  scopeFit: number;
+  /** Transitional read alias; score remains authoritative. */
+  composite: number;
+}
+
+function sourceKindFromProvenance(source: string | undefined): SourceKind | undefined {
+  if (!source) return undefined;
+  const normalized = source.toLowerCase();
+  if (normalized.includes("user")) return "session_user";
+  if (normalized.includes("tool")) return "tool_result";
+  if (normalized.includes("rule")) return "rule_file";
+  if (normalized.includes("doc") || normalized.includes("scan")) return "document";
+  if (normalized.includes("log")) return "work_log";
+  if (normalized.includes("agent") || normalized.includes("system")) return "agent_output";
+  return "agent_output";
+}
+
+/** 从持久化记录恢复 importance 明细所需的稳定输入。 */
+export function importanceMetadataFromRecord(
+  record: MemoryRecord,
+): ImportanceMetadata | undefined {
+  if (!record.semanticType) return undefined;
+  const salience = typeof record.metadata?.salience === "number"
+    ? record.metadata.salience
+    : record.confidence ?? record.importance;
+  const sourceKind = sourceKindFromProvenance(record.provenance?.source);
+  if (!Number.isFinite(salience) || !sourceKind) return undefined;
+  return {
+    salience,
+    sourceKind,
+    explicitSave: detectExplicitSave(record.text),
+    semanticType: record.semanticType,
+  };
+}
+
+export function computeRecallScoreBreakdown(
+  record: MemoryRecord,
+  signals: Required<Pick<NodeScoreSignals, "relevance" | "scopeFit">>,
+  matchedBy: readonly RecallMatchedBy[],
+  sourceSignals: Readonly<Record<string, number>>,
+  weights: RecallWeights = DEFAULT_RECALL_WEIGHTS,
+): CompleteRecallScoreBreakdown {
+  const allowedMatchedBy = new Set<RecallMatchedBy>(["vector", "text", "recent", "graph", "tree"]);
+  if (matchedBy.length === 0 || matchedBy.some((source) => !allowedMatchedBy.has(source))) {
+    throw new Error("recall score matchedBy is incomplete or invalid");
+  }
+  if (Object.values(sourceSignals).some((signal) =>
+    typeof signal !== "number" || !Number.isFinite(signal))) {
+    throw new Error("recall score sourceSignals are invalid");
+  }
+  const breakdown = computeNodeScoreWithBreakdown(
+    record,
+    weights,
+    signals,
+    importanceMetadataFromRecord(record),
+  );
+  return Object.freeze({
+    ...breakdown,
+    matchedBy: Object.freeze([...matchedBy]),
+    sourceSignals: Object.freeze({ ...sourceSignals }),
+    scopeFit: breakdown.factors.scopeFit,
+    composite: breakdown.score,
+  });
+}
+
+export function isRecallScoreBreakdown(value: unknown): value is CompleteRecallScoreBreakdown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const input = value as Partial<RecallScoreBreakdown>;
+  const factorNames = [
+    "relevance", "scopeFit", "importance", "confidence", "evidenceWeight", "recency",
+  ] as const;
+  const matchedBy = new Set<RecallMatchedBy>(["vector", "text", "recent", "graph", "tree"]);
+  const weights = input.weights;
+  const factors = input.factors;
+  const contributions = input.contributions;
+  if (typeof input.score !== "number" || !Number.isFinite(input.score) ||
+      input.score < 0 || input.score > 1 ||
+      !weights || !factors || !contributions ||
+      !Array.isArray(input.matchedBy) || input.matchedBy.length === 0 ||
+      input.matchedBy.some((source) => !matchedBy.has(source)) ||
+      !input.sourceSignals || typeof input.sourceSignals !== "object" ||
+      Array.isArray(input.sourceSignals) ||
+      Object.values(input.sourceSignals).some((signal) =>
+        typeof signal !== "number" || !Number.isFinite(signal))) {
+    return false;
+  }
+  for (const name of factorNames) {
+    const weight = weights[name];
+    const factor = factors[name];
+    const contribution = contributions[name];
+    if (weight !== DEFAULT_RECALL_WEIGHTS[name] ||
+        typeof factor !== "number" || !Number.isFinite(factor) || factor < 0 || factor > 1 ||
+        typeof contribution !== "number" || !Number.isFinite(contribution) ||
+        Math.abs(contribution - weight * factor) > 1e-9) {
+      return false;
+    }
+  }
+  const contributionSum = factorNames.reduce((sum, name) => sum + contributions[name], 0);
+  return Math.abs(input.score - clamp01(contributionSum)) <= 1e-9;
 }
 
 /**

@@ -6,8 +6,13 @@
  * - Layer 2（LLM faithfulness judge）：根据 mode 配置决定是否触发
  */
 
-import type { TreeBuffer, TreeSummaryNode, SummaryFaithfulnessConfig } from "./types.js";
+import type { TreeBuffer, TreeLeaf, TreeSummaryNode, SummaryFaithfulnessConfig } from "./types.js";
 import type { LlmClient } from "../runtime/llm/llm-client.js";
+import { GLOBAL_TREE_IMPORTANCE } from "./leaf-routing.js";
+
+const HIGH_IMPORTANCE_LEAF_RATIO = 0.7;
+
+export type LeafImportanceEvidence = Pick<TreeLeaf, "id" | "importance">;
 
 const PROMPT_INJECTION_KEYWORDS = [
   "ignore previous",
@@ -56,7 +61,10 @@ export function validateDeterministicEvidence(
 /**
  * 判断是否为高风险摘要（§7.7 high_risk 场景）。
  */
-export function isHighRiskSummary(node: TreeSummaryNode, buffer?: TreeBuffer): boolean {
+export function isHighRiskSummary(
+  node: TreeSummaryNode,
+  leaves?: readonly LeafImportanceEvidence[],
+): boolean {
   // 1. rules topic summary
   if (node.treeType === "topic" && node.treeKey === "rules") {
     return true;
@@ -77,18 +85,48 @@ export function isHighRiskSummary(node: TreeSummaryNode, buffer?: TreeBuffer): b
     return true;
   }
 
-  // 5. 高 importance leaf 占比高的摘要（>70%）
-  // TODO: 需要从 repository 获取实际的 leaf importance 值
-  // 当前暂时禁用此检查，避免误判所有节点为高风险
-  // if (buffer) {
-  //   const highImportanceCount = buffer.leafIds.length; // 简化：假设进入 buffer 的都是高价值
-  //   const totalCount = buffer.leafIds.length;
-  //   if (totalCount > 0 && highImportanceCount / totalCount > 0.7) {
-  //     return true;
-  //   }
-  // }
+  // 5. 高 importance leaf 占比高的摘要（严格 >70%）。
+  // importance 由调用方从 repository 的真实 leaf 数据传入；证据不完整或非法时保守判为高风险。
+  if (!Array.isArray(leaves) || leaves.length === 0 || leaves.length !== node.leafIds.length) {
+    return true;
+  }
+  const expectedLeafIds = new Set(node.leafIds);
+  if (expectedLeafIds.size !== node.leafIds.length) return true;
 
-  return false;
+  const seenLeafIds = new Set<string>();
+  let highImportanceCount = 0;
+  for (const leaf of leaves) {
+    if (!leaf || typeof leaf !== "object" || typeof leaf.id !== "string" ||
+        !expectedLeafIds.has(leaf.id) || seenLeafIds.has(leaf.id) ||
+        typeof leaf.importance !== "number" || !Number.isFinite(leaf.importance) ||
+        leaf.importance < 0 || leaf.importance > 1) {
+      return true;
+    }
+    seenLeafIds.add(leaf.id);
+    if (leaf.importance >= GLOBAL_TREE_IMPORTANCE) highImportanceCount += 1;
+  }
+
+  return seenLeafIds.size !== expectedLeafIds.size ||
+    highImportanceCount / leaves.length > HIGH_IMPORTANCE_LEAF_RATIO;
+}
+
+/** Asset promotion/read must consume a previously governed tree receipt, never run a judge inline. */
+export function isGovernedTreeSummaryForAsset(
+  node: TreeSummaryNode,
+  mode: SummaryFaithfulnessConfig["mode"],
+  leaves?: readonly LeafImportanceEvidence[],
+): boolean {
+  if (!validateDeterministicEvidence(node).valid ||
+      node.metadata.faithfulnessFailed === true ||
+      node.metadata.faithfulnessUntrusted === true) {
+    return false;
+  }
+  const summaryMode = node.metadata.summaryMode;
+  if (summaryMode !== "extractive" && summaryMode !== "abstractive") return false;
+  const judgeRequired = mode === "always" ||
+    (mode === "high_risk" && isHighRiskSummary(node, leaves));
+  return summaryMode === "extractive" || !judgeRequired ||
+    node.metadata.faithfulnessValidated === true;
 }
 
 /**
@@ -141,12 +179,14 @@ Provide your faithfulness assessment:`;
  */
 export async function validateFaithfulness(params: {
   node: TreeSummaryNode;
+  leaves?: readonly LeafImportanceEvidence[];
+  /** @deprecated 仅为旧调用方兼容；高风险判定必须使用 leaves 中的真实 importance。 */
   buffer?: TreeBuffer;
   evidenceTexts: string[];
   config: SummaryFaithfulnessConfig;
   llmClient?: LlmClient;
 }): Promise<{ valid: boolean; reason?: string; usedLlmJudge: boolean }> {
-  const { node, buffer, evidenceTexts, config, llmClient } = params;
+  const { node, leaves, evidenceTexts, config, llmClient } = params;
 
   // Layer 1: deterministic check（always-on）
   const deterministicResult = validateDeterministicEvidence(node);
@@ -168,7 +208,7 @@ export async function validateFaithfulness(params: {
       break;
     case "high_risk":
       // 仅对 high_risk 摘要触发
-      shouldRunLlmJudge = isHighRiskSummary(node, buffer);
+      shouldRunLlmJudge = isHighRiskSummary(node, leaves);
       break;
     case "always":
       // 全量触发

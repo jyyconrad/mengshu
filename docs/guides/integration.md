@@ -27,6 +27,11 @@ openclaw plugin add ./plugins/openclaw
       "mengshu-openclaw": {
         "enabled": true,
         "config": {
+          "embedding": {
+            "apiKey": "${OPENAI_API_KEY}",
+            "baseURL": "https://api.openai.com/v1",
+            "model": "text-embedding-3-small"
+          },
           "dbType": "postgres",
           "postgres": {
             "host": "${PG_HOST}",
@@ -36,6 +41,18 @@ openclaw plugin add ./plugins/openclaw
             "password": "${PG_PASSWORD}",
             "ssl": false
           },
+          "authority": {
+            "tenantId": "local",
+            "userId": "owner",
+            "allow": {
+              "appIds": ["openclaw"],
+              "projectIds": ["default"],
+              "agentIds": ["main", "codex"],
+              "namespaces": ["default"],
+              "visibilities": ["private"]
+            }
+          },
+          "defaultAgentId": "main",
           "autoCapture": true,
           "autoRecall": true
         }
@@ -44,6 +61,10 @@ openclaw plugin add ./plugins/openclaw
   }
 }
 ```
+
+多 Agent 配置必须显式指定 `defaultAgentId`，且它必须属于
+`authority.allow.agentIds`。hook 与工具按 OpenClaw 的可信 Agent 上下文收窄；
+不在 allowlist 中的 Agent 会被拒绝，不会共享默认 Agent 的私有记忆。
 
 OpenClaw、Codex、Claude Code、CLI 和 MCP 客户端通过 `~/.mengshu/config.json` 复用同一套 PostgreSQL 后端；不要再为不同产品创建独立的本地 LanceDB 目录。`dbPath` 仅在显式选择 `dbType=lancedb` 时使用。
 
@@ -75,7 +96,7 @@ codex plugin marketplace add .agents/plugins
 codex plugin add mengshu-memory@mengshu-local
 ```
 
-首期 Codex MCP 启动器会调用全局 `ms mcp`，因此需要先确保 `ms --help` 可执行、`ms doctor` 通过。插件默认同样使用 `~/.mengshu`。
+Codex MCP 启动器默认使用当前发布包内的 `dist/bin/ms.js`，不读取 PATH 中的全局 `ms`，并在启动前校验插件/runtime 版本一致。先用当前发布包的 `ms doctor` 验证 `~/.mengshu` 配置；开发或隔离测试只有在显式设置绝对路径 `MENGSHU_CODEX_MS_PATH` 时才会覆盖包内 runtime。
 
 ## MCP Server 集成
 

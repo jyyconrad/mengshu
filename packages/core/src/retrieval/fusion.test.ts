@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { MemoryRecord, RecallHit } from "../domain/types.js";
+import { isRecallScoreBreakdown } from "../domain/recall-scoring.js";
 import { fuseHits } from "./fusion.js";
 
 const scope = {
@@ -43,10 +44,52 @@ describe("fuseHits", () => {
 
     expect(results.map((result) => result.record.id)).toEqual(["same", "vector-only", "text-only"]);
     expect(results[0].scoreBreakdown).toMatchObject({
-      vector: 0.9,
-      text: 2.1,
-      rrf: expect.any(Number),
+      score: results[0].score,
+      matchedBy: ["vector", "text"],
+      sourceSignals: { vector: 0.9, text: 2.1, rrf: expect.any(Number) },
+      factors: {
+        relevance: 1,
+        scopeFit: 1,
+        importance: 0.5,
+      },
     });
+    expect(results.every((result) => isRecallScoreBreakdown(result.scoreBreakdown))).toBe(true);
+  });
+
+  test("无法可靠生成完整六因子的 chunk/tree hit 必须 fail-closed", () => {
+    const memory = hit("memory", 0.8, "vector");
+    const chunk: RecallHit = {
+      record: {
+        id: "chunk",
+        scope: memory.record.scope,
+        documentId: "doc",
+        text: "raw evidence",
+        contentHash: "chunk-hash",
+        ordinal: 0,
+        metadata: {},
+        provenance: { source: "document" },
+        createdAt: 1,
+      },
+      score: 1,
+      source: "vector",
+    };
+    const tree: RecallHit = {
+      record: {
+        id: "tree",
+        scope: memory.record.scope,
+        treeType: "topic",
+        level: 2,
+        summary: "derived summary",
+        childIds: [],
+        evidenceIds: [],
+        createdAt: 1,
+      },
+      score: 1,
+      source: "tree",
+    };
+
+    expect(fuseHits([{ source: "vector", hits: [chunk, memory] }, { source: "tree", hits: [tree] }]))
+      .toEqual([expect.objectContaining({ record: expect.objectContaining({ id: "memory" }) })]);
   });
 
   test("respects result limit after fusion", () => {

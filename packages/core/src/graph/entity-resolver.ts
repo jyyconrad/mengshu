@@ -90,6 +90,12 @@ export interface EntityThreshold {
   reviewThreshold: number;
 }
 
+export interface EntitySemanticDecision {
+  readonly action: "merge" | "judge_or_related" | "create";
+  readonly similarity?: number;
+  readonly reason?: "type_no_semantic_merge" | "no_candidates" | "below_threshold";
+}
+
 // ============================================================================
 // 常量配置
 // ============================================================================
@@ -238,6 +244,34 @@ export async function resolveEntity(
   }
 
   return { action: "create", reason: "below_threshold" };
+}
+
+/**
+ * 三级匹配的纯阈值裁决，供 repository-backed runtime adapter 复用。
+ * 数据读取仍由调用方按 AuthorityScope 完成，避免把存储语义带进算法模块。
+ */
+export function decideEntitySemanticMatch(
+  type: EntityType,
+  similarity: number | undefined,
+  config: EntityResolverConfig = {},
+): EntitySemanticDecision {
+  if (NO_SEMANTIC_MERGE_TYPES.has(type)) {
+    return { action: "create", reason: "type_no_semantic_merge" };
+  }
+  if (similarity === undefined) {
+    return { action: "create", reason: "no_candidates" };
+  }
+  if (!Number.isFinite(similarity) || similarity < 0 || similarity > 1) {
+    throw new Error("entity semantic similarity is invalid");
+  }
+  const thresholds = config.thresholds?.[type] ?? ENTITY_THRESHOLDS[type] ?? ENTITY_THRESHOLDS.default;
+  if (similarity >= thresholds.mergeThreshold) {
+    return { action: "merge", similarity };
+  }
+  if (similarity >= thresholds.reviewThreshold) {
+    return { action: "judge_or_related", similarity };
+  }
+  return { action: "create", similarity, reason: "below_threshold" };
 }
 
 // ============================================================================

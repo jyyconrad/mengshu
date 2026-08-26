@@ -21,6 +21,10 @@ import {
   createMcpMemoryTools,
   freezeMcpToolRegistry,
   type McpMemoryTool,
+  type MemoryWriteCommandExecutor,
+  type MemoryAssetReadCapability,
+  type MemoryKnowledgeResourceCapability,
+  type MemorySessionReceiptCapability,
 } from "./tools.js";
 import { formatMcpToolError } from "./tool-error.js";
 
@@ -32,12 +36,16 @@ export interface McpMemoryServer {
 
 export interface McpMemoryServerOptions {
   service: MemoryService;
+  memoryWrite?: MemoryWriteCommandExecutor;
   forgetCapability?: AuthorityScopedForgetCapability;
   authority: AuthorityScope;
   /** 启动期必须与 authority 精确匹配；本层不生成身份或 scope 默认值。 */
   defaultScope: MemoryScope;
   namespaces?: string[];
   agentFastPath?: AgentFastPathService;
+  memoryAssets?: MemoryAssetReadCapability;
+  knowledgeResources?: MemoryKnowledgeResourceCapability;
+  sessionReceipts?: MemorySessionReceiptCapability;
   pipeline?: IngestionPipeline;
   llmClient?: LlmClient;
 }
@@ -175,6 +183,12 @@ export function parseMcpServerAuthorityConfig(
     const authority: AuthorityScope = {
       tenantId: authorityRecord.tenantId as string,
       userId: authorityRecord.userId as string,
+      ...(defaultScopeRecord.workspaceId === undefined
+        ? {}
+        : { workspaceId: defaultScopeRecord.workspaceId as string }),
+      ...(defaultScopeRecord.sessionId === undefined
+        ? {}
+        : { sessionId: defaultScopeRecord.sessionId as string }),
       allow: {
         appIds: copyExactArray(allowRecord.appIds) as string[],
         projectIds: copyExactArray(allowRecord.projectIds) as string[],
