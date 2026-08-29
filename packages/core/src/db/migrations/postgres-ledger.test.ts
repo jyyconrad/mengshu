@@ -313,6 +313,9 @@ class FakePostgresClient implements PostgresMigrationClient {
               (tableName === "mengshu_loadout_versions" && column === "project_id")) ? "YES" : "NO",
             is_valid: true, is_ready: true,
           })));
+        const governedDocumentKinds = this.calls.some(({ sql: callSql }) =>
+          callSql.includes("ADD CONSTRAINT mengshu_asset_versions_kind_check") &&
+          callSql.includes("'memory_document'"));
         const constraints: Record<string, readonly string[]> = requestedTables.includes("mengshu_loadout_audit")
           ? {
               mengshu_loadout_audit: [
@@ -331,7 +334,12 @@ class FakePostgresClient implements PostgresMigrationClient {
           : {
               mengshu_asset_versions: [
                 "PRIMARY KEY (scope_fingerprint, asset_id, version)",
-                "CHECK (kind = 'memory_view')", "CHECK (status = ANY)",
+                governedDocumentKinds
+                  ? "CHECK (kind = ANY (ARRAY['memory_view'::text, 'memory_document'::text, 'tree_document'::text, 'index_document'::text]))"
+                  : "CHECK (kind = 'memory_view')",
+                governedDocumentKinds
+                  ? "CHECK (status = ANY (ARRAY['draft'::text, 'review'::text, 'published'::text, 'active'::text, 'deprecated'::text, 'revoked'::text]))"
+                  : "CHECK (status = ANY)",
                 "CHECK (visibility = 'private')", "CHECK (jsonb_typeof(descriptor) = 'object')",
               ],
               mengshu_asset_heads: [
@@ -948,7 +956,7 @@ describe("executePostgresMigrations", () => {
 
     expect(result.appliedVersions).toEqual([1, 2, 3, 4, 5]);
     expect(result.toVersion).toBe(5);
-    expect(result.pendingContractVersions).toEqual([6, 10, 18]);
+    expect(result.pendingContractVersions).toEqual([6, 10, 18, 26]);
     expect(client.calls[0]?.sql).toBe("BEGIN");
     expect(client.calls.at(-1)?.sql).toBe("COMMIT");
     expect(client.calls.findIndex((call) => call.sql === LOCK_MIGRATIONS_SQL)).toBeLessThan(
@@ -1244,6 +1252,28 @@ describe("executePostgresMigrations", () => {
       sql === DURABLE_DOMAIN_SCHEMA_CATALOG_SQL && Array.isArray(params[0]) &&
       (params[0].includes("mengshu_asset_versions") || params[0].includes("mengshu_loadout_audit"))).length)
       .toBe(catalogCalls + 2);
+  });
+
+  test("已应用 v24 的库升级 v25-v27 时按 v26 扩展约束复核 asset catalog", async () => {
+    const client = new FakePostgresClient();
+    const bootstrap = await executePostgresMigrations(client, {
+      migrations: SCHEMA_MIGRATIONS.slice(0, 24),
+      currentSchemaVersion: 24,
+      contractMigration: { mode: "apply", maintenance: true, quiescenceConfirmed: true },
+    });
+    expect(bootstrap.toVersion).toBe(24);
+
+    const result = await executePostgresMigrations(client, {
+      contractMigration: { mode: "apply", maintenance: true, quiescenceConfirmed: true },
+    });
+
+    expect(result.fromVersion).toBe(24);
+    expect(result.toVersion).toBe(27);
+    expect(result.appliedVersions).toEqual([25, 26, 27]);
+    expect(client.calls.some(({ sql }) =>
+      sql.includes("ADD CONSTRAINT mengshu_asset_versions_kind_check") &&
+      sql.includes("'memory_document'"))).toBe(true);
+    expect(client.calls.at(-1)?.sql).toBe("COMMIT");
   });
 
   test.each([20, 21])("v%s overlay catalog 残缺时 rollback 且不写 ledger", async (version) => {

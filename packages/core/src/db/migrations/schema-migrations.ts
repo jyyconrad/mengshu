@@ -47,6 +47,15 @@ WHERE lifecycle_status = 'active'`,
   "ALTER INDEX memories_active_authority_content_hash_uidx RENAME TO memories_authority_content_hash_uidx",
 ] as const;
 
+const GOVERNED_DOCUMENT_ASSET_CONTRACT_STATEMENTS = [
+  `ALTER TABLE mengshu_asset_versions
+  DROP CONSTRAINT IF EXISTS mengshu_asset_versions_kind_check,
+  ADD CONSTRAINT mengshu_asset_versions_kind_check CHECK (kind IN ('memory_view', 'memory_document', 'tree_document', 'index_document'))`,
+  `ALTER TABLE mengshu_asset_versions
+  DROP CONSTRAINT IF EXISTS mengshu_asset_versions_status_check,
+  ADD CONSTRAINT mengshu_asset_versions_status_check CHECK (status IN ('draft', 'review', 'published', 'active', 'deprecated', 'revoked'))`,
+] as const;
+
 export const DURABLE_JOB_STATE_CONSTRAINT_NAME = "mengshu_jobs_v2_state_check";
 
 /**
@@ -104,6 +113,7 @@ const CONTRACT_STATEMENTS_BY_VERSION = new Map<number, readonly string[]>([
   [6, AUTHORITY_DEDUPE_CONTRACT_STATEMENTS],
   [10, DURABLE_JOB_STATE_CONTRACT_STATEMENTS],
   [18, EVIDENCE_FIRST_ACTIVE_MEMORY_DEDUPE_CONTRACT_STATEMENTS],
+  [26, GOVERNED_DOCUMENT_ASSET_CONTRACT_STATEMENTS],
 ]);
 
 export function schemaMigrationChecksum(migration: SchemaMigration): string {
@@ -1631,6 +1641,325 @@ ON mengshu_history_rebuild_artifacts (run_id, source_table, record_id, artifact_
 )`,
       `CREATE INDEX IF NOT EXISTS mengshu_history_rebuild_model_attempts_budget_idx
 ON mengshu_history_rebuild_model_attempts (migration_id, manifest_hash, state)`,
+    ],
+  },
+  {
+    version: 25,
+    name: "add-governed-document-vault-ledger",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_vaults (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  vault_id TEXT NOT NULL CHECK (char_length(vault_id) BETWEEN 1 AND 256 AND
+    vault_id !~ '[[:space:][:cntrl:]]'),
+  descriptor JSONB NOT NULL CHECK (jsonb_typeof(descriptor) = 'object'),
+  status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'detached')),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+  PRIMARY KEY (scope_fingerprint, vault_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_governed_document_bindings (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  vault_id TEXT NOT NULL CHECK (char_length(vault_id) BETWEEN 1 AND 256 AND
+    vault_id !~ '[[:space:][:cntrl:]]'),
+  asset_id TEXT NOT NULL CHECK (char_length(asset_id) BETWEEN 1 AND 256 AND
+    asset_id !~ '[[:space:][:cntrl:]]'),
+  asset_version INTEGER NOT NULL CHECK (asset_version >= 1),
+  schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'memory_document', 'tree_document', 'index_document'
+  )),
+  purpose TEXT NOT NULL CHECK (purpose IN (
+    'typed_memory', 'tree_summary', 'home', 'type_index', 'tree_index',
+    'project_index', 'topic_index', 'source_index', 'document_index',
+    'governance_catalog'
+  )),
+  semantic_type TEXT CHECK (semantic_type IN (
+    'profile', 'task_context', 'rules', 'experience', 'resource'
+  )),
+  semantic_types JSONB CHECK (semantic_types IS NULL OR
+    jsonb_typeof(semantic_types) = 'array'),
+  tree_type TEXT CHECK (tree_type IN ('source', 'topic', 'global')),
+  tree_level TEXT CHECK (tree_level IN ('L1', 'L2', 'L3')),
+  tree_key TEXT CHECK (tree_key IS NULL OR
+    (char_length(tree_key) BETWEEN 1 AND 256 AND tree_key !~ '[[:cntrl:]]')),
+  tree_node TEXT CHECK (tree_node IS NULL OR
+    (char_length(tree_node) BETWEEN 1 AND 256 AND tree_node !~ '[[:space:][:cntrl:]]')),
+  seal_version INTEGER CHECK (seal_version IS NULL OR seal_version >= 1),
+  lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN (
+    'draft', 'review', 'active', 'deprecated', 'revoked'
+  )),
+  governance_state TEXT NOT NULL CHECK (governance_state IN (
+    'current', 'stale', 'review_required', 'conflicted'
+  )),
+  relative_path TEXT NOT NULL CHECK (char_length(relative_path) BETWEEN 1 AND 4096 AND
+    relative_path !~ '[[:cntrl:]]'),
+  normalized_path TEXT NOT NULL CHECK (char_length(normalized_path) BETWEEN 1 AND 4096 AND
+    normalized_path !~ '[[:cntrl:]]' AND left(normalized_path, 1) <> '/' AND
+    normalized_path !~ '(^|/)[.][.]?(/|$)'),
+  governance_descriptor JSONB NOT NULL CHECK (jsonb_typeof(governance_descriptor) = 'object'),
+  document_index_asset_id TEXT CHECK (document_index_asset_id IS NULL OR
+    (char_length(document_index_asset_id) BETWEEN 1 AND 256 AND
+      document_index_asset_id !~ '[[:space:][:cntrl:]]')),
+  public_content_hash TEXT NOT NULL CHECK (public_content_hash ~ '^[0-9a-f]{64}$'),
+  governance_projection_hash TEXT NOT NULL CHECK (
+    governance_projection_hash ~ '^[0-9a-f]{64}$'),
+  render_hash TEXT NOT NULL CHECK (render_hash ~ '^[0-9a-f]{64}$'),
+  external_hash TEXT CHECK (external_hash IS NULL OR external_hash ~ '^[0-9a-f]{64}$'),
+  sync_state TEXT NOT NULL CHECK (sync_state IN (
+    'sync_pending', 'complete', 'repairing',
+    'external_modified', 'conflict', 'removed'
+  )),
+  last_complete_version INTEGER CHECK (last_complete_version IS NULL OR
+    (last_complete_version >= 1 AND last_complete_version <= asset_version)),
+  synced_at BIGINT CHECK (synced_at IS NULL OR synced_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
+  CHECK (
+    (kind = 'memory_document' AND purpose = 'typed_memory' AND semantic_type IS NOT NULL
+      AND semantic_types IS NULL AND tree_type IS NULL AND tree_level IS NULL
+      AND tree_key IS NULL AND tree_node IS NULL AND seal_version IS NULL)
+    OR
+    (kind = 'tree_document' AND purpose = 'tree_summary' AND semantic_type IS NULL
+      AND jsonb_typeof(semantic_types) = 'array'
+      AND tree_type IS NOT NULL AND tree_level IS NOT NULL AND tree_key IS NOT NULL
+      AND tree_node IS NOT NULL AND seal_version IS NOT NULL)
+    OR
+    (kind = 'index_document' AND purpose NOT IN ('typed_memory', 'tree_summary')
+      AND semantic_type IS NULL AND semantic_types IS NULL AND tree_type IS NULL
+      AND tree_level IS NULL AND tree_key IS NULL AND tree_node IS NULL
+      AND seal_version IS NULL)
+  ),
+  PRIMARY KEY (scope_fingerprint, vault_id, asset_id),
+  UNIQUE (scope_fingerprint, vault_id, normalized_path),
+  UNIQUE (scope_fingerprint, vault_id, asset_id, asset_version),
+  FOREIGN KEY (scope_fingerprint, vault_id)
+    REFERENCES mengshu_vaults(scope_fingerprint, vault_id),
+  FOREIGN KEY (scope_fingerprint, asset_id, asset_version)
+    REFERENCES mengshu_asset_versions(scope_fingerprint, asset_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_governed_document_sync_receipts (
+  receipt_id TEXT PRIMARY KEY CHECK (char_length(receipt_id) BETWEEN 1 AND 256 AND
+    receipt_id !~ '[[:space:][:cntrl:]]'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  vault_id TEXT NOT NULL CHECK (char_length(vault_id) BETWEEN 1 AND 256 AND
+    vault_id !~ '[[:space:][:cntrl:]]'),
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256 AND
+    idempotency_key !~ '[[:space:][:cntrl:]]'),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  asset_id TEXT NOT NULL CHECK (char_length(asset_id) BETWEEN 1 AND 256 AND
+    asset_id !~ '[[:space:][:cntrl:]]'),
+  asset_version INTEGER NOT NULL CHECK (asset_version >= 1),
+  postgres_public_content_hash TEXT NOT NULL CHECK (
+    postgres_public_content_hash ~ '^[0-9a-f]{64}$'),
+  markdown_public_content_hash TEXT NOT NULL CHECK (
+    markdown_public_content_hash ~ '^[0-9a-f]{64}$'),
+  governance_projection_hash TEXT NOT NULL CHECK (
+    governance_projection_hash ~ '^[0-9a-f]{64}$'),
+  completion_contract_hash TEXT NOT NULL CHECK (
+    completion_contract_hash ~ '^[0-9a-f]{64}$'),
+  disposition TEXT NOT NULL CHECK (disposition IN (
+    'complete', 'pending', 'conflict', 'aborted'
+  )),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  UNIQUE (scope_fingerprint, vault_id, idempotency_key),
+  UNIQUE (scope_fingerprint, vault_id, asset_id, asset_version, receipt_id),
+  FOREIGN KEY (scope_fingerprint, vault_id, asset_id, asset_version)
+    REFERENCES mengshu_governed_document_bindings(
+      scope_fingerprint, vault_id, asset_id, asset_version
+    )
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_governed_document_complete_heads (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  asset_id TEXT NOT NULL CHECK (char_length(asset_id) BETWEEN 1 AND 256 AND
+    asset_id !~ '[[:space:][:cntrl:]]'),
+  complete_version INTEGER NOT NULL CHECK (complete_version >= 1),
+  vault_id TEXT NOT NULL CHECK (char_length(vault_id) BETWEEN 1 AND 256 AND
+    vault_id !~ '[[:space:][:cntrl:]]'),
+  completion_receipt_id TEXT NOT NULL CHECK (
+    char_length(completion_receipt_id) BETWEEN 1 AND 256 AND
+    completion_receipt_id !~ '[[:space:][:cntrl:]]'),
+  changed_at BIGINT NOT NULL CHECK (changed_at >= 0),
+  PRIMARY KEY (scope_fingerprint, asset_id),
+  FOREIGN KEY (scope_fingerprint, asset_id, complete_version)
+    REFERENCES mengshu_asset_versions(scope_fingerprint, asset_id, version),
+  FOREIGN KEY (
+    scope_fingerprint, vault_id, asset_id, complete_version, completion_receipt_id
+  ) REFERENCES mengshu_governed_document_sync_receipts(
+    scope_fingerprint, vault_id, asset_id, asset_version, receipt_id
+  )
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_document_governance_runs (
+  governance_run_id TEXT PRIMARY KEY CHECK (
+    char_length(governance_run_id) BETWEEN 1 AND 256 AND
+    governance_run_id !~ '[[:space:][:cntrl:]]'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  trigger_type TEXT NOT NULL CHECK (char_length(trigger_type) BETWEEN 1 AND 128 AND
+    trigger_type !~ '[[:space:][:cntrl:]]'),
+  policy_version TEXT NOT NULL CHECK (char_length(policy_version) BETWEEN 1 AND 256 AND
+    policy_version !~ '[[:space:][:cntrl:]]'),
+  model_fingerprint TEXT CHECK (model_fingerprint IS NULL OR
+    model_fingerprint ~ '^[0-9a-f]{64}$'),
+  resolution_hash TEXT NOT NULL CHECK (resolution_hash ~ '^[0-9a-f]{64}$'),
+  status TEXT NOT NULL CHECK (status IN (
+    'selecting', 'organizing', 'validating',
+    'applied', 'review_required', 'failed'
+  )),
+  started_at BIGINT NOT NULL CHECK (started_at >= 0),
+  completed_at BIGINT CHECK (completed_at IS NULL OR completed_at >= started_at),
+  UNIQUE (governance_run_id, scope_fingerprint)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_information_dispositions (
+  governance_run_id TEXT NOT NULL CHECK (
+    char_length(governance_run_id) BETWEEN 1 AND 256 AND
+    governance_run_id !~ '[[:space:][:cntrl:]]'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  information_ref TEXT NOT NULL CHECK (char_length(information_ref) BETWEEN 1 AND 1024 AND
+    information_ref !~ '[[:cntrl:]]'),
+  source_kind TEXT NOT NULL CHECK (source_kind IN (
+    'conversation', 'file', 'knowledge', 'tool', 'system_event'
+  )),
+  semantic_type TEXT CHECK (semantic_type IN (
+    'profile', 'task_context', 'rules', 'experience', 'resource'
+  )),
+  tree_routes JSONB NOT NULL CHECK (jsonb_typeof(tree_routes) = 'array'),
+  disposition TEXT NOT NULL CHECK (disposition IN (
+    'attached_to_typed_document', 'attached_and_routed', 'tree_only',
+    'native_only', 'lookup_only', 'rejected_below_threshold', 'deferred',
+    'redundant_with_evidence', 'superseded', 'archive_stale',
+    'conflict', 'quarantine'
+  )),
+  target_asset_ids JSONB NOT NULL CHECK (jsonb_typeof(target_asset_ids) = 'array'),
+  reason_code TEXT NOT NULL CHECK (char_length(reason_code) BETWEEN 1 AND 256 AND
+    reason_code !~ '[[:space:][:cntrl:]]'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  CHECK (disposition <> 'attached_to_typed_document' OR
+    (semantic_type IS NOT NULL AND jsonb_array_length(target_asset_ids) > 0)),
+  CHECK (disposition <> 'tree_only' OR jsonb_array_length(tree_routes) > 0),
+  CHECK (disposition <> 'attached_and_routed' OR
+    (semantic_type IS NOT NULL AND jsonb_array_length(target_asset_ids) > 0 AND
+      jsonb_array_length(tree_routes) > 0)),
+  PRIMARY KEY (governance_run_id, information_ref),
+  FOREIGN KEY (governance_run_id, scope_fingerprint)
+    REFERENCES mengshu_document_governance_runs(governance_run_id, scope_fingerprint)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_governed_document_bindings_sync_idx
+ON mengshu_governed_document_bindings (
+  scope_fingerprint, vault_id, sync_state, updated_at, asset_id
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_governed_document_sync_receipts_asset_idx
+ON mengshu_governed_document_sync_receipts (
+  scope_fingerprint, asset_id, asset_version, created_at
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_document_governance_runs_status_idx
+ON mengshu_document_governance_runs (scope_fingerprint, status, started_at, governance_run_id)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_information_dispositions_result_idx
+ON mengshu_information_dispositions (
+  scope_fingerprint, disposition, governance_run_id, information_ref
+)`,
+    ],
+  },
+  {
+    version: 26,
+    name: "allow-governed-document-asset-kinds",
+    kind: "contract",
+    statements: GOVERNED_DOCUMENT_ASSET_CONTRACT_STATEMENTS,
+  },
+  {
+    version: 27,
+    name: "add-markdown-workset-migration-ledger",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_markdown_migration_runs (
+  run_id TEXT PRIMARY KEY CHECK (char_length(run_id) BETWEEN 1 AND 256 AND
+    run_id !~ '[[:space:][:cntrl:]]'),
+  source_manifest_sha256 TEXT NOT NULL CHECK (source_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+  source_snapshot_sha256 TEXT NOT NULL CHECK (source_snapshot_sha256 ~ '^[0-9a-f]{64}$'),
+  governed_manifest_sha256 TEXT CHECK (
+    governed_manifest_sha256 IS NULL OR governed_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+  governed_snapshot_sha256 TEXT CHECK (
+    governed_snapshot_sha256 IS NULL OR governed_snapshot_sha256 ~ '^[0-9a-f]{64}$'),
+  verification_sha256 TEXT CHECK (
+    verification_sha256 IS NULL OR verification_sha256 ~ '^[0-9a-f]{64}$'),
+  policy_version TEXT NOT NULL CHECK (char_length(policy_version) BETWEEN 1 AND 256 AND
+    policy_version !~ '[[:space:][:cntrl:]]'),
+  status TEXT NOT NULL CHECK (status IN (
+    'prepared', 'staging', 'verified', 'activated', 'rolled_back', 'blocked'
+  )),
+  source_count BIGINT NOT NULL CHECK (source_count >= 0),
+  mapped_count BIGINT NOT NULL DEFAULT 0 CHECK (mapped_count >= 0 AND mapped_count <= source_count),
+  staged_live_count BIGINT NOT NULL DEFAULT 0 CHECK (staged_live_count >= 0),
+  prepared_at BIGINT NOT NULL CHECK (prepared_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= prepared_at),
+  activated_at BIGINT CHECK (activated_at IS NULL OR activated_at >= prepared_at),
+  rolled_back_at BIGINT CHECK (rolled_back_at IS NULL OR rolled_back_at >= prepared_at)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_markdown_migration_staged_rows (
+  run_id TEXT NOT NULL REFERENCES mengshu_markdown_migration_runs(run_id),
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  record_id TEXT NOT NULL CHECK (char_length(record_id) BETWEEN 1 AND 512 AND
+    record_id !~ '[[:space:][:cntrl:]]'),
+  source_ref TEXT NOT NULL CHECK (char_length(source_ref) BETWEEN 1 AND 1024 AND
+    source_ref !~ '[[:cntrl:]]'),
+  source_hash TEXT NOT NULL CHECK (source_hash ~ '^[0-9a-f]{64}$'),
+  row_sha256 TEXT NOT NULL CHECK (row_sha256 ~ '^[0-9a-f]{64}$'),
+  row_payload JSONB NOT NULL CHECK (jsonb_typeof(row_payload) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (run_id, source_table, record_id),
+  UNIQUE (run_id, source_ref)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_markdown_migration_mappings (
+  run_id TEXT NOT NULL REFERENCES mengshu_markdown_migration_runs(run_id),
+  source_ref TEXT NOT NULL CHECK (char_length(source_ref) BETWEEN 1 AND 1024 AND
+    source_ref !~ '[[:cntrl:]]'),
+  source_hash TEXT NOT NULL CHECK (source_hash ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT CHECK (
+    scope_fingerprint IS NULL OR scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  disposition TEXT NOT NULL CHECK (disposition IN (
+    'canonical_keep', 'merge_exact', 'merge_semantic', 'supersede',
+    'archive_stale', 'lookup_only', 'quarantine', 'distinct_keep'
+  )),
+  canonical_target_ref TEXT CHECK (canonical_target_ref IS NULL OR
+    (char_length(canonical_target_ref) BETWEEN 1 AND 1024 AND
+      canonical_target_ref !~ '[[:cntrl:]]')),
+  reason_code TEXT NOT NULL CHECK (char_length(reason_code) BETWEEN 1 AND 256 AND
+    reason_code !~ '[[:space:][:cntrl:]]'),
+  mapping_sha256 TEXT NOT NULL CHECK (mapping_sha256 ~ '^[0-9a-f]{64}$'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (run_id, source_ref)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_markdown_migration_before_rows (
+  run_id TEXT NOT NULL REFERENCES mengshu_markdown_migration_runs(run_id),
+  source_table TEXT NOT NULL CHECK (source_table IN ('memories', 'knowledge')),
+  record_id TEXT NOT NULL CHECK (char_length(record_id) BETWEEN 1 AND 512 AND
+    record_id !~ '[[:space:][:cntrl:]]'),
+  row_sha256 TEXT NOT NULL CHECK (row_sha256 ~ '^[0-9a-f]{64}$'),
+  row_payload JSONB NOT NULL CHECK (jsonb_typeof(row_payload) = 'object'),
+  captured_at BIGINT NOT NULL CHECK (captured_at >= 0),
+  PRIMARY KEY (run_id, source_table, record_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_markdown_migration_activation_receipts (
+  activation_id TEXT PRIMARY KEY CHECK (char_length(activation_id) BETWEEN 1 AND 256 AND
+    activation_id !~ '[[:space:][:cntrl:]]'),
+  run_id TEXT NOT NULL REFERENCES mengshu_markdown_migration_runs(run_id),
+  operation TEXT NOT NULL CHECK (operation IN ('activate', 'rollback')),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  source_manifest_sha256 TEXT NOT NULL CHECK (source_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+  governed_manifest_sha256 TEXT NOT NULL CHECK (governed_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+  verification_sha256 TEXT NOT NULL CHECK (verification_sha256 ~ '^[0-9a-f]{64}$'),
+  before_snapshot_sha256 TEXT NOT NULL CHECK (before_snapshot_sha256 ~ '^[0-9a-f]{64}$'),
+  after_snapshot_sha256 TEXT NOT NULL CHECK (after_snapshot_sha256 ~ '^[0-9a-f]{64}$'),
+  confirmation_hash TEXT NOT NULL CHECK (confirmation_hash ~ '^[0-9a-f]{64}$'),
+  result JSONB NOT NULL CHECK (jsonb_typeof(result) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  UNIQUE (run_id, operation),
+  UNIQUE (run_id, request_hash)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_markdown_migration_runs_status_idx
+ON mengshu_markdown_migration_runs (status, updated_at, run_id)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_markdown_migration_mappings_result_idx
+ON mengshu_markdown_migration_mappings (run_id, disposition, source_ref)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_markdown_migration_staged_rows_table_idx
+ON mengshu_markdown_migration_staged_rows (run_id, source_table, record_id)`,
     ],
   },
 ];

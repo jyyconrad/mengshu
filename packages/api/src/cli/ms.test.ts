@@ -17,6 +17,7 @@ import {
   dispatchHistoryRebuildAndDrainTrees,
   dispatchHistoryTreeWorkerOperator,
   historyTreeWorkerOperatorArgv,
+  markdownWorksetOperatorArgv,
   topicTreeMigrationOperatorArgv,
   runMengshuCli,
 } from "./ms.js";
@@ -275,6 +276,24 @@ describe("ms serve RuntimeHost composition", () => {
     ]);
   });
 
+  test("Markdown workset export 默认注入 config，离线 govern 参数保持原样", () => {
+    expect(markdownWorksetOperatorArgv([
+      "node", "ms", "migrate-markdown-workset", "export",
+      "--containment-root", "/tmp/migration", "--output", "/tmp/migration/source",
+      "--run-id", "run-01", "--policy-version", "markdown-export/v1",
+    ], "/tmp/config.json")).toEqual([
+      "export", "--config", "/tmp/config.json",
+      "--containment-root", "/tmp/migration", "--output", "/tmp/migration/source",
+      "--run-id", "run-01", "--policy-version", "markdown-export/v1",
+    ]);
+    expect(markdownWorksetOperatorArgv([
+      "node", "ms", "migrate-markdown-workset", "govern",
+      "--manifest", "/tmp/source/manifest.json",
+    ], "/tmp/config.json")).toEqual([
+      "govern", "--manifest", "/tmp/source/manifest.json",
+    ]);
+  });
+
   test("history rebuild command forwards config, live-model and write gates to its operator", async () => {
     expect(historyRebuildOperatorArgv([
       "node", "ms", "migrate-history", "--manifest", "/tmp/history.json",
@@ -478,13 +497,13 @@ describe("ms serve RuntimeHost composition", () => {
     }
   });
 
-  test("schema migration configless help exposes the current v24 cutover gates", async () => {
+  test("schema migration configless help exposes the current v27 cutover gates", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       await runMengshuCli(["node", "ms", "migrate", "--help"]);
       const output = log.mock.calls.map((call) => String(call[0])).join("\n");
       expect(output).toContain("--to-schema <schema>");
-      expect(output).toContain("(default: \"v24\")");
+      expect(output).toContain("(default: \"v27\")");
       expect(output).toContain("--apply");
       expect(output).toContain("--maintenance");
       expect(output).toContain("--quiescence-confirmed");

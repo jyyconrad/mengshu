@@ -67,6 +67,7 @@ export * from "./assets/repository.js";
 export * from "./assets/in-memory-repository.js";
 export * from "./assets/postgres-repository.js";
 export * from "./assets/memory-view-service.js";
+export * from "./documents/index.js";
 export * from "./loadout/types.js";
 export * from "./loadout/repository.js";
 export * from "./loadout/in-memory-repository.js";

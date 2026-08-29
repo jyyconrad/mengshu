@@ -205,6 +205,26 @@ function printConfiglessHelp(argv: string[]): void {
     .option("--concurrency <count>", "Maximum scopes processed concurrently")
     .option("--maintenance", "Confirm maintenance mode for this write operation")
     .option("--quiescence-confirmed", "Confirm all normal writers are stopped");
+  program.command("migrate-markdown-workset <operation>")
+    .description("Export PostgreSQL to migration Markdown, preprocess/govern it, or plan re-import")
+    .option("--config <path>", "Resolved Mengshu PostgreSQL configuration")
+    .option("--containment-root <path>", "Migration containment root")
+    .option("--output <path>", "Fresh output directory")
+    .option("--run-id <id>", "Stable migration run identifier")
+    .option("--policy-version <version>", "Pinned export/governance policy version")
+    .option("--page-size <count>", "PostgreSQL keyset page size")
+    .option("--write-concurrency <count>", "Concurrent private Markdown file writes (1-64)")
+    .option("--concurrency <count>", "Concurrent preprocessing reads and writes (1-64)")
+    .option("--manifest <path>", "Pinned source or governed workset manifest")
+    .option("--manifest-sha256 <sha256>", "Pinned exact manifest bytes")
+    .option("--prepare", "Prepare an activation-capable import plan after strict verification")
+    .option("--source-manifest-sha256 <sha256>", "Pinned original PostgreSQL export manifest")
+    .option("--expected-current-snapshot-sha256 <sha256>", "CAS guard for current native rows")
+    .option("--idempotency-key <key>", "Stable activation or rollback request key")
+    .option("--confirmation-token <token>", "Exact token emitted by plan-import")
+    .option("--activation-receipt <path>", "Activation receipt used by rollback-import")
+    .option("--maintenance", "Confirm maintenance mode for replacement")
+    .option("--quiescence-confirmed", "Confirm all normal writers are stopped");
   program.command("asset").description("Inspect, deprecate, or revoke private governed assets");
   program.command("loadout").description("Inspect, unbind, or pause the current private Agent Loadout");
   program.command("session").description("Explain persisted exact-session context assembly receipts");
@@ -244,6 +264,18 @@ export function semanticTypeBackfillOperatorArgv(
 export const topicTreeMigrationOperatorArgv = semanticTypeBackfillOperatorArgv;
 export const historyRebuildOperatorArgv = semanticTypeBackfillOperatorArgv;
 export const historyTreeWorkerOperatorArgv = semanticTypeBackfillOperatorArgv;
+
+export function markdownWorksetOperatorArgv(
+  argv: readonly string[],
+  configPath: string,
+): string[] {
+  const args = [...argv.slice(3)];
+  if (["export", "activate-import", "rollback-import"].includes(args[0] ?? "") &&
+      !args.includes("--config")) {
+    args.splice(1, 0, "--config", configPath);
+  }
+  return args;
+}
 
 export async function dispatchHistoryRebuildOperator(
   argv: readonly string[],
@@ -813,6 +845,17 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
 
   if (argv[2] === "migrate-history-worker") {
     const result = await dispatchHistoryTreeWorkerOperator(argv, configPath);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (argv[2] === "migrate-markdown-workset") {
+    const { runMarkdownWorksetOperatorCli } = await import(
+      "../../../../scripts/operator-markdown-workset-cli.js"
+    );
+    const result = await runMarkdownWorksetOperatorCli(
+      markdownWorksetOperatorArgv(argv, configPath),
+    );
     console.log(JSON.stringify(result, null, 2));
     return;
   }

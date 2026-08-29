@@ -172,7 +172,7 @@ JOIN mengshu_asset_versions AS versions
   ON versions.scope_fingerprint = heads.scope_fingerprint
  AND versions.asset_id = heads.asset_id
  AND versions.version = heads.latest_version
-WHERE heads.scope_fingerprint = $1
+WHERE heads.scope_fingerprint = $1 AND versions.kind = 'memory_view'
 ORDER BY heads.asset_id`,
       [fingerprint],
     );
@@ -195,7 +195,8 @@ JOIN mengshu_asset_versions AS versions
   ON versions.scope_fingerprint = heads.scope_fingerprint
  AND versions.asset_id = heads.asset_id
  AND versions.version = heads.latest_version
-WHERE heads.scope_fingerprint = $1 AND heads.asset_id = $2`,
+WHERE heads.scope_fingerprint = $1 AND heads.asset_id = $2
+  AND versions.kind = 'memory_view'`,
       [fingerprint, assetId],
     );
     const row = first(result);
@@ -213,7 +214,8 @@ WHERE heads.scope_fingerprint = $1 AND heads.asset_id = $2`,
 SELECT scope_fingerprint, asset_id, version, kind, status, visibility,
        owner_user_id, descriptor
 FROM mengshu_asset_versions
-WHERE scope_fingerprint = $1 AND asset_id = $2 AND version = $3`,
+WHERE scope_fingerprint = $1 AND asset_id = $2 AND version = $3
+  AND kind = 'memory_view'`,
       [fingerprint, assetId, version],
     );
     const row = first(result);

@@ -907,6 +907,17 @@ const ASSET_LOADOUT_OVERLAY_REQUIRED_CONSTRAINTS: Readonly<Record<string, readon
     ],
   });
 
+const GOVERNED_DOCUMENT_ASSET_REQUIRED_CONSTRAINTS: Readonly<Record<string, readonly string[]>> =
+  Object.freeze({
+    ...ASSET_LOADOUT_OVERLAY_REQUIRED_CONSTRAINTS,
+    mengshu_asset_versions: Object.freeze([
+      "PRIMARY KEY (scope_fingerprint, asset_id, version)",
+      "kind = ANY (ARRAY['memory_view'::text, 'memory_document'::text, 'tree_document'::text, 'index_document'::text])",
+      "status = ANY (ARRAY['draft'::text, 'review'::text, 'published'::text, 'active'::text, 'deprecated'::text, 'revoked'::text])",
+      "visibility = 'private'", "jsonb_typeof(descriptor) = 'object'",
+    ]),
+  });
+
 const LOADOUT_EVENT_LEDGER_REQUIRED_CONSTRAINTS: Readonly<Record<string, readonly string[]>> =
   Object.freeze({
     mengshu_loadout_audit: [
@@ -1738,12 +1749,15 @@ async function verifyOverlaySchemaCatalog(
 /** v20 private asset/loadout overlay must be physically complete before exposure. */
 export async function verifyAssetLoadoutOverlaySchemaCatalog(
   client: PostgresMigrationClient,
+  options: Readonly<{ governedDocumentKinds?: boolean }> = {},
 ): Promise<void> {
   await verifyOverlaySchemaCatalog(
     client,
     ASSET_LOADOUT_OVERLAY_REQUIRED_COLUMNS,
     ASSET_LOADOUT_OVERLAY_COLUMN_TYPES,
-    ASSET_LOADOUT_OVERLAY_REQUIRED_CONSTRAINTS,
+    options.governedDocumentKinds === true
+      ? GOVERNED_DOCUMENT_ASSET_REQUIRED_CONSTRAINTS
+      : ASSET_LOADOUT_OVERLAY_REQUIRED_CONSTRAINTS,
     ASSET_LOADOUT_OVERLAY_REQUIRED_INDEXES,
     "asset/loadout overlay",
   );
@@ -2050,7 +2064,9 @@ export async function executePostgresMigrations(
       await verifyCanonicalEntityResolutionSchemaCatalog(client);
     }
     if (effectiveApplied.has(20) && !appliedVersions.includes(20)) {
-      await verifyAssetLoadoutOverlaySchemaCatalog(client);
+      await verifyAssetLoadoutOverlaySchemaCatalog(client, {
+        governedDocumentKinds: effectiveApplied.has(26),
+      });
     }
     if (effectiveApplied.has(21) && !appliedVersions.includes(21)) {
       await verifyLoadoutEventLedgerSchemaCatalog(client);

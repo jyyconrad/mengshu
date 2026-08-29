@@ -30,7 +30,7 @@ describe("schema migration registry", () => {
     expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
   });
 
-  test("内置 migration 从 1 连续递增，v6/v10/v18 仅允许各自白名单 contract", () => {
+  test("内置 migration 从 1 连续递增，v6/v10/v18/v26 仅允许各自白名单 contract", () => {
     expect(validateMigrationRegistry(SCHEMA_MIGRATIONS, CURRENT_SCHEMA_VERSION)).toBeUndefined();
     expect(SCHEMA_MIGRATIONS.map((item) => item.version)).toEqual(
       Array.from({ length: CURRENT_SCHEMA_VERSION }, (_, index) => index + 1),
@@ -41,6 +41,8 @@ describe("schema migration registry", () => {
     expect(SCHEMA_MIGRATIONS[9]?.kind).toBe("contract");
     expect(SCHEMA_MIGRATIONS.slice(10, 17).every((item) => item.kind === "expand")).toBe(true);
     expect(SCHEMA_MIGRATIONS[17]?.kind).toBe("contract");
+    expect(SCHEMA_MIGRATIONS.slice(18, 25).every((item) => item.kind === "expand")).toBe(true);
+    expect(SCHEMA_MIGRATIONS[25]?.kind).toBe("contract");
   });
 
   test.each([
@@ -806,7 +808,7 @@ describe("schema migration registry", () => {
     ]);
     expect(planSchemaMigrations(appliedV17)).toMatchObject({
       fromVersion: 17,
-      toVersion: 24,
+      toVersion: 27,
       pending: [
         SCHEMA_MIGRATIONS[17],
         SCHEMA_MIGRATIONS[18],
@@ -815,6 +817,9 @@ describe("schema migration registry", () => {
         SCHEMA_MIGRATIONS[21],
         SCHEMA_MIGRATIONS[22],
         SCHEMA_MIGRATIONS[23],
+        SCHEMA_MIGRATIONS[24],
+        SCHEMA_MIGRATIONS[25],
+        SCHEMA_MIGRATIONS[26],
       ],
     });
   });
@@ -869,7 +874,7 @@ describe("schema migration registry", () => {
       checksum: checksum!,
     }));
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(24);
+    expect(CURRENT_SCHEMA_VERSION).toBe(27);
     expect(v21?.name).toBe("add-loadout-audit-invalidation-outbox");
     expect(v21?.kind).toBe("expand");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_loadout_audit");
@@ -902,8 +907,16 @@ describe("schema migration registry", () => {
     ]);
     expect(planSchemaMigrations(appliedV20)).toMatchObject({
       fromVersion: 20,
-      toVersion: 24,
-      pending: [v21, SCHEMA_MIGRATIONS[21], SCHEMA_MIGRATIONS[22], SCHEMA_MIGRATIONS[23]],
+      toVersion: 27,
+      pending: [
+        v21,
+        SCHEMA_MIGRATIONS[21],
+        SCHEMA_MIGRATIONS[22],
+        SCHEMA_MIGRATIONS[23],
+        SCHEMA_MIGRATIONS[24],
+        SCHEMA_MIGRATIONS[25],
+        SCHEMA_MIGRATIONS[26],
+      ],
     });
   });
 
@@ -911,7 +924,7 @@ describe("schema migration registry", () => {
     const v23 = SCHEMA_MIGRATIONS.find((item) => item.version === 23);
     const sql = v23?.statements.join("\n") ?? "";
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(24);
+    expect(CURRENT_SCHEMA_VERSION).toBe(27);
     expect(v23?.name).toBe("add-history-rebuild-ledger");
     expect(v23?.kind).toBe("expand");
     for (const table of [
@@ -968,8 +981,148 @@ describe("schema migration registry", () => {
     expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME|ALTER\s+TABLE)\b/i);
     expect(planSchemaMigrations(appliedV23)).toMatchObject({
       fromVersion: 23,
-      toVersion: 24,
-      pending: [v24],
+      toVersion: 27,
+      pending: [v24, SCHEMA_MIGRATIONS[24], SCHEMA_MIGRATIONS[25], SCHEMA_MIGRATIONS[26]],
+    });
+  });
+
+  test("v25 expand-only 新增 governed document、Vault、complete head 与治理账本", () => {
+    const v25 = SCHEMA_MIGRATIONS.find((item) => item.version === 25);
+    const sql = v25?.statements.join("\n") ?? "";
+
+    expect(v25?.name).toBe("add-governed-document-vault-ledger");
+    expect(v25?.kind).toBe("expand");
+    for (const table of [
+      "mengshu_vaults",
+      "mengshu_governed_document_bindings",
+      "mengshu_governed_document_sync_receipts",
+      "mengshu_governed_document_complete_heads",
+      "mengshu_document_governance_runs",
+      "mengshu_information_dispositions",
+    ]) expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+
+    expect(sql).toContain("PRIMARY KEY (scope_fingerprint, vault_id)");
+    expect(sql).toContain("PRIMARY KEY (scope_fingerprint, vault_id, asset_id)");
+    expect(sql).toContain("PRIMARY KEY (scope_fingerprint, asset_id)");
+    expect(sql).toContain("UNIQUE (scope_fingerprint, vault_id, idempotency_key)");
+    expect(sql).toContain("UNIQUE (governance_run_id, scope_fingerprint)");
+    expect(sql).toContain("FOREIGN KEY (scope_fingerprint, asset_id, asset_version)");
+    expect(sql).toContain("REFERENCES mengshu_asset_versions(scope_fingerprint, asset_id, version)");
+    expect(sql).toContain("REFERENCES mengshu_vaults(scope_fingerprint, vault_id)");
+    expect(sql).toContain("REFERENCES mengshu_governed_document_sync_receipts");
+    expect(sql).toContain("REFERENCES mengshu_document_governance_runs(governance_run_id, scope_fingerprint)");
+
+    expect(sql).toContain("jsonb_typeof(descriptor) = 'object'");
+    expect(sql).toContain("jsonb_typeof(governance_descriptor) = 'object'");
+    expect(sql).toContain("jsonb_typeof(semantic_types) = 'array'");
+    expect(sql).toContain("jsonb_typeof(tree_routes) = 'array'");
+    expect(sql).toContain("jsonb_typeof(target_asset_ids) = 'array'");
+    expect(sql).toMatch(/char_length\(vault_id\) BETWEEN 1 AND 256/);
+    expect(sql).toMatch(/char_length\(asset_id\) BETWEEN 1 AND 256/);
+    expect(sql).toMatch(/char_length\(idempotency_key\) BETWEEN 1 AND 256/);
+    expect(sql).toMatch(/char_length\(normalized_path\) BETWEEN 1 AND 4096/);
+    expect(sql).toMatch(/scope_fingerprint ~ '\^\[0-9a-f\]\{64\}\$'/);
+    expect(sql).toMatch(/public_content_hash ~ '\^\[0-9a-f\]\{64\}\$'/);
+    expect(sql).toMatch(/governance_projection_hash ~ '\^\[0-9a-f\]\{64\}\$'/);
+    expect(sql).toMatch(/completion_contract_hash ~ '\^\[0-9a-f\]\{64\}\$'/);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v26 allowlisted contract 只放宽 asset kind/status 并保留 legacy 值", () => {
+    const v26 = SCHEMA_MIGRATIONS.find((item) => item.version === 26);
+    const sql = v26?.statements.join("\n") ?? "";
+
+    expect(v26?.name).toBe("allow-governed-document-asset-kinds");
+    expect(v26?.kind).toBe("contract");
+    expect(v26?.statements).toHaveLength(2);
+    expect(v26?.statements.every((statement) =>
+      /^ALTER TABLE mengshu_asset_versions\b/.test(statement))).toBe(true);
+    expect(sql).toMatch(/DROP CONSTRAINT IF EXISTS mengshu_asset_versions_kind_check/);
+    expect(sql).toMatch(/ADD CONSTRAINT mengshu_asset_versions_kind_check CHECK \(kind IN \('memory_view', 'memory_document', 'tree_document', 'index_document'\)\)/);
+    expect(sql).toMatch(/DROP CONSTRAINT IF EXISTS mengshu_asset_versions_status_check/);
+    expect(sql).toMatch(/ADD CONSTRAINT mengshu_asset_versions_status_check CHECK \(status IN \('draft', 'review', 'published', 'active', 'deprecated', 'revoked'\)\)/);
+    expect(sql).not.toMatch(/\b(?:UPDATE|DELETE|TRUNCATE|INSERT)\b/i);
+    expect(sql).not.toMatch(/\b(?:memories|knowledge|mengshu_asset_heads)\b/i);
+  });
+
+  test("v26 contract 任一 CHECK 漂移都被 allowlist fail-closed", () => {
+    const tampered = SCHEMA_MIGRATIONS.map(({ checksum: _checksum, ...migration }) =>
+      migration.version === 26
+        ? {
+            ...migration,
+            statements: [
+              migration.statements[0]!,
+              migration.statements[1]!.replace("'revoked'", "'revoked', 'removed'"),
+            ],
+          }
+        : migration);
+
+    expect(() => validateMigrationRegistry(tampered, 27)).toThrow(/allowlist|contract/i);
+  });
+
+  test("v27 expand-only 建立 Markdown 工作集 staging、映射、before-image 与 activation receipt", () => {
+    const v27 = SCHEMA_MIGRATIONS.find((item) => item.version === 27);
+    const sql = v27?.statements.join("\n") ?? "";
+
+    expect(CURRENT_SCHEMA_VERSION).toBe(27);
+    expect(v27?.name).toBe("add-markdown-workset-migration-ledger");
+    expect(v27?.kind).toBe("expand");
+    for (const table of [
+      "mengshu_markdown_migration_runs",
+      "mengshu_markdown_migration_staged_rows",
+      "mengshu_markdown_migration_mappings",
+      "mengshu_markdown_migration_before_rows",
+      "mengshu_markdown_migration_activation_receipts",
+    ]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+    }
+    expect(sql).toMatch(/status IN \(\s*'prepared', 'staging', 'verified', 'activated', 'rolled_back', 'blocked'\s*\)/i);
+    expect(sql).toMatch(/disposition IN \(\s*'canonical_keep', 'merge_exact', 'merge_semantic', 'supersede',\s*'archive_stale', 'lookup_only', 'quarantine', 'distinct_keep'\s*\)/i);
+    expect(sql).toContain("row_payload JSONB NOT NULL CHECK (jsonb_typeof(row_payload) = 'object')");
+    expect(sql).toContain("before_snapshot_sha256 TEXT NOT NULL");
+    expect(sql).toContain("after_snapshot_sha256 TEXT NOT NULL");
+    expect(sql).toContain("confirmation_hash TEXT NOT NULL");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v25-v27 append 不改变 v1-v24 checksum，v24 ledger 只计划三步安全迁移", () => {
+    const v1ToV24Checksums = [
+      "579838a230d7e915c1a82d7937d42d04b73dcd0a7682b0320ba8920444c04b55",
+      "351de9a732b876ac7ebcfe68e6aad89cbacf56c416c32482e504dd07d674db74",
+      "dfdca1eee72077512614cedd89a7f832fc3e5ef0579fc4c600ec74ae8cad2491",
+      "a448b7db685ab929bb47b6851018a633df3bd0aa1bc87f42961d22dd8d4dfb2c",
+      "b98b8d4f4c23f3f1978ea8653bb73f64b3cb8fcb566411c50e725fbd2c37b4c2",
+      "0e1b2fa7016cddc9da9b324bf5d0531f3c70329ecf024cc3b7b4858a72f49e93",
+      "c15af146bef3270f1a8e39d138bf1628eb8fb0cb816d351daa748ab8538c9da7",
+      "6abe4c875385418efaf2b5a195c68a30cdc377f8d080db6b25d5832da87417a2",
+      "f70c1d636493d2379dbcd88043853343828d86f06c6a8bdecac5a9f099b1397f",
+      "e2325803791bd7ac34ee723c9d81cf26c9a3163d54167741ee10183dfcd72ded",
+      "8b0284e17cd4e6efe4dcda913d91779735d99f9e477484f1445d41b6b45607c5",
+      "26dcfcfd6ca0a55496f60cfe37d718751d75beb6c89bd28177668af4d660ea82",
+      "ec3d7bd001828317bd38dea5137cc38c0c957bbbc42ae2e9217a76b18bfb0a42",
+      "8cdadbedc3283cc8ba760429808d09965b615d0d831d7a8df978f76dfa63aeaa",
+      "b29861f3f76806f5843a19700192163d941c11c21647f0e3a55feb754f372e4f",
+      "03f32ac752804aba5dabdca4967e728c91dc217ac97f3896399214cb02938eb4",
+      "b3ace4e344bcadb3ddd8f15f7bbb0139834f8c32ec5874ad49639ba1be00886f",
+      "1394410f346b9411b2677ca2edd777340b053dafd954fa0b784cbe0b68209943",
+      "23ffa2e19c3ac66136e686fd20d45ed47826fe02fe37000e7574d6a708698e96",
+      "e5450cfe2e1c3814a367122efaff7fb314aba0b0b61f5aa347d51f4b997b3cf8",
+      "ae5b8745083216972e7eb310e89d92435df43a8eab0e01398e09868090a3672e",
+      "f1c3c9883c8fe950eed30b07a8bd6441c3dc2d5d7c8d432e30b340bf701dd473",
+      "b7e7935bb46242dccf17a57926c8b1628cc572610cd81d3a38451c905bd1611b",
+      "d8162524bd4930b8edfc264406bf533bec14b5a6fcbf1ad4a1ed2f14cbc56cab",
+    ];
+    const appliedV24 = SCHEMA_MIGRATIONS.slice(0, 24).map(({ version, name, checksum }) => ({
+      version, name, checksum: checksum!,
+    }));
+
+    expect(SCHEMA_MIGRATIONS.slice(0, 24).map((item) => item.checksum))
+      .toEqual(v1ToV24Checksums);
+    expect(CURRENT_SCHEMA_VERSION).toBe(27);
+    expect(planSchemaMigrations(appliedV24)).toMatchObject({
+      fromVersion: 24,
+      toVersion: 27,
+      pending: [SCHEMA_MIGRATIONS[24], SCHEMA_MIGRATIONS[25], SCHEMA_MIGRATIONS[26]],
     });
   });
 });

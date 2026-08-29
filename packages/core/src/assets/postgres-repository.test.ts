@@ -105,6 +105,22 @@ function repository(options: {
 }
 
 describe("PostgresMemoryViewAssetRepository", () => {
+  test("legacy reads filter memory_view before governed document kinds are enabled", async () => {
+    const query = vi.fn(async (_sql: string, _params?: readonly unknown[]) => ({
+      rows: [], rowCount: 0,
+    }));
+    const repo = new PostgresMemoryViewAssetRepository({ query, connect: vi.fn() as never });
+
+    await repo.listLatest(scope);
+    await repo.getLatest(scope, "asset-1");
+    await repo.getVersion(scope, "asset-1", 1);
+
+    expect(query).toHaveBeenCalledTimes(3);
+    for (const [sql] of query.mock.calls) {
+      expect(sql).toMatch(/kind\s*=\s*'memory_view'/);
+    }
+  });
+
   test("appends immutable version/head/receipt/audit/outbox in one transaction", async () => {
     const fake = repository();
     await expect(fake.repo.appendVersion({

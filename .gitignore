@@ -20,6 +20,7 @@ dist
 build
 *.log
 .codegraph/
+.firecrawl/
 
 # Test artifacts
 coverage
