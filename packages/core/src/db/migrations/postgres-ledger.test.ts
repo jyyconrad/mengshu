@@ -1254,7 +1254,7 @@ describe("executePostgresMigrations", () => {
       .toBe(catalogCalls + 2);
   });
 
-  test("已应用 v24 的库升级 v25-v27 时按 v26 扩展约束复核 asset catalog", async () => {
+  test("已应用 v24 的库升级到当前版本时按 v26 扩展约束复核 asset catalog", async () => {
     const client = new FakePostgresClient();
     const bootstrap = await executePostgresMigrations(client, {
       migrations: SCHEMA_MIGRATIONS.slice(0, 24),
@@ -1268,8 +1268,10 @@ describe("executePostgresMigrations", () => {
     });
 
     expect(result.fromVersion).toBe(24);
-    expect(result.toVersion).toBe(27);
-    expect(result.appliedVersions).toEqual([25, 26, 27]);
+    expect(result.toVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(result.appliedVersions).toEqual(
+      Array.from({ length: CURRENT_SCHEMA_VERSION - 24 }, (_, index) => index + 25),
+    );
     expect(client.calls.some(({ sql }) =>
       sql.includes("ADD CONSTRAINT mengshu_asset_versions_kind_check") &&
       sql.includes("'memory_document'"))).toBe(true);

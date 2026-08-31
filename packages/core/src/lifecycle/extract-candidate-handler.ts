@@ -28,6 +28,7 @@ export interface ExtractCandidateHandlerDeps {
   llmClient?: LlmClient;
   /** Legacy adapter 可选接入；缺失时 valueScore receipt 明确标 legacy_unknown。 */
   resolveMaxSimilarity?: CandidateComputationDeps["resolveMaxSimilarity"];
+  policyResolver?: CandidateComputationDeps["policyResolver"];
   /** Legacy adapters must explicitly prove persisted evidence; absence stays fail-closed. */
   readEvidenceFacts?(input: {
     scope: MemoryScope;
@@ -149,6 +150,7 @@ export function createExtractCandidateHandler(
         ...(deps.resolveMaxSimilarity
           ? { resolveMaxSimilarity: deps.resolveMaxSimilarity }
           : {}),
+        ...(deps.policyResolver ? { policyResolver: deps.policyResolver } : {}),
       },
       { scope, text, traceId, ...(intent ? { intent } : {}), ...(evidenceFacts ? { evidenceFacts } : {}) },
     );

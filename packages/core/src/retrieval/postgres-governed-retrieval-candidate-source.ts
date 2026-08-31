@@ -67,13 +67,38 @@ const MEMORY_KINDS = new Set<MemoryKind>([
 const SEMANTIC_TYPES = new Set<MemorySemanticType>([
   "profile", "task_context", "rules", "experience", "resource",
 ]);
-const CONTENT_HASH = /^[a-f0-9]{32}$/;
+const CONTENT_HASH = /^(?:[a-f0-9]{32}|[a-f0-9]{64})$/;
 
 const MEMORY_SESSION_SQL = `COALESCE(
   memory.metadata->>'sessionId',
   memory.metadata #>> '{governance,provenance,sessionId}',
   ''
 )`;
+
+const MEMORY_EFFECTIVE_LIFECYCLE_SQL = `CASE
+  WHEN memory.temporal_activation_state = 'staged'
+    AND memory.valid_from <= CURRENT_TIMESTAMP
+    AND (memory.valid_to IS NULL OR memory.valid_to > CURRENT_TIMESTAMP)
+  THEN 'active'
+  ELSE memory.lifecycle_status
+END`;
+
+const MEMORY_CURRENT_VERSION_SQL = `(memory.lineage_id IS NULL OR memory.id = (
+  SELECT current_version.id
+  FROM memories AS current_version
+  WHERE current_version.scope_fingerprint = memory.scope_fingerprint
+    AND current_version.lineage_id = memory.lineage_id
+    AND current_version.valid_from <= CURRENT_TIMESTAMP
+    AND (current_version.valid_to IS NULL OR current_version.valid_to > CURRENT_TIMESTAMP)
+    AND current_version.temporal_invalidated IS NOT TRUE
+    AND current_version.temporal_purge_pending IS NOT TRUE
+    AND ((current_version.lifecycle_status = 'active'
+        AND current_version.temporal_activation_state = 'active')
+      OR (current_version.lifecycle_status = 'archived'
+        AND current_version.temporal_activation_state = 'staged'))
+  ORDER BY current_version.valid_from DESC, current_version.revision DESC
+  LIMIT 1
+))`;
 
 const GRAPH_SCOPE_SQL = (alias: string): string => `${alias}.scope_fingerprint = $1
   AND ${alias}.tenant_id = $2 AND ${alias}.user_id = $3 AND ${alias}.app_id = $4
@@ -86,11 +111,15 @@ const GRAPH_SCOPE_SQL = (alias: string): string => `${alias}.scope_fingerprint =
  * monotonically normalized result contributes relevance only; Mengshu's
  * six-factor breakdown remains the final score.
  */
-const SEARCH_SQL = `WITH lexical_query AS MATERIALIZED (
-  SELECT websearch_to_tsquery('simple', $11) AS terms
-), query_terms AS MATERIALIZED (
+const SEARCH_SQL = `WITH query_terms AS MATERIALIZED (
   SELECT DISTINCT term.lexeme
   FROM unnest(to_tsvector('simple', $11)) AS term(lexeme, positions, weights)
+), lexical_query AS MATERIALIZED (
+  SELECT to_tsquery(
+    'simple',
+    COALESCE(string_agg(quote_literal(term.lexeme), ' | ' ORDER BY term.lexeme), '')
+  ) AS terms
+  FROM query_terms AS term
 ), authoritative_memory AS MATERIALIZED (
   SELECT memory.id::text AS id,
     memory.text,
@@ -104,7 +133,7 @@ const SEARCH_SQL = `WITH lexical_query AS MATERIALIZED (
     COALESCE(memory.workspace_id, '') AS workspace_id,
     ${MEMORY_SESSION_SQL} AS session_id,
     memory.data_type,
-    memory.lifecycle_status,
+    ${MEMORY_EFFECTIVE_LIFECYCLE_SQL} AS lifecycle_status,
     memory.metadata->>'admissionRoute' AS admission_route,
     memory.metadata->>'contextEligible' AS context_eligible,
     memory.metadata #>> '{governance,native,kind}' AS memory_kind,
@@ -123,18 +152,25 @@ const SEARCH_SQL = `WITH lexical_query AS MATERIALIZED (
     AND COALESCE(memory.workspace_id, '') = $9
     AND ${MEMORY_SESSION_SQL} = $10
     AND memory.data_type = 'memory'
-    AND memory.lifecycle_status IN ('active', 'archived')
+    AND ${MEMORY_EFFECTIVE_LIFECYCLE_SQL} IN ('active', 'archived')
     AND memory.metadata->>'admissionRoute' IN ('active', 'lookup_only')
     AND (
-      (memory.lifecycle_status = 'active'
+      (${MEMORY_EFFECTIVE_LIFECYCLE_SQL} = 'active'
         AND memory.metadata->>'admissionRoute' = 'active'
         AND memory.metadata->>'contextEligible' = 'true')
       OR
-      (memory.lifecycle_status = 'archived'
+      (${MEMORY_EFFECTIVE_LIFECYCLE_SQL} = 'archived'
         AND memory.metadata->>'admissionRoute' = 'lookup_only'
         AND memory.metadata->>'contextEligible' = 'false')
     )
     AND memory.legacy_quarantine_reason IS NULL
+    AND memory.temporal_invalidated IS NOT TRUE
+    AND memory.temporal_purge_pending IS NOT TRUE
+    AND (memory.lineage_id IS NULL OR (
+      memory.valid_from <= CURRENT_TIMESTAMP
+      AND (memory.valid_to IS NULL OR memory.valid_to > CURRENT_TIMESTAMP)
+    ))
+    AND ${MEMORY_CURRENT_VERSION_SQL}
     AND jsonb_typeof(memory.metadata->'sourceNodeIds') = 'array'
     AND jsonb_typeof(memory.metadata #> '{governance,evidenceIds}') = 'array'
     AND jsonb_typeof(memory.metadata #> '{governance,candidate,evidence,eventIds}') = 'array'

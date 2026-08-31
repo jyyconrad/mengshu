@@ -43,7 +43,11 @@ import type { AuthorityScope } from "../../core/src/domain/authority-scope.js";
 import { chunkMarkdown } from "../../core/src/ingest/chunker.js";
 import { scopeToKey } from "../../core/src/domain/scope.js";
 import { loadFileContent } from "../../core/src/ingest/file-loader.js";
-import { resolveMcpAuthorityScope } from "./authority.js";
+import {
+  resolveMcpAuthorityScope,
+  snapshotMcpProjectWorkspaceBindings,
+  type McpProjectWorkspaceBindings,
+} from "./authority.js";
 import {
   isAuthorityScopedForgetCapability,
   type AuthorityScopedForgetCapability,
@@ -58,6 +62,36 @@ import type { ContextAssemblyReceiptRepository } from
   "../../core/src/context/assembly-receipt.js";
 import type { KnowledgeResourceCapability } from
   "../../core/src/resources/knowledge-resource-capability.js";
+import type { MemoryEvolutionService } from
+  "../../core/src/temporal/memory-evolution-service.js";
+import type { SessionWorkingSetService } from
+  "../../core/src/working-set/session-working-set-service.js";
+import type { SessionWorkingSetMemoryBridge } from
+  "../../core/src/working-set/memory-bridge.js";
+import type { SkillArtifactService } from
+  "../../core/src/skills/skill-artifact-service.js";
+import type {
+  MemoryPolicyOverlayService,
+  MemoryPolicyResolver,
+} from "../../core/src/policy/memory-policy-overlay.js";
+import type {
+  IngestToolPairInput,
+  PromoteWorkingSetClaimInput,
+  ReadSessionPayloadInput,
+  RecordTaskBoundaryInput,
+  SessionAssembleInput,
+} from "../../core/src/working-set/types.js";
+import type {
+  ProposeSkillInput,
+  CuratedSkillImportInput,
+  AppendSkillVersionInput,
+  PublishSkillInput,
+  RevokeSkillInput,
+  ReviewSkillInput,
+  SearchSkillInput,
+} from "../../core/src/skills/types.js";
+import type { AppendMemoryPolicyOverlayInput, MemoryPolicyLayer } from
+  "../../core/src/policy/types.js";
 
 /** JSON Schema 对象（MCP inputSchema 形态，保持宽松类型） */
 export type JsonSchemaObject = Record<string, unknown>;
@@ -87,6 +121,33 @@ export type MemoryKnowledgeResourceCapability = Pick<
   KnowledgeResourceCapability,
   "search" | "read"
 >;
+
+export type MemoryTemporalCapability = Pick<
+  MemoryEvolutionService,
+  "history" | "recallAsOf" | "recallAsOfResolved" | "expire" | "revoke" | "purge"
+>;
+
+export type MemoryWorkingSetCapability = Pick<
+  SessionWorkingSetService,
+  "ingestToolPair" | "recordTaskBoundary" | "assemble" | "readPayload" |
+  "explainRewrite" | "closeSession"
+>;
+
+export type MemoryWorkingSetBridgeCapability = Pick<
+  SessionWorkingSetMemoryBridge,
+  "promoteClaim"
+>;
+
+export type MemorySkillArtifactCapability = Pick<
+  SkillArtifactService,
+  "proposeFromCandidate" | "importCurated" | "review" | "publish" | "appendVersion" | "revoke" |
+  "read" | "search" | "explain"
+>;
+
+export interface MemoryPolicyCapability {
+  readonly mutations: Pick<MemoryPolicyOverlayService, "appendVersion">;
+  readonly resolver: Pick<MemoryPolicyResolver, "resolve">;
+}
 
 function deepFreeze(value: unknown, seen = new WeakSet<object>()): void {
   if (!value || typeof value !== "object" || seen.has(value)) return;
@@ -123,12 +184,19 @@ export interface McpMemoryToolsOptions {
   knowledgeResources?: MemoryKnowledgeResourceCapability;
   /** Persisted final assembly receipts. The tool is not advertised when absent. */
   sessionReceipts?: MemorySessionReceiptCapability;
+  temporalMemory?: MemoryTemporalCapability;
+  sessionWorkingSet?: MemoryWorkingSetCapability;
+  sessionWorkingSetBridge?: MemoryWorkingSetBridgeCapability;
+  skillArtifacts?: MemorySkillArtifactCapability;
+  memoryPolicy?: MemoryPolicyCapability;
   /** 可选 ingestion pipeline；注入后 memory_ingest 走真实持久化链路 */
   pipeline?: IngestionPipeline;
   /** 可选 LLM 客户端（预留给后续 ingest 增强；当前 ingest 热路径不调用 LLM） */
   llmClient?: LlmClient;
   /** Server-owned authority. Required by production server/stdio wrappers. */
   authority?: AuthorityScope;
+  /** Server-owned project registry bindings; clients cannot supply workspaceId. */
+  projectWorkspaceByProjectId?: McpProjectWorkspaceBindings;
   /** @deprecated Test-only compatibility channel for the pre-authority constructor. */
   unsafeLegacyScope?: true;
   /**
@@ -737,6 +805,12 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
   if (!options.authority && options.unsafeLegacyScope !== true) {
     throw new Error("MCP authority is required; unsafeLegacyScope is test-only and deprecated");
   }
+  const projectWorkspaceByProjectId = options.authority
+    ? snapshotMcpProjectWorkspaceBindings(
+        options.authority,
+        options.projectWorkspaceByProjectId,
+      )
+    : undefined;
   const configuredNamespaces = options.namespaces ?? ["memories", "knowledge"];
   const namespaces = Object.freeze(options.authority
     ? configuredNamespaces.filter((namespace) => options.authority!.allow.namespaces.includes(namespace))
@@ -815,6 +889,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
       return resolveMcpAuthorityScope(
         options.authority,
         { ...serverDefault, ...(clientScope ?? {}) },
+        projectWorkspaceByProjectId,
       ) as unknown as Record<string, unknown>;
     }
     return {
@@ -905,6 +980,52 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
       },
     },
   ];
+
+  if (options.temporalMemory) {
+    baseTools.splice(
+      baseTools.length - 1,
+      0,
+      ...buildMemoryTemporalTools(
+        options.temporalMemory,
+        options.memoryWrite,
+        options.authority,
+        mergeScope,
+        requestScopeSchema,
+      ),
+    );
+  }
+  if (options.sessionWorkingSet) {
+    baseTools.splice(
+      baseTools.length - 1,
+      0,
+      ...buildWorkingSetTools(options.sessionWorkingSet, mergeScope, requestScopeSchema),
+    );
+  }
+  if (options.sessionWorkingSetBridge) {
+    baseTools.splice(
+      baseTools.length - 1,
+      0,
+      ...buildWorkingSetBridgeTools(
+        options.sessionWorkingSetBridge,
+        mergeScope,
+        requestScopeSchema,
+      ),
+    );
+  }
+  if (options.skillArtifacts) {
+    baseTools.splice(
+      baseTools.length - 1,
+      0,
+      ...buildSkillArtifactTools(options.skillArtifacts, mergeScope, requestScopeSchema),
+    );
+  }
+  if (options.memoryPolicy) {
+    baseTools.splice(
+      baseTools.length - 1,
+      0,
+      ...buildMemoryPolicyTools(options.memoryPolicy, mergeScope, requestScopeSchema),
+    );
+  }
 
   // Tool discovery is itself a capability contract. Never advertise forget
   // merely because MemoryService has a method that may lack a transaction port.
@@ -1165,6 +1286,732 @@ function exactToolInput(
     typeof key !== "string" || !allowed.includes(key))) {
     throw new McpInvalidRequestError(message);
   }
+}
+
+function temporalInteger(value: unknown, minimum = 0): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
+}
+
+function buildWorkingSetTools(
+  capability: MemoryWorkingSetCapability,
+  mergeScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
+  requestScopeSchema: JsonSchemaObject,
+): McpMemoryTool[] {
+  const scope = (input: Record<string, unknown>) =>
+    mergeScope(input.scope as Record<string, unknown> | undefined) as unknown as MemoryScope;
+  return [
+    {
+      name: "memory_working_set_ingest",
+      description: "Persist an exact-session tool pair shell and optional governed summary.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema, sessionId: { type: "string" },
+          taskBoundaryId: { type: "string" }, toolCallId: { type: "string" },
+          toolName: { type: "string" },
+          sourceMessageIds: { type: "array", minItems: 2, maxItems: 2, items: { type: "string" } },
+          payloadRef: { type: "object" },
+          outcome: { type: "string", enum: ["success", "failure", "permission_denied", "cancelled"] },
+          summary: { type: "string" }, replaceability: { type: "number", minimum: 0, maximum: 1 },
+          evidenceRefs: { type: "array", items: { type: "string" } },
+          riskFlags: { type: "array", items: { type: "string" } },
+          idempotencyKey: { type: "string" },
+        },
+        required: ["sessionId", "toolCallId", "toolName", "sourceMessageIds", "payloadRef",
+          "outcome", "replaceability", "evidenceRefs", "riskFlags", "idempotencyKey"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "sessionId", "taskBoundaryId", "toolCallId", "toolName",
+          "sourceMessageIds", "payloadRef", "outcome", "summary", "replaceability",
+          "evidenceRefs", "riskFlags", "idempotencyKey"], "memory_working_set_ingest input is invalid");
+        return capability.ingestToolPair({ ...input, scope: scope(input) } as unknown as IngestToolPairInput);
+      },
+    },
+    {
+      name: "memory_working_set_outline",
+      description: "Append one exact-session TaskOutline version with CAS.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema, sessionId: { type: "string" }, taskBoundaryId: { type: "string" },
+          expectedVersion: { type: "integer", minimum: 0 }, goal: { type: "string" },
+          status: { type: "string", enum: ["doing", "blocked", "completed", "abandoned"] },
+          completedSteps: { type: "array", items: { type: "string" } },
+          currentSteps: { type: "array", items: { type: "string" } },
+          nextSteps: { type: "array", items: { type: "string" } },
+          decisions: { type: "array", items: { type: "string" } },
+          openQuestions: { type: "array", items: { type: "string" } },
+          entryRefs: { type: "array", items: { type: "string" } },
+          evidenceRefs: { type: "array", items: { type: "string" } },
+          policyVersion: { type: "string" },
+        },
+        required: ["sessionId", "taskBoundaryId", "expectedVersion", "goal", "status",
+          "completedSteps", "currentSteps", "nextSteps", "decisions", "openQuestions",
+          "entryRefs", "evidenceRefs", "policyVersion"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "sessionId", "taskBoundaryId", "expectedVersion", "goal",
+          "status", "completedSteps", "currentSteps", "nextSteps", "decisions", "openQuestions",
+          "entryRefs", "evidenceRefs", "policyVersion"], "memory_working_set_outline input is invalid");
+        return capability.recordTaskBoundary({ ...input, scope: scope(input) } as unknown as RecordTaskBoundaryInput);
+      },
+    },
+    {
+      name: "memory_working_set_assemble",
+      description: "Rewrite exact-session context under a deterministic protected-set policy.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema, sessionId: { type: "string" }, taskBoundaryId: { type: "string" },
+          messages: { type: "array", items: { type: "object" } },
+          contextWindow: { type: "integer", minimum: 1 },
+          protectedMessageIds: { type: "array", items: { type: "string" } },
+        },
+        required: ["sessionId", "messages", "contextWindow", "protectedMessageIds"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "sessionId", "taskBoundaryId", "messages", "contextWindow",
+          "protectedMessageIds"], "memory_working_set_assemble input is invalid");
+        return capability.assemble({ ...input, scope: scope(input) } as unknown as SessionAssembleInput);
+      },
+    },
+    {
+      name: "memory_working_set_payload_read",
+      description: "Read a bounded, hash-verified payload through the RuntimeHost reader.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema,
+          sessionId: { type: "string" },
+          entryId: { type: "string" },
+          maxBytes: { type: "integer", minimum: 1 },
+        },
+        required: ["sessionId", "entryId", "maxBytes"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "sessionId", "entryId", "maxBytes"],
+          "memory_working_set_payload_read input is invalid");
+        return capability.readPayload({ ...input, scope: scope(input) } as unknown as ReadSessionPayloadInput);
+      },
+    },
+    {
+      name: "memory_working_set_explain",
+      description: "Read an immutable context rewrite receipt.",
+      inputSchema: {
+        type: "object", properties: { scope: requestScopeSchema, sessionId: { type: "string" },
+          receiptId: { type: "string" } }, required: ["sessionId", "receiptId"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "sessionId", "receiptId"], "memory_working_set_explain input is invalid");
+        if (typeof input.sessionId !== "string" || typeof input.receiptId !== "string") {
+          throw new McpInvalidRequestError("memory_working_set_explain parameters are invalid");
+        }
+        return capability.explainRewrite(input.receiptId, scope(input), input.sessionId);
+      },
+    },
+    {
+      name: "memory_working_set_close",
+      description: "Close an exact session and expire its active Working Set entries.",
+      inputSchema: {
+        type: "object", properties: { scope: requestScopeSchema, sessionId: { type: "string" } },
+        required: ["sessionId"], additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "sessionId"], "memory_working_set_close input is invalid");
+        if (typeof input.sessionId !== "string") throw new McpInvalidRequestError("sessionId is required");
+        return capability.closeSession(scope(input), input.sessionId);
+      },
+    },
+  ];
+}
+
+function buildSkillArtifactTools(
+  capability: MemorySkillArtifactCapability,
+  mergeScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
+  requestScopeSchema: JsonSchemaObject,
+): McpMemoryTool[] {
+  const scope = (input: Record<string, unknown>) =>
+    mergeScope(input.scope as Record<string, unknown> | undefined) as unknown as MemoryScope;
+  const string = { type: "string", minLength: 1, maxLength: 256 } as const;
+  const nonNegativeVersion = { type: "integer", minimum: 0 } as const;
+  const positiveVersion = { type: "integer", minimum: 1 } as const;
+  const property = (name: string): JsonSchemaObject => {
+    if (["ownerUserId", "actorUserId", "candidateId", "skillId", "expectedOutcomePolicyVersion",
+      "idempotencyKey", "reviewerUserId", "reviewReceiptId", "reason", "query",
+      "title", "description", "applicability", "provenanceRef"].includes(name)) {
+      return string;
+    }
+    if (name === "expectedLatestVersion") return nonNegativeVersion;
+    if (name === "version") return positiveVersion;
+    if (name === "limit") return { type: "integer", minimum: 1, maximum: 100 };
+    if (name === "embeddingAvailable") return { type: "boolean" };
+    if (name === "highRisk") return { type: "boolean" };
+    if (name === "decision") return { type: "string", enum: ["approve", "reject"] };
+    if (name === "manifest") {
+      return {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            path: string,
+            contentHash: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            sizeBytes: { type: "integer", minimum: 0 },
+            mimeType: { type: "string", minLength: 1, maxLength: 128 },
+            executable: { type: "boolean", const: false },
+            provenanceRef: string,
+          },
+          required: ["path", "contentHash", "sizeBytes", "mimeType", "executable"],
+          additionalProperties: false,
+        },
+      };
+    }
+    if (name === "updates") {
+      const stringArray = { type: "array", items: { type: "string" } };
+      return {
+        type: "object",
+        properties: {
+          title: { type: "string" }, description: { type: "string" },
+          applicability: { type: "string" }, triggerConditions: stringArray,
+          preconditions: stringArray, steps: stringArray, successSignals: stringArray,
+          antiPatterns: stringArray, riskBoundaries: stringArray,
+          evidenceMemoryIds: stringArray, evidenceChunkIds: stringArray,
+          manifest: property("manifest"), expectedOutcomePolicyVersion: string,
+        },
+        additionalProperties: false,
+      };
+    }
+    if (["triggerConditions", "preconditions", "steps", "successSignals", "antiPatterns",
+      "riskBoundaries", "evidenceMemoryIds", "evidenceChunkIds"].includes(name)) {
+      return { type: "array", minItems: 1, items: { type: "string", minLength: 1, maxLength: 2048 } };
+    }
+    if (name === "license") {
+      return {
+        type: "object",
+        properties: {
+          spdxId: { type: "string", minLength: 1, maxLength: 64 },
+          sourceUrl: { type: "string", minLength: 1, maxLength: 2048 },
+        },
+        required: ["spdxId"],
+        additionalProperties: false,
+      };
+    }
+    return {};
+  };
+  const mutation = (
+    name: string,
+    description: string,
+    allowed: readonly string[],
+    required: readonly string[],
+    execute: (input: Record<string, unknown>, resolved: MemoryScope) => Promise<unknown>,
+  ): McpMemoryTool => ({
+    name, description,
+    inputSchema: {
+      type: "object",
+      properties: Object.fromEntries(allowed.map((key) => [
+        key,
+        key === "scope" ? requestScopeSchema : property(key),
+      ])),
+      ...(required.length === 0 ? {} : { required: [...required] }),
+      additionalProperties: false,
+    },
+    execute: async (input) => {
+      exactToolInput(input, allowed, `${name} input is invalid`);
+      return execute(input, scope(input));
+    },
+  });
+  return [
+    mutation("memory_skill_propose", "Create an immutable reviewed Skill draft from a candidate.",
+      ["scope", "ownerUserId", "candidateId", "skillId", "expectedLatestVersion", "manifest",
+        "expectedOutcomePolicyVersion", "idempotencyKey"],
+      ["ownerUserId", "candidateId", "skillId", "expectedLatestVersion", "manifest",
+        "expectedOutcomePolicyVersion", "idempotencyKey"],
+      (input, resolved) => capability.proposeFromCandidate({ ...input, scope: resolved } as unknown as ProposeSkillInput)),
+    mutation("memory_skill_import_curated", "Import a provenance- and license-checked Skill as a review-required draft.",
+      ["scope", "ownerUserId", "skillId", "expectedLatestVersion", "title", "description",
+        "applicability", "triggerConditions", "preconditions", "steps", "successSignals",
+        "antiPatterns", "riskBoundaries", "evidenceMemoryIds", "evidenceChunkIds", "manifest",
+        "expectedOutcomePolicyVersion", "provenanceRef", "license", "highRisk", "idempotencyKey"],
+      ["ownerUserId", "skillId", "expectedLatestVersion", "title", "description",
+        "triggerConditions", "preconditions", "steps", "successSignals", "antiPatterns",
+        "riskBoundaries", "evidenceMemoryIds", "evidenceChunkIds", "manifest",
+        "expectedOutcomePolicyVersion", "provenanceRef", "license", "idempotencyKey"],
+      (input, resolved) => capability.importCurated({
+        ...input, scope: resolved,
+      } as unknown as CuratedSkillImportInput)),
+    mutation("memory_skill_review", "Record an authorized Skill review decision as a new version.",
+      ["scope", "skillId", "expectedLatestVersion", "reviewerUserId", "decision", "reason", "idempotencyKey"],
+      ["skillId", "expectedLatestVersion", "reviewerUserId", "decision", "reason", "idempotencyKey"],
+      (input, resolved) => capability.review({ ...input, scope: resolved } as unknown as ReviewSkillInput)),
+    mutation("memory_skill_publish", "Publish an approved suggest-only Skill version.",
+      ["scope", "skillId", "expectedLatestVersion", "reviewerUserId", "reviewReceiptId", "idempotencyKey"],
+      ["skillId", "expectedLatestVersion", "reviewerUserId", "reviewReceiptId", "idempotencyKey"],
+      (input, resolved) => capability.publish({ ...input, scope: resolved } as unknown as PublishSkillInput)),
+    mutation("memory_skill_append", "Append a reviewed Skill draft version with head CAS.",
+      ["scope", "skillId", "expectedLatestVersion", "ownerUserId", "updates", "idempotencyKey"],
+      ["skillId", "expectedLatestVersion", "ownerUserId", "updates", "idempotencyKey"],
+      (input, resolved) => capability.appendVersion({
+        ...input, scope: resolved,
+      } as unknown as AppendSkillVersionInput)),
+    mutation("memory_skill_revoke", "Revoke a Skill by appending a terminal head version.",
+      ["scope", "skillId", "expectedLatestVersion", "actorUserId", "reason", "idempotencyKey"],
+      ["skillId", "expectedLatestVersion", "actorUserId", "reason", "idempotencyKey"],
+      (input, resolved) => capability.revoke({ ...input, scope: resolved } as unknown as RevokeSkillInput)),
+    mutation("memory_skill_read", "Read one exact-scope Skill head or pinned version.",
+      ["scope", "skillId", "version"], ["skillId"], async (input, resolved) => {
+        if (typeof input.skillId !== "string") throw new McpInvalidRequestError("skillId is required");
+        return capability.read({ scope: resolved, skillId: input.skillId,
+          ...(typeof input.version === "number" ? { version: input.version } : {}) });
+      }),
+    mutation("memory_skill_search", "Search published Skills with BM25 fallback.",
+      ["scope", "query", "limit", "embeddingAvailable"],
+      ["query"],
+      (input, resolved) => capability.search({ ...input, scope: resolved } as unknown as SearchSkillInput)),
+    mutation("memory_skill_explain", "Explain Skill status, evidence, resources, and lifecycle receipts.",
+      ["scope", "skillId", "version"], ["skillId"], async (input, resolved) => {
+        if (typeof input.skillId !== "string") throw new McpInvalidRequestError("skillId is required");
+        return capability.explain({ scope: resolved, skillId: input.skillId,
+          ...(typeof input.version === "number" ? { version: input.version } : {}) });
+      }),
+  ];
+}
+
+function buildWorkingSetBridgeTools(
+  capability: MemoryWorkingSetBridgeCapability,
+  mergeScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
+  requestScopeSchema: JsonSchemaObject,
+): McpMemoryTool[] {
+  return [{
+    name: "memory_working_set_promote",
+    description: "Promote one independently evidenced Working Set claim through the Write Kernel.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: requestScopeSchema,
+        sessionId: { type: "string" },
+        source: { type: "string", enum: [
+          "user_explicit", "verified_decision", "verified_outcome",
+        ] },
+        text: { type: "string" },
+        semanticType: { type: "string", enum: [
+          "profile", "task_context", "rules", "experience", "resource",
+        ] },
+        evidenceEntryIds: { type: "array", minItems: 1, items: { type: "string" } },
+        evidenceRefs: { type: "array", minItems: 1, items: { type: "string" } },
+        idempotencyKey: { type: "string" },
+        confirmation: { type: "string", enum: ["REMEMBER"] },
+      },
+      required: ["sessionId", "source", "text", "semanticType", "evidenceEntryIds",
+        "evidenceRefs", "idempotencyKey"],
+      additionalProperties: false,
+    },
+    execute: async (input) => {
+      exactToolInput(input, ["scope", "sessionId", "source", "text", "semanticType",
+        "evidenceEntryIds", "evidenceRefs", "idempotencyKey", "confirmation"],
+      "memory_working_set_promote input is invalid");
+      const scope = mergeScope(
+        input.scope as Record<string, unknown> | undefined,
+      ) as unknown as MemoryScope;
+      return capability.promoteClaim({ ...input, scope } as unknown as PromoteWorkingSetClaimInput);
+    },
+  }];
+}
+
+function buildMemoryPolicyTools(
+  capability: MemoryPolicyCapability,
+  mergeScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
+  requestScopeSchema: JsonSchemaObject,
+): McpMemoryTool[] {
+  const scope = (input: Record<string, unknown>) =>
+    mergeScope(input.scope as Record<string, unknown> | undefined) as unknown as MemoryScope;
+  return [
+    {
+      name: "memory_policy_append",
+      description: "Append a restricted structured Memory Policy Overlay version.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema,
+          id: { type: "string", minLength: 1, maxLength: 256 },
+          expectedLatestVersion: { type: "integer", minimum: 0 },
+          idempotencyKey: { type: "string", minLength: 1, maxLength: 256 },
+          ownerUserId: { type: "string", minLength: 1, maxLength: 256 },
+          target: {
+            type: "object",
+            properties: {
+              appId: { type: "string", minLength: 1, maxLength: 256 },
+              projectId: { type: "string", minLength: 1, maxLength: 256 },
+              agentId: { type: "string", minLength: 1, maxLength: 256 },
+            },
+            additionalProperties: false,
+          },
+          layer: { type: "string", enum: [
+            "candidate_extraction", "tree_summary", "skill_review", "document_organization",
+          ] },
+          focusHints: { type: "array", maxItems: 16, items: { type: "string", maxLength: 256 } },
+          ignoreHints: { type: "array", maxItems: 16, items: { type: "string", maxLength: 256 } },
+          aggregationHints: {
+            type: "array", maxItems: 16, items: { type: "string", maxLength: 256 },
+          },
+          status: { type: "string", enum: ["draft", "active", "revoked"] },
+        },
+        required: ["id", "expectedLatestVersion", "idempotencyKey", "ownerUserId", "target",
+          "layer", "focusHints", "ignoreHints", "aggregationHints", "status"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "id", "expectedLatestVersion", "idempotencyKey", "ownerUserId",
+          "target", "layer", "focusHints", "ignoreHints", "aggregationHints", "status"],
+        "memory_policy_append input is invalid");
+        return capability.mutations.appendVersion({ ...input, scope: scope(input) } as unknown as AppendMemoryPolicyOverlayInput);
+      },
+    },
+    {
+      name: "memory_policy_resolve",
+      description: "Resolve one structured overlay under fixed precedence and guard rules.",
+      inputSchema: { type: "object", properties: { scope: requestScopeSchema,
+        layer: { type: "string" } }, required: ["layer"], additionalProperties: false },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "layer"], "memory_policy_resolve input is invalid");
+        if (typeof input.layer !== "string") throw new McpInvalidRequestError("layer is required");
+        return capability.resolver.resolve({ scope: scope(input), layer: input.layer as MemoryPolicyLayer });
+      },
+    },
+  ];
+}
+
+function temporalLineageId(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 256 &&
+    value === value.trim() && !/[\p{White_Space}\p{Cc}]/u.test(value);
+}
+
+function buildMemoryTemporalTools(
+  capability: MemoryTemporalCapability,
+  memoryWrite: MemoryWriteCommandExecutor | undefined,
+  authority: AuthorityScope | undefined,
+  mergeScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
+  requestScopeSchema: JsonSchemaObject,
+): McpMemoryTool[] {
+  const exactScope = (input: Record<string, unknown>): MemoryScope =>
+    mergeScope(input.scope as Record<string, unknown> | undefined) as unknown as MemoryScope;
+  const requireLineage = (input: Record<string, unknown>): string => {
+    if (!temporalLineageId(input.lineageId)) {
+      throw new McpInvalidRequestError("temporal memory requires a valid lineageId");
+    }
+    return input.lineageId;
+  };
+  const tools: McpMemoryTool[] = [
+    {
+      name: "memory_history",
+      description: "Read every governed revision for one exact-scope memory lineage.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema,
+          lineageId: { type: "string", minLength: 1, maxLength: 256 },
+        },
+        required: ["lineageId"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(input, ["scope", "lineageId"], "memory_history accepts only scope and lineageId");
+        return capability.history({ scope: exactScope(input), lineageId: requireLineage(input) });
+      },
+    },
+    {
+      name: "memory_recall_as_of",
+      description: "Recall the trusted revision valid at an explicit epoch-millisecond time.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema,
+          lineageId: { type: "string", minLength: 1, maxLength: 256 },
+          asOf: { oneOf: [
+            { type: "integer", minimum: 0 },
+            { type: "string", minLength: 1, maxLength: 128 },
+          ] },
+          knownAt: { oneOf: [
+            { type: "integer", minimum: 0 },
+            { type: "string", minLength: 1, maxLength: 128 },
+          ] },
+          timezoneOffsetMinutes: { type: "integer", minimum: -840, maximum: 840 },
+          anchorAt: { type: "integer", minimum: 0 },
+        },
+        required: ["lineageId", "asOf"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(
+          input,
+          ["scope", "lineageId", "asOf", "knownAt", "timezoneOffsetMinutes", "anchorAt"],
+          "memory_recall_as_of input is invalid",
+        );
+        if (typeof input.asOf === "string") {
+          if ((input.knownAt !== undefined && typeof input.knownAt !== "string" &&
+                !temporalInteger(input.knownAt)) ||
+              (input.timezoneOffsetMinutes !== undefined &&
+                (!Number.isInteger(input.timezoneOffsetMinutes) ||
+                  (input.timezoneOffsetMinutes as number) < -840 ||
+                  (input.timezoneOffsetMinutes as number) > 840)) ||
+              (input.anchorAt !== undefined && !temporalInteger(input.anchorAt))) {
+            throw new McpInvalidRequestError("memory_recall_as_of expression parameters are invalid");
+          }
+          return capability.recallAsOfResolved({
+            scope: exactScope(input),
+            lineageId: requireLineage(input),
+            asOf: input.asOf,
+            ...(input.knownAt === undefined ? {} : { knownAt: input.knownAt as string | number }),
+            ...(input.timezoneOffsetMinutes === undefined
+              ? {}
+              : { timezoneOffsetMinutes: input.timezoneOffsetMinutes as number }),
+            ...(input.anchorAt === undefined ? {} : { anchorAt: input.anchorAt as number }),
+          });
+        }
+        if (!temporalInteger(input.asOf) ||
+            (input.knownAt !== undefined && !temporalInteger(input.knownAt))) {
+          throw new McpInvalidRequestError("memory_recall_as_of requires epoch milliseconds");
+        }
+        return capability.recallAsOf({
+          scope: exactScope(input),
+          lineageId: requireLineage(input),
+          asOf: input.asOf,
+          ...(input.knownAt === undefined ? {} : { knownAt: input.knownAt }),
+        });
+      },
+    },
+    {
+      name: "memory_expire",
+      description: "Close the current valid interval while preserving governed history.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema,
+          lineageId: { type: "string", minLength: 1, maxLength: 256 },
+          expectedHeadRevision: { type: "integer", minimum: 1 },
+          validTo: { type: "integer", minimum: 0 },
+          reason: { type: "string", minLength: 1, maxLength: 1024 },
+          idempotencyKey: { type: "string", minLength: 1, maxLength: 256 },
+        },
+        required: ["lineageId", "expectedHeadRevision", "validTo", "idempotencyKey"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(
+          input,
+          ["scope", "lineageId", "expectedHeadRevision", "validTo", "reason", "idempotencyKey"],
+          "memory_expire input is invalid",
+        );
+        if (!temporalInteger(input.expectedHeadRevision, 1) ||
+            !temporalInteger(input.validTo) || typeof input.idempotencyKey !== "string") {
+          throw new McpInvalidRequestError("memory_expire parameters are invalid");
+        }
+        return capability.expire({
+          scope: exactScope(input),
+          lineageId: requireLineage(input),
+          expectedHeadRevision: input.expectedHeadRevision,
+          validTo: input.validTo,
+          ...(typeof input.reason === "string" ? { reason: input.reason } : {}),
+          idempotencyKey: input.idempotencyKey,
+        });
+      },
+    },
+    {
+      name: "memory_revoke",
+      description: "Withdraw the current revision from normal current and historical fact views.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema,
+          lineageId: { type: "string", minLength: 1, maxLength: 256 },
+          expectedHeadRevision: { type: "integer", minimum: 1 },
+          reason: { type: "string", minLength: 1, maxLength: 1024 },
+          idempotencyKey: { type: "string", minLength: 1, maxLength: 256 },
+        },
+        required: ["lineageId", "expectedHeadRevision", "reason", "idempotencyKey"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(
+          input,
+          ["scope", "lineageId", "expectedHeadRevision", "reason", "idempotencyKey"],
+          "memory_revoke input is invalid",
+        );
+        if (!temporalInteger(input.expectedHeadRevision, 1) ||
+            typeof input.reason !== "string" || typeof input.idempotencyKey !== "string") {
+          throw new McpInvalidRequestError("memory_revoke parameters are invalid");
+        }
+        return capability.revoke({
+          scope: exactScope(input),
+          lineageId: requireLineage(input),
+          expectedHeadRevision: input.expectedHeadRevision,
+          reason: input.reason,
+          idempotencyKey: input.idempotencyKey,
+        });
+      },
+    },
+    {
+      name: "memory_purge",
+      description: "Irreversibly erase one lineage and its derived content with explicit confirmation.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema,
+          lineageId: { type: "string", minLength: 1, maxLength: 256 },
+          confirmation: { type: "string", enum: ["PURGE"] },
+          idempotencyKey: { type: "string", minLength: 1, maxLength: 256 },
+        },
+        required: ["lineageId", "confirmation", "idempotencyKey"],
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        exactToolInput(
+          input,
+          ["scope", "lineageId", "confirmation", "idempotencyKey"],
+          "memory_purge input is invalid",
+        );
+        if (input.confirmation !== "PURGE" || typeof input.idempotencyKey !== "string") {
+          throw new McpInvalidRequestError("memory_purge requires explicit PURGE confirmation");
+        }
+        return capability.purge({
+          scope: exactScope(input),
+          lineageId: requireLineage(input),
+          confirmation: "PURGE",
+          idempotencyKey: input.idempotencyKey,
+        });
+      },
+    },
+  ];
+  if (!memoryWrite || !authority) return tools;
+
+  const transitionProperties = {
+    scope: requestScopeSchema,
+    lineageId: { type: "string", minLength: 1, maxLength: 256 },
+    expectedHeadRevision: { type: "integer", minimum: 1 },
+    expectedHeadVersionId: { type: "string", minLength: 1, maxLength: 256 },
+    validFrom: { type: "integer", minimum: 0 },
+    text: { type: "string", minLength: 1, maxLength: 100_000 },
+    kind: { type: "string", minLength: 1, maxLength: 256 },
+    semanticType: { type: "string", enum: [...MEMORY_SEMANTIC_TYPES] },
+    evidenceIds: {
+      type: "array", minItems: 1, maxItems: 100, uniqueItems: true,
+      items: { type: "string", minLength: 1, maxLength: 256 },
+    },
+    reason: { type: "string", minLength: 1, maxLength: 1024 },
+    idempotencyKey: { type: "string", minLength: 1, maxLength: 256 },
+    metadata: { type: "object" },
+    provenance: { type: "object" },
+  } satisfies Record<string, JsonSchemaObject>;
+  const executeTransition = async (
+    input: Record<string, unknown>,
+    transitionType: "evolved" | "corrected" | "restored",
+  ): Promise<unknown> => {
+    const allowed = [
+      "scope", "lineageId", "expectedHeadRevision", "expectedHeadVersionId",
+      "sourceVersionId", "validFrom", "text", "kind", "semanticType",
+      "evidenceIds", "reason", "idempotencyKey", "metadata", "provenance",
+    ];
+    exactToolInput(input, allowed, `memory_${transitionType} input is invalid`);
+    const evidenceIds = Array.isArray(input.evidenceIds) && input.evidenceIds.length > 0 &&
+        input.evidenceIds.every((id) => typeof id === "string" && id.length > 0)
+      ? input.evidenceIds as string[]
+      : undefined;
+    if (!temporalLineageId(input.lineageId) ||
+        !temporalInteger(input.expectedHeadRevision, 1) ||
+        !temporalInteger(input.validFrom) || typeof input.text !== "string" ||
+        input.text.trim().length === 0 || typeof input.kind !== "string" ||
+        !MEMORY_SEMANTIC_TYPES.has(input.semanticType as MemorySemanticType) ||
+        typeof input.idempotencyKey !== "string" || !evidenceIds) {
+      throw new McpInvalidRequestError("temporal memory write parameters are invalid");
+    }
+    if (transitionType !== "restored" &&
+        !temporalLineageId(input.expectedHeadVersionId)) {
+      throw new McpInvalidRequestError("temporal memory write requires expectedHeadVersionId");
+    }
+    if (transitionType === "restored" && !temporalLineageId(input.sourceVersionId)) {
+      throw new McpInvalidRequestError("memory_restore requires sourceVersionId");
+    }
+    const scope = exactScope(input);
+    const targetId = temporalLineageId(input.expectedHeadVersionId)
+      ? input.expectedHeadVersionId
+      : input.sourceVersionId as string;
+    const result = await memoryWrite.executeMemoryWrite({
+      type: "correctMemory",
+      correctionKind: "replaceText",
+      targetId,
+      idempotencyKey: input.idempotencyKey,
+      serverAuthority: authority,
+      clientScope: scope,
+      text: input.text,
+      kind: input.kind as never,
+      semanticType: input.semanticType as MemorySemanticType,
+      dataType: "memory",
+      tableName: "memories",
+      evidenceIds,
+      metadata: { ...asRecord(input.metadata), source: "mcp" },
+      provenance: { ...asRecord(input.provenance), source: "mcp" },
+      temporal: {
+        lineageId: input.lineageId,
+        expectedHeadRevision: input.expectedHeadRevision,
+        ...(temporalLineageId(input.expectedHeadVersionId)
+          ? { expectedHeadVersionId: input.expectedHeadVersionId }
+          : {}),
+        validFrom: input.validFrom,
+        transitionType,
+        ...(transitionType === "restored"
+          ? { restoredFromVersionId: input.sourceVersionId as string }
+          : {}),
+        ...(typeof input.reason === "string" ? { reason: input.reason } : {}),
+      },
+    });
+    return adaptWriteResult("saveExplicit", result);
+  };
+  const required = [
+    "lineageId", "expectedHeadRevision", "validFrom", "text", "kind",
+    "semanticType", "evidenceIds", "idempotencyKey",
+  ];
+  tools.push(
+    {
+      name: "memory_evolve",
+      description: "Create a governed current revision that supersedes the expected lineage head.",
+      inputSchema: {
+        type: "object",
+        properties: transitionProperties,
+        required: [...required, "expectedHeadVersionId"],
+        additionalProperties: false,
+      },
+      execute: (input) => executeTransition(input, "evolved"),
+    },
+    {
+      name: "memory_correct",
+      description: "Invalidate an incorrect head and create its governed corrected revision.",
+      inputSchema: {
+        type: "object",
+        properties: transitionProperties,
+        required: [...required, "expectedHeadVersionId", "reason"],
+        additionalProperties: false,
+      },
+      execute: (input) => executeTransition(input, "corrected"),
+    },
+    {
+      name: "memory_restore",
+      description: "Copy one historical version into a newly governed current revision.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ...transitionProperties,
+          sourceVersionId: { type: "string", minLength: 1, maxLength: 256 },
+        },
+        required: [...required, "sourceVersionId", "reason"],
+        additionalProperties: false,
+      },
+      execute: (input) => executeTransition(input, "restored"),
+    },
+  );
+  return tools;
 }
 
 function buildMemoryKnowledgeTools(

@@ -46,6 +46,7 @@ import {
   type McpServerAuthorityConfig,
 } from "../../../mcp/src/server.js";
 import {
+  createRuntimeMcpFacade,
   startMcpStdioServer,
   waitForMcpServerShutdown,
   type McpStdioServerOptions,
@@ -58,7 +59,10 @@ import type { MemoryViewAssetService } from
 import type { AgentLoadoutService } from "../../../core/src/loadout/service.js";
 import type { ContextAssemblyReceiptRepository } from
   "../../../core/src/context/assembly-receipt.js";
-import { readRegistry } from "../../../core/src/runtime/registry.js";
+import {
+  projectWorkspaceBindings,
+  readRegistry,
+} from "../../../core/src/runtime/registry.js";
 import {
   createPostgresSchemaCutoverPort,
   POSTGRES_SCHEMA_CUTOVER_TARGET,
@@ -462,23 +466,8 @@ export function resolveRuntimeMemoryWriteCapability(
 export function createCliMcpStdioServerOptions(
   runtime: MengshuRuntime,
   authorityConfig: McpServerAuthorityConfig,
+  projectWorkspaceByProjectId?: Readonly<Record<string, string>>,
 ): McpStdioServerOptions {
-  let durableJobV2: McpStdioServerOptions["durableJobV2"];
-  const capability = runtime.durableJobV2ServeCapability;
-  const bundle = runtime.durableJobV2RuntimeBundle;
-  const dbType = runtime.config?.dbType;
-  if (dbType === "postgres" || capability !== undefined || bundle !== undefined) {
-    if (dbType !== undefined && dbType !== "postgres") {
-      throw new Error("MCP durable job v2 capability requires PostgreSQL");
-    }
-    if (!capability || !bundle || capability.repository !== bundle.repository) {
-      throw new Error("MCP Postgres durable job v2 capability is unavailable");
-    }
-    durableJobV2 = {
-      repository: bundle.repository,
-      registry: capability.registry,
-    };
-  }
   return {
     service: runtime.memoryService,
     ...(runtime.executeMemoryWrite
@@ -487,16 +476,27 @@ export function createCliMcpStdioServerOptions(
     forgetCapability: resolveRuntimeForgetCapability(runtime),
     authority: authorityConfig.authority,
     defaultScope: authorityConfig.defaultScope,
+    workerOwnership: "external-runtime-host",
+    projectWorkspaceByProjectId,
     agentFastPath: runtime.agentFastPath,
     memoryAssets: runtime.memoryViewAssets,
     knowledgeResources: runtime.knowledgeResources,
+    temporalMemory: runtime.memoryEvolution,
+    sessionWorkingSet: runtime.sessionWorkingSet,
+    sessionWorkingSetBridge: runtime.sessionWorkingSetMemoryBridge,
+    skillArtifacts: runtime.skillArtifacts,
+    ...(runtime.memoryPolicyOverlays && runtime.memoryPolicyResolver
+      ? { memoryPolicy: {
+          mutations: runtime.memoryPolicyOverlays,
+          resolver: runtime.memoryPolicyResolver,
+        } }
+      : {}),
     ...(runtime.contextAssemblyReceipts
       ? { sessionReceipts: runtime.contextAssemblyReceipts }
       : {}),
     namespaces: ["memories", "knowledge"],
     pipeline: runtime.ingestionPipeline,
     llmClient: runtime.llmClient,
-    ...(durableJobV2 ? { durableJobV2 } : {}),
   };
 }
 
@@ -877,6 +877,12 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
   const rawConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const cfg = memoryConfigSchema.parse(rawConfig);
 
+  if (isMcpCommand(argv) && process.env.MENGSHU_MCP_DIRECT_DIAGNOSTIC !== "1") {
+    const { runStandaloneMcpServer } = await import("../../../../scripts/mengshu-mcp.js");
+    await runStandaloneMcpServer();
+    return;
+  }
+
   const resolvedDbPath = resolveRuntimeDbPath(cfg, configPath);
 
   const defaultScope = serverAuthority?.defaultScope ?? {
@@ -925,7 +931,11 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
         throw new Error("MCP authority configuration is required");
       }
       const running = await startMcpStdioServer(
-        createCliMcpStdioServerOptions(runtime, serverAuthority),
+        createCliMcpStdioServerOptions(
+          runtime,
+          serverAuthority,
+          projectWorkspaceBindings(readRegistry()),
+        ),
       );
       process.stderr.write("MCP stdio server started (Ctrl+C to stop)\n");
       try {
@@ -942,6 +952,19 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
     config: cfg,
     service: runtime.memoryService,
     memoryWrite: resolveRuntimeMemoryWriteCapability(runtime),
+    memoryEvolution: runtime.memoryEvolution,
+    sessionWorkingSet: runtime.sessionWorkingSet,
+    sessionWorkingSetMemoryBridge: runtime.sessionWorkingSetMemoryBridge,
+    skillArtifacts: runtime.skillArtifacts,
+    memoryPolicyOverlays: runtime.memoryPolicyOverlays,
+    memoryPolicyResolver: runtime.memoryPolicyResolver,
+    runtimeMcp: serverAuthority
+      ? createRuntimeMcpFacade(createCliMcpStdioServerOptions(
+          runtime,
+          serverAuthority,
+          projectWorkspaceBindings(readRegistry()),
+        ))
+      : undefined,
     console: runtime.consoleApi,
     agentFastPath: runtime.agentFastPath,
     defaultScope: runtime.defaultScope,

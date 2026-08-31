@@ -28,7 +28,10 @@ function sameScope(a: MemoryScope, b: MemoryScope): boolean {
     a.userId === b.userId &&
     a.projectId === b.projectId &&
     a.agentId === b.agentId &&
-    a.namespace === b.namespace
+    a.namespace === b.namespace &&
+    (a.visibility ?? "private") === (b.visibility ?? "private") &&
+    (a.workspaceId ?? "") === (b.workspaceId ?? "") &&
+    (a.sessionId ?? "") === (b.sessionId ?? "")
   );
 }
 
@@ -57,8 +60,8 @@ export class InMemoryCandidateRepository implements CandidateRepository {
     // D-02 / §17.1：候选区单会话容量约束。
     // 仅对新写入 status=pending 的候选生效——超限时把同会话最早入队的 pending
     // 标记为 archived（含 audit 原因 archived_due_to_session_capacity），保证候选区
-    // 不会无限膨胀。会话身份按 scope.sessionId 识别；缺省时退回 full scope 比较，
-    // 让限制即便在无 sessionId 的旧调用方也生效。
+    // 不会无限膨胀。会话身份使用完整 canonical scope；缺省 sessionId 时仍按
+    // 其余 authority 维度精确比较，让旧调用方的容量限制继续生效。
     if (status === "pending") {
       this.evictOldestPendingIfFull(input.scope);
     }
@@ -88,7 +91,7 @@ export class InMemoryCandidateRepository implements CandidateRepository {
   /**
    * D-02：超限时归档最早入队的 pending 候选。
    *
-   * 同会话（按 scope.sessionId 优先；缺省退回 sameScope 全字段匹配）的 pending
+   * 同会话使用 canonical 9D scope；缺省 sessionId 时按其余 8 维匹配。pending
    * 数 >= maxCandidatesPerSession 时，按 createdAt 升序找最旧条目并将 status
    * 改为 archived，metadata.statusReason 写入 archived_due_to_session_capacity
    * 以便后续 audit 追溯。该归档行为是内部副作用，不改 enqueue 外部签名。
@@ -97,15 +100,9 @@ export class InMemoryCandidateRepository implements CandidateRepository {
     const limit = this.config.maxCandidatesPerSession;
     if (!Number.isFinite(limit) || limit <= 0) return;
 
-    const sessionId = scope.sessionId;
-    const sameSession = (a: MemoryScope): boolean =>
-      sessionId !== undefined
-        ? a.sessionId === sessionId
-        : sameScope(a, scope);
-
     const pendingInSession: CandidateRecord[] = [];
     for (const r of this.records.values()) {
-      if (r.status === "pending" && sameSession(r.scope)) {
+      if (r.status === "pending" && sameScope(r.scope, scope)) {
         pendingInSession.push(r);
       }
     }

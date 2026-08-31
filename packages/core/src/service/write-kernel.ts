@@ -5,6 +5,8 @@
  * model call and durable operation is injected through an explicit contract.
  */
 
+import { createHash } from "node:crypto";
+
 import {
   createMemoryWriteReceipt,
   createWriteCommandFingerprint,
@@ -14,6 +16,8 @@ import {
   type NormalizedMemoryWriteReceipt,
   type WriteIdempotencyIdentity,
 } from "./write-kernel-transaction.js";
+import { authorityScopeFingerprint } from "../domain/authority-scope-fingerprint.js";
+import type { MemoryVersionTransitionReceipt } from "../temporal/types.js";
 import type { MemoryCategory } from "../../../../config.js";
 import type {
   MemoryContainer,
@@ -74,11 +78,33 @@ interface TextWriteCommand extends WriteCommandContext {
 
 export type MemoryCorrectionKind = "replaceText" | "revoke" | "archive" | "delete";
 
+export interface TemporalMemoryWriteIntent {
+  readonly lineageId: string;
+  readonly expectedHeadRevision: number;
+  readonly expectedHeadVersionId?: string;
+  readonly validFrom: number;
+  readonly transitionType: "evolved" | "corrected" | "restored";
+  readonly restoredFromVersionId?: string;
+  readonly reason?: string;
+}
+
+export interface TemporalMemoryWriteMutation {
+  readonly lineageId: string;
+  readonly expectedHeadRevision: number;
+  readonly expectedHeadVersionId?: string;
+  readonly validFrom: number;
+  readonly transitionType: "created" | TemporalMemoryWriteIntent["transitionType"];
+  readonly restoredFromVersionId?: string;
+  readonly reason?: string;
+  readonly receipt: MemoryVersionTransitionReceipt;
+}
+
 export type CorrectMemoryCommand =
   | (TextWriteCommand & {
       type: "correctMemory";
       correctionKind: "replaceText";
       targetId: string;
+      temporal?: TemporalMemoryWriteIntent;
     })
   | (WriteCommandContext & {
       type: "correctMemory";
@@ -162,6 +188,7 @@ export type WriteMemoryRecord =
       }>;
       correctsId?: string;
       sourceId?: string;
+      temporal?: TemporalMemoryWriteMutation;
     })
   | (BaseWriteMemoryRecord & {
       mutation: "lifecycle";
@@ -211,6 +238,8 @@ export interface MemoryWriteTransactionContext {
 }
 
 export interface MemoryWriteKernelDependencies {
+  /** When enabled, every newly active canonical row is born inside a temporal lineage. */
+  readonly temporalMemoryEnabled?: boolean;
   resolveAuthority(input: {
     serverAuthority: unknown;
     clientScope: unknown;
@@ -362,6 +391,90 @@ function isLifecycleCorrection(
   command: MemoryWriteCommand,
 ): command is Extract<CorrectMemoryCommand, { correctionKind: "revoke" | "archive" | "delete" }> {
   return command.type === "correctMemory" && command.correctionKind !== "replaceText";
+}
+
+const SAFE_TEMPORAL_ID = /^[^\s\p{Cc}]{1,256}$/u;
+const SAFE_TEMPORAL_REASON = /^[^\p{Cc}]{1,1024}$/u;
+
+function validateTemporalIntent(intent: TemporalMemoryWriteIntent): void {
+  if (!SAFE_TEMPORAL_ID.test(intent.lineageId) ||
+      !Number.isSafeInteger(intent.expectedHeadRevision) || intent.expectedHeadRevision < 1 ||
+      !Number.isSafeInteger(intent.validFrom) || intent.validFrom < 0 ||
+      !["evolved", "corrected", "restored"].includes(intent.transitionType) ||
+      (intent.expectedHeadVersionId !== undefined &&
+        !SAFE_TEMPORAL_ID.test(intent.expectedHeadVersionId)) ||
+      (intent.restoredFromVersionId !== undefined &&
+        !SAFE_TEMPORAL_ID.test(intent.restoredFromVersionId)) ||
+      (intent.transitionType === "restored") !==
+        (intent.restoredFromVersionId !== undefined) ||
+      (intent.reason !== undefined &&
+        (intent.reason !== intent.reason.trim() || !SAFE_TEMPORAL_REASON.test(intent.reason)))) {
+    throw new WriteKernelError("INVALID_COMMAND", "temporal memory intent is invalid");
+  }
+}
+
+function temporalMutation(
+  command: MemoryWriteCommand,
+  scope: WriteScope,
+  fingerprint: string,
+  versionId: string,
+  occurredAt: number,
+  route: WriteAdmissionRoute,
+  bootstrapEnabled: boolean,
+): TemporalMemoryWriteMutation | undefined {
+  const scopeFingerprint = authorityScopeFingerprint({
+    ...scope,
+    visibility: scope.visibility ?? "private",
+  });
+  if (command.type !== "correctMemory" || command.correctionKind !== "replaceText" ||
+      command.temporal === undefined) {
+    if (!bootstrapEnabled || route !== "active") return undefined;
+    const receipt: MemoryVersionTransitionReceipt = {
+      id: createHash("sha256").update(JSON.stringify([
+        "mengshu.memory-version-transition-receipt/v1",
+        scopeFingerprint,
+        command.idempotencyKey,
+        fingerprint,
+        "created",
+      ])).digest("hex"),
+      idempotencyKey: command.idempotencyKey,
+      requestHash: fingerprint,
+      scopeFingerprint,
+      lineageId: versionId,
+      transitionType: "created",
+      versionId,
+      revision: 1,
+      occurredAt,
+    };
+    return Object.freeze({
+      lineageId: versionId,
+      expectedHeadRevision: 0,
+      validFrom: occurredAt,
+      transitionType: "created",
+      receipt,
+    });
+  }
+  validateTemporalIntent(command.temporal);
+  const receipt: MemoryVersionTransitionReceipt = {
+    id: createHash("sha256").update(JSON.stringify([
+      "mengshu.memory-version-transition-receipt/v1",
+      scopeFingerprint,
+      command.idempotencyKey,
+      fingerprint,
+    ])).digest("hex"),
+    idempotencyKey: command.idempotencyKey,
+    requestHash: fingerprint,
+    scopeFingerprint,
+    lineageId: command.temporal.lineageId,
+    transitionType: command.temporal.transitionType,
+    ...(command.temporal.expectedHeadVersionId === undefined
+      ? {}
+      : { previousVersionId: command.temporal.expectedHeadVersionId }),
+    versionId,
+    revision: command.temporal.expectedHeadRevision + 1,
+    occurredAt,
+  };
+  return Object.freeze({ ...command.temporal, receipt });
 }
 
 export class MemoryWriteKernel {
@@ -611,8 +724,19 @@ export class MemoryWriteKernel {
 
     const route = persistedRoute(command, admission);
     const confidence = governedConfidence(command, validation.candidate);
+    const memoryId = this.dependencies.createId();
+    const createdAt = this.dependencies.now();
+    const temporal = temporalMutation(
+      command,
+      scope,
+      fingerprint,
+      memoryId,
+      createdAt,
+      route,
+      this.dependencies.temporalMemoryEnabled === true,
+    );
     const memory: WriteMemoryRecord = {
-        id: this.dependencies.createId(),
+        id: memoryId,
         commandType: command.type,
         mutation: "content",
         scope,
@@ -643,9 +767,10 @@ export class MemoryWriteKernel {
             ? {}
             : { valueSignalProvenance: admission.valueSignalProvenance }),
         }),
-        createdAt: this.dependencies.now(),
+        createdAt,
         ...(command.type === "correctMemory" ? { correctsId: command.targetId } : {}),
         ...(command.type === "importEvidence" ? { sourceId: command.sourceId } : {}),
+        ...(temporal === undefined ? {} : { temporal }),
     };
     return this.commitDurable(command, memory, identity, fingerprint);
   }

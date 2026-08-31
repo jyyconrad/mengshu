@@ -12,6 +12,15 @@ import type {
 } from "./skill-candidate-types.js";
 import type { MemoryScope } from "../domain/types.js";
 
+function sameScope(left: MemoryScope, right: MemoryScope): boolean {
+  return left.tenantId === right.tenantId && left.userId === right.userId &&
+    left.appId === right.appId && left.projectId === right.projectId &&
+    left.agentId === right.agentId && left.namespace === right.namespace &&
+    (left.visibility ?? "private") === (right.visibility ?? "private") &&
+    (left.workspaceId ?? "") === (right.workspaceId ?? "") &&
+    (left.sessionId ?? "") === (right.sessionId ?? "");
+}
+
 /**
  * 内存实现
  */
@@ -119,16 +128,8 @@ export class InMemorySkillCandidateRepository implements SkillCandidateRepositor
     return this.store.size;
   }
 
-  /**
-   * Scope 匹配（简化版本）
-   */
+  /** Scope matching mirrors the canonical 9D authority identity. */
   private scopeMatches(candidateScope: MemoryScope, filterScope: MemoryScope): boolean {
-    // 简单实现：精确匹配核心字段
-    return (
-      candidateScope.tenantId === filterScope.tenantId &&
-      candidateScope.appId === filterScope.appId &&
-      candidateScope.userId === filterScope.userId &&
-      candidateScope.projectId === filterScope.projectId
-    );
+    return sameScope(candidateScope, filterScope);
   }
 }

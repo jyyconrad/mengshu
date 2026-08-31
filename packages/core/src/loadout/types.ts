@@ -14,6 +14,8 @@ export type DisclosureMode =
 
 export interface SlotAssetBinding {
   readonly assetId: string;
+  /** 旧版本缺省为 memory_view。 */
+  readonly assetKind?: "memory_view" | "skill";
   readonly slot: MemorySemanticType;
   readonly pinnedVersion?: number;
   readonly disclosureMode: DisclosureMode;
@@ -86,7 +88,7 @@ export interface PauseAgentLoadoutInput {
 export interface LoadoutAssetCandidate {
   readonly assetId: string;
   readonly assetVersion: number;
-  readonly assetKind: "memory_view";
+  readonly assetKind: "memory_view" | "skill";
   readonly status: MemoryViewAssetStatus;
   readonly contentValidity: MemoryViewContentValidity;
   readonly scope: MemoryScope;
@@ -137,6 +139,11 @@ export interface LoadoutAssemblyResult {
   readonly receipt?: {
     readonly loadoutId: string;
     readonly loadoutVersion: number;
-    readonly assetVersions: ReadonlyArray<{ assetId: string; version: number }>;
+    readonly assetVersions: ReadonlyArray<{
+      assetId: string;
+      /** 旧 receipt 缺省为 memory_view。 */
+      assetKind?: "memory_view" | "skill";
+      version: number;
+    }>;
   };
 }

@@ -7,11 +7,15 @@ import { createEmbeddingSpace } from
   "../../packages/core/src/domain/embedding-space.js";
 import { PostgresProvider } from "../../packages/core/src/db/providers/postgres.js";
 import { loadEvalManifest, selectEvalSuites } from "../eval/runners/eval-manifest.js";
-import { buildReport } from "../eval/runners/quick-eval.js";
+import {
+  buildReport,
+  describeProductionGateFailures,
+} from "../eval/runners/quick-eval.js";
 import {
   createRuntimeE2eProgressReporter,
   runProductionRestRuntimeE2eSuite,
 } from "../eval/runners/runtime-e2e.js";
+import { findProductionTreeReceiptIssues } from "../eval/runners/eval-metrics.js";
 import {
   loadGlobalMengshuConfig,
   provisionGlobalPostgresTestSchema,
@@ -70,7 +74,14 @@ describe.skipIf(!liveEnabled)("production REST RuntimeHost eval live e2e", () =>
         }),
       ]);
       expect(report.releaseGatePassed).toBe(true);
-      expect(report.productionReleaseGatePassed).toBe(true);
+      expect(
+        report.productionReleaseGatePassed,
+        [
+          ...describeProductionGateFailures(report),
+          ...findProductionTreeReceiptIssues(run.summary.execution?.productionStageEvidence?.tree)
+            .map((issue) => `tree:${issue}`),
+        ].join("; "),
+      ).toBe(true);
       expect(report.suites[0]).toMatchObject({
         gatePassed: true,
         execution: {

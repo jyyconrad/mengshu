@@ -1962,6 +1962,532 @@ ON mengshu_markdown_migration_mappings (run_id, disposition, source_ref)`,
 ON mengshu_markdown_migration_staged_rows (run_id, source_table, record_id)`,
     ],
   },
+  {
+    version: 28,
+    name: "add-temporal-memory-version-chain",
+    kind: "expand",
+    statements: [
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS scope_fingerprint TEXT",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS lineage_id TEXT",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS revision INTEGER",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS previous_version_id UUID",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS restored_from_version_id UUID",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_to TIMESTAMPTZ",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS transition_type TEXT",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS transition_reason TEXT",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS temporal_invalidated BOOLEAN",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS temporal_purge_pending BOOLEAN",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS temporal_snapshot JSONB",
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_lineage_heads (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  lineage_id TEXT NOT NULL CHECK (char_length(lineage_id) BETWEEN 1 AND 256 AND
+    lineage_id !~ '[[:space:][:cntrl:]]'),
+  latest_revision INTEGER NOT NULL CHECK (latest_revision >= 1),
+  current_version_id UUID REFERENCES memories(id),
+  current_version_revision INTEGER CHECK (
+    current_version_revision IS NULL OR current_version_revision >= 1
+  ),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (scope_fingerprint, lineage_id),
+  UNIQUE (scope_fingerprint, lineage_id, latest_revision),
+  CHECK ((current_version_id IS NULL AND current_version_revision IS NULL) OR
+    (current_version_id IS NOT NULL AND current_version_revision IS NOT NULL AND
+      current_version_revision <= latest_revision))
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_version_transition_receipts (
+  receipt_id TEXT NOT NULL CHECK (char_length(receipt_id) BETWEEN 1 AND 256 AND
+    receipt_id !~ '[[:space:][:cntrl:]]'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256 AND
+    idempotency_key !~ '[[:space:][:cntrl:]]'),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  lineage_id TEXT NOT NULL CHECK (char_length(lineage_id) BETWEEN 1 AND 256 AND
+    lineage_id !~ '[[:space:][:cntrl:]]'),
+  transition_type TEXT NOT NULL CHECK (transition_type IN (
+    'created', 'evolved', 'corrected', 'expired', 'restored', 'revoked'
+  )),
+  previous_version_id UUID,
+  version_id UUID,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  PRIMARY KEY (scope_fingerprint, idempotency_key),
+  UNIQUE (receipt_id),
+  UNIQUE (scope_fingerprint, lineage_id, revision, transition_type, request_hash)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_purge_receipts (
+  operation_id TEXT NOT NULL CHECK (char_length(operation_id) BETWEEN 1 AND 256 AND
+    operation_id !~ '[[:space:][:cntrl:]]'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256 AND
+    idempotency_key !~ '[[:space:][:cntrl:]]'),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  lineage_hash TEXT NOT NULL CHECK (lineage_hash ~ '^[0-9a-f]{64}$'),
+  purged_versions INTEGER NOT NULL CHECK (purged_versions >= 1),
+  derived_artifacts_purged INTEGER NOT NULL CHECK (derived_artifacts_purged >= 0),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  PRIMARY KEY (scope_fingerprint, idempotency_key),
+  UNIQUE (operation_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_version_outbox (
+  event_id TEXT PRIMARY KEY CHECK (event_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  lineage_id TEXT NOT NULL CHECK (char_length(lineage_id) BETWEEN 1 AND 256 AND
+    lineage_id !~ '[[:space:][:cntrl:]]'),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'memory.version.created', 'memory.version.closed', 'memory.version.corrected',
+    'memory.version.restored', 'memory.version.purge_pending', 'memory.version.purged'
+  )),
+  payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  published_at BIGINT CHECK (published_at IS NULL OR published_at >= occurred_at)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_temporal_migration_runs (
+  run_id TEXT PRIMARY KEY CHECK (char_length(run_id) BETWEEN 1 AND 256 AND
+    run_id !~ '[[:space:][:cntrl:]]'),
+  manifest_hash TEXT NOT NULL CHECK (manifest_hash ~ '^[0-9a-f]{64}$'),
+  before_hash TEXT NOT NULL CHECK (before_hash ~ '^[0-9a-f]{64}$'),
+  after_hash TEXT CHECK (after_hash IS NULL OR after_hash ~ '^[0-9a-f]{64}$'),
+  state TEXT NOT NULL CHECK (state IN (
+    'planned', 'review_required', 'applied', 'verified', 'rolled_back', 'failed'
+  )),
+  scanned_count BIGINT NOT NULL CHECK (scanned_count >= 0),
+  applied_count BIGINT NOT NULL CHECK (applied_count >= 0 AND applied_count <= scanned_count),
+  ambiguous_count BIGINT NOT NULL CHECK (
+    ambiguous_count >= 0 AND ambiguous_count <= scanned_count
+  ),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= created_at)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_temporal_migration_rows (
+  run_id TEXT NOT NULL REFERENCES mengshu_memory_temporal_migration_runs(run_id),
+  memory_id UUID NOT NULL REFERENCES memories(id),
+  scope_fingerprint TEXT CHECK (
+    scope_fingerprint IS NULL OR scope_fingerprint ~ '^[0-9a-f]{64}$'
+  ),
+  disposition TEXT NOT NULL CHECK (disposition IN (
+    'bootstrap_single', 'reuse_supersedes_chain', 'independent_lineage',
+    'review_multiple_heads', 'review_time_conflict', 'quarantine_invalid'
+  )),
+  lineage_id TEXT CHECK (lineage_id IS NULL OR
+    (char_length(lineage_id) BETWEEN 1 AND 256 AND lineage_id !~ '[[:space:][:cntrl:]]')),
+  revision INTEGER CHECK (revision IS NULL OR revision >= 1),
+  before_hash TEXT NOT NULL CHECK (before_hash ~ '^[0-9a-f]{64}$'),
+  after_hash TEXT CHECK (after_hash IS NULL OR after_hash ~ '^[0-9a-f]{64}$'),
+  before_row JSONB NOT NULL CHECK (jsonb_typeof(before_row) = 'object'),
+  after_row JSONB CHECK (after_row IS NULL OR jsonb_typeof(after_row) = 'object'),
+  reason_code TEXT NOT NULL CHECK (char_length(reason_code) BETWEEN 1 AND 256 AND
+    reason_code !~ '[[:space:][:cntrl:]]'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (run_id, memory_id)
+)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS memories_temporal_lineage_revision_uidx
+ON memories (scope_fingerprint, lineage_id, revision)
+WHERE lineage_id IS NOT NULL`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS memories_temporal_current_head_uidx
+ON memories (scope_fingerprint, lineage_id)
+WHERE lineage_id IS NOT NULL AND valid_to IS NULL AND lifecycle_status = 'active'
+  AND temporal_invalidated IS NOT TRUE AND temporal_purge_pending IS NOT TRUE`,
+      `CREATE INDEX IF NOT EXISTS memories_temporal_valid_time_idx
+ON memories (scope_fingerprint, lineage_id, valid_from, valid_to, revision)
+WHERE lineage_id IS NOT NULL`,
+      `CREATE INDEX IF NOT EXISTS mengshu_memory_version_outbox_pending_idx
+ON mengshu_memory_version_outbox (occurred_at, event_id)
+WHERE published_at IS NULL`,
+      `CREATE INDEX IF NOT EXISTS mengshu_memory_temporal_migration_rows_disposition_idx
+ON mengshu_memory_temporal_migration_rows (run_id, disposition, memory_id)`,
+    ],
+  },
+  {
+    version: 29,
+    name: "add-session-working-set",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_session_working_set_entries (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  session_id TEXT NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 256 AND
+    session_id !~ '[[:space:][:cntrl:]]'),
+  entry_id TEXT NOT NULL CHECK (char_length(entry_id) BETWEEN 1 AND 256 AND
+    entry_id !~ '[[:space:][:cntrl:]]'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility = 'private'),
+  workspace_id TEXT,
+  task_boundary_id TEXT,
+  kind TEXT NOT NULL CHECK (kind IN (
+    'user_message_ref', 'assistant_message_ref', 'tool_pair',
+    'tool_result_ref', 'task_boundary'
+  )),
+  status TEXT NOT NULL CHECK (status IN (
+    'active', 'summarized', 'replaced', 'expired', 'revoked'
+  )),
+  source_message_ids JSONB NOT NULL CHECK (jsonb_typeof(source_message_ids) = 'array'),
+  tool_call_id TEXT,
+  tool_name TEXT,
+  payload_ref JSONB CHECK (payload_ref IS NULL OR jsonb_typeof(payload_ref) = 'object'),
+  summary TEXT,
+  replaceability DOUBLE PRECISION NOT NULL CHECK (replaceability BETWEEN 0 AND 1),
+  evidence_refs JSONB NOT NULL CHECK (jsonb_typeof(evidence_refs) = 'array'),
+  risk_flags JSONB NOT NULL CHECK (jsonb_typeof(risk_flags) = 'array'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+  PRIMARY KEY (scope_fingerprint, session_id, entry_id),
+  CHECK (kind <> 'tool_pair' OR (
+    tool_call_id IS NOT NULL AND tool_name IS NOT NULL AND payload_ref IS NOT NULL AND
+    jsonb_array_length(source_message_ids) = 2
+  ))
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_session_working_set_idempotency_receipts (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  session_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256 AND
+    idempotency_key !~ '[[:space:][:cntrl:]]'),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  entry_id TEXT NOT NULL,
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (scope_fingerprint, session_id, idempotency_key),
+  FOREIGN KEY (scope_fingerprint, session_id, entry_id)
+    REFERENCES mengshu_session_working_set_entries (scope_fingerprint, session_id, entry_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_session_task_outline_versions (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  session_id TEXT NOT NULL,
+  task_boundary_id TEXT NOT NULL CHECK (char_length(task_boundary_id) BETWEEN 1 AND 256 AND
+    task_boundary_id !~ '[[:space:][:cntrl:]]'),
+  outline_id TEXT NOT NULL CHECK (char_length(outline_id) BETWEEN 1 AND 256 AND
+    outline_id !~ '[[:space:][:cntrl:]]'),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  policy_version TEXT NOT NULL,
+  content_hash TEXT NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+  outline JSONB NOT NULL CHECK (jsonb_typeof(outline) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (scope_fingerprint, session_id, task_boundary_id, version),
+  UNIQUE (outline_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_session_task_outline_heads (
+  scope_fingerprint TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  task_boundary_id TEXT NOT NULL,
+  latest_version INTEGER NOT NULL CHECK (latest_version >= 1),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (scope_fingerprint, session_id, task_boundary_id),
+  FOREIGN KEY (scope_fingerprint, session_id, task_boundary_id, latest_version)
+    REFERENCES mengshu_session_task_outline_versions (
+      scope_fingerprint, session_id, task_boundary_id, version
+    )
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_context_rewrite_receipts (
+  receipt_id TEXT PRIMARY KEY CHECK (char_length(receipt_id) BETWEEN 1 AND 256 AND
+    receipt_id !~ '[[:space:][:cntrl:]]'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  session_id TEXT NOT NULL,
+  task_boundary_id TEXT,
+  input_hash TEXT NOT NULL CHECK (input_hash ~ '^[0-9a-f]{64}$'),
+  output_hash TEXT NOT NULL CHECK (output_hash ~ '^[0-9a-f]{64}$'),
+  policy_version TEXT NOT NULL,
+  level TEXT NOT NULL CHECK (level IN ('normal', 'mild', 'aggressive', 'emergency')),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  UNIQUE (scope_fingerprint, session_id, input_hash, policy_version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_session_close_receipts (
+  receipt_id TEXT PRIMARY KEY CHECK (receipt_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  session_id TEXT NOT NULL,
+  expired_entries INTEGER NOT NULL CHECK (expired_entries >= 0),
+  reason TEXT NOT NULL,
+  closed_at BIGINT NOT NULL CHECK (closed_at >= 0),
+  UNIQUE (scope_fingerprint, session_id)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_session_working_set_entries_active_idx
+ON mengshu_session_working_set_entries (
+  scope_fingerprint, session_id, task_boundary_id, created_at, entry_id
+) WHERE status IN ('active', 'summarized')`,
+      `CREATE INDEX IF NOT EXISTS mengshu_context_rewrite_receipts_session_idx
+ON mengshu_context_rewrite_receipts (scope_fingerprint, session_id, created_at DESC, receipt_id)`,
+    ],
+  },
+  {
+    version: 30,
+    name: "add-reviewed-skill-artifacts",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_skill_candidates (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  candidate_id TEXT NOT NULL CHECK (char_length(candidate_id) BETWEEN 1 AND 256 AND
+    candidate_id !~ '[[:space:][:cntrl:]]'),
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility = 'private'),
+  topic_label TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'archived', 'rejected')),
+  confidence DOUBLE PRECISION NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+  candidate JSONB NOT NULL CHECK (jsonb_typeof(candidate) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT CHECK (updated_at IS NULL OR updated_at >= created_at),
+  PRIMARY KEY (scope_fingerprint, candidate_id),
+  UNIQUE (candidate_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_skill_asset_versions (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  skill_id TEXT NOT NULL CHECK (char_length(skill_id) BETWEEN 1 AND 256 AND
+    skill_id !~ '[[:space:][:cntrl:]]'),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  owner_user_id TEXT NOT NULL,
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility = 'private'),
+  workspace_id TEXT,
+  source_candidate_id TEXT,
+  title TEXT NOT NULL CHECK (char_length(title) BETWEEN 1 AND 80),
+  description TEXT NOT NULL,
+  content_hash TEXT NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+  status TEXT NOT NULL CHECK (status IN ('draft', 'review', 'published', 'deprecated', 'revoked')),
+  execution_mode TEXT NOT NULL CHECK (execution_mode = 'suggest_only'),
+  resource_state TEXT NOT NULL CHECK (resource_state IN ('prepared', 'complete', 'failed')),
+  expected_outcome_policy_version TEXT NOT NULL,
+  artifact JSONB NOT NULL CHECK (jsonb_typeof(artifact) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (scope_fingerprint, skill_id, version),
+  UNIQUE (scope_fingerprint, skill_id, version, content_hash)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_skill_asset_resources (
+  scope_fingerprint TEXT NOT NULL,
+  skill_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  path TEXT NOT NULL CHECK (char_length(path) BETWEEN 1 AND 1024 AND
+    path !~ '[[:cntrl:]]' AND path !~ '(^|/)\.\.(/|$)' AND path !~ '^/'),
+  content_hash TEXT NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+  size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+  mime_type TEXT NOT NULL,
+  executable BOOLEAN NOT NULL CHECK (executable = FALSE),
+  provenance_ref TEXT,
+  PRIMARY KEY (scope_fingerprint, skill_id, version, path),
+  FOREIGN KEY (scope_fingerprint, skill_id, version)
+    REFERENCES mengshu_skill_asset_versions (scope_fingerprint, skill_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_skill_asset_heads (
+  scope_fingerprint TEXT NOT NULL,
+  skill_id TEXT NOT NULL,
+  latest_version INTEGER NOT NULL CHECK (latest_version >= 1),
+  latest_complete_version INTEGER NOT NULL CHECK (
+    latest_complete_version >= 1 AND latest_complete_version <= latest_version
+  ),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (scope_fingerprint, skill_id),
+  FOREIGN KEY (scope_fingerprint, skill_id, latest_complete_version)
+    REFERENCES mengshu_skill_asset_versions (scope_fingerprint, skill_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_skill_promotion_receipts (
+  receipt_id TEXT NOT NULL UNIQUE CHECK (char_length(receipt_id) BETWEEN 1 AND 256 AND
+    receipt_id !~ '[[:space:][:cntrl:]]'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256 AND
+    idempotency_key !~ '[[:space:][:cntrl:]]'),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  skill_id TEXT NOT NULL,
+  artifact_version INTEGER NOT NULL CHECK (artifact_version >= 1),
+  operation TEXT NOT NULL CHECK (operation IN ('propose', 'review', 'publish', 'append', 'revoke')),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  PRIMARY KEY (scope_fingerprint, idempotency_key),
+  FOREIGN KEY (scope_fingerprint, skill_id, artifact_version)
+    REFERENCES mengshu_skill_asset_versions (scope_fingerprint, skill_id, version)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_skill_asset_versions_search_idx
+ON mengshu_skill_asset_versions USING GIN (
+  to_tsvector('simple', title || ' ' || description)
+) WHERE status = 'published' AND resource_state = 'complete'`,
+      `CREATE INDEX IF NOT EXISTS mengshu_skill_asset_versions_scope_status_idx
+ON mengshu_skill_asset_versions (
+  scope_fingerprint, status, resource_state, skill_id, version DESC
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_skill_candidates_scope_status_idx
+ON mengshu_skill_candidates (scope_fingerprint, status, topic_label, created_at DESC, candidate_id)`,
+    ],
+  },
+  {
+    version: 31,
+    name: "add-scoped-memory-policy-overlays",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_policy_overlay_versions (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  overlay_id TEXT NOT NULL CHECK (char_length(overlay_id) BETWEEN 1 AND 256 AND
+    overlay_id !~ '[[:space:][:cntrl:]]'),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  owner_user_id TEXT NOT NULL,
+  tenant_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  app_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  visibility TEXT NOT NULL CHECK (visibility = 'private'),
+  target_app_id TEXT,
+  target_project_id TEXT,
+  target_agent_id TEXT,
+  layer TEXT NOT NULL CHECK (layer IN (
+    'candidate_extraction', 'tree_summary', 'skill_review', 'document_organization'
+  )),
+  status TEXT NOT NULL CHECK (status IN ('draft', 'active', 'revoked')),
+  content_hash TEXT NOT NULL CHECK (content_hash ~ '^[0-9a-f]{64}$'),
+  guard_version TEXT NOT NULL CHECK (guard_version = 'memory-policy-guard-v1'),
+  overlay JSONB NOT NULL CHECK (jsonb_typeof(overlay) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (scope_fingerprint, overlay_id, version),
+  CHECK (target_app_id IS NOT NULL OR target_project_id IS NOT NULL OR
+    target_agent_id IS NOT NULL OR (
+      target_app_id IS NULL AND target_project_id IS NULL AND target_agent_id IS NULL
+    ))
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_policy_overlay_heads (
+  scope_fingerprint TEXT NOT NULL,
+  overlay_id TEXT NOT NULL,
+  latest_version INTEGER NOT NULL CHECK (latest_version >= 1),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
+  PRIMARY KEY (scope_fingerprint, overlay_id),
+  FOREIGN KEY (scope_fingerprint, overlay_id, latest_version)
+    REFERENCES mengshu_memory_policy_overlay_versions (scope_fingerprint, overlay_id, version)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_policy_overlay_receipts (
+  receipt_id TEXT NOT NULL UNIQUE CHECK (char_length(receipt_id) BETWEEN 1 AND 256 AND
+    receipt_id !~ '[[:space:][:cntrl:]]'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256 AND
+    idempotency_key !~ '[[:space:][:cntrl:]]'),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  overlay_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  PRIMARY KEY (scope_fingerprint, idempotency_key),
+  FOREIGN KEY (scope_fingerprint, overlay_id, version)
+    REFERENCES mengshu_memory_policy_overlay_versions (scope_fingerprint, overlay_id, version)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_memory_policy_overlay_active_idx
+ON mengshu_memory_policy_overlay_versions (
+  scope_fingerprint, layer, status, target_project_id, target_agent_id,
+  target_app_id, overlay_id, version DESC
+)`,
+    ],
+  },
+  {
+    version: 32,
+    name: "add-temporal-prerequisite-repair-audit",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_temporal_prerequisite_repair_runs (
+  run_id TEXT PRIMARY KEY CHECK (char_length(run_id) BETWEEN 1 AND 256 AND
+    run_id !~ '[[:space:][:cntrl:]]'),
+  manifest_hash TEXT NOT NULL CHECK (manifest_hash ~ '^[0-9a-f]{64}$'),
+  before_hash TEXT NOT NULL CHECK (before_hash ~ '^[0-9a-f]{64}$'),
+  after_hash TEXT CHECK (after_hash IS NULL OR after_hash ~ '^[0-9a-f]{64}$'),
+  state TEXT NOT NULL CHECK (state IN ('planned', 'applied', 'verified', 'rolled_back', 'failed')),
+  scanned_count INTEGER NOT NULL CHECK (scanned_count >= 0),
+  repaired_count INTEGER NOT NULL CHECK (repaired_count >= 0),
+  review_count INTEGER NOT NULL CHECK (review_count >= 0),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= created_at)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_temporal_prerequisite_repair_rows (
+  run_id TEXT NOT NULL REFERENCES mengshu_temporal_prerequisite_repair_runs(run_id),
+  memory_id UUID NOT NULL REFERENCES memories(id),
+  disposition TEXT NOT NULL CHECK (disposition IN ('migrate_candidate', 'quarantine_duplicate', 'review_invalid_hash')),
+  duplicate_of UUID,
+  candidate_id TEXT,
+  candidate_inserted BOOLEAN,
+  before_hash TEXT NOT NULL CHECK (before_hash ~ '^[0-9a-f]{64}$'),
+  after_hash TEXT CHECK (after_hash IS NULL OR after_hash ~ '^[0-9a-f]{64}$'),
+  before_row JSONB NOT NULL CHECK (jsonb_typeof(before_row) = 'object'),
+  after_row JSONB CHECK (after_row IS NULL OR jsonb_typeof(after_row) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (run_id, memory_id),
+  CHECK ((disposition = 'migrate_candidate' AND candidate_id IS NOT NULL) OR
+    (disposition = 'quarantine_duplicate' AND duplicate_of IS NOT NULL) OR
+    disposition = 'review_invalid_hash')
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_temporal_prerequisite_repair_rows_disposition_idx
+ON mengshu_temporal_prerequisite_repair_rows (run_id, disposition, memory_id)`,
+    ],
+  },
+  {
+    version: 33,
+    name: "add-session-working-set-cleanup-receipts",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_session_cleanup_receipts (
+  receipt_id TEXT PRIMARY KEY CHECK (receipt_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  session_id TEXT NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 256 AND
+    session_id !~ '[[:space:][:cntrl:]]'),
+  reason TEXT NOT NULL CHECK (reason IN ('session_closed', 'retention_expired')),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  closed_at BIGINT NOT NULL CHECK (closed_at >= 0),
+  UNIQUE (scope_fingerprint, session_id, reason)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_session_cleanup_receipts_closed_idx
+ON mengshu_session_cleanup_receipts (closed_at, receipt_id)`,
+    ],
+  },
+  {
+    version: 34,
+    name: "add-temporal-future-activation-state",
+    kind: "expand",
+    statements: [
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS temporal_activation_state TEXT NOT NULL DEFAULT 'active' CHECK (temporal_activation_state IN ('active', 'staged'))",
+      `CREATE INDEX IF NOT EXISTS memories_temporal_staged_activation_idx
+ON memories (valid_from, scope_fingerprint, lineage_id, revision)
+WHERE temporal_activation_state = 'staged' AND temporal_purge_pending IS NOT TRUE`,
+    ],
+  },
+  {
+    version: 35,
+    name: "add-temporal-purge-retry-requests",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_memory_purge_retry_requests (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  lineage_id TEXT NOT NULL CHECK (char_length(lineage_id) BETWEEN 1 AND 256 AND
+    lineage_id !~ '[[:space:][:cntrl:]]'),
+  operation_id TEXT NOT NULL UNIQUE CHECK (char_length(operation_id) BETWEEN 1 AND 256 AND
+    operation_id !~ '[[:space:][:cntrl:]]'),
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256 AND
+    idempotency_key !~ '[[:space:][:cntrl:]]'),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  request JSONB NOT NULL CHECK (jsonb_typeof(request) = 'object'),
+  version_ids JSONB NOT NULL CHECK (jsonb_typeof(version_ids) = 'array'),
+  derived_artifacts_purged INTEGER NOT NULL DEFAULT 0 CHECK (derived_artifacts_purged >= 0),
+  derived_complete BOOLEAN NOT NULL DEFAULT FALSE,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at BIGINT NOT NULL CHECK (next_attempt_at >= 0),
+  last_error_code TEXT,
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+  PRIMARY KEY (scope_fingerprint, idempotency_key),
+  UNIQUE (scope_fingerprint, lineage_id)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_memory_purge_retry_due_idx
+ON mengshu_memory_purge_retry_requests (next_attempt_at, scope_fingerprint, lineage_id)`,
+    ],
+  },
 ];
 
 export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = Object.freeze(

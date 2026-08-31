@@ -25,11 +25,13 @@ import type { LlmClient } from "../runtime/llm/llm-client.js";
 import type { JobHandler } from "../runtime/jobs.js";
 import type { JobRecord } from "../storage/repositories/types.js";
 import type { MemoryScope } from "../domain/types.js";
+import type { MemoryPolicyResolver } from "../policy/memory-policy-overlay.js";
 
 export interface BuildTreeHandlerDeps {
   repository: TreeRepository;
   llmClient?: LlmClient;
   policy?: SealPolicy;
+  policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
 }
 
 interface BuildTreePayload {
@@ -134,6 +136,7 @@ export function createBuildTreeHandler(deps: BuildTreeHandlerDeps): JobHandler {
         buffer,
         now,
         llmClient: deps.llmClient,
+        policyResolver: deps.policyResolver,
       });
       return { sealed: true, nodeId: node.id };
     }

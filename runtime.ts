@@ -126,6 +126,8 @@ import {
 import type { ContextAssemblyReceiptRepository } from
   "./packages/core/src/context/assembly-receipt.js";
 import type { JobHandler } from "./server/workers.js";
+import { TemporalActivationLoop } from
+  "./packages/core/src/temporal/activation-loop.js";
 import {
   RuntimeLifecycle,
   type RuntimeLifecycleStepResult,
@@ -171,6 +173,26 @@ import { JsonlRuntimeCostLedger } from
   "./packages/core/src/cost/runtime-cost-ledger.js";
 import { runtimePricingSnapshotFromConfig } from
   "./packages/core/src/cost/runtime-pricing.js";
+import { MemoryEvolutionService } from
+  "./packages/core/src/temporal/memory-evolution-service.js";
+import { SessionWorkingSetService } from
+  "./packages/core/src/working-set/session-working-set-service.js";
+import { SessionWorkingSetMemoryBridge } from
+  "./packages/core/src/working-set/memory-bridge.js";
+import { WorkingSetRetentionLoop } from
+  "./packages/core/src/working-set/retention-loop.js";
+import { SkillArtifactService } from
+  "./packages/core/src/skills/skill-artifact-service.js";
+import type { SkillCandidateRepository } from
+  "./packages/core/src/lifecycle/skill-candidate-types.js";
+import { SkillCandidateAggregator } from
+  "./packages/core/src/lifecycle/skill-candidate-aggregator.js";
+import { SkillCandidateAggregationLoop } from
+  "./packages/core/src/lifecycle/skill-candidate-aggregation-loop.js";
+import {
+  MemoryPolicyOverlayService,
+  MemoryPolicyResolver,
+} from "./packages/core/src/policy/memory-policy-overlay.js";
 
 export interface RuntimeLogger {
   info?(message: string): void;
@@ -197,6 +219,18 @@ export interface RuntimeOptions {
   durableJobV2RuntimeBundle?: PostgresDurableJobV2RuntimeBundle;
   /** Provider-owned v11 memory.written outbox capability for post-commit derivation repair. */
   activeDerivationOutboxRepository?: ActiveDerivationOutboxRepository;
+  /** Host tokenizer for exact Working Set budget accounting. */
+  workingSetTokenCounter?: import("./packages/core/src/working-set/session-working-set-service.js")
+    .WorkingSetTokenCounter;
+  /** Host-owned bounded reader for session payload locators. */
+  workingSetPayloadReader?: import("./packages/core/src/working-set/session-working-set-service.js")
+    .SessionPayloadReader;
+  /** Host-owned deletion port used after the configured Working Set retention window. */
+  workingSetPayloadRetention?: import("./packages/core/src/working-set/session-working-set-service.js")
+    .SessionPayloadRetention;
+  /** Host-owned canonical-evidence guard; failures retain payloads conservatively. */
+  workingSetEvidenceRetentionGuard?: import("./packages/core/src/working-set/session-working-set-service.js")
+    .WorkingSetEvidenceRetentionGuard;
 }
 
 const COMMITTED_ACTIVE_DERIVATION_WARNING =
@@ -249,6 +283,18 @@ export interface MengshuRuntime {
   knowledgeResources?: KnowledgeResourceCapability;
   /** F1 durable session assembly explain capability; PostgreSQL schema v22+. */
   contextAssemblyReceipts?: ContextAssemblyReceiptRepository;
+  /** M1 exact-private temporal version/history facade; feature-off by default. */
+  memoryEvolution?: MemoryEvolutionService;
+  /** M2 exact-session Working Set facade; feature-off by default. */
+  sessionWorkingSet?: SessionWorkingSetService;
+  sessionWorkingSetMemoryBridge?: SessionWorkingSetMemoryBridge;
+  /** M3 durable procedural candidate source and reviewed artifact facade. */
+  skillCandidates?: SkillCandidateRepository;
+  skillCandidateAggregator?: SkillCandidateAggregator;
+  skillArtifacts?: SkillArtifactService;
+  /** M4 structured overlay mutation and resolution facades. */
+  memoryPolicyOverlays?: MemoryPolicyOverlayService;
+  memoryPolicyResolver?: MemoryPolicyResolver;
   routingEngine: RoutingEngine | null;
   handlers: Record<"extract_candidate" | "build_tree" | "extract_graph", JobHandler>;
   lifecycle: RuntimeLifecycle;
@@ -559,7 +605,11 @@ function runtimeWriteSalience(command: MemoryWriteCommand): number {
       Number.isFinite(command.confidence)) {
     return Math.max(0, Math.min(1, command.confidence));
   }
-  return command.type === "saveExplicit" ? 1 : 0.5;
+  return command.type === "saveExplicit" ||
+    (command.type === "correctMemory" && command.correctionKind === "replaceText" &&
+      command.temporal !== undefined)
+    ? 1
+    : 0.5;
 }
 
 function isValidRuntimeEmbeddingVector(
@@ -594,10 +644,13 @@ function publicMemoryWriteResult(result: EvidenceFirstMemoryWriteResult): Memory
 }
 
 function runtimeValidatedCandidate(
-  command: Exclude<MemoryWriteCommand, { type: "correctMemory" }>,
+  command: MemoryWriteCommand,
   scope: WriteScope,
   text: string,
 ): ValidatedCandidate | { rejected: true; reason: string } {
+  if (!("text" in command)) return { rejected: true, reason: "memory_text_required" };
+  const temporalTransition = command.type === "correctMemory" &&
+    command.correctionKind === "replaceText" && command.temporal !== undefined;
   const eventIds = runtimeWriteEvidenceIds(command);
   const level = runtimeCandidateScope(scope);
   const raw: RawCandidate = {
@@ -607,7 +660,7 @@ function runtimeValidatedCandidate(
     temporality: command.type === "observeAuto" && command.intent !== "remember"
       ? "ephemeral"
       : "persistent",
-    crossContextual: command.type === "saveExplicit" ||
+    crossContextual: command.type === "saveExplicit" || temporalTransition ||
       (command.type === "observeAuto" && command.intent === "remember"),
     targetScope: level,
     ...(typeof command.metadata?.profileDimension === "string"
@@ -624,7 +677,7 @@ function runtimeValidatedCandidate(
     targetScope: verdict.targetScope,
     riskFlags: verdict.riskFlags,
     evidenceIds: verdict.evidence.eventIds ?? [],
-    explicit: command.type === "saveExplicit" ||
+    explicit: command.type === "saveExplicit" || temporalTransition ||
       (command.type === "observeAuto" && command.intent === "remember"),
   });
   return Object.freeze({
@@ -788,6 +841,106 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
       db instanceof PostgresProvider
     ? db.createKnowledgeResourceCapability()
     : undefined;
+  if (options.config.features?.temporalMemory === true &&
+      (options.config.dbType !== "postgres" || !(db instanceof PostgresProvider))) {
+    throw new Error("Temporal Memory requires PostgreSQL");
+  }
+  const memoryEvolution = options.config.features?.temporalMemory === true &&
+      db instanceof PostgresProvider
+    ? new MemoryEvolutionService(db.createTemporalMemoryRepository())
+    : undefined;
+  const temporalActivationLoop = memoryEvolution === undefined
+    ? undefined
+    : new TemporalActivationLoop(memoryEvolution, {
+        onError: () => options.logger?.warn?.(
+          "temporal activation reconciliation failed; read-time valid-time filtering remains active",
+        ),
+      });
+  if (options.config.features?.sessionWorkingSet === true &&
+      (options.config.dbType !== "postgres" || !(db instanceof PostgresProvider))) {
+    throw new Error("Session Working Set requires PostgreSQL");
+  }
+  const sessionWorkingSet = options.config.features?.sessionWorkingSet === true &&
+      db instanceof PostgresProvider
+    ? new SessionWorkingSetService(db.createSessionWorkingSetRepository(), {
+        tokenCounter: options.workingSetTokenCounter,
+        payloadReader: options.workingSetPayloadReader,
+        payloadRetention: options.workingSetPayloadRetention,
+        evidenceRetentionGuard: options.workingSetEvidenceRetentionGuard,
+        retentionDays: options.config.sessionWorkingSet?.retentionDays,
+        policy: options.config.sessionWorkingSet === undefined
+          ? undefined
+          : {
+              mildRatio: options.config.sessionWorkingSet.mildRatio,
+              aggressiveRatio: options.config.sessionWorkingSet.aggressiveRatio,
+              emergencyRatio: options.config.sessionWorkingSet.emergencyRatio,
+              emergencyTargetRatio: options.config.sessionWorkingSet.emergencyTargetRatio,
+              outlineMaxRatio: options.config.sessionWorkingSet.outlineMaxRatio,
+            },
+      })
+    : undefined;
+  const workingSetRetentionLoop = sessionWorkingSet === undefined
+    ? undefined
+    : new WorkingSetRetentionLoop(sessionWorkingSet, {
+        onError: () => options.logger?.warn?.(
+          "working-set retention cleanup failed; payloads remain retained for retry",
+        ),
+      });
+  if (options.config.features?.memoryPolicyOverlay === true &&
+      (options.config.dbType !== "postgres" || !(db instanceof PostgresProvider))) {
+    throw new Error("Memory Policy Overlay requires PostgreSQL");
+  }
+  const memoryPolicyRepository = options.config.features?.memoryPolicyOverlay === true &&
+      db instanceof PostgresProvider
+    ? db.createMemoryPolicyOverlayRepository()
+    : undefined;
+  const memoryPolicyOverlays = memoryPolicyRepository
+    ? new MemoryPolicyOverlayService(memoryPolicyRepository)
+    : undefined;
+  const memoryPolicyResolver = memoryPolicyRepository
+    ? new MemoryPolicyResolver(memoryPolicyRepository)
+    : undefined;
+  if (options.config.features?.skillArtifacts === true &&
+      (options.config.dbType !== "postgres" || !(db instanceof PostgresProvider))) {
+    throw new Error("Reviewed Skill Artifacts require PostgreSQL");
+  }
+  const skillCandidates = options.config.features?.skillArtifacts === true &&
+      db instanceof PostgresProvider
+    ? db.createSkillCandidateRepository()
+    : undefined;
+  const skillArtifacts = skillCandidates && db instanceof PostgresProvider &&
+      activeMemoryDerivationReadPort
+    ? new SkillArtifactService({
+        repository: db.createSkillArtifactRepository(),
+        candidates: skillCandidates,
+        evidence: {
+          validate: async ({ scope, memoryIds, chunkIds }) => {
+            try {
+              const signal = new AbortController().signal;
+              const records = await activeMemoryDerivationReadPort.readCommittedActiveRecords({
+                scope,
+                activeMemoryIds: memoryIds,
+                signal,
+              });
+              const facts = await activeMemoryDerivationReadPort.readEvidenceFacts({
+                memoryIds,
+                records,
+                signal,
+              });
+              const resolved = new Set(facts.map((fact) => fact.evidenceId));
+              return { readable: chunkIds.every((id) => resolved.has(id)) };
+            } catch {
+              return { readable: false, reason: "evidence_unavailable" };
+            }
+          },
+        },
+        maxResourceBytes: options.config.skillArtifacts?.maxResourceBytes,
+        ...(memoryPolicyResolver ? { policyResolver: memoryPolicyResolver } : {}),
+      })
+    : undefined;
+  if (options.config.features?.skillArtifacts === true && !skillArtifacts) {
+    throw new Error("Reviewed Skill Artifacts require committed evidence validation");
+  }
   const agentLoadouts = agentLoadoutRepository
     ? new AgentLoadoutService(agentLoadoutRepository)
     : undefined;
@@ -934,6 +1087,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
   };
   const memoryWriteKernel = memoryWriteKernelTransactions
     ? new MemoryWriteKernel({
+        temporalMemoryEnabled: options.config.features?.temporalMemory === true,
         resolveAuthority: ({ serverAuthority, clientScope }) =>
           trustedRuntimeWriteScope(clientScope, serverAuthority),
         normalize: ({ command, scope }) => {
@@ -968,7 +1122,9 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
               }),
             };
           }
-          if (command.type === "correctMemory") {
+          if (command.type === "correctMemory" &&
+              (command.correctionKind !== "replaceText" || command.temporal === undefined ||
+                options.config.features?.temporalMemory !== true)) {
             return { accepted: false as const, reason: "runtime_correction_requires_forget_capability" };
           }
           if (command.semanticType === undefined) {
@@ -1019,7 +1175,34 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
             };
           }
           if (command.type === "correctMemory") {
-            return { route: "drop" as const, valueScore: 0, reason: "unsupported_runtime_command" };
+            if (command.correctionKind !== "replaceText" || command.temporal === undefined ||
+                options.config.features?.temporalMemory !== true) {
+              return { route: "drop" as const, valueScore: 0, reason: "unsupported_runtime_command" };
+            }
+            const validatedCandidate = candidate as unknown as ValidatedCandidate;
+            const sourceKind = runtimeWriteSourceKind(command);
+            if (!isValidRuntimeEmbeddingVector(vector, embeddingSpace.fingerprint.dim)) {
+              return {
+                route: "drop" as const,
+                valueScore: 0,
+                reason: "value_score_signal_invalid",
+              };
+            }
+            const decision = decideAdmissionWithBreakdown(validatedCandidate, {
+              intent: "remember",
+              sourceKind,
+              hasConflict: false,
+              valueSignals: {
+                mode: "authoritative",
+                sourceKind,
+                // Explicit lineage CAS distinguishes an evolution from duplicate storage.
+                maxSimilarity: 0,
+              },
+            });
+            return decision.route === "active"
+              ? decision
+              : { route: "drop" as const, valueScore: decision.valueScore,
+                  reason: "temporal_transition_requires_active" };
           }
           if (candidate.compatibility === "kind_only_explicit") {
             return {
@@ -1193,6 +1376,21 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
   });
 
   const candidateRepository = new InMemoryCandidateRepository();
+  const skillCandidateAggregator = skillCandidates === undefined
+    ? undefined
+    : new SkillCandidateAggregator({
+        candidateRepository,
+        skillCandidateRepository: skillCandidates,
+        llmClient,
+        ...(memoryPolicyResolver ? { policyResolver: memoryPolicyResolver } : {}),
+      });
+  const skillCandidateAggregationLoop = skillCandidateAggregator === undefined
+    ? undefined
+    : new SkillCandidateAggregationLoop(skillCandidateAggregator, runtimeDefaultScope, {
+        onError: () => options.logger?.warn?.(
+          "skill candidate aggregation failed; experience memories remain available",
+        ),
+      });
   // Production Postgres review is bound to the provider's private pool and the
   // runtime authority scope. The legacy in-memory repository remains the
   // direct-handler compatibility path for non-Postgres providers.
@@ -1320,7 +1518,11 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         namespace: runtimeDefaultScope.namespace,
         visibility: runtimeDefaultScope.visibility,
       },
-      candidateComputation: { extractor: defaultTypeExtractor, llmClient },
+      candidateComputation: {
+        extractor: defaultTypeExtractor,
+        llmClient,
+        ...(memoryPolicyResolver ? { policyResolver: memoryPolicyResolver } : {}),
+      },
       candidateMaterialization: createRuntimeCandidateMaterialization({
         embeddingSpace,
         assertEmbeddingWriteAllowed: () => embeddingWriteGuard.assertWriteAllowed(),
@@ -1433,6 +1635,22 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         }
         return result;
       }
+    : undefined;
+  const sessionWorkingSetMemoryBridge = sessionWorkingSet && executeRuntimeMemoryWrite
+    ? new SessionWorkingSetMemoryBridge({
+        repository: sessionWorkingSet.repository,
+        memoryWrite: { executeMemoryWrite: executeRuntimeMemoryWrite },
+        serverAuthority: Object.freeze({
+          tenantId: runtimeDefaultScope.tenantId,
+          userId: runtimeDefaultScope.userId,
+          ...(runtimeDefaultScope.workspaceId === undefined
+            ? {}
+            : { workspaceId: runtimeDefaultScope.workspaceId }),
+          ...(runtimeDefaultScope.sessionId === undefined
+            ? {}
+            : { sessionId: runtimeDefaultScope.sessionId }),
+        }),
+      })
     : undefined;
 
   const activeDerivationOutboxRepository = options.activeDerivationOutboxRepository ??
@@ -1724,6 +1942,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     extractor: defaultTypeExtractor,
     candidates: candidateRepository,
     llmClient,
+    ...(memoryPolicyResolver ? { policyResolver: memoryPolicyResolver } : {}),
     audit: async ({ scope, action, targetId, metadata }) => {
       await persistentRepos.audit.append({ scope, action, targetId, metadata });
     },
@@ -1731,6 +1950,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
   const buildTreeHandler = createBuildTreeHandler({
     repository: treeRepository,
     llmClient,
+    ...(memoryPolicyResolver ? { policyResolver: memoryPolicyResolver } : {}),
   });
   const extractGraphHandler = createExtractGraphHandler({
     llmClient,
@@ -1835,6 +2055,27 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
           stop: () => slotInvalidationOutboxLoop.stop(),
         }]
       : []),
+    ...(temporalActivationLoop
+      ? [{
+          name: "temporal-activation",
+          start: () => temporalActivationLoop.start(),
+          stop: () => temporalActivationLoop.stop(),
+        }]
+      : []),
+    ...(workingSetRetentionLoop
+      ? [{
+          name: "working-set-retention",
+          start: () => workingSetRetentionLoop.start(),
+          stop: () => workingSetRetentionLoop.stop(),
+        }]
+      : []),
+    ...(skillCandidateAggregationLoop
+      ? [{
+          name: "skill-candidate-aggregation",
+          start: () => skillCandidateAggregationLoop.start(),
+          stop: () => skillCandidateAggregationLoop.stop(),
+        }]
+      : []),
     ...(activeDerivationOutboxLoop
       ? [{
           name: "active-derivation-outbox",
@@ -1879,6 +2120,14 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     ...(agentLoadouts ? { agentLoadouts } : {}),
     ...(knowledgeResources ? { knowledgeResources } : {}),
     ...(contextAssemblyReceipts ? { contextAssemblyReceipts } : {}),
+    ...(memoryEvolution ? { memoryEvolution } : {}),
+    ...(sessionWorkingSet ? { sessionWorkingSet } : {}),
+    ...(sessionWorkingSetMemoryBridge ? { sessionWorkingSetMemoryBridge } : {}),
+    ...(skillCandidates ? { skillCandidates } : {}),
+    ...(skillCandidateAggregator ? { skillCandidateAggregator } : {}),
+    ...(skillArtifacts ? { skillArtifacts } : {}),
+    ...(memoryPolicyOverlays ? { memoryPolicyOverlays } : {}),
+    ...(memoryPolicyResolver ? { memoryPolicyResolver } : {}),
     routingEngine,
     handlers,
     lifecycle,

@@ -316,6 +316,7 @@ export class OpenAiLlmClient implements LlmClient {
       category: override?.category ?? this.costContext.category,
       scopeFingerprint: override?.scopeFingerprint ?? this.costContext.scopeFingerprint,
       operation: override?.operation ?? this.costContext.operation ?? operation,
+      policyResolution: override?.policyResolution ?? this.costContext.policyResolution,
     };
   }
 
@@ -343,6 +344,7 @@ export class OpenAiLlmClient implements LlmClient {
         status,
         attempt,
         scopeFingerprint: context.scopeFingerprint,
+        policyResolution: context.policyResolution,
       }),
       this.onCostLedgerError,
     );

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -56,6 +56,7 @@ function event(overrides: Partial<RuntimeCostEvent> = {}): RuntimeCostEvent {
     rejectionReason: null,
     attempt: 1,
     scopeFingerprint: fingerprintRuntimeScope({ tenantId: "tenant-a", userId: "user-a" }),
+    policyResolution: null,
     ...overrides,
   };
 }
@@ -93,6 +94,45 @@ describe("JsonlRuntimeCostLedger", () => {
     expect(raw).not.toContain("private body");
     expect(raw).not.toContain("sk-secret");
     expect(raw).toContain("sha256:");
+  });
+
+  test("persists a fixed policy resolution receipt without policy hint plaintext", async () => {
+    const path = await tempLedgerPath();
+    const ledger = new JsonlRuntimeCostLedger(path);
+    const scopeFingerprint = fingerprintRuntimeScope({ tenantId: "tenant-a", userId: "user-a" });
+    await ledger.append(event({
+      scopeFingerprint,
+      category: "policy_overlay",
+      policyResolution: {
+        scopeFingerprint: scopeFingerprint.slice("sha256:".length),
+        layer: "candidate_extraction",
+        overlayId: "policy-1",
+        overlayVersion: 2,
+        contentHash: "b".repeat(64),
+        guardVersion: "memory-policy-guard-v1",
+        resolutionHash: "c".repeat(64),
+      },
+    }));
+
+    const [row] = await ledger.query();
+    expect(row?.policyResolution).toMatchObject({
+      overlayId: "policy-1",
+      overlayVersion: 2,
+      contentHash: "b".repeat(64),
+    });
+    expect(await readFile(path, "utf8")).not.toContain("focusHints");
+  });
+
+  test("normalizes legacy v1 events without policy attribution to null", async () => {
+    const path = await tempLedgerPath();
+    const legacy = { ...event() } as Record<string, unknown>;
+    delete legacy.policyResolution;
+    await mkdir(join(path, ".."), { recursive: true });
+    await writeFile(path, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+
+    await expect(new JsonlRuntimeCostLedger(path).query()).resolves.toMatchObject([
+      { version: 1, policyResolution: null },
+    ]);
   });
 
   test("fails closed and reports the exact line when JSONL is corrupt", async () => {

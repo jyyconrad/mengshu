@@ -42,6 +42,12 @@ import {
   type ValueScoreSignalProvenance,
 } from "../scoring/value-score-signals.js";
 import type { SourceKind } from "../scoring/importance-score.js";
+import type { MemoryPolicyResolver } from "../policy/memory-policy-overlay.js";
+import type {
+  MemoryPolicyResolutionReceipt,
+  ResolvedMemoryPolicy,
+} from "../policy/types.js";
+import { memoryPolicyCostContext } from "../policy/cost-attribution.js";
 
 type JsonPrimitive = string | number | boolean | null;
 export type CandidateJsonValue =
@@ -80,6 +86,8 @@ export interface CandidateComputationDeps {
     readonly scope: MemoryScope;
     readonly signal?: AbortSignal;
   }): Promise<CandidateMaximumSimilarityResolution | undefined>;
+  /** 可选的受限策略解析器；未注入时保持 feature-off 的原始计算合同。 */
+  policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
 }
 
 export interface ComputedCandidateSpec {
@@ -120,12 +128,14 @@ export interface CandidateProposalReceiptV1 {
   readonly validation?: CandidateValidationReceiptV1;
   readonly admission?: CandidateAdmissionReceiptV1;
   readonly computationReason?: string;
+  readonly policyResolution?: MemoryPolicyResolutionReceipt;
 }
 
 export interface CandidateComputationResult {
   readonly specs: readonly ComputedCandidateSpec[];
   readonly proposalReceipts: readonly CandidateProposalReceiptV1[];
   readonly fallbackReason: CandidateFallbackReason | null;
+  readonly policyResolution?: MemoryPolicyResolutionReceipt;
 }
 
 const SAFE_TRACE_ID = /^[^\s\p{Cc}]{1,256}$/u;
@@ -677,6 +687,7 @@ async function validateAndRoute(
 async function computeLlm(
   deps: CandidateComputationDeps,
   input: CandidateComputationInput,
+  resolvedPolicy?: ResolvedMemoryPolicy,
   signal?: AbortSignal,
 ): Promise<{
   specs: ComputedCandidateSpec[] | null;
@@ -688,7 +699,12 @@ async function computeLlm(
   }
   const { source, eventId } = sourceFor(input);
   const messages: LlmCompletionMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    {
+      role: "system",
+      content: resolvedPolicy === undefined
+        ? SYSTEM_PROMPT
+        : `${SYSTEM_PROMPT}\n\n# 受限记忆策略（系统合同优先）\n${resolvedPolicy.rendered}`,
+    },
     {
       role: "user",
       content: [
@@ -709,7 +725,17 @@ async function computeLlm(
     const result = await deps.llmClient.extractStructured<unknown>(
       messages,
       CANDIDATE_SCHEMA,
-      { modelType: "extraction", ...(signal ? { signal } : {}) },
+      {
+        modelType: "extraction",
+        costContext: memoryPolicyCostContext({
+          scope: input.scope,
+          resolvedPolicy,
+          category: "native_memory",
+          operation: "candidate.extract",
+          classifyOverlay: true,
+        }),
+        ...(signal ? { signal } : {}),
+      },
     );
     throwIfAborted(signal);
     snapshot = snapshotJson(result);
@@ -1032,7 +1058,14 @@ export async function computeCandidateSpecs(
       fallbackReason: null,
     });
   }
-  const llm = await computeLlm(deps, normalizedInput, signal);
+  const resolvedPolicy = deps.policyResolver === undefined
+    ? undefined
+    : await deps.policyResolver.resolve({
+        scope: normalizedInput.scope,
+        layer: "candidate_extraction",
+      });
+  throwIfAborted(signal);
+  const llm = await computeLlm(deps, normalizedInput, resolvedPolicy, signal);
   throwIfAborted(signal);
   const heuristic = llm.specs === null
     ? await computeHeuristic(deps, normalizedInput, signal)
@@ -1063,9 +1096,23 @@ export async function computeCandidateSpecs(
     seen.add(key);
     return true;
   });
+  const policyResolution = resolvedPolicy?.receipt;
+  const policyAwareSpecs = policyResolution === undefined
+    ? deduped
+    : deduped.map((spec) => deepFreeze({
+        ...spec,
+        auditMetadata: deepFreeze({
+          ...spec.auditMetadata,
+          policyResolution: snapshotJson(policyResolution),
+        }),
+      }));
+  const policyAwareReceipts = policyResolution === undefined
+    ? proposalReceipts
+    : proposalReceipts.map((receipt) => deepFreeze({ ...receipt, policyResolution }));
   return deepFreeze({
-    specs: deepFreeze(deduped),
-    proposalReceipts: deepFreeze(proposalReceipts),
+    specs: deepFreeze(policyAwareSpecs),
+    proposalReceipts: deepFreeze(policyAwareReceipts),
     fallbackReason: llm.fallbackReason,
+    ...(policyResolution === undefined ? {} : { policyResolution }),
   });
 }

@@ -18,6 +18,140 @@ function migration(version: number, name = `migration-${version}`): SchemaMigrat
 }
 
 describe("schema migration registry", () => {
+  test("v35 persists content-free purge retry requests with backoff state", () => {
+    const v35 = SCHEMA_MIGRATIONS.find((item) => item.version === 35);
+    const sql = v35?.statements.join("\n") ?? "";
+    expect(v35?.name).toBe("add-temporal-purge-retry-requests");
+    expect(sql).toContain("mengshu_memory_purge_retry_requests");
+    expect(sql).toContain("version_ids JSONB");
+    expect(sql).toContain("next_attempt_at BIGINT");
+    expect(sql).not.toContain("text_body");
+  });
+
+  test("v34 stages future temporal versions without extending lifecycle status", () => {
+    const v34 = SCHEMA_MIGRATIONS.find((item) => item.version === 34);
+    const sql = v34?.statements.join("\n") ?? "";
+    expect(v34?.name).toBe("add-temporal-future-activation-state");
+    expect(sql).toContain("temporal_activation_state");
+    expect(sql).toContain("'active', 'staged'");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v33 expand-only adds immutable Working Set cleanup receipts", () => {
+    const v33 = SCHEMA_MIGRATIONS.find((item) => item.version === 33);
+    const sql = v33?.statements.join("\n") ?? "";
+    expect(v33?.name).toBe("add-session-working-set-cleanup-receipts");
+    expect(sql).toContain("mengshu_session_cleanup_receipts");
+    expect(sql).toContain("retention_expired");
+    expect(sql).toContain("receipt JSONB NOT NULL");
+    expect(sql).toMatch(/UNIQUE \(scope_fingerprint, session_id, reason\)/i);
+  });
+
+  test("v32 expand-only 增加 temporal prerequisite repair 审计与回滚快照", () => {
+    const v32 = SCHEMA_MIGRATIONS.find((item) => item.version === 32);
+    const sql = v32?.statements.join("\n") ?? "";
+    expect(v32?.name).toBe("add-temporal-prerequisite-repair-audit");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_temporal_prerequisite_repair_runs");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_temporal_prerequisite_repair_rows");
+    expect(sql).toMatch(/disposition IN \('migrate_candidate', 'quarantine_duplicate', 'review_invalid_hash'\)/i);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v31 expand-only 增加受限 Policy Overlay version、head 与 receipt", () => {
+    const v31 = SCHEMA_MIGRATIONS.find((item) => item.version === 31);
+    const sql = v31?.statements.join("\n") ?? "";
+    expect(v31?.name).toBe("add-scoped-memory-policy-overlays");
+    for (const relation of [
+      "mengshu_memory_policy_overlay_versions",
+      "mengshu_memory_policy_overlay_heads",
+      "mengshu_memory_policy_overlay_receipts",
+    ]) expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${relation}`);
+    expect(sql).toMatch(/PRIMARY KEY \(scope_fingerprint, overlay_id, version\)/i);
+    expect(sql).toContain("guard_version TEXT NOT NULL CHECK (guard_version = 'memory-policy-guard-v1')");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v30 expand-only 增加 reviewed Skill Artifact version、resource、head 与 receipt", () => {
+    const v30 = SCHEMA_MIGRATIONS.find((item) => item.version === 30);
+    const sql = v30?.statements.join("\n") ?? "";
+    expect(v30?.name).toBe("add-reviewed-skill-artifacts");
+    for (const relation of [
+      "mengshu_skill_asset_versions",
+      "mengshu_skill_asset_resources",
+      "mengshu_skill_asset_heads",
+      "mengshu_skill_promotion_receipts",
+    ]) expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${relation}`);
+    expect(sql).toMatch(/PRIMARY KEY \(scope_fingerprint, skill_id, version\)/i);
+    expect(sql).toContain("execution_mode TEXT NOT NULL CHECK (execution_mode = 'suggest_only')");
+    expect(sql).toContain("executable BOOLEAN NOT NULL CHECK (executable = FALSE)");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v29 expand-only 增加 exact-session Working Set、outline 与 rewrite receipt", () => {
+    const v29 = SCHEMA_MIGRATIONS.find((item) => item.version === 29);
+    const sql = v29?.statements.join("\n") ?? "";
+
+    expect(v29?.name).toBe("add-session-working-set");
+    expect(v29?.kind).toBe("expand");
+    for (const relation of [
+      "mengshu_session_working_set_entries",
+      "mengshu_session_working_set_idempotency_receipts",
+      "mengshu_session_task_outline_versions",
+      "mengshu_session_task_outline_heads",
+      "mengshu_context_rewrite_receipts",
+      "mengshu_session_close_receipts",
+    ]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${relation}`);
+    }
+    expect(sql).toMatch(/PRIMARY KEY \(scope_fingerprint, session_id, entry_id\)/i);
+    expect(sql).toMatch(/UNIQUE \(scope_fingerprint, session_id, input_hash, policy_version\)/i);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
+  test("v28 expand-only 增加双时态版本链、单 head、receipt/outbox 与迁移审计", () => {
+    const v28 = SCHEMA_MIGRATIONS.find((item) => item.version === 28);
+    const sql = v28?.statements.join("\n") ?? "";
+
+    expect(v28?.name).toBe("add-temporal-memory-version-chain");
+    expect(v28?.kind).toBe("expand");
+    for (const column of [
+      "scope_fingerprint TEXT",
+      "lineage_id TEXT",
+      "revision INTEGER",
+      "previous_version_id UUID",
+      "restored_from_version_id UUID",
+      "valid_from TIMESTAMPTZ",
+      "valid_to TIMESTAMPTZ",
+      "recorded_at TIMESTAMPTZ",
+      "closed_at TIMESTAMPTZ",
+      "transition_type TEXT",
+      "transition_reason TEXT",
+      "temporal_invalidated BOOLEAN",
+      "temporal_purge_pending BOOLEAN",
+      "temporal_snapshot JSONB",
+    ]) {
+      expect(sql).toContain(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS ${column}`);
+    }
+    for (const relation of [
+      "mengshu_memory_lineage_heads",
+      "mengshu_memory_version_transition_receipts",
+      "mengshu_memory_purge_receipts",
+      "mengshu_memory_version_outbox",
+      "mengshu_memory_temporal_migration_runs",
+      "mengshu_memory_temporal_migration_rows",
+    ]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${relation}`);
+    }
+    expect(sql).toMatch(/PRIMARY KEY \(scope_fingerprint, lineage_id\)/i);
+    expect(sql).toMatch(/UNIQUE \(scope_fingerprint, lineage_id, latest_revision\)/i);
+    expect(sql).toMatch(/memories_temporal_lineage_revision_uidx[\s\S]+scope_fingerprint, lineage_id, revision/i);
+    expect(sql).toMatch(/memories_temporal_current_head_uidx[\s\S]+WHERE lineage_id IS NOT NULL[\s\S]+lifecycle_status = 'active'/i);
+    expect(sql).toMatch(/request_hash TEXT NOT NULL CHECK \(request_hash ~ '\^\[0-9a-f\]\{64\}\$'\)/i);
+    expect(sql).toMatch(/before_hash TEXT NOT NULL CHECK \(before_hash ~ '\^\[0-9a-f\]\{64\}\$'\)/i);
+    expect(sql).toMatch(/after_hash TEXT CHECK \(after_hash IS NULL OR after_hash ~ '\^\[0-9a-f\]\{64\}\$'\)/i);
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
   test("v22 expand-only persists exact-session context assembly receipts", () => {
     const v22 = SCHEMA_MIGRATIONS.find((item) => item.version === 22);
     const sql = v22?.statements.join("\n") ?? "";
@@ -782,7 +916,7 @@ describe("schema migration registry", () => {
     expect(sql).not.toMatch(/UPDATE|DELETE|TRUNCATE|ALTER\s+TABLE/i);
   });
 
-  test("v18 append 不改变 v1-v17 checksum，v17 ledger 只计划 v18", () => {
+  test("v18-v32 append 不改变 v1-v17 checksum，v17 ledger 计划全部后续迁移", () => {
     const appliedV17 = SCHEMA_MIGRATIONS.slice(0, 17).map(({ version, name, checksum }) => ({
       version, name, checksum: checksum!,
     }));
@@ -808,19 +942,8 @@ describe("schema migration registry", () => {
     ]);
     expect(planSchemaMigrations(appliedV17)).toMatchObject({
       fromVersion: 17,
-      toVersion: 27,
-      pending: [
-        SCHEMA_MIGRATIONS[17],
-        SCHEMA_MIGRATIONS[18],
-        SCHEMA_MIGRATIONS[19],
-        SCHEMA_MIGRATIONS[20],
-        SCHEMA_MIGRATIONS[21],
-        SCHEMA_MIGRATIONS[22],
-        SCHEMA_MIGRATIONS[23],
-        SCHEMA_MIGRATIONS[24],
-        SCHEMA_MIGRATIONS[25],
-        SCHEMA_MIGRATIONS[26],
-      ],
+      toVersion: CURRENT_SCHEMA_VERSION,
+      pending: SCHEMA_MIGRATIONS.slice(17),
     });
   });
 
@@ -874,7 +997,7 @@ describe("schema migration registry", () => {
       checksum: checksum!,
     }));
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(27);
+    expect(CURRENT_SCHEMA_VERSION).toBe(SCHEMA_MIGRATIONS.at(-1)?.version);
     expect(v21?.name).toBe("add-loadout-audit-invalidation-outbox");
     expect(v21?.kind).toBe("expand");
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_loadout_audit");
@@ -907,16 +1030,8 @@ describe("schema migration registry", () => {
     ]);
     expect(planSchemaMigrations(appliedV20)).toMatchObject({
       fromVersion: 20,
-      toVersion: 27,
-      pending: [
-        v21,
-        SCHEMA_MIGRATIONS[21],
-        SCHEMA_MIGRATIONS[22],
-        SCHEMA_MIGRATIONS[23],
-        SCHEMA_MIGRATIONS[24],
-        SCHEMA_MIGRATIONS[25],
-        SCHEMA_MIGRATIONS[26],
-      ],
+      toVersion: CURRENT_SCHEMA_VERSION,
+      pending: SCHEMA_MIGRATIONS.slice(20),
     });
   });
 
@@ -924,7 +1039,7 @@ describe("schema migration registry", () => {
     const v23 = SCHEMA_MIGRATIONS.find((item) => item.version === 23);
     const sql = v23?.statements.join("\n") ?? "";
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(27);
+    expect(CURRENT_SCHEMA_VERSION).toBe(SCHEMA_MIGRATIONS.at(-1)?.version);
     expect(v23?.name).toBe("add-history-rebuild-ledger");
     expect(v23?.kind).toBe("expand");
     for (const table of [
@@ -981,8 +1096,8 @@ describe("schema migration registry", () => {
     expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME|ALTER\s+TABLE)\b/i);
     expect(planSchemaMigrations(appliedV23)).toMatchObject({
       fromVersion: 23,
-      toVersion: 27,
-      pending: [v24, SCHEMA_MIGRATIONS[24], SCHEMA_MIGRATIONS[25], SCHEMA_MIGRATIONS[26]],
+      toVersion: CURRENT_SCHEMA_VERSION,
+      pending: SCHEMA_MIGRATIONS.slice(23),
     });
   });
 
@@ -1057,14 +1172,14 @@ describe("schema migration registry", () => {
           }
         : migration);
 
-    expect(() => validateMigrationRegistry(tampered, 27)).toThrow(/allowlist|contract/i);
+    expect(() => validateMigrationRegistry(tampered, CURRENT_SCHEMA_VERSION)).toThrow(/allowlist|contract/i);
   });
 
   test("v27 expand-only 建立 Markdown 工作集 staging、映射、before-image 与 activation receipt", () => {
     const v27 = SCHEMA_MIGRATIONS.find((item) => item.version === 27);
     const sql = v27?.statements.join("\n") ?? "";
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(27);
+    expect(CURRENT_SCHEMA_VERSION).toBe(SCHEMA_MIGRATIONS.at(-1)?.version);
     expect(v27?.name).toBe("add-markdown-workset-migration-ledger");
     expect(v27?.kind).toBe("expand");
     for (const table of [
@@ -1085,7 +1200,7 @@ describe("schema migration registry", () => {
     expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
   });
 
-  test("v25-v27 append 不改变 v1-v24 checksum，v24 ledger 只计划三步安全迁移", () => {
+  test("v25-v32 append 不改变 v1-v24 checksum，v24 ledger 计划全部后续安全迁移", () => {
     const v1ToV24Checksums = [
       "579838a230d7e915c1a82d7937d42d04b73dcd0a7682b0320ba8920444c04b55",
       "351de9a732b876ac7ebcfe68e6aad89cbacf56c416c32482e504dd07d674db74",
@@ -1118,11 +1233,11 @@ describe("schema migration registry", () => {
 
     expect(SCHEMA_MIGRATIONS.slice(0, 24).map((item) => item.checksum))
       .toEqual(v1ToV24Checksums);
-    expect(CURRENT_SCHEMA_VERSION).toBe(27);
+    expect(CURRENT_SCHEMA_VERSION).toBe(SCHEMA_MIGRATIONS.at(-1)?.version);
     expect(planSchemaMigrations(appliedV24)).toMatchObject({
       fromVersion: 24,
-      toVersion: 27,
-      pending: [SCHEMA_MIGRATIONS[24], SCHEMA_MIGRATIONS[25], SCHEMA_MIGRATIONS[26]],
+      toVersion: CURRENT_SCHEMA_VERSION,
+      pending: SCHEMA_MIGRATIONS.slice(24),
     });
   });
 });

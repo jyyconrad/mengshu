@@ -33,6 +33,7 @@ import {
   buildListToolsResult,
   closeMcpServerAndRuntime,
   createMcpStdioServer,
+  createRuntimeMcpFacade,
   startMcpStdioServer,
   waitForMcpServerShutdown,
 } from "./stdio-server.js";
@@ -229,6 +230,17 @@ describe("buildListToolsResult", () => {
     const health = result.tools.find((t) => t.name === "memory_health");
     expect(health).toBeDefined();
     expect(health?.inputSchema).toHaveProperty("type", "object");
+  });
+});
+
+describe("createRuntimeMcpFacade", () => {
+  test("keeps the tool registry and authority inside RuntimeHost composition", async () => {
+    const facade = createRuntimeMcpFacade({
+      authority, defaultScope, service: new FakeMemoryService(),
+    });
+    expect(facade.listTools().map((tool) => tool.name)).toContain("memory_health");
+    await expect(facade.callTool("memory_health", {})).resolves.toEqual({ ok: true });
+    await expect(facade.callTool("missing", {})).rejects.toThrow("RUNTIME_MCP_TOOL_NOT_FOUND");
   });
 });
 
@@ -499,6 +511,7 @@ describe("createMcpStdioServer", () => {
       defaultScope,
       service: new FakeMemoryService(),
       durableJobV2: { repository, registry },
+      workerOwnership: "direct-diagnostic",
     }, {
       transport: new FakeTransport(),
       startDurableJobV2Supervisor: startSupervisor,
@@ -549,6 +562,7 @@ describe("createMcpStdioServer", () => {
       defaultScope,
       service: new FakeMemoryService(),
       durableJobV2: { repository, registry },
+      workerOwnership: "direct-diagnostic",
     }, {
       transport,
       startDurableJobV2Supervisor: starter,
@@ -587,6 +601,7 @@ describe("createMcpStdioServer", () => {
       defaultScope,
       service: new FakeMemoryService(),
       durableJobV2: { repository, registry: partialRegistry },
+      workerOwnership: "direct-diagnostic",
     }, { transport })).rejects.toThrow(/durable job.*invalid/i);
 
     expect(startTransport).not.toHaveBeenCalled();

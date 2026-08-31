@@ -113,6 +113,31 @@ export type MemoryConfig = {
     webConsole?: boolean;
     /** 显式启用 private Asset/Loadout 对原生 5 槽位的增强注入。 */
     assetInjection?: boolean;
+    temporalMemory?: boolean;
+    sessionWorkingSet?: boolean;
+    skillArtifacts?: boolean;
+    memoryPolicyOverlay?: boolean;
+    teamAssets?: boolean;
+    proxy?: boolean;
+  };
+  temporalMemory?: {
+    defaultExpirationAction?: "archive";
+    allowHistoricalRecall?: boolean;
+    allowRestore?: boolean;
+    historicalIndex?: "bm25";
+  };
+  sessionWorkingSet?: {
+    mildRatio?: number;
+    aggressiveRatio?: number;
+    emergencyRatio?: number;
+    emergencyTargetRatio?: number;
+    outlineMaxRatio?: number;
+    retentionDays?: number;
+  };
+  skillArtifacts?: {
+    maxResourceBytes?: number;
+    allowExecutable?: false;
+    executionMode?: "suggest_only";
   };
   dbType?: "lancedb" | "supabase" | "postgres";
   dbPath?: string;
@@ -525,7 +550,7 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "authority", "defaultAgentId", "llm", "mode", "server", "features", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
+      ["embedding", "authority", "defaultAgentId", "llm", "mode", "server", "features", "temporalMemory", "sessionWorkingSet", "skillArtifacts", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
       "memory config",
     );
 
@@ -633,14 +658,103 @@ export const memoryConfigSchema = {
     if (features) {
       assertAllowedKeys(
         features,
-        ["bm25", "graph", "summaryTree", "webConsole", "assetInjection"],
+        ["bm25", "graph", "summaryTree", "webConsole", "assetInjection", "temporalMemory", "sessionWorkingSet", "skillArtifacts", "memoryPolicyOverlay", "teamAssets", "proxy"],
         "features config",
       );
-      for (const key of ["bm25", "graph", "summaryTree", "webConsole", "assetInjection"]) {
+      for (const key of ["bm25", "graph", "summaryTree", "webConsole", "assetInjection", "temporalMemory", "sessionWorkingSet", "skillArtifacts", "memoryPolicyOverlay", "teamAssets", "proxy"]) {
         if (features[key] !== undefined && typeof features[key] !== "boolean") {
           throw new Error(`features.${key} must be a boolean`);
         }
       }
+    }
+
+    const temporalMemory = cfg.temporalMemory as Record<string, unknown> | undefined;
+    if (temporalMemory) {
+      assertAllowedKeys(
+        temporalMemory,
+        ["defaultExpirationAction", "allowHistoricalRecall", "allowRestore", "historicalIndex"],
+        "temporalMemory config",
+      );
+      if (temporalMemory.defaultExpirationAction !== undefined &&
+          temporalMemory.defaultExpirationAction !== "archive") {
+        throw new Error("temporalMemory.defaultExpirationAction must be archive");
+      }
+      if (temporalMemory.historicalIndex !== undefined &&
+          temporalMemory.historicalIndex !== "bm25") {
+        throw new Error("temporalMemory.historicalIndex must be bm25");
+      }
+      for (const key of ["allowHistoricalRecall", "allowRestore"]) {
+        if (temporalMemory[key] !== undefined && typeof temporalMemory[key] !== "boolean") {
+          throw new Error(`temporalMemory.${key} must be a boolean`);
+        }
+      }
+    }
+
+    const sessionWorkingSet = cfg.sessionWorkingSet as Record<string, unknown> | undefined;
+    let normalizedSessionWorkingSet: NonNullable<MemoryConfig["sessionWorkingSet"]> | undefined;
+    if (sessionWorkingSet) {
+      assertAllowedKeys(
+        sessionWorkingSet,
+        ["mildRatio", "aggressiveRatio", "emergencyRatio", "emergencyTargetRatio", "outlineMaxRatio", "retentionDays"],
+        "sessionWorkingSet config",
+      );
+      const ratio = (key: string, fallback: number): number => {
+        const value = sessionWorkingSet[key] ?? fallback;
+        if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value >= 1) {
+          throw new Error(`sessionWorkingSet.${key} must be a ratio between 0 and 1`);
+        }
+        return value;
+      };
+      const mildRatio = ratio("mildRatio", 0.5);
+      const aggressiveRatio = ratio("aggressiveRatio", 0.85);
+      const emergencyRatio = ratio("emergencyRatio", 0.95);
+      const emergencyTargetRatio = ratio("emergencyTargetRatio", 0.6);
+      const outlineMaxRatio = ratio("outlineMaxRatio", 0.2);
+      if (!(mildRatio < aggressiveRatio && aggressiveRatio < emergencyRatio) ||
+          emergencyTargetRatio >= aggressiveRatio || outlineMaxRatio > 0.2) {
+        throw new Error(
+          "sessionWorkingSet ratio order must satisfy mild < aggressive < emergency, target < aggressive, outline <= 0.2",
+        );
+      }
+      const retentionDays = sessionWorkingSet.retentionDays ?? 30;
+      if (typeof retentionDays !== "number" || !Number.isInteger(retentionDays) || retentionDays < 0) {
+        throw new Error("sessionWorkingSet.retentionDays must be a non-negative integer");
+      }
+      normalizedSessionWorkingSet = {
+        mildRatio,
+        aggressiveRatio,
+        emergencyRatio,
+        emergencyTargetRatio,
+        outlineMaxRatio,
+        retentionDays,
+      };
+    }
+
+    const skillArtifacts = cfg.skillArtifacts as Record<string, unknown> | undefined;
+    let normalizedSkillArtifacts: NonNullable<MemoryConfig["skillArtifacts"]> | undefined;
+    if (skillArtifacts) {
+      assertAllowedKeys(
+        skillArtifacts,
+        ["maxResourceBytes", "allowExecutable", "executionMode"],
+        "skillArtifacts config",
+      );
+      const maxResourceBytes = skillArtifacts.maxResourceBytes ?? 5_242_880;
+      if (typeof maxResourceBytes !== "number" || !Number.isSafeInteger(maxResourceBytes) ||
+          maxResourceBytes < 1) {
+        throw new Error("skillArtifacts.maxResourceBytes must be a positive integer");
+      }
+      if (skillArtifacts.allowExecutable !== undefined && skillArtifacts.allowExecutable !== false) {
+        throw new Error("skillArtifacts.allowExecutable must be false in v1");
+      }
+      if (skillArtifacts.executionMode !== undefined &&
+          skillArtifacts.executionMode !== "suggest_only") {
+        throw new Error("skillArtifacts.executionMode must be suggest_only in v1");
+      }
+      normalizedSkillArtifacts = {
+        maxResourceBytes,
+        allowExecutable: false,
+        executionMode: "suggest_only",
+      };
     }
 
     // Validate supabase config if provided
@@ -860,7 +974,27 @@ export const memoryConfigSchema = {
         summaryTree: features?.summaryTree === true,
         webConsole: features?.webConsole === true,
         assetInjection: features?.assetInjection === true,
+        temporalMemory: features?.temporalMemory === true,
+        sessionWorkingSet: features?.sessionWorkingSet === true,
+        skillArtifacts: features?.skillArtifacts === true,
+        memoryPolicyOverlay: features?.memoryPolicyOverlay === true,
+        teamAssets: features?.teamAssets === true,
+        proxy: features?.proxy === true,
       },
+      ...(temporalMemory ? {
+        temporalMemory: {
+          defaultExpirationAction: "archive" as const,
+          allowHistoricalRecall: temporalMemory.allowHistoricalRecall !== false,
+          allowRestore: temporalMemory.allowRestore !== false,
+          historicalIndex: "bm25" as const,
+        },
+      } : {}),
+      ...(normalizedSessionWorkingSet === undefined
+        ? {}
+        : { sessionWorkingSet: normalizedSessionWorkingSet }),
+      ...(normalizedSkillArtifacts === undefined
+        ? {}
+        : { skillArtifacts: normalizedSkillArtifacts }),
       dbType,
       dbPath: dbType === "lancedb"
         ? (typeof cfg.dbPath === "string" ? cfg.dbPath : resolveDefaultDbPath())

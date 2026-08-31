@@ -11,6 +11,24 @@ export function computeContentHash(text: string): string {
     .digest("hex");
 }
 
+/** Markdown 工作集治理使用的规范文本 SHA-256。 */
+export function computeCanonicalContentHash(text: string): string {
+  return createHash("sha256")
+    .update(text.replace(/\r\n?/g, "\n").normalize("NFC"), "utf8")
+    .digest("hex");
+}
+
+/** 同时验证历史 MD5 与规范 Markdown 工作集 SHA-256，不接受不可重算的占位 hash。 */
+export function matchesContentHash(text: string, contentHash: string): boolean {
+  if (/^[0-9a-f]{32}$/.test(contentHash)) {
+    return contentHash === computeContentHash(text);
+  }
+  if (/^[0-9a-f]{64}$/.test(contentHash)) {
+    return contentHash === computeCanonicalContentHash(text);
+  }
+  return false;
+}
+
 /**
  * 批量计算文本内容的MD5哈希值
  * @param texts 文本数组

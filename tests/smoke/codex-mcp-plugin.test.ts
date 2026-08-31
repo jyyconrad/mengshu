@@ -304,7 +304,7 @@ describe("Codex MCP plugin smoke", () => {
     }
   });
 
-  test("starts through plugins/codex/mcp/server.mjs and lists mengshu tools", async () => {
+  test("lists bundled tools through the explicit direct-diagnostic packaging path", async () => {
     const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-mcp-"));
     try {
       const binDir = join(temp, "bin");
@@ -332,6 +332,9 @@ describe("Codex MCP plugin smoke", () => {
           MENGSHU_HOME: homeDir,
           MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
           MENGSHU_AUTHORITY_FILE: "",
+          // RuntimeHost proxy behavior has its own live smoke. This case only
+          // proves that the packaged launcher can resolve and start its runtime.
+          MENGSHU_MCP_DIRECT_DIAGNOSTIC: "1",
           PATH: process.env.PATH ?? "",
           MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
         },

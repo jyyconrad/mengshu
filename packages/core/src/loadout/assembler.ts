@@ -35,7 +35,8 @@ function selectVersion(
   binding: SlotAssetBinding,
   candidates: readonly LoadoutAssetCandidate[],
 ): LoadoutAssetCandidate | undefined {
-  const matching = candidates.filter((item) => item.assetId === binding.assetId);
+  const matching = candidates.filter((item) => item.assetId === binding.assetId &&
+    item.assetKind === (binding.assetKind ?? "memory_view"));
   if (binding.pinnedVersion !== undefined) {
     return matching.find((item) => item.assetVersion === binding.pinnedVersion);
   }
@@ -48,7 +49,8 @@ function denyReason(
   candidate: LoadoutAssetCandidate,
   minScore: number,
 ): LoadoutDeniedReason | undefined {
-  if (candidate.assetKind !== "memory_view" || candidate.status !== "published") {
+  if ((candidate.assetKind !== "memory_view" && candidate.assetKind !== "skill") ||
+      candidate.status !== "published") {
     return "asset_not_published";
   }
   if (candidate.contentValidity !== "current") return "asset_stale";
@@ -167,8 +169,14 @@ export class AgentLoadoutAssembler {
       }
     }
     const assetVersions = contributions
-      .map(({ assetId, assetVersion }) => ({ assetId, version: assetVersion }))
-      .sort((left, right) => left.assetId.localeCompare(right.assetId));
+      .map(({ assetId, assetKind, assetVersion }) => ({
+        assetId,
+        ...(assetKind === "skill" ? { assetKind } : {}),
+        version: assetVersion,
+      }))
+      .sort((left, right) => (left.assetKind ?? "memory_view")
+        .localeCompare(right.assetKind ?? "memory_view") ||
+        left.assetId.localeCompare(right.assetId));
     return freeze({
       enhancementEnabled: true,
       contributions,

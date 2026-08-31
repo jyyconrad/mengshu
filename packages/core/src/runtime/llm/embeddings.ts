@@ -321,6 +321,7 @@ export class Embeddings {
         status,
         attempt,
         scopeFingerprint: this.costContext.scopeFingerprint,
+        policyResolution: this.costContext.policyResolution,
       }),
       this.onCostLedgerError,
     );

@@ -502,6 +502,7 @@ function commandPayload(command: MemoryWriteCommand): Record<string, unknown> {
   if (command.type === "correctMemory") {
     common.correctionKind = command.correctionKind;
     common.targetId = command.targetId;
+    if (command.correctionKind === "replaceText") common.temporal = command.temporal;
   }
   return common;
 }

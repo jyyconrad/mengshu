@@ -29,6 +29,12 @@ describe("middleware config", () => {
       summaryTree: false,
       webConsole: false,
       assetInjection: false,
+      temporalMemory: false,
+      sessionWorkingSet: false,
+      skillArtifacts: false,
+      memoryPolicyOverlay: false,
+      teamAssets: false,
+      proxy: false,
     });
   });
 
@@ -180,6 +186,12 @@ describe("middleware config", () => {
         summaryTree: true,
         webConsole: true,
         assetInjection: true,
+        temporalMemory: true,
+        sessionWorkingSet: true,
+        skillArtifacts: true,
+        memoryPolicyOverlay: true,
+        teamAssets: false,
+        proxy: false,
       },
     });
 
@@ -197,7 +209,96 @@ describe("middleware config", () => {
       summaryTree: true,
       webConsole: true,
       assetInjection: true,
+      temporalMemory: true,
+      sessionWorkingSet: true,
+      skillArtifacts: true,
+      memoryPolicyOverlay: true,
+      teamAssets: false,
+      proxy: false,
     });
+  });
+
+  test("解析时态记忆配置并拒绝隐式 purge 或未知历史索引", () => {
+    const config = memoryConfigSchema.parse({
+      ...baseConfig,
+      features: { temporalMemory: true },
+      temporalMemory: {
+        defaultExpirationAction: "archive",
+        allowHistoricalRecall: true,
+        allowRestore: true,
+        historicalIndex: "bm25",
+      },
+    });
+
+    expect(config.temporalMemory).toEqual({
+      defaultExpirationAction: "archive",
+      allowHistoricalRecall: true,
+      allowRestore: true,
+      historicalIndex: "bm25",
+    });
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      temporalMemory: { defaultExpirationAction: "purge" },
+    })).toThrow(/temporalMemory\.defaultExpirationAction/i);
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      temporalMemory: { historicalIndex: "ann" },
+    })).toThrow(/temporalMemory\.historicalIndex/i);
+  });
+
+  test("解析 Working Set 配置并拒绝无序 ratio、负 retention", () => {
+    const config = memoryConfigSchema.parse({
+      ...baseConfig,
+      features: { sessionWorkingSet: true },
+      sessionWorkingSet: {
+        mildRatio: 0.5,
+        aggressiveRatio: 0.85,
+        emergencyRatio: 0.95,
+        emergencyTargetRatio: 0.6,
+        outlineMaxRatio: 0.2,
+        retentionDays: 30,
+      },
+    });
+    expect(config.sessionWorkingSet).toEqual({
+      mildRatio: 0.5,
+      aggressiveRatio: 0.85,
+      emergencyRatio: 0.95,
+      emergencyTargetRatio: 0.6,
+      outlineMaxRatio: 0.2,
+      retentionDays: 30,
+    });
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      sessionWorkingSet: { mildRatio: 0.9, aggressiveRatio: 0.8 },
+    })).toThrow(/sessionWorkingSet.*ratio/i);
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      sessionWorkingSet: { retentionDays: -1 },
+    })).toThrow(/sessionWorkingSet\.retentionDays/i);
+  });
+
+  test("Skill Artifact v1 配置强制 suggest_only 且禁止 executable", () => {
+    const config = memoryConfigSchema.parse({
+      ...baseConfig,
+      skillArtifacts: {
+        maxResourceBytes: 5_242_880,
+        allowExecutable: false,
+        executionMode: "suggest_only",
+      },
+    });
+    expect(config.skillArtifacts).toEqual({
+      maxResourceBytes: 5_242_880,
+      allowExecutable: false,
+      executionMode: "suggest_only",
+    });
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      skillArtifacts: { allowExecutable: true },
+    })).toThrow(/skillArtifacts\.allowExecutable/i);
+    expect(() => memoryConfigSchema.parse({
+      ...baseConfig,
+      skillArtifacts: { executionMode: "execute" },
+    })).toThrow(/skillArtifacts\.executionMode/i);
   });
 
   test("rejects unknown middleware config keys", () => {

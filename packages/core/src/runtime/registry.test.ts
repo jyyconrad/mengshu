@@ -14,6 +14,7 @@ import {
   REGISTRY_VERSION,
   emptyRegistry,
   listProjects,
+  projectWorkspaceBindings,
   registerCanonicalProject,
   readRegistry,
   resolveProjectAlias,
@@ -73,6 +74,28 @@ describe("registry/readRegistry", () => {
     const filePath = join(tmpHome, "registry.json");
     require("node:fs").writeFileSync(filePath, "{not-json", "utf8");
     expect(() => readRegistry(opts())).toThrow(/解析 registry 失败/);
+  });
+});
+
+describe("registry/projectWorkspaceBindings", () => {
+  it("returns a sorted immutable project-to-workspace snapshot", () => {
+    const registry: MemoryAutodbRegistry = {
+      version: REGISTRY_VERSION,
+      projects: {
+        "project-b": { ...baseEntry, workspaceId: "workspace-b" },
+        "project-a": { ...baseEntry, workspaceId: "workspace-a" },
+      },
+      workspaces: {},
+    };
+
+    const bindings = projectWorkspaceBindings(registry);
+
+    expect(Object.keys(bindings)).toEqual(["project-a", "project-b"]);
+    expect(bindings).toEqual({
+      "project-a": "workspace-a",
+      "project-b": "workspace-b",
+    });
+    expect(Object.isFrozen(bindings)).toBe(true);
   });
 });
 

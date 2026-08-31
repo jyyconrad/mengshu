@@ -123,4 +123,44 @@ describe("OpenAiLlmClient runtime cost instrumentation", () => {
       { operation: "llm.extract_structured", status: "succeeded", attempt: 2, inputTokens: 20 },
     ]);
   });
+
+  test("copies call-level policy attribution into every provider attempt", async () => {
+    const events: unknown[] = [];
+    const scopeFingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const llm = new OpenAiLlmClient(config, {
+      client: { chat: { completions: { create: async () => ({
+        choices: [{ message: { content: '{"ok":true}' } }],
+        usage: { prompt_tokens: 20, completion_tokens: 3 },
+      }) } } },
+      costLedger: { append: async (value) => { events.push(value); } },
+      pricingSnapshot: pricing,
+    });
+
+    await llm.extractStructured(
+      [{ role: "user", content: "extract" }],
+      { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+      {
+        costContext: {
+          category: "policy_overlay",
+          scopeFingerprint,
+          operation: "candidate.extract",
+          policyResolution: {
+            scopeFingerprint: "a".repeat(64),
+            layer: "candidate_extraction",
+            overlayId: "policy-1",
+            overlayVersion: 2,
+            contentHash: "b".repeat(64),
+            guardVersion: "memory-policy-guard-v1",
+            resolutionHash: "c".repeat(64),
+          },
+        },
+      },
+    );
+
+    expect(events).toMatchObject([{
+      operation: "candidate.extract",
+      category: "policy_overlay",
+      policyResolution: { overlayId: "policy-1", overlayVersion: 2 },
+    }]);
+  });
 });

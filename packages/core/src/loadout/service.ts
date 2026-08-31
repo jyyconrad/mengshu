@@ -60,7 +60,12 @@ function bindings(value: readonly SlotAssetBinding[]): readonly SlotAssetBinding
   if (!Array.isArray(value)) throw new AgentLoadoutError("INVALID_INPUT");
   const result = value.map((binding) => {
     if (!binding || typeof binding !== "object" || !TYPES.has(binding.slot) ||
-        !MODES.has(binding.disclosureMode) || !Number.isSafeInteger(binding.priority) ||
+        !MODES.has(binding.disclosureMode) ||
+        (binding.assetKind !== undefined &&
+          binding.assetKind !== "memory_view" && binding.assetKind !== "skill") ||
+        (binding.assetKind === "skill" &&
+          binding.slot !== "experience" && binding.slot !== "resource") ||
+        !Number.isSafeInteger(binding.priority) ||
         binding.priority < 0 || binding.priority > 1_000_000 ||
         typeof binding.required !== "boolean" ||
         (binding.pinnedVersion !== undefined &&
@@ -71,7 +76,8 @@ function bindings(value: readonly SlotAssetBinding[]): readonly SlotAssetBinding
     }
     return Object.freeze({ ...binding, assetId: id(binding.assetId) });
   });
-  if (new Set(result.map((item) => `${item.assetId}:${item.slot}`)).size !== result.length) {
+  if (new Set(result.map((item) =>
+    `${item.assetKind ?? "memory_view"}:${item.assetId}:${item.slot}`)).size !== result.length) {
     throw new AgentLoadoutError("DUPLICATE_BINDING");
   }
   return Object.freeze(result);

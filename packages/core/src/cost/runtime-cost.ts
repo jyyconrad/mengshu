@@ -4,6 +4,10 @@ export const RUNTIME_COST_EVENT_VERSION = 1 as const;
 
 export const RUNTIME_COST_CATEGORIES = [
   "native_memory",
+  "session_summary",
+  "task_outline",
+  "skill_review",
+  "policy_overlay",
   "asset_promotion",
   "prewarm",
   "asset_tool",
@@ -15,10 +19,28 @@ export type RuntimeCostCategory = typeof RUNTIME_COST_CATEGORIES[number];
 export type RuntimeCostStatus = "succeeded" | "failed" | "rejected";
 export type EmbeddingUnitKind = "tokens" | "inputs";
 
+export type RuntimeCostPolicyLayer =
+  | "candidate_extraction"
+  | "tree_summary"
+  | "skill_review"
+  | "document_organization";
+
+/** Fixed, content-free projection of a policy resolution receipt. */
+export interface RuntimeCostPolicyResolution {
+  readonly scopeFingerprint: string;
+  readonly layer: RuntimeCostPolicyLayer;
+  readonly overlayId?: string;
+  readonly overlayVersion?: number;
+  readonly contentHash?: string;
+  readonly guardVersion: "memory-policy-guard-v1";
+  readonly resolutionHash: string;
+}
+
 export interface RuntimeCostContext {
   category: RuntimeCostCategory;
   scopeFingerprint: string;
   operation?: string;
+  policyResolution?: RuntimeCostPolicyResolution;
 }
 
 export interface RuntimeCostEvent {
@@ -39,6 +61,7 @@ export interface RuntimeCostEvent {
   rejectionReason: string | null;
   attempt: number;
   scopeFingerprint: string;
+  policyResolution: RuntimeCostPolicyResolution | null;
 }
 
 export interface RuntimeCostEventSink {
@@ -166,6 +189,7 @@ export interface CreateRuntimeCostEventInput extends RuntimeCostUsage {
   rejectionReason?: string | null;
   attempt: number;
   scopeFingerprint: string;
+  policyResolution?: RuntimeCostPolicyResolution;
   pricingSnapshot: RuntimePricingSnapshot;
 }
 
@@ -192,6 +216,7 @@ export function createRuntimeCostEvent(input: CreateRuntimeCostEventInput): Runt
     rejectionReason: input.rejectionReason ?? null,
     attempt: input.attempt,
     scopeFingerprint: input.scopeFingerprint,
+    policyResolution: input.policyResolution ?? null,
   };
 }
 

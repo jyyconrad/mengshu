@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { appendLeafToBuffer, InMemoryTreeRepository } from "./buffer.js";
 import { sealBuffer } from "./seal.js";
 import type { TreeLeaf, SummaryFaithfulnessConfig } from "./types.js";
-import type { LlmClient } from "../runtime/llm/llm-client.js";
+import type { LlmClient, LlmCompletionOptions } from "../runtime/llm/llm-client.js";
 
 const scope = {
   tenantId: "local",
@@ -342,5 +342,61 @@ describe("sealBuffer", () => {
     expect(node.metadata.summaryMode).toBe("extractive");
     expect(node.metadata.faithfulnessFailed).toBe(true);
     expect(node.summary).toContain("real evidence text");
+  });
+
+  test("tree overlay 进入 system prompt 与 summary metadata receipt", async () => {
+    const repository = new InMemoryTreeRepository();
+    let systemPrompt = "";
+    let llmOptions: LlmCompletionOptions | undefined;
+    const llmClient = new MockLlmClient("policy aware summary");
+    const originalExtract = llmClient.extractStructured.bind(llmClient);
+    llmClient.extractStructured = async <T>(
+      messages: Array<{ role: string; content: string }>,
+      schema: unknown,
+      options?: LlmCompletionOptions,
+    ) => {
+      systemPrompt = messages[0]!.content;
+      llmOptions = options;
+      return originalExtract(messages, schema) as Promise<T>;
+    };
+    const { buffer } = await appendLeafToBuffer(repository, {
+      scope,
+      treeType: "source",
+      treeKey: "policy-tree",
+      leaf: leaf("policy", "grounded policy evidence", 0.9, 1710000000000),
+      now: 1710000000000,
+    });
+    const receipt = {
+      scopeFingerprint: "a".repeat(64),
+      layer: "tree_summary" as const,
+      overlayId: "tree-policy",
+      overlayVersion: 1,
+      contentHash: "b".repeat(64),
+      guardVersion: "memory-policy-guard-v1" as const,
+      resolutionHash: "c".repeat(64),
+    };
+    const node = await sealBuffer(repository, {
+      buffer,
+      now: 1710000010000,
+      llmClient,
+      policyResolver: {
+        resolve: async () => ({
+          source: "overlay" as const,
+          policy: { focusHints: [], ignoreHints: [], aggregationHints: ["按时间组织"] },
+          rendered: "TREE_POLICY_WITH_GUARD",
+          warnings: [],
+          receipt,
+        }),
+      },
+    });
+
+    expect(systemPrompt).toContain("TREE_POLICY_WITH_GUARD");
+    expect(llmOptions?.costContext).toMatchObject({
+      category: "session_summary",
+      operation: "tree.summary",
+      scopeFingerprint: `sha256:${"a".repeat(64)}`,
+      policyResolution: receipt,
+    });
+    expect(node.metadata.policyResolution).toEqual(receipt);
   });
 });

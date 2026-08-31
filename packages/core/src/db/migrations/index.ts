@@ -20,3 +20,6 @@ export * from "./knowledge-resource-curation.js";
 export * from "./markdown-scope-registry.js";
 export * from "./typed-memory-batch-plan.js";
 export * from "./governed-asset-proposal.js";
+export * from "./temporal-memory-backfill.js";
+export * from "./temporal-memory-backfill-executor.js";
+export * from "./temporal-prerequisite-repair.js";

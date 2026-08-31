@@ -39,6 +39,34 @@ import type {
 } from "../agent-fast-path/index.js";
 import { resolveRestAuthorityScope } from "./authority.js";
 import { createHash } from "node:crypto";
+import { MemoryEvolutionError } from
+  "../../../core/src/temporal/memory-evolution-service.js";
+import { TemporalTimeResolutionError } from
+  "../../../core/src/temporal/time-resolution.js";
+import { SessionWorkingSetError } from
+  "../../../core/src/working-set/session-working-set-service.js";
+import { SkillArtifactError } from
+  "../../../core/src/skills/skill-artifact-service.js";
+import { MemoryPolicyOverlayError } from
+  "../../../core/src/policy/memory-policy-overlay.js";
+import type {
+  IngestToolPairInput,
+  PromoteWorkingSetClaimInput,
+  ReadSessionPayloadInput,
+  RecordTaskBoundaryInput,
+  SessionAssembleInput,
+} from "../../../core/src/working-set/types.js";
+import type {
+  ProposeSkillInput,
+  CuratedSkillImportInput,
+  AppendSkillVersionInput,
+  PublishSkillInput,
+  RevokeSkillInput,
+  ReviewSkillInput,
+  SearchSkillInput,
+} from "../../../core/src/skills/types.js";
+import type { AppendMemoryPolicyOverlayInput, MemoryPolicyLayer } from
+  "../../../core/src/policy/types.js";
 
 export interface RestRouter {
   handle(request: RestRequest): Promise<RestResponse>;
@@ -77,6 +105,12 @@ export function createRestApi(
     router: createRestRouter({
       service: runtime.memoryService,
       memoryWrite: runtimeMemoryWriteCapability(runtime),
+      memoryEvolution: runtime.memoryEvolution,
+      sessionWorkingSet: runtime.sessionWorkingSet,
+      sessionWorkingSetMemoryBridge: runtime.sessionWorkingSetMemoryBridge,
+      skillArtifacts: runtime.skillArtifacts,
+      memoryPolicyOverlays: runtime.memoryPolicyOverlays,
+      memoryPolicyResolver: runtime.memoryPolicyResolver,
       console: runtime.consoleApi,
       agentFastPath: runtime.agentFastPath,
       server: config.server,
@@ -95,6 +129,45 @@ function notFound(): RestResponse {
 
 function badRequest(message: string): RestResponse {
   return { status: 400, body: { error: message } };
+}
+
+function temporalError(error: unknown): RestResponse {
+  if (error instanceof TemporalTimeResolutionError) {
+    return { status: 400, body: { error: error.code } };
+  }
+  if (!(error instanceof MemoryEvolutionError)) {
+    return { status: 500, body: { error: "Temporal memory operation failed" } };
+  }
+  if (error.code === "MEMORY_EVOLUTION_INVALID" ||
+      error.code === "MEMORY_PURGE_CONFIRMATION_REQUIRED") {
+    return { status: 400, body: { error: error.code } };
+  }
+  if (error.code === "MEMORY_LINEAGE_NOT_FOUND" ||
+      error.code === "MEMORY_VERSION_NOT_FOUND") {
+    return { status: 404, body: { error: error.code } };
+  }
+  if (error.code === "MEMORY_PURGE_PENDING") {
+    return { status: 503, body: { error: error.code } };
+  }
+  return { status: 409, body: { error: error.code } };
+}
+
+function extensionError(error: unknown): RestResponse {
+  if (error instanceof SessionWorkingSetError || error instanceof SkillArtifactError ||
+      error instanceof MemoryPolicyOverlayError) {
+    const code = error.code;
+    if (code.includes("NOT_FOUND")) return { status: 404, body: { error: code } };
+    if (code.includes("STALE") || code.includes("CONFLICT")) {
+      return { status: 409, body: { error: code } };
+    }
+    if (code.includes("UNAVAILABLE")) return { status: 503, body: { error: code } };
+    return { status: 400, body: { error: code } };
+  }
+  return { status: 500, body: { error: "Memory extension operation failed" } };
+}
+
+function temporalInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function writeResponse(result: MemoryWriteKernelResult): RestResponse {
@@ -227,6 +300,395 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
       });
       if (!auth.ok) {
         return { status: auth.status, body: { error: auth.message } };
+      }
+
+      if (request.path === "/v1/runtime") {
+        if (!options.runtimeControl) return notFound();
+        if (request.method !== "GET") return methodNotAllowed();
+        try {
+          return { status: 200, body: options.runtimeControl.snapshot() };
+        } catch {
+          return { status: 503, body: { error: "Runtime control plane is unavailable" } };
+        }
+      }
+
+      if (request.path === "/v1/runtime/mcp-tools") {
+        if (!options.runtimeControl || !options.runtimeMcp) return notFound();
+        if (request.method !== "GET") return methodNotAllowed();
+        return { status: 200, body: { tools: options.runtimeMcp.listTools() } };
+      }
+
+      if (request.path === "/v1/runtime/mcp-call") {
+        if (!options.runtimeControl || !options.runtimeMcp) return notFound();
+        if (request.method !== "POST") return methodNotAllowed();
+        const body = requireObjectBody(request.body);
+        const args = requireObjectBody(body?.arguments);
+        if (!body || typeof body.name !== "string" || body.name.trim().length === 0 ||
+            !args || Object.keys(body).some((key) => key !== "name" && key !== "arguments")) {
+          return badRequest("runtime MCP call is invalid");
+        }
+        try {
+          return { status: 200, body: await options.runtimeMcp.callTool(body.name, args) };
+        } catch {
+          return { status: 500, body: { error: "Runtime MCP operation failed" } };
+        }
+      }
+
+      if (request.path.startsWith("/v1/session/working-set/") ||
+          request.path === "/v1/session/task-boundary") {
+        if (!options.sessionWorkingSet) return notFound();
+        if (request.method !== "POST") return methodNotAllowed();
+        const body = requireObjectBody(request.body);
+        if (!body || typeof body.sessionId !== "string") return badRequest("sessionId is required");
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
+        try {
+          if (request.path === "/v1/session/working-set/promote") {
+            if (!options.sessionWorkingSetMemoryBridge) return notFound();
+            return {
+              status: 201,
+              body: await options.sessionWorkingSetMemoryBridge.promoteClaim({
+                ...body,
+                scope,
+              } as unknown as PromoteWorkingSetClaimInput),
+            };
+          }
+          if (request.path === "/v1/session/working-set/tool-pair") {
+            return {
+              status: 201,
+              body: await options.sessionWorkingSet.ingestToolPair({
+                ...body,
+                scope,
+              } as unknown as IngestToolPairInput),
+            };
+          }
+          if (request.path === "/v1/session/task-boundary") {
+            return {
+              status: 201,
+              body: await options.sessionWorkingSet.recordTaskBoundary({
+                ...body,
+                scope,
+              } as unknown as RecordTaskBoundaryInput),
+            };
+          }
+          if (request.path === "/v1/session/working-set/assemble") {
+            return {
+              status: 200,
+              body: await options.sessionWorkingSet.assemble({
+                ...body,
+                scope,
+              } as unknown as SessionAssembleInput),
+            };
+          }
+          if (request.path === "/v1/session/working-set/rewrite/explain") {
+            if (typeof body.receiptId !== "string") return badRequest("receiptId is required");
+            return {
+              status: 200,
+              body: await options.sessionWorkingSet.explainRewrite(
+                body.receiptId,
+                scope,
+                body.sessionId,
+              ),
+            };
+          }
+          if (request.path === "/v1/session/working-set/payload/read") {
+            return {
+              status: 200,
+              body: await options.sessionWorkingSet.readPayload({
+                ...body,
+                scope,
+              } as unknown as ReadSessionPayloadInput),
+            };
+          }
+          if (request.path === "/v1/session/working-set/close") {
+            return {
+              status: 200,
+              body: await options.sessionWorkingSet.closeSession(scope, body.sessionId),
+            };
+          }
+          return notFound();
+        } catch (error) {
+          return extensionError(error);
+        }
+      }
+
+      if (request.path.startsWith("/v1/skills/")) {
+        if (!options.skillArtifacts) return notFound();
+        if (request.method !== "POST") return methodNotAllowed();
+        const body = requireObjectBody(request.body);
+        if (!body) return badRequest("request body is required");
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
+        try {
+          if (request.path === "/v1/skills/propose") {
+            return { status: 201, body: await options.skillArtifacts.proposeFromCandidate({
+              ...body, scope,
+            } as unknown as ProposeSkillInput) };
+          }
+          if (request.path === "/v1/skills/import-curated") {
+            return { status: 201, body: await options.skillArtifacts.importCurated({
+              ...body, scope,
+            } as unknown as CuratedSkillImportInput) };
+          }
+          if (request.path === "/v1/skills/review") {
+            return { status: 201, body: await options.skillArtifacts.review({
+              ...body, scope,
+            } as unknown as ReviewSkillInput) };
+          }
+          if (request.path === "/v1/skills/publish") {
+            return { status: 201, body: await options.skillArtifacts.publish({
+              ...body, scope,
+            } as unknown as PublishSkillInput) };
+          }
+          if (request.path === "/v1/skills/append") {
+            return { status: 201, body: await options.skillArtifacts.appendVersion({
+              ...body, scope,
+            } as unknown as AppendSkillVersionInput) };
+          }
+          if (request.path === "/v1/skills/revoke") {
+            return { status: 201, body: await options.skillArtifacts.revoke({
+              ...body, scope,
+            } as unknown as RevokeSkillInput) };
+          }
+          if (request.path === "/v1/skills/read") {
+            if (typeof body.skillId !== "string") return badRequest("skillId is required");
+            return { status: 200, body: await options.skillArtifacts.read({
+              scope, skillId: body.skillId,
+              ...(typeof body.version === "number" ? { version: body.version } : {}),
+            }) };
+          }
+          if (request.path === "/v1/skills/search") {
+            return { status: 200, body: await options.skillArtifacts.search({
+              ...body, scope,
+            } as unknown as SearchSkillInput) };
+          }
+          if (request.path === "/v1/skills/explain") {
+            if (typeof body.skillId !== "string") return badRequest("skillId is required");
+            return { status: 200, body: await options.skillArtifacts.explain({
+              scope, skillId: body.skillId,
+              ...(typeof body.version === "number" ? { version: body.version } : {}),
+            }) };
+          }
+          return notFound();
+        } catch (error) {
+          return extensionError(error);
+        }
+      }
+
+      if (request.path === "/v1/memory-policy/versions" ||
+          request.path === "/v1/memory-policy/resolve") {
+        if (request.method !== "POST") return methodNotAllowed();
+        const body = requireObjectBody(request.body);
+        if (!body) return badRequest("request body is required");
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
+        try {
+          if (request.path === "/v1/memory-policy/versions") {
+            if (!options.memoryPolicyOverlays) return notFound();
+            return { status: 201, body: await options.memoryPolicyOverlays.appendVersion({
+              ...body, scope,
+            } as unknown as AppendMemoryPolicyOverlayInput) };
+          }
+          if (!options.memoryPolicyResolver || typeof body.layer !== "string") return notFound();
+          return { status: 200, body: await options.memoryPolicyResolver.resolve({
+            scope, layer: body.layer as MemoryPolicyLayer,
+          }) };
+        } catch (error) {
+          return extensionError(error);
+        }
+      }
+
+      if (request.path === "/v1/memories/history" ||
+          request.path === "/v1/recall/as-of" ||
+          request.path === "/v1/memories/expire" ||
+          request.path === "/v1/memories/revoke" ||
+          request.path === "/v1/memories/purge") {
+        if (!options.memoryEvolution) return notFound();
+        if (request.method !== "POST") return methodNotAllowed();
+        const body = requireObjectBody(request.body);
+        if (!body || typeof body.lineageId !== "string" ||
+            body.lineageId.length === 0 || body.lineageId !== body.lineageId.trim()) {
+          return badRequest("lineageId is required");
+        }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
+        try {
+          if (request.path === "/v1/memories/history") {
+            return {
+              status: 200,
+              body: await options.memoryEvolution.history({
+                scope,
+                lineageId: body.lineageId,
+              }),
+            };
+          }
+          if (request.path === "/v1/recall/as-of") {
+            if (typeof body.asOf === "string") {
+              const timezoneOffsetMinutes = body.timezoneOffsetMinutes;
+              if ((body.knownAt !== undefined && typeof body.knownAt !== "string" &&
+                    !temporalInteger(body.knownAt)) ||
+                  (timezoneOffsetMinutes !== undefined &&
+                    (typeof timezoneOffsetMinutes !== "number" ||
+                      !Number.isInteger(timezoneOffsetMinutes) ||
+                      timezoneOffsetMinutes < -840 || timezoneOffsetMinutes > 840)) ||
+                  (body.anchorAt !== undefined && !temporalInteger(body.anchorAt))) {
+                return badRequest("temporal expression parameters are invalid");
+              }
+              return {
+                status: 200,
+                body: await options.memoryEvolution.recallAsOfResolved({
+                  scope,
+                  lineageId: body.lineageId,
+                  asOf: body.asOf,
+                  ...(body.knownAt === undefined ? {} : { knownAt: body.knownAt as string | number }),
+                  ...(timezoneOffsetMinutes === undefined
+                    ? {}
+                    : { timezoneOffsetMinutes }),
+                  ...(body.anchorAt === undefined ? {} : { anchorAt: body.anchorAt }),
+                }),
+              };
+            }
+            if (!temporalInteger(body.asOf) ||
+                (body.knownAt !== undefined && !temporalInteger(body.knownAt))) {
+              return badRequest("asOf/knownAt must be epoch milliseconds or a resolvable expression");
+            }
+            return {
+              status: 200,
+              body: await options.memoryEvolution.recallAsOf({
+                scope,
+                lineageId: body.lineageId,
+                asOf: body.asOf,
+                ...(body.knownAt === undefined ? {} : { knownAt: body.knownAt }),
+              }),
+            };
+          }
+          if (request.path === "/v1/memories/expire") {
+            if (!temporalInteger(body.expectedHeadRevision) ||
+                body.expectedHeadRevision < 1 || !temporalInteger(body.validTo) ||
+                typeof body.idempotencyKey !== "string") {
+              return badRequest("expire parameters are invalid");
+            }
+            return {
+              status: 200,
+              body: await options.memoryEvolution.expire({
+                scope,
+                lineageId: body.lineageId,
+                expectedHeadRevision: body.expectedHeadRevision,
+                validTo: body.validTo,
+                ...(typeof body.reason === "string" ? { reason: body.reason } : {}),
+                idempotencyKey: body.idempotencyKey,
+              }),
+            };
+          }
+          if (request.path === "/v1/memories/revoke") {
+            if (!temporalInteger(body.expectedHeadRevision) ||
+                body.expectedHeadRevision < 1 || typeof body.reason !== "string" ||
+                typeof body.idempotencyKey !== "string") {
+              return badRequest("revoke parameters are invalid");
+            }
+            return {
+              status: 200,
+              body: await options.memoryEvolution.revoke({
+                scope,
+                lineageId: body.lineageId,
+                expectedHeadRevision: body.expectedHeadRevision,
+                reason: body.reason,
+                idempotencyKey: body.idempotencyKey,
+              }),
+            };
+          }
+          if (typeof body.idempotencyKey !== "string" ||
+              typeof body.confirmation !== "string") {
+            return badRequest("purge parameters are invalid");
+          }
+          return {
+            status: 200,
+            body: await options.memoryEvolution.purge({
+              scope,
+              lineageId: body.lineageId,
+              confirmation: body.confirmation,
+              idempotencyKey: body.idempotencyKey,
+            }),
+          };
+        } catch (error) {
+          return temporalError(error);
+        }
+      }
+
+      if (request.path === "/v1/memories/evolve" ||
+          request.path === "/v1/memories/correct" ||
+          request.path === "/v1/memories/restore") {
+        if (!options.memoryEvolution || !options.memoryWrite) return notFound();
+        if (request.method !== "POST") return methodNotAllowed();
+        const body = requireObjectBody(request.body);
+        const evidenceIds = Array.isArray(body?.evidenceIds) &&
+            body.evidenceIds.length > 0 &&
+            body.evidenceIds.every((id) => typeof id === "string" && id.length > 0)
+          ? body.evidenceIds as string[]
+          : undefined;
+        if (!body || typeof body.lineageId !== "string" ||
+            typeof body.text !== "string" || body.text.trim().length === 0 ||
+            typeof body.kind !== "string" || typeof body.semanticType !== "string" ||
+            typeof body.idempotencyKey !== "string" ||
+            !temporalInteger(body.expectedHeadRevision) || body.expectedHeadRevision < 1 ||
+            !temporalInteger(body.validFrom) || !evidenceIds) {
+          return badRequest("temporal write parameters are invalid");
+        }
+        const transitionType = request.path === "/v1/memories/evolve"
+          ? "evolved" as const
+          : request.path === "/v1/memories/correct"
+          ? "corrected" as const
+          : "restored" as const;
+        if (transitionType !== "restored" && typeof body.expectedHeadVersionId !== "string") {
+          return badRequest("expectedHeadVersionId is required");
+        }
+        if (transitionType === "restored" && typeof body.sourceVersionId !== "string") {
+          return badRequest("sourceVersionId is required");
+        }
+        const scope = scopeOrResponse(options, body.scope);
+        if (isRestResponse(scope)) return scope;
+        try {
+          const metadata = requireObjectBody(body.metadata) ?? {};
+          const provenance = requireObjectBody(body.provenance) ?? {};
+          const targetId = typeof body.expectedHeadVersionId === "string"
+            ? body.expectedHeadVersionId
+            : body.sourceVersionId as string;
+          const result = await options.memoryWrite.executeMemoryWrite({
+            type: "correctMemory",
+            correctionKind: "replaceText",
+            targetId,
+            idempotencyKey: body.idempotencyKey,
+            serverAuthority: options.authority!,
+            clientScope: scope,
+            text: body.text,
+            kind: body.kind as never,
+            semanticType: body.semanticType as never,
+            ...(typeof body.container === "string" ? { container: body.container as never } : {}),
+            ...(typeof body.confidence === "number" ? { confidence: body.confidence } : {}),
+            ...(typeof body.category === "string" ? { category: body.category as never } : {}),
+            dataType: "memory",
+            tableName: "memories",
+            evidenceIds,
+            metadata: { ...metadata, source: "user" },
+            provenance: { ...provenance, source: "user" },
+            temporal: {
+              lineageId: body.lineageId,
+              expectedHeadRevision: body.expectedHeadRevision,
+              ...(typeof body.expectedHeadVersionId === "string"
+                ? { expectedHeadVersionId: body.expectedHeadVersionId }
+                : {}),
+              validFrom: body.validFrom,
+              transitionType,
+              ...(transitionType === "restored"
+                ? { restoredFromVersionId: body.sourceVersionId as string }
+                : {}),
+              ...(typeof body.reason === "string" ? { reason: body.reason } : {}),
+            },
+          });
+          return writeResponse(result);
+        } catch (error) {
+          return temporalError(error);
+        }
       }
 
       if (request.path === "/v1/health") {

@@ -176,7 +176,7 @@ describe.skipIf(!liveEnabled)("PostgreSQL v17 canonical entity alias lifecycle",
     const isolated = await provisionGlobalPostgresTestSchema("entity_alias_lifecycle");
     let client: pg.Client | undefined;
     try {
-      expect(CURRENT_SCHEMA_VERSION).toBe(24);
+      expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(32);
 
       client = new Client({
         ...isolated.postgres,

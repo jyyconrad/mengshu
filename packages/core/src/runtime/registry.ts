@@ -134,6 +134,22 @@ export function readRegistry(options: HomePathOptions = {}): MemoryAutodbRegistr
   }
 }
 
+/** Build an immutable server-owned project -> workspace lookup for runtime adapters. */
+export function projectWorkspaceBindings(
+  registry: Pick<MemoryAutodbRegistry, "projects">,
+): Readonly<Record<string, string>> {
+  const bindings = Object.create(null) as Record<string, string>;
+  for (const projectId of Object.keys(registry.projects).sort()) {
+    Object.defineProperty(bindings, projectId, {
+      value: registry.projects[projectId]!.workspaceId,
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return Object.freeze(bindings);
+}
+
 /**
  * 原子写入 registry：保证 home 目录存在 → 写 tmp 文件 → rename 覆盖。
  * 中途 crash 不会留下半写的 registry.json。

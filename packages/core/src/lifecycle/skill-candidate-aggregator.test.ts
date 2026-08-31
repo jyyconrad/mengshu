@@ -9,7 +9,11 @@ import { SkillCandidateAggregator } from "./skill-candidate-aggregator.js";
 import { InMemorySkillCandidateRepository } from "./skill-candidate-repository.js";
 import type { CandidateRepository, CandidateRecord } from "./candidate-types.js";
 import type { MemoryScope } from "../domain/types.js";
-import type { LlmClient } from "../runtime/llm/llm-client.js";
+import type {
+  LlmClient,
+  LlmCompletionMessage,
+  LlmCompletionOptions,
+} from "../runtime/llm/llm-client.js";
 
 /**
  * Mock CandidateRepository
@@ -398,6 +402,89 @@ describe("SkillCandidateAggregator", () => {
       expect(retrieved).not.toBeUndefined();
       expect(retrieved!.topicLabel).toBe("testing");
     });
+
+    it("should append the structured skill policy and persist its resolution receipt", async () => {
+      let systemPrompt = "";
+      const receipt = {
+        scopeFingerprint: "a".repeat(64),
+        layer: "skill_review" as const,
+        overlayId: "skill-policy",
+        overlayVersion: 1,
+        contentHash: "b".repeat(64),
+        guardVersion: "memory-policy-guard-v1" as const,
+        resolutionHash: "c".repeat(64),
+      };
+      let llmOptions: LlmCompletionOptions | undefined;
+      aggregator = new SkillCandidateAggregator({
+        candidateRepository: candidateRepo,
+        skillCandidateRepository: skillRepo,
+        now: () => mockNow,
+        llmClient: {
+          available: true,
+          complete: async () => "",
+          summarize: async () => "",
+          extractStructured: async <T>(
+            messages: LlmCompletionMessage[],
+            _schema: unknown,
+            options?: LlmCompletionOptions,
+          ) => {
+            systemPrompt = messages[0]!.content;
+            llmOptions = options;
+            return {
+              generalizable: true,
+              candidateType: "skill_candidate",
+              title: "Reviewed release",
+              topicLabel: "release",
+              applicability: "release",
+              preconditions: ["green CI"],
+              steps: ["review"],
+              successSignals: ["healthy"],
+              riskBoundaries: ["no bypass"],
+              highRisk: false,
+              sourceEvidenceIds: ["exp-1"],
+              reason: "grounded",
+            } as T;
+          },
+        },
+        policyResolver: {
+          resolve: async () => ({
+            source: "overlay" as const,
+            policy: { focusHints: ["审核证据"], ignoreHints: [], aggregationHints: [] },
+            rendered: "SKILL_POLICY_WITH_GUARD",
+            warnings: [],
+            receipt,
+          }),
+        },
+      });
+      const experience = await candidateRepo.enqueue({
+        scope: mockScope,
+        text: "先检查 CI，然后发布，最终成功。",
+        semanticType: "experience",
+        kind: "lesson",
+        confidence: 0.9,
+        evidenceIds: ["evidence-1"],
+        metadata: { topicLabel: "release", hasOutcome: true },
+      });
+      const skill = await aggregator.generateSkillCandidate({
+        topicLabel: "release",
+        experienceIds: [experience.id],
+        evidenceCount: 5,
+        timeSpanDays: 4,
+        avgSimilarity: 0.9,
+        successOutcomeCount: 2,
+        meetsThreshold: true,
+        reason: "meets_all_thresholds",
+      });
+
+      expect(systemPrompt).toContain("SKILL_POLICY_WITH_GUARD");
+      expect(llmOptions?.costContext).toMatchObject({
+        category: "skill_review",
+        operation: "skill.review",
+        scopeFingerprint: `sha256:${"a".repeat(64)}`,
+        policyResolution: receipt,
+      });
+      expect(skill?.metadata?.policyResolution).toEqual(receipt);
+    });
   });
 
   describe("runAggregation", () => {
@@ -443,6 +530,10 @@ describe("SkillCandidateAggregator", () => {
         const retrieved = await skillRepo.get(skill.id);
         expect(retrieved).not.toBeUndefined();
       }
+      const replay = await aggregator.runAggregation(mockScope);
+      expect(replay.skillCandidates.map((candidate) => candidate.id).sort())
+        .toEqual(result.skillCandidates.map((candidate) => candidate.id).sort());
+      expect(await skillRepo.list({ scope: mockScope })).toHaveLength(2);
     });
 
     it("should handle partial failures gracefully", async () => {

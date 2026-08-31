@@ -182,6 +182,7 @@ describe("PostgresGovernedRetrievalCandidateSource", () => {
       "mengshu_tree_leaves",
       "tree_leaf.id::text = memory.id::text",
       "tree_leaf.chunk_id",
+      "string_agg(quote_literal(term.lexeme), ' | ' ORDER BY term.lexeme)",
       "unnest(to_tsvector('simple', memory.text))",
       "cardinality(term.positions)",
       "document_frequency",
@@ -198,6 +199,7 @@ describe("PostgresGovernedRetrievalCandidateSource", () => {
     ]) {
       expect(sql).toContain(fragment);
     }
+    expect(sql).not.toContain("websearch_to_tsquery");
   });
 
   test("BM25 允许 active 与 lookup_only，图和树候选只允许 active", async () => {
@@ -228,6 +230,24 @@ describe("PostgresGovernedRetrievalCandidateSource", () => {
       .rejects.toBeInstanceOf(PostgresGovernedRetrievalCandidateSourceError);
   });
 
+  test("候选 identity 接受 Markdown 工作集规范 SHA-256", async () => {
+    const source = new PostgresGovernedRetrievalCandidateSource(clientWith([
+      row({ memory_content_hash: "b".repeat(64) }),
+    ]));
+
+    await expect(source.search({ query: "memory", scope: SCOPE, limit: 1 }))
+      .resolves.toEqual([
+        expect.objectContaining({
+          governedSemanticIdentity: JSON.stringify([
+            "mengshu.governed-semantic-identity/v1",
+            "decision",
+            "rules",
+            "b".repeat(64),
+          ]),
+        }),
+      ]);
+  });
+
   test.each([
     ["cross-scope", { tenant_id: "tenant-b" }],
     ["forged-fingerprint", { scope_fingerprint: "0".repeat(64) }],
@@ -235,6 +255,7 @@ describe("PostgresGovernedRetrievalCandidateSource", () => {
     ["invalid-governed-kind", { memory_kind: "rule" }],
     ["invalid-governed-semantic-type", { memory_semantic_type: "instruction" }],
     ["invalid-governed-content-hash", { memory_content_hash: "not-a-hash" }],
+    ["unverifiable-legacy-content-hash", { memory_content_hash: "a".repeat(36) }],
     ["unknown-source", { source: "external_code_graph" }],
     ["entity-text-as-memory", {
       source: "entity_graph", node_type: "memory", source_ref: "entity-a",

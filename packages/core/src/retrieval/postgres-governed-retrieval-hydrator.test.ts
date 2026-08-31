@@ -1,7 +1,10 @@
 import { describe, expect, test, vi } from "vitest";
 
 import type { MemoryScope } from "../domain/types.js";
-import { computeContentHash } from "../scoring/hash-utils.js";
+import {
+  computeCanonicalContentHash,
+  computeContentHash,
+} from "../scoring/hash-utils.js";
 import {
   GovernedRetrievalEngine,
   type GovernedRetrievalCandidate,
@@ -231,6 +234,7 @@ describe("Postgres governed retrieval hydrator", () => {
     const [, params] = query.mock.calls[0] as [string, readonly unknown[]];
     const [sql] = query.mock.calls[0] as [string, readonly unknown[]];
     expect(sql).toContain("created_at_ms");
+    expect(sql).toContain("importance::double precision AS importance");
     expect(sql).toContain("created_at) * 1000)::text AS updated_at_ms");
     expect(sql).not.toContain("epoch FROM updated_at");
     expect(params).toEqual([
@@ -292,6 +296,34 @@ describe("Postgres governed retrieval hydrator", () => {
       },
       evidenceIds: ["evidence-a"],
     });
+  });
+
+  test("兼容 Markdown 工作集 SHA-256，并把 legacy 自由类别归一为 other", async () => {
+    const text = "Always use the governed retrieval path.";
+    const metadata = governance();
+    const native = (metadata.governance as Record<string, unknown>)
+      .native as Record<string, unknown>;
+    native.category = "configuration";
+    const { hydrator } = harness([memoryRow({
+      content_hash: computeCanonicalContentHash(text),
+      category: "configuration",
+      metadata,
+    })]);
+
+    await expect(hydrator.hydrate(hydrationInput())).resolves.toMatchObject({
+      record: {
+        contentHash: computeCanonicalContentHash(text),
+        category: "other",
+        metadata: {
+          governance: { native: { category: "configuration" } },
+        },
+      },
+    });
+  });
+
+  test("不可验证的 36 位 legacy content hash 继续 fail closed", async () => {
+    const { hydrator } = harness([memoryRow({ content_hash: "a".repeat(36) })]);
+    await expect(hydrator.hydrate(hydrationInput())).resolves.toBeUndefined();
   });
 
   test("保留 MemoryKind + 可选 semanticType，不把 5 type 误设为通用召回前提", async () => {

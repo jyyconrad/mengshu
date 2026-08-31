@@ -21,10 +21,12 @@ import {
   expandHome,
   resolveConfigPath,
   resolveEnvPath,
+  resolveHomeDir,
   resolveLegacyHomeDir,
 } from "../core/paths.js";
 import type { MemoryService, StoreMemoryInput } from "../core/service-types.js";
 import { normalizeScope } from "../core/scope.js";
+import { projectWorkspaceBindings, readRegistry } from "../core/registry.js";
 import type { MemoryKind, MemoryRecord, MemoryScope, MemorySemanticType } from "../core/types.js";
 import { Embeddings } from "../processing/embeddings.js";
 import { computeContentHash } from "../processing/hash-utils.js";
@@ -35,6 +37,15 @@ import {
   type McpStdioServerOptions,
   type RunningMcpStdioServer,
 } from "../packages/mcp/src/stdio-server.js";
+import { startRuntimeClientMcpStdioServer } from
+  "../packages/mcp/src/runtime-client-proxy.js";
+import {
+  RuntimeClient,
+  createFetchRuntimeClientTransport,
+  createUnixSocketRuntimeClientTransport,
+} from "../packages/api/src/runtime-client.js";
+import { fingerprintRuntimeHome } from
+  "../packages/core/src/runtime/host-contract.js";
 import {
   loadMcpServerAuthorityFromEnv,
   type McpServerAuthorityConfig,
@@ -51,6 +62,39 @@ const DEFAULT_OPENCLAW_PLUGIN_CONFIG_PATH = path.join(resolveLegacyHomeDir(), "c
 /** 旧版 .env（仅用于兼容回退）。 */
 const LEGACY_ENV_PATH = path.join(resolveLegacyHomeDir(), ".env");
 const OPENCLAW_PLUGIN_CONFIG_KEYS = ["mengshu-openclaw", "memory-autodb", "mengshu"] as const;
+
+export function resolveMcpRuntimeUrl(
+  cfg: Pick<MemoryConfig, "server">,
+  explicit = process.env.MENGSHU_RUNTIME_URL,
+): string {
+  const configuredHost = cfg.server?.host ?? "127.0.0.1";
+  const host = configuredHost === "0.0.0.0"
+    ? "127.0.0.1"
+    : configuredHost === "::"
+    ? "[::1]"
+    : configuredHost;
+  const url = new URL(explicit?.trim() || `http://${host}:${cfg.server?.port ?? 3847}`);
+  if ((url.protocol !== "http:" && url.protocol !== "https:") ||
+      !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+      (url.username.length > 0 || url.password.length > 0)) {
+    throw new Error("Mengshu RuntimeClient requires a credential-free loopback URL");
+  }
+  return url.toString();
+}
+
+export function resolveMcpRuntimeSocketPath(
+  runtimeHome = resolveHomeDir(),
+  explicit = process.env.MENGSHU_RUNTIME_SOCKET,
+): string | undefined {
+  const runRoot = path.resolve(runtimeHome, "run");
+  const candidate = explicit?.trim()
+    ? path.resolve(expandHome(explicit.trim()))
+    : path.join(runRoot, "mengshu.sock");
+  if (path.dirname(candidate) !== runRoot) {
+    throw new Error("Mengshu runtime socket must be directly under MENGSHU_HOME/run");
+  }
+  return fs.existsSync(candidate) || explicit?.trim() ? candidate : undefined;
+}
 
 function resolveMaybeRelative(input: string, baseDir: string): string {
   const expanded = expandHome(input);
@@ -297,6 +341,7 @@ export function createStandaloneMcpStdioServerOptions(
   runtime: MengshuRuntime,
   service: MemoryService,
   authorityConfig: McpServerAuthorityConfig,
+  projectWorkspaceByProjectId?: Readonly<Record<string, string>>,
 ): McpStdioServerOptions {
   return {
     service,
@@ -306,6 +351,7 @@ export function createStandaloneMcpStdioServerOptions(
     forgetCapability: runtime.authorityScopedForgetCapability,
     authority: authorityConfig.authority,
     defaultScope: authorityConfig.defaultScope,
+    projectWorkspaceByProjectId,
     agentFastPath: runtime.agentFastPath,
     memoryAssets: runtime.memoryViewAssets,
     knowledgeResources: runtime.knowledgeResources,
@@ -343,6 +389,34 @@ export async function runStandaloneMcpServer(): Promise<void> {
   const rawConfig = readConfig(configPath);
   const cfg = memoryConfigSchema.parse(rawConfig);
   const defaultScope: MemoryScope = authorityConfig.defaultScope;
+  if (process.env.MENGSHU_MCP_DIRECT_DIAGNOSTIC !== "1") {
+    const socketPath = resolveMcpRuntimeSocketPath();
+    const client = new RuntimeClient({
+      transport: socketPath
+        ? createUnixSocketRuntimeClientTransport({
+            socketPath,
+            bearerToken: cfg.server?.secret,
+          })
+        : createFetchRuntimeClientTransport({
+            baseUrl: resolveMcpRuntimeUrl(cfg),
+            bearerToken: cfg.server?.secret,
+          }),
+      expectedHomeFingerprint: fingerprintRuntimeHome(resolveHomeDir()),
+    });
+    let running: RunningMcpStdioServer | undefined;
+    try {
+      running = await startRuntimeClientMcpStdioServer(client);
+      process.stderr.write(
+        `mengshu MCP client connected via ${socketPath ? "unix" : "loopback"} (${configPath})\n`,
+      );
+      const reason = await waitForMcpServerShutdown(running);
+      if (reason === "SIGINT") process.exitCode = 130;
+      if (reason === "SIGTERM") process.exitCode = 143;
+    } finally {
+      await running?.close();
+    }
+    return;
+  }
   const runtime = createMengshuRuntime({
     config: cfg,
     resolvedDbPath: resolveDbPath(cfg, configPath),
@@ -363,9 +437,14 @@ export async function runStandaloneMcpServer(): Promise<void> {
       embeddingModel: cfg.embedding.model,
     });
 
-    process.stderr.write(`mengshu MCP started (${configPath})\n`);
+    process.stderr.write(`mengshu MCP direct diagnostic started (${configPath})\n`);
     running = await startMcpStdioServer(
-      createStandaloneMcpStdioServerOptions(runtime, service, authorityConfig),
+      createStandaloneMcpStdioServerOptions(
+        runtime,
+        service,
+        authorityConfig,
+        projectWorkspaceBindings(readRegistry()),
+      ),
     );
     const reason = await waitForMcpServerShutdown(running);
     if (reason === "SIGINT") process.exitCode = 130;

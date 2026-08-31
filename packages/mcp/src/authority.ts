@@ -6,6 +6,8 @@ import type { MemoryScope } from "../../core/src/domain/types.js";
 
 const CLIENT_FIELDS = ["appId", "projectId", "agentId", "namespace", "visibility"] as const;
 
+export type McpProjectWorkspaceBindings = Readonly<Record<string, string>>;
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -33,6 +35,7 @@ export function createExactMcpAuthority(scope: MemoryScope): AuthorityScope {
 export function resolveMcpAuthorityScope(
   authority: AuthorityScope,
   clientScope: unknown,
+  projectWorkspaceByProjectId?: McpProjectWorkspaceBindings,
 ): MemoryScope {
   const requested = { ...asRecord(clientScope) };
   // Identity is authenticated by the server. Client copies are ignored, never merged.
@@ -47,5 +50,45 @@ export function resolveMcpAuthorityScope(
       requested[field] = allowlist[0];
     }
   }
-  return resolveAuthorityScope(authority, requested);
+  const resolved = resolveAuthorityScope(authority, requested);
+  if (resolved.workspaceId !== undefined || projectWorkspaceByProjectId === undefined) {
+    return resolved;
+  }
+  if (!Object.prototype.hasOwnProperty.call(projectWorkspaceByProjectId, resolved.projectId)) {
+    return resolved;
+  }
+  return resolveAuthorityScope(
+    { ...authority, workspaceId: projectWorkspaceByProjectId[resolved.projectId] },
+    requested,
+  );
+}
+
+/** Snapshot and validate registry bindings against the authority allowlist at startup. */
+export function snapshotMcpProjectWorkspaceBindings(
+  authority: AuthorityScope,
+  bindings?: McpProjectWorkspaceBindings,
+): McpProjectWorkspaceBindings | undefined {
+  if (authority.workspaceId !== undefined || bindings === undefined) return undefined;
+
+  const snapshot = Object.create(null) as Record<string, string>;
+  for (const projectId of authority.allow.projectIds) {
+    if (!Object.prototype.hasOwnProperty.call(bindings, projectId)) continue;
+    const resolved = resolveAuthorityScope(
+      { ...authority, workspaceId: bindings[projectId] },
+      {
+        appId: authority.allow.appIds[0],
+        projectId,
+        agentId: authority.allow.agentIds[0],
+        namespace: authority.allow.namespaces[0],
+        visibility: authority.allow.visibilities[0],
+      },
+    );
+    Object.defineProperty(snapshot, projectId, {
+      value: resolved.workspaceId!,
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return Object.freeze(snapshot);
 }

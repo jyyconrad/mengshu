@@ -1,5 +1,11 @@
 import type { MemorySemanticType } from "../domain/types.js";
 import type { DocumentGovernanceProposal } from "./types.js";
+import type { MemoryScope } from "../domain/types.js";
+import type { MemoryPolicyResolver } from "../policy/memory-policy-overlay.js";
+import type {
+  MemoryPolicyResolutionReceipt,
+  ResolvedMemoryPolicy,
+} from "../policy/types.js";
 
 export type DocumentGovernanceReasonCode =
   | "SCOPE_MISMATCH"
@@ -18,7 +24,8 @@ export type DocumentGovernanceReasonCode =
   | "CLAIM_OWNERSHIP_CHANGE"
   | "DESTRUCTIVE_ACTION"
   | "RISK_REVIEW_REQUIRED"
-  | "MODEL_REVIEW_REQUIRED";
+  | "MODEL_REVIEW_REQUIRED"
+  | "POLICY_RESOLUTION_INVALID";
 
 export interface EvaluateDocumentGovernanceProposalInput {
   readonly proposal: DocumentGovernanceProposal;
@@ -31,6 +38,7 @@ export interface EvaluateDocumentGovernanceProposalInput {
   readonly sensitiveDisclosureRefs: readonly string[];
   readonly previousSemanticType?: MemorySemanticType;
   readonly policyVersion: string;
+  readonly policyResolution?: MemoryPolicyResolutionReceipt;
 }
 
 export interface DocumentGovernanceEvaluation {
@@ -40,6 +48,23 @@ export interface DocumentGovernanceEvaluation {
   readonly dispositionCoverage: number;
   readonly claimEvidenceCoverage: number;
   readonly policyVersion: string;
+  readonly policyResolution?: MemoryPolicyResolutionReceipt;
+}
+
+export interface DocumentOrganizationPolicyContext {
+  readonly systemPromptSuffix: string;
+  readonly resolved: ResolvedMemoryPolicy;
+}
+
+export async function resolveDocumentOrganizationPolicy(
+  resolver: Pick<MemoryPolicyResolver, "resolve">,
+  scope: MemoryScope,
+): Promise<DocumentOrganizationPolicyContext> {
+  const resolved = await resolver.resolve({ scope, layer: "document_organization" });
+  return Object.freeze({
+    systemPromptSuffix: `# 受限记忆策略（系统合同优先）\n${resolved.rendered}`,
+    resolved,
+  });
 }
 
 function unique(values: readonly string[]): boolean {
@@ -73,6 +98,11 @@ export function evaluateDocumentGovernanceProposal(
 
   if (proposal.scopeFingerprint !== input.expectedScopeFingerprint) {
     quarantine.push("SCOPE_MISMATCH");
+  }
+  if (input.policyResolution !== undefined &&
+      (input.policyResolution.layer !== "document_organization" ||
+       input.policyResolution.scopeFingerprint !== input.expectedScopeFingerprint)) {
+    quarantine.push("POLICY_RESOLUTION_INVALID");
   }
   if (proposal.expectedLatestVersion !== input.expectedLatestVersion) {
     quarantine.push("VERSION_CONFLICT");
@@ -155,5 +185,8 @@ export function evaluateDocumentGovernanceProposal(
     dispositionCoverage: ratio(covered, input.selectedInformationRefs.length),
     claimEvidenceCoverage: ratio(groundedClaims, claimCount),
     policyVersion: input.policyVersion,
+    ...(input.policyResolution === undefined
+      ? {}
+      : { policyResolution: Object.freeze({ ...input.policyResolution }) }),
   });
 }

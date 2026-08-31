@@ -7,6 +7,7 @@ import {
 } from "../../service/write-kernel-postgres-transaction.js";
 import type { WriteMemoryRecord } from "../../service/write-kernel.js";
 import { PostgresProvider } from "./postgres.js";
+import { CURRENT_SCHEMA_VERSION } from "../migrations/schema-migrations.js";
 import { PostgresCandidateDedupReadAdapter } from
   "../../lifecycle/candidate-dedup-read-port.js";
 import { PostgresActiveMemoryDerivationReadPort } from
@@ -23,6 +24,8 @@ import { PostgresSlotInvalidationOutboxRepository } from
   "../../context/postgres-slot-invalidation-outbox.js";
 import { PostgresContextAssemblyReceiptRepository } from
   "../../context/postgres-assembly-receipt.js";
+import { PostgresTemporalMemoryRepository } from
+  "../../temporal/postgres-repository.js";
 import { PostgresActiveDerivationOutboxRepository } from
   "../../../../../server/postgres-active-derivation-outbox.js";
 import { isProviderOwnedDuplicateEvidenceLinkPort } from
@@ -57,6 +60,35 @@ function result(rows: readonly Record<string, unknown>[] = []) {
 }
 
 describe("PostgresProvider F0 factories", () => {
+  test("M1 temporal repository reuses provider pool and requires the current temporal schema", async () => {
+    const pool = {
+      query: vi.fn(async () => result()),
+      connect: vi.fn(),
+      end: vi.fn(),
+    };
+    const scope = {
+      tenantId: "tenant-a", userId: "user-a", appId: "codex",
+      projectId: "project-a", agentId: "agent-a", namespace: "memories",
+      visibility: "private" as const,
+    };
+    const repository = providerWithPool(pool, CURRENT_SCHEMA_VERSION)
+      .createTemporalMemoryRepository();
+
+    expect(repository).toBeInstanceOf(PostgresTemporalMemoryRepository);
+    await expect(repository.getHead(scope, "release-process")).resolves.toBeUndefined();
+    expect(pool.query).toHaveBeenCalledOnce();
+
+    const stalePool = { query: vi.fn(), connect: vi.fn(), end: vi.fn() };
+    const stale = providerWithPool(stalePool, CURRENT_SCHEMA_VERSION - 1)
+      .createTemporalMemoryRepository();
+    await expect(stale.getHead(scope, "release-process"))
+      .rejects.toThrow(new RegExp(
+        `temporal memory repository.*schema v${CURRENT_SCHEMA_VERSION}`,
+        "i",
+      ));
+    expect(stalePool.query).not.toHaveBeenCalled();
+  });
+
   test("active derivation outbox pool reuses a dedicated provider client and requires schema v11", async () => {
     const client = {
       query: vi.fn(async (sql: string) => sql === "BEGIN" || sql === "COMMIT"
@@ -652,6 +684,129 @@ describe("PostgresProvider F0 factories", () => {
     expect(calls.some((sql) => sql.includes("INSERT INTO mengshu_write_receipts"))).toBe(true);
     expect(calls.at(-1)).toBe("COMMIT");
     expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  test("temporal replaceText 在同一 kernel transaction 推进 lineage 并写双 journal", async () => {
+    const calls: string[] = [];
+    const oldId = "11111111-1111-4111-8111-111111111110";
+    const newId = "11111111-1111-4111-8111-111111111111";
+    const scopeFingerprint = "c".repeat(64);
+    const query = vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+      calls.push(sql);
+      if (sql.includes("temporal-repository:receipt-lock")) return result();
+      if (sql.includes("temporal-repository:head-lock")) {
+        return result([{
+          scope_fingerprint: scopeFingerprint,
+          lineage_id: "release-process",
+          latest_revision: 1,
+          current_version_id: oldId,
+          current_version_revision: 1,
+          updated_at: 1_000,
+        }]);
+      }
+      if (sql.includes("temporal-repository:close-head")) return result([{ id: oldId }]);
+      if (/INSERT INTO "memories"/.test(sql)) return result([{ id: newId }]);
+      if (sql.includes("temporal-repository:stamp-version")) return result([{ id: newId }]);
+      if (sql.includes("temporal-repository:advance-head")) {
+        return result([{ latest_revision: 2 }]);
+      }
+      if (sql.includes("temporal-repository:insert-receipt")) {
+        return result([{ receipt_id: "d".repeat(64) }]);
+      }
+      if (sql.includes("temporal-repository:insert-outbox")) {
+        return result([{ event_id: params[0] as string }]);
+      }
+      return result();
+    });
+    const client: PostgresMemoryWriteKernelClient = {
+      query: query as unknown as PostgresMemoryWriteKernelClient["query"],
+      release: vi.fn(),
+    };
+    const provider = providerWithPool({
+      query: vi.fn(),
+      connect: vi.fn(async () => client),
+    }, CURRENT_SCHEMA_VERSION);
+    const memory: WriteMemoryRecord = {
+      id: newId,
+      commandType: "correctMemory",
+      mutation: "content",
+      scope: {
+        tenantId: "tenant-a", userId: "user-a", appId: "codex",
+        projectId: "project-a", agentId: "agent-a", namespace: "memories",
+        visibility: "private",
+      },
+      text: "CI approval release",
+      vector: [0.1, 0.2],
+      route: "active",
+      valueScore: 0.9,
+      importance: 0.7,
+      kind: "decision",
+      semanticType: "rules",
+      confidence: 0.9,
+      provenance: { source: "user" },
+      evidenceIds: ["evidence-a"],
+      governance: { candidate: { confidence: 0.9 } },
+      metadata: {
+        embeddingSpaceId: `embedding-space:v1:${"a".repeat(64)}`,
+        embeddingSpaceState: "known-queryable",
+      },
+      createdAt: 2_000,
+      correctsId: oldId,
+      temporal: {
+        lineageId: "release-process",
+        expectedHeadRevision: 1,
+        expectedHeadVersionId: oldId,
+        validFrom: 2_000,
+        transitionType: "evolved",
+        receipt: {
+          id: "d".repeat(64),
+          idempotencyKey: "evolve-1",
+          requestHash: "b".repeat(64),
+          scopeFingerprint,
+          lineageId: "release-process",
+          transitionType: "evolved",
+          previousVersionId: oldId,
+          versionId: newId,
+          revision: 2,
+          occurredAt: 2_000,
+        },
+      },
+    };
+    const identity = {
+      tenantId: "tenant-a", userId: "user-a", clientKey: "evolve-1",
+      storageKey: "a".repeat(64),
+    };
+    await provider.createMemoryWriteKernelTransactionPort().transaction(async (tx) => {
+      await tx.getReceipt(identity);
+      const mutation = await tx.writeMemory(memory);
+      await tx.appendAudit({
+        action: "memory.write", recordType: "memory", memoryId: mutation.memoryId,
+        requestFingerprint: "b".repeat(64), commandType: "correctMemory",
+        scope: memory.scope, route: "active", at: memory.createdAt,
+      });
+      await tx.appendOutbox({
+        topic: "memory.written", recordType: "memory", memoryId: mutation.memoryId,
+        requestFingerprint: "b".repeat(64), commandType: "correctMemory",
+        scope: memory.scope, at: memory.createdAt,
+      });
+      await tx.saveReceipt(createMemoryWriteReceipt(identity, "b".repeat(64), {
+        status: "persisted", route: "active", recordType: "memory",
+        memoryId: mutation.memoryId, stored: mutation.stored,
+      }));
+    });
+
+    for (const marker of [
+      "temporal-repository:close-head",
+      "temporal-repository:stamp-version",
+      "temporal-repository:advance-head",
+      "temporal-repository:insert-receipt",
+      "temporal-repository:insert-outbox",
+      "INSERT INTO mengshu_write_receipts",
+    ]) {
+      expect(calls.some((sql) => sql.includes(marker))).toBe(true);
+    }
+    expect(calls.filter((sql) => sql === "BEGIN")).toHaveLength(1);
+    expect(calls.filter((sql) => sql === "COMMIT")).toHaveLength(1);
   });
 
   test("candidate route 使用同一 client 写候选表和 candidate journal", async () => {

@@ -25,6 +25,11 @@ import {
   type MemoryAssetReadCapability,
   type MemoryKnowledgeResourceCapability,
   type MemorySessionReceiptCapability,
+  type MemoryTemporalCapability,
+  type MemoryWorkingSetCapability,
+  type MemoryWorkingSetBridgeCapability,
+  type MemorySkillArtifactCapability,
+  type MemoryPolicyCapability,
 } from "./tools.js";
 import { formatMcpToolError } from "./tool-error.js";
 
@@ -46,6 +51,11 @@ export interface McpMemoryServerOptions {
   memoryAssets?: MemoryAssetReadCapability;
   knowledgeResources?: MemoryKnowledgeResourceCapability;
   sessionReceipts?: MemorySessionReceiptCapability;
+  temporalMemory?: MemoryTemporalCapability;
+  sessionWorkingSet?: MemoryWorkingSetCapability;
+  sessionWorkingSetBridge?: MemoryWorkingSetBridgeCapability;
+  skillArtifacts?: MemorySkillArtifactCapability;
+  memoryPolicy?: MemoryPolicyCapability;
   pipeline?: IngestionPipeline;
   llmClient?: LlmClient;
 }
@@ -57,7 +67,12 @@ export interface McpServerAuthorityConfig {
 
 const MAX_AUTHORITY_BYTES = 64 * 1024;
 const TOP_LEVEL_KEYS = ["authority", "defaultScope"] as const;
-const AUTHORITY_KEYS = ["tenantId", "userId", "allow"] as const;
+const AUTHORITY_REQUIRED_KEYS = ["tenantId", "userId", "allow"] as const;
+const AUTHORITY_KEYS = [
+  ...AUTHORITY_REQUIRED_KEYS,
+  "sessionId",
+  "workspaceId",
+] as const;
 const ALLOW_KEYS = [
   "appIds",
   "projectIds",
@@ -172,7 +187,7 @@ export function parseMcpServerAuthorityConfig(
     const authorityRecord = readExactDataRecord(
       root.authority,
       AUTHORITY_KEYS,
-      AUTHORITY_KEYS,
+      AUTHORITY_REQUIRED_KEYS,
     );
     const allowRecord = readExactDataRecord(authorityRecord.allow, ALLOW_KEYS, ALLOW_KEYS);
     const defaultScopeRecord = readExactDataRecord(
@@ -209,6 +224,10 @@ export function parseMcpServerAuthorityConfig(
           /[\u0000-\u001f\u007f]/.test(value))
       ) {
         throw authorityConfigError("is invalid");
+      }
+      const authorityValue = authorityRecord[field];
+      if (authorityValue !== undefined && authorityValue !== value) {
+        throw authorityConfigError("does not match defaultScope");
       }
     }
     const resolved = resolveAuthorityScope(

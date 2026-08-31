@@ -7,8 +7,8 @@
 
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { readFile } from "node:fs/promises";
-import { dirname, join, normalize } from "node:path";
+import { chmod, lstat, mkdir, readFile, unlink } from "node:fs/promises";
+import { dirname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MemoryService } from "../core/service-types.js";
 import { createRestRouter } from "../adapters/rest/router.js";
@@ -18,11 +18,23 @@ import type { JobRepository } from "../storage/repositories/types.js";
 import type { MemoryScope } from "../packages/core/src/domain/types.js";
 import type { AuthorityScope } from "../packages/core/src/domain/authority-scope.js";
 import { createExactRestAuthority } from "../packages/api/src/rest/authority.js";
+import { randomUUID } from "node:crypto";
+import { resolveHomeDir } from "../packages/core/src/runtime/paths.js";
+import { createRuntimeControlPlane } from "./runtime-control-plane.js";
+import type { RuntimeHostControlPlane } from
+  "../packages/core/src/runtime/host-contract.js";
 
 export interface StartMemoryServerOptions {
   service: MemoryService;
   /** Runtime 持有的统一 Write Kernel 能力；缺失时 REST 写入保持 fail-closed。 */
   memoryWrite?: RestRouterOptions["memoryWrite"];
+  runtimeMcp?: RestRouterOptions["runtimeMcp"];
+  memoryEvolution?: RestRouterOptions["memoryEvolution"];
+  sessionWorkingSet?: RestRouterOptions["sessionWorkingSet"];
+  sessionWorkingSetMemoryBridge?: RestRouterOptions["sessionWorkingSetMemoryBridge"];
+  skillArtifacts?: RestRouterOptions["skillArtifacts"];
+  memoryPolicyOverlays?: RestRouterOptions["memoryPolicyOverlays"];
+  memoryPolicyResolver?: RestRouterOptions["memoryPolicyResolver"];
   graph?: RestRouterOptions["graph"];
   console?: RestRouterOptions["console"];
   agentFastPath?: RestRouterOptions["agentFastPath"];
@@ -32,6 +44,8 @@ export interface StartMemoryServerOptions {
   authority?: AuthorityScope;
   host?: string;
   port?: number;
+  /** Optional owner-only Unix socket under $MENGSHU_HOME/run; takes precedence over TCP. */
+  socketPath?: string;
   secret?: string;
   requireHttps?: boolean;
   /** 后台 job worker：注入后 daemon 在 listen 期间轮询 drain 队列，stop 时清理。 */
@@ -40,6 +54,8 @@ export interface StartMemoryServerOptions {
   } & Omit<JobWorkerLoopOptions, "workerId"> & { workerId?: string };
   /** 新 RuntimeHost 的渐进迁移接点；未注入时保持原 daemon 行为。 */
   runtimeHost?: MemoryServerLifecycleHost;
+  /** Canonical MENGSHU_HOME used only to derive the non-reversible control fingerprint. */
+  runtimeHome?: string;
   /** 仅用于 composition/test 注入；生产默认使用 node:http。 */
   listenerFactory?: MemoryServerListenerFactory;
   /** 仅注册回调，不允许 daemon 直接 process.exit。 */
@@ -152,9 +168,15 @@ function requestPath(url: string | undefined): string {
   return parsed.pathname;
 }
 
-function writeJson(response: http.ServerResponse, status: number, body: unknown): void {
+function writeJson(
+  response: http.ServerResponse,
+  status: number,
+  body: unknown,
+  headers: Readonly<Record<string, string>> = {},
+): void {
   response.statusCode = status;
   response.setHeader("content-type", "application/json; charset=utf-8");
+  for (const [name, value] of Object.entries(headers)) response.setHeader(name, value);
   response.end(JSON.stringify(body));
 }
 
@@ -300,6 +322,7 @@ function listen(
   onLateBind: () => Promise<boolean>,
   onBound: () => void,
   errorIsTerminal: boolean,
+  socketPath?: string,
 ): ListenerBindOperation {
   let finishCompletion!: (closed: boolean) => void;
   let completionSettled = false;
@@ -321,7 +344,7 @@ function listen(
     };
     listener.once("error", onError);
     try {
-      listener.listen(port, host, () => {
+      const callback = () => {
         if (settled) {
           if (isCancelled()) {
             try {
@@ -354,12 +377,53 @@ function listen(
         }
         finishCompletion(true);
         resolve();
-      });
+      };
+      if (socketPath) {
+        (listener.listen as unknown as (path: string, callback: () => void) => MemoryServerListener)(
+          socketPath,
+          callback,
+        );
+      } else {
+        listener.listen(port, host, callback);
+      }
     } catch (error) {
       onError(error, true);
     }
   });
   return { result, completion };
+}
+
+async function prepareUnixSocket(socketPath: string, runtimeHome: string): Promise<string> {
+  if (!isAbsolute(socketPath) || /[\u0000-\u001f\u007f]/.test(socketPath)) {
+    throw new MemoryServerDaemonError("DAEMON_START_FAILED");
+  }
+  const runRoot = resolve(runtimeHome, "run");
+  const resolved = resolve(socketPath);
+  if (dirname(resolved) !== runRoot || relative(runRoot, resolved).startsWith("..")) {
+    throw new MemoryServerDaemonError("DAEMON_START_FAILED");
+  }
+  await mkdir(runRoot, { recursive: true, mode: 0o700 });
+  await chmod(runRoot, 0o700);
+  try {
+    await lstat(resolved);
+    throw new MemoryServerDaemonError("DAEMON_START_FAILED");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return resolved;
+}
+
+async function removeUnixSocket(socketPath: string | undefined): Promise<boolean> {
+  if (!socketPath) return true;
+  try {
+    const stat = await lstat(socketPath);
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (!stat.isSocket() || (uid !== undefined && stat.uid !== uid)) return false;
+    await unlink(socketPath);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
 }
 
 interface ListenerBindOperation {
@@ -405,11 +469,19 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
   private cleanupFailed = false;
   private readonly lifecycleScheduler: MemoryServerLifecycleScheduler;
   private readonly operationTimeoutMs: number;
+  private readonly runtimeControl?: RuntimeHostControlPlane;
 
   constructor(private readonly options: StartMemoryServerOptions) {
     this.lifecycleScheduler = options.lifecycleScheduler ?? DEFAULT_LIFECYCLE_SCHEDULER;
     this.operationTimeoutMs = options.lifecycleOperationTimeoutMs ??
       options.runtimeHostStopTimeoutMs ?? DEFAULT_RUNTIME_HOST_STOP_TIMEOUT_MS;
+    this.runtimeControl = options.runtimeHost
+      ? createRuntimeControlPlane({
+          runtimeHome: options.runtimeHome ?? resolveHomeDir(),
+          ownerId: `runtime-${randomUUID()}`,
+          host: options.runtimeHost,
+        })
+      : undefined;
   }
 
   snapshot(): MemoryServerDaemonSnapshot {
@@ -430,6 +502,20 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
       mode: this.options.runtimeHost ? "runtime_host" : "legacy",
       ...(this.failureCode ? { failureCode: this.failureCode } : {}),
     });
+  }
+
+  private runtimeResponseHeaders(): Record<string, string> {
+    if (!this.runtimeControl) return {};
+    try {
+      const snapshot = this.runtimeControl.snapshot();
+      return {
+        "x-mengshu-runtime-owner": snapshot.ownerId,
+        "x-mengshu-runtime-home": snapshot.homeFingerprint,
+        "x-mengshu-runtime-generation": String(snapshot.generation),
+      };
+    } catch {
+      return {};
+    }
   }
 
   start(): Promise<RunningMemoryServer> {
@@ -469,6 +555,12 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
     try {
       const host = this.options.host ?? "127.0.0.1";
       const port = this.options.port ?? 3847;
+      const socketPath = this.options.socketPath === undefined
+        ? undefined
+        : await prepareUnixSocket(
+            this.options.socketPath,
+            this.options.runtimeHome ?? resolveHomeDir(),
+          );
       if (this.options.runtimeHost && this.options.worker) {
         throw new MemoryServerDaemonError("DAEMON_START_FAILED");
       }
@@ -488,7 +580,15 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
       const authority = this.options.authority ?? createExactRestAuthority(this.options.defaultScope!);
       const router = createRestRouter({
         service: this.options.service,
+        runtimeControl: this.runtimeControl,
+        runtimeMcp: this.options.runtimeMcp,
         memoryWrite: this.options.memoryWrite,
+        memoryEvolution: this.options.memoryEvolution,
+        sessionWorkingSet: this.options.sessionWorkingSet,
+        sessionWorkingSetMemoryBridge: this.options.sessionWorkingSetMemoryBridge,
+        skillArtifacts: this.options.skillArtifacts,
+        memoryPolicyOverlays: this.options.memoryPolicyOverlays,
+        memoryPolicyResolver: this.options.memoryPolicyResolver,
         forgetService: typeof (this.options.service as unknown as { forget?: unknown }).forget === "function"
           ? this.options.service as never
           : undefined,
@@ -519,7 +619,10 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
             protocol: "http",
           };
           const restResponse = await router.handle(restRequest);
-          writeJson(response, restResponse.status, restResponse.body);
+          writeJson(response, restResponse.status, restResponse.body, {
+            ...restResponse.headers,
+            ...this.runtimeResponseHeaders(),
+          });
         } catch (error) {
           const invalidJson = error instanceof Error && error.message === "Invalid JSON body";
           if (!invalidJson) {
@@ -544,7 +647,7 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
           }
           writeJson(response, invalidJson ? 400 : 500, {
             error: invalidJson ? "Invalid JSON body" : "Internal server error",
-          });
+          }, this.runtimeResponseHeaders());
         }
       };
       if (this.options.runtimeHost) {
@@ -584,6 +687,7 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
         () => this.closeLateBoundListener(),
         () => { this.installListenerRuntimeErrorHandler(); },
         !this.options.listenerFactory || this.listener.listenErrorIsTerminal === true,
+        socketPath,
       );
       this.listenerBindOperation = listenerBindOperation;
       const listenerBound = await settleWithin(
@@ -595,6 +699,7 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
         this.listenerBindCancelled = true;
         throw new MemoryServerDaemonError("DAEMON_START_FAILED");
       }
+      if (socketPath) await chmod(socketPath, 0o600);
       if (this.stoppingRequested()) throw new MemoryServerDaemonError("DAEMON_STOPPING");
       if (this.options.runtimeHost && !this.ownedHostIsReady()) {
         startFailureCode = "DAEMON_HOST_NOT_READY";
@@ -602,7 +707,9 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
       }
 
       const address = this.listener.address();
-      if (!address || typeof address === "string" || !isPositiveSafeInteger(address.port)) {
+      if (!address || (socketPath
+        ? typeof address !== "string" || resolve(address) !== socketPath
+        : typeof address === "string" || !isPositiveSafeInteger(address.port))) {
         throw new MemoryServerDaemonError("DAEMON_START_FAILED");
       }
       this.workerLoop = this.options.worker
@@ -616,7 +723,9 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
         : undefined;
 
       this.running = Object.freeze({
-        url: `http://${host}:${address.port}`,
+        url: socketPath
+          ? `http+unix://${encodeURIComponent(socketPath)}`
+          : `http://${host}:${(address as AddressInfo).port}`,
         server: this.listener as http.Server,
         stop: () => this.stop(),
         snapshot: () => this.snapshot(),
@@ -643,6 +752,7 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
       this.listenerBindCancelled = true;
       const signalUnregistered = this.unregisterSignalOnce();
       const listenerClosed = await this.closeListenerWithinBoundary();
+      const socketRemoved = await removeUnixSocket(this.options.socketPath);
       const listenerErrorHandlerRemoved = this.removeListenerRuntimeErrorHandlerOnce();
       const workerStopped = await this.stopLegacyWorker();
       const hostStopped = await this.stopHostOnce();
@@ -650,7 +760,7 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
         ? await this.lateHostStopPromise
         : true;
       if (this.state === "stopping") throw new MemoryServerDaemonError("DAEMON_STOPPING");
-      if (!signalUnregistered || !listenerClosed || !listenerErrorHandlerRemoved ||
+      if (!signalUnregistered || !listenerClosed || !socketRemoved || !listenerErrorHandlerRemoved ||
           !workerStopped || !hostStopped || !lateHostStopped || this.cleanupFailed) {
         this.state = "failed";
         this.failureCode = "DAEMON_STOP_FAILED";
@@ -679,12 +789,13 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
     const workerStoppedAfterStart = await this.stopLegacyWorker();
     const hostStoppedAfterStart = await this.stopHostOnce();
     const ownershipDrained = await this.drainLateCleanupOwnership();
+    const socketRemoved = await removeUnixSocket(this.options.socketPath);
 
     if (!signalUnregistered || !signalUnregisteredAfterStart ||
         !listenerClosed || !listenerClosedAfterStart ||
         !listenerErrorHandlerRemoved || !listenerErrorHandlerRemovedAfterStart ||
         !workerStopped || !workerStoppedAfterStart ||
-        !hostStopped || !hostStoppedAfterStart || !ownershipDrained ||
+        !hostStopped || !hostStoppedAfterStart || !ownershipDrained || !socketRemoved ||
         !startSettled || this.cleanupFailed) {
       this.state = "failed";
       this.failureCode = "DAEMON_STOP_FAILED";

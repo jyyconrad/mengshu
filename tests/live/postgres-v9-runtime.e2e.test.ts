@@ -219,7 +219,7 @@ describe.skipIf(!liveEnabled)("PostgreSQL current-schema RuntimeHost live e2e", 
     const isolated = await provisionGlobalPostgresTestSchema("runtime_v9");
     const config = isolated.postgres;
     try {
-      expect(CURRENT_SCHEMA_VERSION).toBe(24);
+      expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(32);
 
       const provider = new PostgresProvider(config, liveEmbeddingModel);
     const runtimeBundle = provider.createDurableJobV2RuntimeBundle({

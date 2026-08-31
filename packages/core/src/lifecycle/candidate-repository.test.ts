@@ -7,7 +7,7 @@
  *   最早 pending 被标 archived 且 statusReason=archived_due_to_session_capacity。
  * - 新写入条目以 pending 状态入库，原条目从 pending 列表移除。
  * 关键边界：
- * - 仅按 sessionId 聚合（不污染其他 session）。
+ * - 按完整 9D canonical scope 聚合，不污染其他 session/tenant/workspace。
  * - 已 archived/expired/approved 状态的旧条目不计入容量。
  * - 缺省 sessionId 时按 full scope 聚合（向后兼容旧调用方）。
  */
@@ -77,8 +77,6 @@ describe("InMemoryCandidateRepository 容量约束 (D-02 / §17.1)", () => {
     const sessionA: MemoryScope = { ...baseScope, sessionId: "session-A" };
     const sessionB: MemoryScope = { ...baseScope, sessionId: "session-B" };
 
-    // 注：list/count 的 scope 过滤用 sameScope（不含 sessionId），无法区分会话，
-    // 因此这里跟踪具体 id 来验证会话隔离。
     const bIds: string[] = [];
     for (let i = 0; i < 3; i++) {
       await repo.enqueue(makeInput(sessionA, `a-${i}`));
@@ -93,6 +91,32 @@ describe("InMemoryCandidateRepository 容量约束 (D-02 / §17.1)", () => {
     for (const id of bIds) {
       const r = await repo.get(id);
       expect(r?.status).toBe("pending");
+    }
+    expect(await repo.count({ scope: sessionA, status: "pending" })).toBe(3);
+    expect(await repo.count({ scope: sessionB, status: "pending" })).toBe(3);
+  });
+
+  it("同名 session 在不同 tenant/workspace/visibility 下保持 exact-scope 隔离", async () => {
+    const repo = new InMemoryCandidateRepository({ config: { maxCandidatesPerSession: 1 } });
+    const privateScope: MemoryScope = {
+      ...baseScope, visibility: "private", workspaceId: "workspace-a",
+    };
+    const otherTenant: MemoryScope = { ...privateScope, tenantId: "other-tenant" };
+    const otherWorkspace: MemoryScope = { ...privateScope, workspaceId: "workspace-b" };
+    const workspaceVisible: MemoryScope = { ...privateScope, visibility: "workspace" };
+    const records = await Promise.all([
+      repo.enqueue(makeInput(privateScope, "private")),
+      repo.enqueue(makeInput(otherTenant, "tenant")),
+      repo.enqueue(makeInput(otherWorkspace, "workspace")),
+      repo.enqueue(makeInput(workspaceVisible, "visible")),
+    ]);
+
+    for (const [candidateScope, candidate] of [
+      [privateScope, records[0]], [otherTenant, records[1]],
+      [otherWorkspace, records[2]], [workspaceVisible, records[3]],
+    ] as const) {
+      expect(await repo.list({ scope: candidateScope, status: "pending" }))
+        .toEqual([candidate]);
     }
   });
 

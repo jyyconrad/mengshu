@@ -19,6 +19,9 @@ import { scopeToKey } from "../domain/scope.js";
 import type { TreeBuffer, TreeLeaf, TreeRepository, TreeSummaryNode, SummaryFaithfulnessConfig } from "./types.js";
 import type { LlmClient } from "../runtime/llm/llm-client.js";
 import { validateFaithfulness } from "./faithfulness.js";
+import type { MemoryPolicyResolver } from "../policy/memory-policy-overlay.js";
+import type { ResolvedMemoryPolicy } from "../policy/types.js";
+import { memoryPolicyCostContext } from "../policy/cost-attribution.js";
 
 export interface SealBufferInput {
   buffer: TreeBuffer;
@@ -27,6 +30,7 @@ export interface SealBufferInput {
   relationIds?: string[];
   llmClient?: LlmClient;
   faithfulnessConfig?: SummaryFaithfulnessConfig;
+  policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
 }
 
 function summaryId(buffer: TreeBuffer, sealedAt: number): string {
@@ -72,6 +76,7 @@ async function generateStructuredSummary(
   llmClient: LlmClient,
   leaves: TreeLeaf[],
   buffer: TreeBuffer,
+  resolvedPolicy?: ResolvedMemoryPolicy,
 ): Promise<string> {
   // 按 eventAt 升序准备输入 leaves
   const inputLeaves: SealInputLeaf[] = leaves
@@ -87,7 +92,7 @@ async function generateStructuredSummary(
       evidenceChunkId: leaf.chunkId,
     }));
 
-  const systemMessage = `你是 mengshu 记忆树摘要器。给定同一来源下的若干条记忆 leaf，压缩为结构化摘要。
+  const baseSystemMessage = `你是 mengshu 记忆树摘要器。给定同一来源下的若干条记忆 leaf，压缩为结构化摘要。
 
 严格要求：
 - 不引入 leaf 中没有的信息（禁止外推）。
@@ -97,6 +102,9 @@ async function generateStructuredSummary(
 - 不要合并相互冲突的规则；冲突写入 openQuestions 或 riskFlags。
 - 每个 keyFact 必须引用 evidenceLeafIds。
 - 输出语言与原文一致。`;
+  const systemMessage = resolvedPolicy === undefined
+    ? baseSystemMessage
+    : `${baseSystemMessage}\n\n# 受限记忆策略（系统合同优先）\n${resolvedPolicy.rendered}`;
 
   const userMessage = `请为以下记忆 leaves 生成结构化摘要：
 
@@ -133,17 +141,23 @@ ${JSON.stringify(inputLeaves, null, 2)}`;
     },
   };
 
-  // 检查 llmClient 是否支持 extractStructured
-  if (typeof (llmClient as any).extractStructured === "function") {
-    const result: SealSummaryOutput = await (llmClient as any).extractStructured({
-      messages: [
+  if (typeof llmClient.extractStructured === "function") {
+    const result = await llmClient.extractStructured<SealSummaryOutput>(
+      [
         { role: "system", content: systemMessage },
         { role: "user", content: userMessage },
       ],
       schema,
-      schemaName: "SealSummaryOutput",
-      modelType: "summarization", // 使用摘要模型
-    });
+      {
+        modelType: "summarization",
+        costContext: memoryPolicyCostContext({
+          scope: buffer.scope,
+          resolvedPolicy,
+          category: "session_summary",
+          operation: "tree.summary",
+        }),
+      },
+    );
 
     // 组装最终 summary（三级结构：title + summary + keyFacts）
     let finalSummary = `# ${result.title}\n\n${result.summary}`;
@@ -186,6 +200,12 @@ export async function sealBuffer(
   const evidenceChunkIds = leaves.map((leaf) => leaf.chunkId);
   const entityIds = Array.from(new Set(leaves.flatMap((leaf) => leaf.entityIds)));
   const eventTimes = leaves.map((leaf) => leaf.eventAt);
+  const resolvedPolicy = input.policyResolver === undefined
+    ? undefined
+    : await input.policyResolver.resolve({
+        scope: input.buffer.scope,
+        layer: "tree_summary",
+      });
 
   // 生成摘要：优先使用 LLM abstractive 摘要，失败则降级到 extractive
   const extractiveSummary = summarizeLeaves(leaves) || `${leaves.length} events sealed.`;
@@ -195,7 +215,12 @@ export async function sealBuffer(
 
   if (input.llmClient?.available) {
     try {
-      summary = await generateStructuredSummary(input.llmClient, leaves, input.buffer);
+      summary = await generateStructuredSummary(
+        input.llmClient,
+        leaves,
+        input.buffer,
+        resolvedPolicy,
+      );
       summaryMode = "abstractive";
     } catch (err) {
       // LLM 调用失败，降级到 extractive（不阻塞）
@@ -226,7 +251,10 @@ export async function sealBuffer(
     status: "sealed",
     createdAt: sealedAt,
     sealedAt,
-    metadata: { summaryMode },
+    metadata: {
+      summaryMode,
+      ...(resolvedPolicy === undefined ? {} : { policyResolution: resolvedPolicy.receipt }),
+    },
   };
 
   // Faithfulness 校验（P2 升级，D-07）
@@ -246,6 +274,7 @@ export async function sealBuffer(
         // 降级到 extractive 摘要
         node.summary = extractiveSummary;
         node.metadata = {
+          ...node.metadata,
           summaryMode: "extractive",
           faithfulnessFailed: true,
           faithfulnessReason: faithfulnessValidation.reason,
@@ -253,6 +282,7 @@ export async function sealBuffer(
       } else if (input.faithfulnessConfig.failAction === "mark_untrusted") {
         // 保留 abstractive 摘要，但标记为不可信
         node.metadata = {
+          ...node.metadata,
           summaryMode: "abstractive",
           faithfulnessUntrusted: true,
           faithfulnessReason: faithfulnessValidation.reason,
@@ -261,6 +291,7 @@ export async function sealBuffer(
         // retry 策略：简单降级到 extractive（实际 retry 需要更复杂的逻辑）
         node.summary = extractiveSummary;
         node.metadata = {
+          ...node.metadata,
           summaryMode: "extractive",
           faithfulnessFailed: true,
           faithfulnessReason: faithfulnessValidation.reason,

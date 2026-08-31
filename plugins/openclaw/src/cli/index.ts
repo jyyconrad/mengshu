@@ -6,6 +6,7 @@
  */
 
 import { createConnection } from "node:net";
+import { resolve } from "node:path";
 import type { MemoryConfig } from "../../../../config.js";
 import type { MemoryService } from "../../../../core/service-types.js";
 import type { TableStats } from "../../../../db/types.js";
@@ -64,6 +65,13 @@ export interface RegisterMemoryServerCliOptions extends OpenClawCliAuthorityCont
   keepAlive?: boolean;
   /** Runtime 持有的统一 Write Kernel 能力；serve 只负责透传。 */
   memoryWrite?: StartMemoryServerOptions["memoryWrite"];
+  memoryEvolution?: StartMemoryServerOptions["memoryEvolution"];
+  sessionWorkingSet?: StartMemoryServerOptions["sessionWorkingSet"];
+  sessionWorkingSetMemoryBridge?: StartMemoryServerOptions["sessionWorkingSetMemoryBridge"];
+  skillArtifacts?: StartMemoryServerOptions["skillArtifacts"];
+  memoryPolicyOverlays?: StartMemoryServerOptions["memoryPolicyOverlays"];
+  memoryPolicyResolver?: StartMemoryServerOptions["memoryPolicyResolver"];
+  runtimeMcp?: StartMemoryServerOptions["runtimeMcp"];
   /** Console 聚合 API，注入后 serve 启动的 daemon 暴露 /v1/console/* 与 Candidates 闭环。 */
   console?: StartMemoryServerOptions["console"];
   /** Agent 快路径服务，注入后 daemon 暴露 /v1/agent/*（context/observe/lookup/session）。 */
@@ -163,11 +171,13 @@ export function registerMemoryServerCliCommands(
     .description("Start the local memory REST server")
     .option("--host <host>", "Host to bind")
     .option("--port <port>", "Port to bind")
+    .option("--socket <path>", "Owner-only Unix socket under MENGSHU_HOME/run")
     .action(async (opts = {}) => {
       requireOpenClawCliAuthority(options);
-      const values = opts as { host?: string; port?: string };
+      const values = opts as { host?: string; port?: string; socket?: string };
       const host = values.host ?? serverHost(options.config);
       const port = values.port ? Number.parseInt(values.port, 10) : serverPort(options.config);
+      const socketPath = values.socket ?? process.env.MENGSHU_RUNTIME_SOCKET;
       if (!options.runtimeHostFactory) {
         throw new Error("Durable Job v2 RuntimeHost factory is required for serve");
       }
@@ -175,6 +185,13 @@ export function registerMemoryServerCliCommands(
       const running = await (options.startServer ?? startMemoryServer)({
         service: options.service,
         memoryWrite: options.memoryWrite,
+        memoryEvolution: options.memoryEvolution,
+        sessionWorkingSet: options.sessionWorkingSet,
+        sessionWorkingSetMemoryBridge: options.sessionWorkingSetMemoryBridge,
+        skillArtifacts: options.skillArtifacts,
+        memoryPolicyOverlays: options.memoryPolicyOverlays,
+        memoryPolicyResolver: options.memoryPolicyResolver,
+        ...(options.runtimeMcp ? { runtimeMcp: options.runtimeMcp } : {}),
         console: options.console,
         agentFastPath: options.agentFastPath,
         authority: options.authority,
@@ -183,6 +200,7 @@ export function registerMemoryServerCliCommands(
         worker: undefined,
         host,
         port,
+        ...(socketPath ? { socketPath: resolve(socketPath) } : {}),
         secret: options.config.server?.secret,
         requireHttps: options.config.server?.requireHttps,
         logger: options.serverLogger,

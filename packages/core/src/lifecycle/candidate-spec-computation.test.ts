@@ -859,4 +859,48 @@ describe("computeCandidateSpecs", () => {
     expect(Object.isFrozen(result)).toBe(true);
     expect(Object.isFrozen(result.specs)).toBe(true);
   });
+
+  test("受限 overlay 只追加到 system prompt，并进入候选与 proposal 回执", async () => {
+    let systemPrompt = "";
+    let llmOptions: LlmCompletionOptions | undefined;
+    const llmClient = new FakeLlmClient(async (messages, _schema, options) => {
+      systemPrompt = messages[0]!.content;
+      llmOptions = options;
+      return { candidates: [llmCandidate()] };
+    });
+    const policyResolution = {
+      scopeFingerprint: "a".repeat(64),
+      layer: "candidate_extraction" as const,
+      overlayId: "policy-1",
+      overlayVersion: 2,
+      contentHash: "b".repeat(64),
+      guardVersion: "memory-policy-guard-v1" as const,
+      resolutionHash: "c".repeat(64),
+    };
+    const result = await computeCandidateSpecs({
+      extractor: new HeuristicTypeExtractor(),
+      llmClient,
+      policyResolver: {
+        resolve: async () => ({
+          source: "overlay" as const,
+          policy: { focusHints: ["发布证据"], ignoreHints: [], aggregationHints: [] },
+          rendered: "RENDERED_POLICY_WITH_GUARD",
+          warnings: [],
+          receipt: policyResolution,
+        }),
+      },
+    }, input);
+
+    expect(systemPrompt).toContain("你是 mengshu 长期记忆系统的候选记忆抽取器");
+    expect(systemPrompt).toContain("RENDERED_POLICY_WITH_GUARD");
+    expect(llmOptions?.costContext).toMatchObject({
+      category: "policy_overlay",
+      operation: "candidate.extract",
+      scopeFingerprint: `sha256:${"a".repeat(64)}`,
+      policyResolution,
+    });
+    expect(result.policyResolution).toEqual(policyResolution);
+    expect(result.proposalReceipts[0]!.policyResolution).toEqual(policyResolution);
+    expect(result.specs[0]!.auditMetadata.policyResolution).toEqual(policyResolution);
+  });
 });

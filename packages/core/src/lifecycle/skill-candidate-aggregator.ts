@@ -8,6 +8,7 @@
  * - 只产出候选，不自动创建可执行 skill
  */
 
+import { createHash } from "node:crypto";
 import type { CandidateRecord, CandidateRepository } from "./candidate-types.js";
 import type {
   SkillCandidate,
@@ -19,6 +20,9 @@ import type {
 import { DEFAULT_GENERALIZATION_TRIGGER } from "./skill-candidate-types.js";
 import type { MemoryScope } from "../domain/types.js";
 import type { LlmClient } from "../runtime/llm/llm-client.js";
+import type { MemoryPolicyResolver } from "../policy/memory-policy-overlay.js";
+import type { ResolvedMemoryPolicy } from "../policy/types.js";
+import { memoryPolicyCostContext } from "../policy/cost-attribution.js";
 
 /**
  * SkillCandidate 聚合器
@@ -29,6 +33,7 @@ export class SkillCandidateAggregator {
   private llmClient?: LlmClient;
   private trigger: GeneralizationTrigger;
   private now: () => number;
+  private policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
 
   constructor(deps: {
     candidateRepository: CandidateRepository;
@@ -36,12 +41,14 @@ export class SkillCandidateAggregator {
     llmClient?: LlmClient;
     trigger?: Partial<GeneralizationTrigger>;
     now?: () => number;
+    policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
   }) {
     this.candidateRepo = deps.candidateRepository;
     this.skillRepo = deps.skillCandidateRepository;
     this.llmClient = deps.llmClient;
     this.trigger = { ...DEFAULT_GENERALIZATION_TRIGGER, ...deps.trigger };
     this.now = deps.now ?? Date.now;
+    this.policyResolver = deps.policyResolver;
   }
 
   /**
@@ -277,11 +284,28 @@ export class SkillCandidateAggregator {
       return null;
     }
 
+    const evidenceSignature = createHash("sha256").update(JSON.stringify([
+      analysis.topicLabel,
+      [...analysis.experienceIds].sort(),
+      [...new Set(experiences.flatMap((experience) => experience.evidenceIds))].sort(),
+    ])).digest("hex");
+    const existing = (await this.skillRepo.findByTopic(analysis.topicLabel, experiences[0]!.scope))
+      .find((candidate) =>
+        (candidate.status === "pending" || candidate.status === "active") &&
+        candidate.metadata?.evidenceSignature === evidenceSignature);
+    if (existing !== undefined) return existing;
+
     // 如果有 LLM，使用 LLM 提取；否则使用启发式
+    const resolvedPolicy = this.policyResolver === undefined
+      ? undefined
+      : await this.policyResolver.resolve({
+          scope: experiences[0]!.scope,
+          layer: "skill_review",
+        });
     let extraction: SkillCandidateExtractionOutput | null = null;
 
     if (this.llmClient) {
-      extraction = await this.extractWithLLM(analysis.topicLabel, experiences);
+      extraction = await this.extractWithLLM(analysis.topicLabel, experiences, resolvedPolicy);
     }
 
     // LLM 失败或不可用，使用启发式降级
@@ -315,6 +339,8 @@ export class SkillCandidateAggregator {
       metadata: {
         analysisTimeSpanDays: analysis.timeSpanDays,
         successOutcomeCount: analysis.successOutcomeCount,
+        evidenceSignature,
+        ...(resolvedPolicy === undefined ? {} : { policyResolution: resolvedPolicy.receipt }),
       },
       createdAt: this.now(),
     };
@@ -328,14 +354,15 @@ export class SkillCandidateAggregator {
    */
   private async extractWithLLM(
     topicLabel: string,
-    experiences: CandidateRecord[]
+    experiences: CandidateRecord[],
+    resolvedPolicy?: ResolvedMemoryPolicy,
   ): Promise<SkillCandidateExtractionOutput | null> {
     if (!this.llmClient || !this.llmClient.extractStructured) {
       return null;
     }
 
     // System message（§8.3）
-    const systemMessage = `你是 mengshu 经验升格器。给定多条情景经验，判断它们是否共同指向一个可复用的 agent 操作模式，并在适用时生成 skill_candidate。你只产出候选，不创建可执行 skill。
+    const baseSystemMessage = `你是 mengshu 经验升格器。给定多条情景经验，判断它们是否共同指向一个可复用的 agent 操作模式，并在适用时生成 skill_candidate。你只产出候选，不创建可执行 skill。
 
 严格要求：
 - 不得引入片段中没有的信息（禁止外推）。
@@ -343,6 +370,9 @@ export class SkillCandidateAggregator {
 - 如果只是用户偏好或单条规则，不要升格为 skill_candidate。
 - 如果需要真实凭证、删除数据、付费操作或外部不可逆动作，标 highRisk=true。
 - 输出语言与原文一致。`;
+    const systemMessage = resolvedPolicy === undefined
+      ? baseSystemMessage
+      : `${baseSystemMessage}\n\n# 受限记忆策略（系统合同优先）\n${resolvedPolicy.rendered}`;
 
     // User message
     const experienceTexts = experiences
@@ -367,6 +397,12 @@ ${experienceTexts}
         {
           maxTokens: 2000,
           modelType: "extraction",
+          costContext: memoryPolicyCostContext({
+            scope: experiences[0]!.scope,
+            resolvedPolicy,
+            category: "skill_review",
+            operation: "skill.review",
+          }),
         }
       );
 

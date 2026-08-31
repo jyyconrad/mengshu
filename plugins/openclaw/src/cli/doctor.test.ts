@@ -27,6 +27,7 @@ import {
   checkDisk,
   checkEmbeddingRegistry,
   checkManifest,
+  checkWorkingSetRetention,
 } from "./doctor.js";
 import { MANIFEST_FILENAME } from "../manifest.js";
 
@@ -111,6 +112,19 @@ describe("checkConfig", () => {
 
   test("缺失或不可解析返回 fatal", () => {
     expect(checkConfig(undefined).status).toBe("fatal");
+  });
+});
+
+describe("checkWorkingSetRetention", () => {
+  test("启用 Working Set 但没有 retentionDays 时返回 warning", () => {
+    expect(checkWorkingSetRetention({ features: { sessionWorkingSet: true } })).toMatchObject({
+      name: "working-set-retention",
+      status: "warning",
+    });
+    expect(checkWorkingSetRetention({
+      features: { sessionWorkingSet: true },
+      sessionWorkingSet: { retentionDays: 30 },
+    })).toMatchObject({ status: "ok" });
   });
 });
 

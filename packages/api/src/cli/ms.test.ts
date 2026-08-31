@@ -22,6 +22,7 @@ import {
   runMengshuCli,
 } from "./ms.js";
 import { Command } from "commander";
+import { CURRENT_SCHEMA_VERSION } from "../../../core/src/db/migrations/schema-migrations.js";
 
 let cliHome: string | undefined;
 
@@ -497,13 +498,13 @@ describe("ms serve RuntimeHost composition", () => {
     }
   });
 
-  test("schema migration configless help exposes the current v27 cutover gates", async () => {
+  test("schema migration configless help exposes the current schema cutover gates", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       await runMengshuCli(["node", "ms", "migrate", "--help"]);
       const output = log.mock.calls.map((call) => String(call[0])).join("\n");
       expect(output).toContain("--to-schema <schema>");
-      expect(output).toContain("(default: \"v27\")");
+      expect(output).toContain(`(default: "v${CURRENT_SCHEMA_VERSION}")`);
       expect(output).toContain("--apply");
       expect(output).toContain("--maintenance");
       expect(output).toContain("--quiescence-confirmed");
@@ -558,6 +559,48 @@ describe("ms serve RuntimeHost composition", () => {
 
     expect(createCliMcpStdioServerOptions(runtime, { authority, defaultScope }).sessionReceipts)
       .toBe(contextAssemblyReceipts);
+  });
+
+  test("MCP 默认是 RuntimeHost 的薄适配器，不取得 durable worker ownership", () => {
+    const repository = {};
+    const runtime = {
+      config: { dbType: "postgres" },
+      db: {},
+      durableJobV2ServeCapability: {
+        version: 2,
+        authoritative: true,
+        repository,
+        registry: { authoritative: true, types: [], get: vi.fn() },
+        scope: {},
+      },
+      durableJobV2RuntimeBundle: { repository },
+      memoryService: {},
+      executeMemoryWrite: undefined,
+      authorityScopedForgetCapability: undefined,
+      agentFastPath: undefined,
+      memoryViewAssets: undefined,
+      knowledgeResources: undefined,
+      contextAssemblyReceipts: undefined,
+      ingestionPipeline: undefined,
+      llmClient: undefined,
+    } as never;
+    const authority = {
+      tenantId: "tenant-cli", userId: "user-cli",
+      allow: {
+        appIds: ["mengshu"], projectIds: ["project-cli"],
+        agentIds: ["agent-cli"], namespaces: ["memories"], visibilities: ["private"],
+      },
+    } as const;
+    const defaultScope = {
+      tenantId: "tenant-cli", userId: "user-cli", appId: "mengshu",
+      projectId: "project-cli", agentId: "agent-cli", namespace: "memories",
+      visibility: "private" as const,
+    };
+
+    const options = createCliMcpStdioServerOptions(runtime, { authority, defaultScope });
+
+    expect(options.durableJobV2).toBeUndefined();
+    expect(options.workerOwnership).toBe("external-runtime-host");
   });
 
   test("无配置 help 展示 session explain 命令面", async () => {

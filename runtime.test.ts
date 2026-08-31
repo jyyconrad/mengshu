@@ -1420,6 +1420,41 @@ describe("createMengshuRuntime", () => {
     expect(create(true).agentFastPath.assetEnhancementConfigured).toBe(true);
   });
 
+  test("Temporal Memory 默认关闭，仅 PostgreSQL 显式开关时暴露版本服务", () => {
+    const defaultScope = {
+      tenantId: "tenant-a", userId: "user-a", appId: "mengshu",
+      projectId: "project-a", agentId: "agent-a", namespace: "memories",
+      visibility: "private" as const,
+    };
+    const create = (temporalMemory: boolean | undefined) => createMengshuRuntime({
+      config: {
+        ...postgresGuardConfig,
+        ...(temporalMemory === undefined ? {} : { features: { temporalMemory } }),
+      },
+      resolvedDbPath: "",
+      appId: "mengshu",
+      defaultScope,
+      db: runtimePostgresProvider(),
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+    });
+
+    expect(create(undefined).memoryEvolution).toBeUndefined();
+    expect(create(false).memoryEvolution).toBeUndefined();
+    expect(create(true).memoryEvolution).toBeDefined();
+    expect(() => createMengshuRuntime({
+      config: {
+        ...postgresGuardConfig,
+        dbType: "lancedb",
+        features: { temporalMemory: true },
+      },
+      resolvedDbPath: "unused",
+      db: new FakeDb(),
+      embeddings: fakeEmbeddings(),
+      treeRepository: fakeTreeRepository(),
+    })).toThrow(/temporal memory requires PostgreSQL/i);
+  });
+
   test("Postgres runtime 将 recall queryHits 回流到 provider-owned 权威 Entity Graph", async () => {
     const defaultScope = {
       tenantId: "tenant-a",
@@ -2771,10 +2806,14 @@ describe("createMengshuRuntime", () => {
       options: {
         logger?: { warn(message: string): void };
         upsertWorkMemoryGraph?: ReturnType<typeof vi.fn>;
+        temporalMemory?: boolean;
       } = {},
     ) {
       const trusted = trustedDurableComposition(scope);
       const db = trusted.provider;
+      if (options.temporalMemory) {
+        Object.assign(db as unknown as Record<string, unknown>, { schemaVersion: 28 });
+      }
       const kernel = trusted.kernel;
       const dedup = installRuntimeCandidateDedup(db, records);
       const upsertWorkMemoryGraph = options.upsertWorkMemoryGraph ??
@@ -2833,7 +2872,10 @@ describe("createMengshuRuntime", () => {
         .mockReturnValue(duplicateLinkPort);
       db.getActiveEmbeddingSpace.mockResolvedValue(runtimeSpace());
       const runtime = createMengshuRuntime({
-        config: postgresGuardConfig,
+        config: {
+          ...postgresGuardConfig,
+          ...(options.temporalMemory ? { features: { temporalMemory: true } } : {}),
+        },
         resolvedDbPath: "",
         appId: scope.appId,
         defaultScope: scope,
@@ -2940,6 +2982,52 @@ describe("createMengshuRuntime", () => {
             sourceId: "event-1",
           },
           admissionReason: "raw_evidence_before_candidate_admission",
+        },
+      });
+      expect(dedup.findExisting).not.toHaveBeenCalled();
+      await runtime.stop();
+    });
+
+    test("temporal replaceText traverses runtime validator and remains active in one kernel write", async () => {
+      const { kernel, dedup, runtime } = createWriteRuntime([], { temporalMemory: true });
+      await runtime.start();
+
+      const result = await runtimeWriteExecutor(runtime)({
+        type: "correctMemory",
+        correctionKind: "replaceText",
+        targetId: "11111111-1111-4111-8111-111111111110",
+        idempotencyKey: "runtime-temporal-evolve-1",
+        serverAuthority: authority,
+        clientScope: scope,
+        text: "部署流程现在必须通过 CI approval release。",
+        kind: "decision",
+        semanticType: "rules",
+        evidenceIds: ["event-temporal-1"],
+        metadata: { source: "user", salience: 1 },
+        provenance: { source: "user", sourceId: "event-temporal-1" },
+        temporal: {
+          lineageId: "release-process",
+          expectedHeadRevision: 1,
+          expectedHeadVersionId: "11111111-1111-4111-8111-111111111110",
+          validFrom: 2_000,
+          transitionType: "evolved",
+          reason: "workflow upgraded",
+        },
+      });
+
+      expect(result).toMatchObject({
+        status: "persisted",
+        route: "active",
+        recordType: "memory",
+      });
+      expect(kernel.writes).toHaveLength(1);
+      expect(kernel.writes[0]).toMatchObject({
+        commandType: "correctMemory",
+        route: "active",
+        temporal: {
+          lineageId: "release-process",
+          expectedHeadRevision: 1,
+          transitionType: "evolved",
         },
       });
       expect(dedup.findExisting).not.toHaveBeenCalled();

@@ -56,6 +56,7 @@ function harness(
   let inTransaction = false;
   const receipts = new Map<string, MemoryWriteReceipt>();
   const durableMutations: string[] = [];
+  const writtenRecords: unknown[] = [];
   let transactionCount = 0;
   const deps: MemoryWriteKernelDependencies = {
     resolveAuthority: async () => {
@@ -126,6 +127,7 @@ function harness(
             expect(inTransaction).toBe(true);
             calls.push("memory");
             stagedMutations.push("memory");
+            writtenRecords.push(structuredClone(memory));
             return { memoryId: memory.id, stored: true };
           },
           appendAudit: async () => {
@@ -160,6 +162,7 @@ function harness(
     deps,
     receipts,
     durableMutations,
+    writtenRecords,
     isInTransaction: () => inTransaction,
   };
 }
@@ -582,6 +585,67 @@ describe("MemoryWriteKernel", () => {
     expect(calls).toContain("embed");
     expect(calls).toContain("exactDedup");
     expect(calls).toContain("semanticDedup");
+  });
+
+  test("temporal replaceText carries a server-derived transition receipt into the final transaction", async () => {
+    const { kernel, writtenRecords } = harness();
+    const command = {
+      type: "correctMemory",
+      correctionKind: "replaceText",
+      targetId: "memory-old",
+      ...baseCommand,
+      idempotencyKey: "temporal-evolve-1",
+      temporal: {
+        lineageId: "release-process",
+        expectedHeadRevision: 1,
+        validFrom: 1_720_000_000_000,
+        transitionType: "evolved",
+        reason: "workflow upgraded",
+      },
+    } as MemoryWriteCommand;
+
+    await expect(kernel.execute(command)).resolves.toMatchObject({ status: "persisted" });
+    expect(writtenRecords).toHaveLength(1);
+    expect(writtenRecords[0]).toMatchObject({
+      temporal: {
+        lineageId: "release-process",
+        expectedHeadRevision: 1,
+        validFrom: 1_720_000_000_000,
+        transitionType: "evolved",
+        receipt: {
+          idempotencyKey: "temporal-evolve-1",
+          requestHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+          scopeFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+          lineageId: "release-process",
+          transitionType: "evolved",
+          revision: 2,
+        },
+      },
+    });
+  });
+
+  test("temporal feature bootstraps every newly active canonical memory as revision 1", async () => {
+    const { kernel, writtenRecords } = harness({ temporalMemoryEnabled: true });
+
+    await expect(kernel.execute(saveCommand({
+      idempotencyKey: "temporal-bootstrap-1",
+      evidenceIds: ["evidence-1"],
+    }))).resolves.toMatchObject({ status: "persisted", route: "active" });
+    expect(writtenRecords[0]).toMatchObject({
+      id: "memory-1",
+      temporal: {
+        lineageId: "memory-1",
+        expectedHeadRevision: 0,
+        validFrom: 1_720_000_000_000,
+        transitionType: "created",
+        receipt: {
+          idempotencyKey: "temporal-bootstrap-1",
+          lineageId: "memory-1",
+          transitionType: "created",
+          revision: 1,
+        },
+      },
+    });
   });
 
   test("lifecycle transaction failure never acknowledges", async () => {

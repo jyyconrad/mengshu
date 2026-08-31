@@ -39,6 +39,23 @@ import {
   type ProviderOwnedMemoryWriteKernelTransactionPort,
 } from "../../service/write-kernel-postgres-transaction.js";
 import {
+  PostgresSessionWorkingSetRepository,
+  type PostgresWorkingSetClient,
+  type PostgresWorkingSetPool,
+} from "../../working-set/postgres-repository.js";
+import {
+  PostgresSkillArtifactRepository,
+  type PostgresSkillArtifactClient,
+  type PostgresSkillArtifactPool,
+} from "../../skills/postgres-repository.js";
+import { PostgresSkillCandidateRepository } from
+  "../../skills/postgres-skill-candidate-repository.js";
+import {
+  PostgresMemoryPolicyOverlayRepository,
+  type PostgresMemoryPolicyClient,
+  type PostgresMemoryPolicyPool,
+} from "../../policy/postgres-repository.js";
+import {
   writeRecordToMemoryRecord,
   writeRecordToPostgresPendingCandidate,
 } from "../../service/write-kernel-mapping.js";
@@ -220,6 +237,13 @@ import {
   PostgresContextAssemblyReceiptRepository,
   type PostgresContextAssemblyReceiptQueryClient,
 } from "../../context/postgres-assembly-receipt.js";
+import {
+  PostgresTemporalMemoryRepository,
+  type PostgresTemporalMemoryClient,
+  type PostgresTemporalMemoryPool,
+} from "../../temporal/postgres-repository.js";
+import { purgePostgresTemporalDerivedArtifacts } from
+  "../../temporal/postgres-derived-purger.js";
 import { KnowledgeResourceCapability } from
   "../../resources/knowledge-resource-capability.js";
 import {
@@ -1908,6 +1932,39 @@ FROM "${table}"`);
         return { memoryId: result.candidateId, stored: result.inserted };
       }
 
+      if (record.temporal) {
+        this.assertSchemaVersion(35, "temporal memory write");
+        const memory = writeRecordToMemoryRecord(record);
+        const temporal = record.temporal;
+        const version = Object.freeze({
+          lineageId: temporal.lineageId,
+          revision: temporal.expectedHeadRevision + 1,
+          record: memory,
+          ...(temporal.expectedHeadVersionId === undefined
+            ? {}
+            : { previousVersionId: temporal.expectedHeadVersionId }),
+          ...(temporal.restoredFromVersionId === undefined
+            ? {}
+            : { restoredFromVersionId: temporal.restoredFromVersionId }),
+          validFrom: temporal.validFrom,
+          recordedAt: record.createdAt,
+          transitionType: temporal.transitionType,
+          ...(temporal.reason === undefined ? {} : { transitionReason: temporal.reason }),
+          invalidated: false,
+          activationState: temporal.validFrom > record.createdAt ? "staged" as const : "active" as const,
+        });
+        const result = await this.createTemporalMemoryRepository().appendVersionWithClient(
+          client as PostgresTemporalMemoryClient,
+          {
+            scope: memory.scope,
+            expectedHeadRevision: temporal.expectedHeadRevision,
+            version,
+            receipt: temporal.receipt,
+          },
+        );
+        return { memoryId: result.version.record.id, stored: !result.replayed };
+      }
+
       const memory = writeRecordToMemoryRecord(record);
       const entry = recordToMemoryEntry(memory);
       const tableName = entry.tableName ?? this.getDefaultTableName(entry.dataType);
@@ -1927,6 +1984,165 @@ FROM "${table}"`);
       }
       return { memoryId: result.persistedId, stored: result.stored };
     });
+  }
+
+  /** M1 exact-scope temporal version chain; future staging requires schema v34. */
+  createTemporalMemoryRepository(): PostgresTemporalMemoryRepository {
+    const temporalPool: PostgresTemporalMemoryPool = {
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(35, "temporal memory repository");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+      connect: async (): Promise<PostgresTemporalMemoryClient> => {
+        await this.initialize();
+        this.assertSchemaVersion(35, "temporal memory repository");
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+    return new PostgresTemporalMemoryRepository(temporalPool, {
+      purgeDerived: async (versionIds, lineageId, scopeFingerprint) => {
+        await this.initialize();
+        this.assertSchemaVersion(32, "temporal derived purge");
+        return purgePostgresTemporalDerivedArtifacts(temporalPool, {
+          versionIds,
+          lineageId,
+          scopeFingerprint,
+        });
+      },
+      persistVersion: async (client, version) => {
+        const entry = recordToMemoryEntry(version.record);
+        if (entry.dataType !== "memory" ||
+            (entry.tableName !== undefined && entry.tableName !== "memories")) {
+          throw new Error("Postgres temporal memory only supports canonical memories");
+        }
+        this.validateStoreEntry(entry);
+        const records = await this.insertEntries("memories", [entry], async (sql, params = []) => {
+          const result = await client.query(sql, params);
+          return { rows: [...result.rows], rowCount: result.rowCount };
+        });
+        const [result] = records;
+        if (!result || records.length !== 1) {
+          throw new Error("Postgres temporal memory returned an invalid memory result");
+        }
+        return { memoryId: result.persistedId, stored: result.stored };
+      },
+    });
+  }
+
+  /** M2 exact-private session Working Set; unavailable before schema v29. */
+  createSessionWorkingSetRepository(): PostgresSessionWorkingSetRepository {
+    const workingSetPool: PostgresWorkingSetPool = {
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(33, "session Working Set repository");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+      connect: async (): Promise<PostgresWorkingSetClient> => {
+        await this.initialize();
+        this.assertSchemaVersion(33, "session Working Set repository");
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+    return new PostgresSessionWorkingSetRepository(workingSetPool);
+  }
+
+  #skillArtifactPool(): PostgresSkillArtifactPool {
+    return {
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(30, "reviewed Skill Artifact repository");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+      connect: async (): Promise<PostgresSkillArtifactClient> => {
+        await this.initialize();
+        this.assertSchemaVersion(30, "reviewed Skill Artifact repository");
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+  }
+
+  /** M3 durable candidate source shared by aggregation and reviewed artifacts. */
+  createSkillCandidateRepository(): PostgresSkillCandidateRepository {
+    return new PostgresSkillCandidateRepository(this.#skillArtifactPool());
+  }
+
+  /** M3 immutable reviewed Skill Artifact versions and resource manifest. */
+  createSkillArtifactRepository(): PostgresSkillArtifactRepository {
+    return new PostgresSkillArtifactRepository(this.#skillArtifactPool());
+  }
+
+  /** M4 scoped structured policy overlays; unavailable before schema v31. */
+  createMemoryPolicyOverlayRepository(): PostgresMemoryPolicyOverlayRepository {
+    const policyPool: PostgresMemoryPolicyPool = {
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        params: readonly unknown[] = [],
+      ) => {
+        await this.initialize();
+        this.assertSchemaVersion(31, "memory Policy Overlay repository");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+      connect: async (): Promise<PostgresMemoryPolicyClient> => {
+        await this.initialize();
+        this.assertSchemaVersion(31, "memory Policy Overlay repository");
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            params: readonly unknown[] = [],
+          ) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: () => client.release(),
+        };
+      },
+    };
+    return new PostgresMemoryPolicyOverlayRepository(policyPool);
   }
 
   /** v15 duplicate dedup -> evidence ledger，始终使用 provider-owned dedicated client。 */

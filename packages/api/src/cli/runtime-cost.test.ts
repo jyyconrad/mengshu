@@ -35,6 +35,7 @@ const rows: RuntimeCostEvent[] = [
     rejectionReason: null,
     attempt: 1,
     scopeFingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    policyResolution: null,
   },
   {
     version: 1,
@@ -54,6 +55,7 @@ const rows: RuntimeCostEvent[] = [
     rejectionReason: "daily_budget_exceeded",
     attempt: 1,
     scopeFingerprint: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    policyResolution: null,
   },
 ];
 

@@ -307,6 +307,128 @@ describe("MCP memory tools", () => {
     expect(getLatest).toHaveBeenCalledTimes(1);
   });
 
+  test("temporal tools are capability-gated and preserve server-owned authority", async () => {
+    const without = createMcpMemoryTools({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+    });
+    const names = [
+      "memory_history", "memory_recall_as_of", "memory_expire", "memory_revoke", "memory_purge",
+    ];
+    expect(without.map((tool) => tool.name)).not.toEqual(expect.arrayContaining(names));
+
+    const captured: unknown[] = [];
+    const temporalMemory = {
+      history: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { lineageId: "release", versions: [] };
+      }),
+      recallAsOf: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { lineageId: "release", historical: true };
+      }),
+      recallAsOfResolved: vi.fn(async (input: { scope: unknown; asOf: string }) => {
+        captured.push(input.scope);
+        return { memory: { historical: true }, asOfResolution: { original: input.asOf } };
+      }),
+      expire: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { receipt: { transitionType: "expired" } };
+      }),
+      revoke: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { receipt: { transitionType: "revoked" } };
+      }),
+      purge: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { operationId: "purge-1" };
+      }),
+    };
+    const writeCommands: MemoryWriteCommand[] = [];
+    const tools = createMcpMemoryTools({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      temporalMemory: temporalMemory as never,
+      memoryWrite: {
+        executeMemoryWrite: vi.fn(async (command: MemoryWriteCommand) => {
+          writeCommands.push(command);
+          return {
+            status: "persisted" as const, route: "active" as const,
+            recordType: "memory" as const, memoryId: "version-new", stored: true,
+          };
+        }),
+      },
+    });
+    expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(names));
+    expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+      "memory_evolve", "memory_correct", "memory_restore",
+    ]));
+
+    await tools.find((tool) => tool.name === "memory_history")!.execute({
+      lineageId: "release", scope: attackerScope,
+    });
+    await tools.find((tool) => tool.name === "memory_recall_as_of")!.execute({
+      lineageId: "release", asOf: 100, scope: attackerScope,
+    });
+    await expect(tools.find((tool) => tool.name === "memory_recall_as_of")!.execute({
+      lineageId: "release", asOf: "昨天", timezoneOffsetMinutes: 480,
+      scope: attackerScope,
+    })).resolves.toMatchObject({ asOfResolution: { original: "昨天" } });
+    await tools.find((tool) => tool.name === "memory_expire")!.execute({
+      lineageId: "release", expectedHeadRevision: 2, validTo: 200,
+      idempotencyKey: "expire-1", scope: attackerScope,
+    });
+    await tools.find((tool) => tool.name === "memory_revoke")!.execute({
+      lineageId: "release", expectedHeadRevision: 2, reason: "withdrawn",
+      idempotencyKey: "revoke-1", scope: attackerScope,
+    });
+    await tools.find((tool) => tool.name === "memory_purge")!.execute({
+      lineageId: "release", confirmation: "PURGE",
+      idempotencyKey: "purge-1", scope: attackerScope,
+    });
+    const transition = {
+      lineageId: "release",
+      expectedHeadRevision: 2,
+      expectedHeadVersionId: "11111111-1111-4111-8111-111111111112",
+      validFrom: 300,
+      text: "CI approval release",
+      kind: "decision",
+      semanticType: "rules",
+      evidenceIds: ["evidence-3"],
+      idempotencyKey: "transition-3",
+      scope: attackerScope,
+    };
+    await tools.find((tool) => tool.name === "memory_evolve")!.execute(transition);
+    await tools.find((tool) => tool.name === "memory_correct")!.execute({
+      ...transition, idempotencyKey: "correct-3", reason: "old content was wrong",
+    });
+    await tools.find((tool) => tool.name === "memory_restore")!.execute({
+      ...transition,
+      expectedHeadVersionId: undefined,
+      sourceVersionId: "11111111-1111-4111-8111-111111111111",
+      idempotencyKey: "restore-3",
+    });
+
+    expect(captured).toHaveLength(6);
+    for (const resolved of captured) {
+      expect(resolved).toMatchObject({
+        tenantId: "server-tenant",
+        userId: "server-user",
+        appId: "mengshu",
+        projectId: "project-1",
+        visibility: "private",
+      });
+    }
+    expect(writeCommands.map((command) => command.type === "correctMemory" &&
+      command.correctionKind === "replaceText" ? command.temporal?.transitionType : undefined))
+      .toEqual(["evolved", "corrected", "restored"]);
+    for (const command of writeCommands) {
+      expect(command.clientScope).toMatchObject({
+        tenantId: "server-tenant", userId: "server-user", visibility: "private",
+      });
+    }
+  });
+
   test("session explain enforces authority session binding and stable not-found errors", async () => {
     const getLatest = vi.fn(async () => undefined);
     const tools = createMcpMemoryTools({
@@ -423,6 +545,50 @@ describe("MCP memory tools", () => {
       idempotencyKey: "mcp-observe-1",
       serverAuthority: transportAuthority,
     }));
+  });
+
+  test("server registry injects and snapshots workspaceId for the authorized project", async () => {
+    const service = new FakeMemoryService();
+    const capturedScopes: MemoryScope[] = [];
+    service.recall = (async (input: { scope: MemoryScope }) => {
+      capturedScopes.push(input.scope);
+      return { scope: input.scope, query: "", hits: [] };
+    }) as unknown as typeof service.recall;
+    const bindings: Record<string, string> = { "project-1": "workspace-1" };
+    const tools = createMcpMemoryTools({
+      service,
+      authority: transportAuthority,
+      projectWorkspaceByProjectId: bindings,
+      defaultScope: {
+        tenantId: "server-tenant",
+        userId: "server-user",
+        appId: "mengshu",
+        projectId: "project-1",
+        agentId: "agent-1",
+        namespace: "memories",
+        visibility: "private",
+      },
+    });
+    bindings["project-1"] = "workspace-mutated-after-start";
+
+    const recall = tools.find((tool) => tool.name === "memory_recall")!;
+    await recall.execute({ query: "registry mapping" });
+
+    expect(capturedScopes).toEqual([
+      expect.objectContaining({ projectId: "project-1", workspaceId: "workspace-1" }),
+    ]);
+    expect(
+      (recall.inputSchema.properties as Record<string, { properties?: Record<string, unknown> }>)
+        .scope.properties,
+    ).not.toHaveProperty("workspaceId");
+  });
+
+  test("invalid server registry workspace binding fails closed at tool startup", () => {
+    expect(() => createMcpMemoryTools({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      projectWorkspaceByProjectId: { "project-1": "../workspace" },
+    })).toThrow(/workspaceId.*canonical/i);
   });
 
   test("authority save and observe fail closed without capability or idempotency key", async () => {
@@ -1572,6 +1738,52 @@ describe("MCP memory tools", () => {
           projectId: "fastpath-project",
         }),
       });
+    });
+
+    test("Skill 与 Policy 工具声明所有可执行入参，避免 MCP schema 拒绝合法调用", () => {
+      const tools = createMcpMemoryTools({
+        unsafeLegacyScope: true,
+        service: new FakeMemoryService(),
+        defaultScope: scope,
+        skillArtifacts: {
+          proposeFromCandidate: vi.fn(),
+          importCurated: vi.fn(),
+          review: vi.fn(),
+          publish: vi.fn(),
+          read: vi.fn(),
+          search: vi.fn(),
+        } as never,
+        memoryPolicy: {
+          mutations: { appendVersion: vi.fn() },
+          resolver: { resolve: vi.fn() },
+        } as never,
+      });
+      const requiredProperties: Readonly<Record<string, readonly string[]>> = {
+        memory_skill_propose: ["ownerUserId", "candidateId", "skillId", "expectedLatestVersion",
+          "manifest", "expectedOutcomePolicyVersion", "idempotencyKey"],
+        memory_skill_import_curated: ["ownerUserId", "skillId", "expectedLatestVersion", "title",
+          "description", "triggerConditions", "preconditions", "steps", "successSignals",
+          "antiPatterns", "riskBoundaries", "evidenceMemoryIds", "evidenceChunkIds", "manifest",
+          "expectedOutcomePolicyVersion", "provenanceRef", "license", "idempotencyKey"],
+        memory_skill_review: ["skillId", "expectedLatestVersion", "reviewerUserId", "decision",
+          "reason", "idempotencyKey"],
+        memory_skill_publish: ["skillId", "expectedLatestVersion", "reviewerUserId",
+          "reviewReceiptId", "idempotencyKey"],
+        memory_skill_read: ["skillId", "version"],
+        memory_skill_search: ["query", "limit", "embeddingAvailable"],
+        memory_policy_append: ["id", "expectedLatestVersion", "idempotencyKey", "ownerUserId",
+          "target", "layer", "focusHints", "ignoreHints", "aggregationHints", "status"],
+      };
+      for (const [name, properties] of Object.entries(requiredProperties)) {
+        const schema = tools.find((tool) => tool.name === name)?.inputSchema as {
+          properties?: Record<string, unknown>;
+          additionalProperties?: boolean;
+        };
+        expect(schema.additionalProperties, name).toBe(false);
+        expect(Object.keys(schema.properties ?? {}), name).toEqual(
+          expect.arrayContaining(["scope", ...properties]),
+        );
+      }
     });
   });
 });

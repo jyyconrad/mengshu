@@ -211,6 +211,24 @@ describe("MCP server-owned authority config", () => {
     })).toThrow(/invalid/i);
   });
 
+  test("parsed authority remains valid when workspace/session scope is pinned", () => {
+    const scoped = {
+      authority: authorityConfig.authority,
+      defaultScope: {
+        ...authorityConfig.defaultScope,
+        workspaceId: "workspace-1",
+        sessionId: "session-1",
+      },
+    };
+    const parsed = parseMcpServerAuthorityConfig(scoped);
+
+    expect(parseMcpServerAuthorityConfig(parsed)).toEqual(parsed);
+    expect(() => parseMcpServerAuthorityConfig({
+      authority: { ...parsed.authority, workspaceId: "other-workspace" },
+      defaultScope: parsed.defaultScope,
+    })).toThrow(/does not match defaultScope/i);
+  });
+
   test("missing/ambiguous host env fails closed", () => {
     expect(() => loadMcpServerAuthorityFromEnv({})).toThrow(/requires/i);
     expect(() => loadMcpServerAuthorityFromEnv({

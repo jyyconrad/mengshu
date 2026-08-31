@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { types as nodeUtilTypes } from "node:util";
 
 import type { MemorySemanticType } from "../../domain/types.js";
+import { computeCanonicalContentHash } from "../../scoring/hash-utils.js";
 import {
   historyCurationSnapshotSha256,
   planHistoryCuration,
@@ -138,11 +138,6 @@ function currentSemanticApproval(
   });
 }
 
-function normalizedContentHash(text: string): string {
-  return createHash("sha256").update(text.replace(/\r\n?/g, "\n").normalize("NFC"), "utf8")
-    .digest("hex");
-}
-
 function toHistorySource(
   source: MarkdownWorksetRecord,
   policyVersion: string,
@@ -170,7 +165,7 @@ function toHistorySource(
     sourceHash: source.sourceHash,
     ...(source.scopeFingerprint ? { scopeFingerprint: source.scopeFingerprint } : {}),
     sourceKind: record.sourceTable === "knowledge" ? "knowledge" : "memory",
-    contentHash: normalizedContentHash(record.text),
+    contentHash: computeCanonicalContentHash(record.text),
     ...(projectedSemanticType ? { semanticType: projectedSemanticType } : {}),
     lifecycle: record.lifecycleStatus ?? "active",
     ...(revision ?? {}),

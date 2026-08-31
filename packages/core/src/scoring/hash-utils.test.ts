@@ -1,5 +1,34 @@
 import { describe, expect, test } from "vitest";
-import { deterministicUuid, durableUuid } from "./hash-utils.js";
+import {
+  computeCanonicalContentHash,
+  computeContentHash,
+  deterministicUuid,
+  durableUuid,
+  matchesContentHash,
+} from "./hash-utils.js";
+
+describe("content hashes", () => {
+  test("同时验证 legacy MD5 与 Markdown 工作集规范 SHA-256", () => {
+    const legacyText = "  legacy memory  ";
+    const canonicalText = "line one\r\nCafe\u0301";
+    const normalizedCanonicalText = "line one\nCaf\u00e9";
+
+    expect(matchesContentHash(legacyText, computeContentHash(legacyText))).toBe(true);
+    expect(computeCanonicalContentHash(canonicalText))
+      .toBe(computeCanonicalContentHash(normalizedCanonicalText));
+    expect(matchesContentHash(
+      canonicalText,
+      computeCanonicalContentHash(normalizedCanonicalText),
+    )).toBe(true);
+  });
+
+  test("拒绝不可验证的 legacy hash 和内容漂移", () => {
+    expect(matchesContentHash("memory", "legacy-content-hash")).toBe(false);
+    expect(matchesContentHash("memory", "a".repeat(36))).toBe(false);
+    expect(matchesContentHash("memory", computeContentHash("other"))).toBe(false);
+    expect(matchesContentHash("memory", computeCanonicalContentHash("other"))).toBe(false);
+  });
+});
 
 describe("deterministicUuid", () => {
   test("同逻辑键稳定生成 UUIDv8，不同逻辑键不冲突", () => {

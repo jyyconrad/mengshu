@@ -74,6 +74,27 @@ export function checkConfig(config: unknown): CheckResult {
   return { name, status: "ok", message: "配置已加载" };
 }
 
+export function checkWorkingSetRetention(config: unknown): CheckResult {
+  const root = asRecord(config);
+  const features = asRecord(root.features);
+  if (features.sessionWorkingSet !== true) {
+    return { name: "working-set-retention", status: "info", message: "Session Working Set 未启用" };
+  }
+  const workingSet = asRecord(root.sessionWorkingSet);
+  if (!Number.isSafeInteger(workingSet.retentionDays) || Number(workingSet.retentionDays) < 0) {
+    return {
+      name: "working-set-retention",
+      status: "warning",
+      message: "Session Working Set 未配置 retentionDays；payload 将保守保留并在清理回执中告警",
+    };
+  }
+  return {
+    name: "working-set-retention",
+    status: "ok",
+    message: `retentionDays=${workingSet.retentionDays}`,
+  };
+}
+
 /** 调 service.health()：ok -> ok（含记录数），ok:false -> fatal，无 service -> warning。 */
 export async function checkDb(
   service: Pick<MemoryService, "health"> | undefined,
@@ -331,6 +352,7 @@ async function runDoctor(dir: string, deps: DoctorCliDeps): Promise<void> {
   const config = deps.config;
   const results: CheckResult[] = [
     checkConfig(config),
+    checkWorkingSetRetention(config),
     await checkDb(deps.service),
     await checkEmbedding(deps.embeddings),
     checkModel(configEmbeddingModel(config)),

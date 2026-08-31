@@ -13,6 +13,11 @@ const MAX_LEDGER_LINE_BYTES = 16 * 1024;
 const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const SAFE_REASON = /^[a-z0-9][a-z0-9._:-]{0,127}$/;
 const SCOPE_FINGERPRINT = /^sha256:[0-9a-f]{64}$/;
+const AUTHORITY_SCOPE_FINGERPRINT = /^[0-9a-f]{64}$/;
+const CONTENT_HASH = /^[0-9a-f]{64}$/;
+const POLICY_LAYERS = new Set([
+  "candidate_extraction", "tree_summary", "skill_review", "document_organization",
+]);
 
 export class RuntimeCostLedgerCorruptError extends Error {
   constructor(
@@ -29,12 +34,51 @@ function validCount(value: unknown, nullable = true): value is number | null {
     (typeof value === "number" && Number.isFinite(value) && value >= 0);
 }
 
+function validatePolicyResolution(
+  value: unknown,
+  eventScopeFingerprint: unknown,
+): RuntimeCostEvent["policyResolution"] | undefined {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  const hasOverlay = row.overlayId !== undefined || row.overlayVersion !== undefined ||
+    row.contentHash !== undefined;
+  const overlayValid = !hasOverlay || (
+    typeof row.overlayId === "string" && SAFE_LABEL.test(row.overlayId) &&
+    typeof row.overlayVersion === "number" && Number.isSafeInteger(row.overlayVersion) &&
+      row.overlayVersion >= 1 &&
+    typeof row.contentHash === "string" && CONTENT_HASH.test(row.contentHash)
+  );
+  if (
+    typeof row.scopeFingerprint !== "string" ||
+    !AUTHORITY_SCOPE_FINGERPRINT.test(row.scopeFingerprint) ||
+    eventScopeFingerprint !== `sha256:${row.scopeFingerprint}` ||
+    typeof row.layer !== "string" || !POLICY_LAYERS.has(row.layer) ||
+    row.guardVersion !== "memory-policy-guard-v1" ||
+    typeof row.resolutionHash !== "string" || !CONTENT_HASH.test(row.resolutionHash) ||
+    !overlayValid
+  ) return undefined;
+  return {
+    scopeFingerprint: row.scopeFingerprint,
+    layer: row.layer as RuntimeCostEvent["policyResolution"] extends infer R
+      ? R extends { layer: infer L } ? L : never : never,
+    ...(hasOverlay ? {
+      overlayId: row.overlayId as string,
+      overlayVersion: row.overlayVersion as number,
+      contentHash: row.contentHash as string,
+    } : {}),
+    guardVersion: "memory-policy-guard-v1",
+    resolutionHash: row.resolutionHash,
+  };
+}
+
 function validateEvent(value: unknown, lineNumber: number): RuntimeCostEvent {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new RuntimeCostLedgerCorruptError(lineNumber, "event must be an object");
   }
   const row = value as Record<string, unknown>;
   const timestamp = typeof row.timestamp === "string" ? Date.parse(row.timestamp) : Number.NaN;
+  const policyResolution = validatePolicyResolution(row.policyResolution, row.scopeFingerprint);
   const valid = row.version === RUNTIME_COST_EVENT_VERSION &&
     Number.isFinite(timestamp) &&
     typeof row.operation === "string" && SAFE_LABEL.test(row.operation) &&
@@ -52,7 +96,8 @@ function validateEvent(value: unknown, lineNumber: number): RuntimeCostEvent {
     (row.rejectionReason === null ||
       (typeof row.rejectionReason === "string" && SAFE_REASON.test(row.rejectionReason))) &&
     typeof row.attempt === "number" && Number.isInteger(row.attempt) && row.attempt >= 1 &&
-    typeof row.scopeFingerprint === "string" && SCOPE_FINGERPRINT.test(row.scopeFingerprint);
+    typeof row.scopeFingerprint === "string" && SCOPE_FINGERPRINT.test(row.scopeFingerprint) &&
+    policyResolution !== undefined;
   if (!valid) throw new RuntimeCostLedgerCorruptError(lineNumber, "event schema validation failed");
 
   return {
@@ -73,6 +118,7 @@ function validateEvent(value: unknown, lineNumber: number): RuntimeCostEvent {
     rejectionReason: row.rejectionReason as string | null,
     attempt: row.attempt as number,
     scopeFingerprint: row.scopeFingerprint as string,
+    policyResolution,
   };
 }
 

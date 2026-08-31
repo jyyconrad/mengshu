@@ -29,6 +29,7 @@ import type { IngestionPipeline } from "../../core/src/ingest/pipeline.js";
 import type { LlmClient } from "../../core/src/runtime/llm/llm-client.js";
 import type { AuthorityScope } from "../../core/src/domain/authority-scope.js";
 import type { MemoryScope } from "../../core/src/domain/types.js";
+import type { McpProjectWorkspaceBindings } from "./authority.js";
 import { DURABLE_JOB_V2_AUTHORITATIVE_TYPES } from
   "../../core/src/storage/repositories/job-v2.js";
 import { PostgresDurableJobV2Repository } from
@@ -47,9 +48,15 @@ import {
   type MemoryWriteCommandExecutor,
   type MemoryAssetReadCapability,
   type MemoryKnowledgeResourceCapability,
+  type MemoryTemporalCapability,
+  type MemoryWorkingSetCapability,
+  type MemoryWorkingSetBridgeCapability,
+  type MemorySkillArtifactCapability,
+  type MemoryPolicyCapability,
 } from "./tools.js";
 import { parseMcpServerAuthorityConfig } from "./server.js";
 import { formatMcpToolError } from "./tool-error.js";
+import type { RuntimeMcpFacade } from "../../api/src/rest/types.js";
 
 const SERVER_NAME = "mengshu";
 const SERVER_VERSION = "1.0.7";
@@ -69,12 +76,19 @@ export interface McpStdioServerOptions {
   forgetService?: AuthorityScopedForgetService;
   /** Authenticated server authority; stdio never accepts client tenant/user. */
   authority: AuthorityScope;
+  /** Immutable server-owned project -> workspace registry snapshot. */
+  projectWorkspaceByProjectId?: McpProjectWorkspaceBindings;
   /** Server-selected default request, validated against authority at host startup. */
   defaultScope?: MemoryScope;
   agentFastPath?: AgentFastPathService;
   memoryAssets?: MemoryAssetReadCapability;
   /** Optional exact-scope read-only Knowledge resource capability. */
   knowledgeResources?: MemoryKnowledgeResourceCapability;
+  temporalMemory?: MemoryTemporalCapability;
+  sessionWorkingSet?: MemoryWorkingSetCapability;
+  sessionWorkingSetBridge?: MemoryWorkingSetBridgeCapability;
+  skillArtifacts?: MemorySkillArtifactCapability;
+  memoryPolicy?: MemoryPolicyCapability;
   /** Optional v22 exact-session assembly receipt read capability. */
   sessionReceipts?: Pick<ContextAssemblyReceiptRepository, "getLatest">;
   namespaces?: string[];
@@ -84,6 +98,11 @@ export interface McpStdioServerOptions {
   llmClient?: LlmClient;
   /** Postgres runtime 注入后启动 broad-authority supervisor；非 Postgres 明确省略。 */
   durableJobV2?: McpDurableJobV2Capability;
+  /**
+   * MCP 默认只做薄协议适配，worker 由共享 RuntimeHost 持有。只有隔离诊断进程可显式
+   * 选择 direct-diagnostic；该模式不得与 daemon 同时运行。
+   */
+  workerOwnership?: "external-runtime-host" | "direct-diagnostic";
 }
 
 /** MCP CallTool 响应的 content 形态 */
@@ -153,6 +172,14 @@ export function createMcpStdioServer(options: McpStdioServerOptions): {
     ...options,
     ...authorityConfig,
   }));
+  return createMcpToolRegistryServer(tools);
+}
+
+export function createMcpToolRegistryServer(toolsInput: readonly McpMemoryTool[]): {
+  server: Server;
+  tools: readonly McpMemoryTool[];
+} {
+  const tools = freezeMcpToolRegistry([...toolsInput]);
   const callTool = buildCallToolHandler(tools);
 
   const server = new Server(
@@ -174,6 +201,30 @@ export function createMcpStdioServer(options: McpStdioServerOptions): {
   return { server, tools };
 }
 
+export function createRuntimeMcpFacade(options: McpStdioServerOptions): RuntimeMcpFacade {
+  const authorityConfig = parseMcpServerAuthorityConfig({
+    authority: options.authority,
+    defaultScope: options.defaultScope,
+  });
+  const tools = freezeMcpToolRegistry(createMcpMemoryTools({
+    ...options,
+    ...authorityConfig,
+  }));
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  return Object.freeze({
+    listTools: () => tools.map((tool) => Object.freeze({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+    })),
+    async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+      const tool = byName.get(name);
+      if (!tool) throw new Error("RUNTIME_MCP_TOOL_NOT_FOUND");
+      return tool.execute(args);
+    },
+  });
+}
+
 export interface RunningMcpStdioServer {
   close(): Promise<void>;
   readonly closed: Promise<void>;
@@ -182,6 +233,40 @@ export interface RunningMcpStdioServer {
 export interface McpStdioStartDependencies {
   transport?: Transport;
   startDurableJobV2Supervisor?: typeof startBroadAuthorityDurableJobV2Supervisor;
+}
+
+export async function startMcpToolRegistryStdioServer(
+  tools: readonly McpMemoryTool[],
+  dependencies: Pick<McpStdioStartDependencies, "transport"> = {},
+): Promise<RunningMcpStdioServer> {
+  const { server } = createMcpToolRegistryServer(tools);
+  const transport = dependencies.transport ?? new StdioServerTransport();
+  let resolveClosed!: () => void;
+  const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+  let closePromise: Promise<void> | undefined;
+  const beginShutdown = (closeServer: boolean): Promise<void> => {
+    if (!closePromise) {
+      closePromise = Promise.resolve()
+        .then(() => closeServer ? server.close() : undefined)
+        .finally(resolveClosed);
+    }
+    return closePromise;
+  };
+  server.onclose = () => { void beginShutdown(false).catch(() => undefined); };
+  try {
+    await server.connect(transport);
+  } catch (connectionFailure) {
+    try {
+      await beginShutdown(true);
+    } catch (shutdownFailure) {
+      throw new AggregateError(
+        [connectionFailure, shutdownFailure],
+        "MCP proxy transport startup and shutdown failed",
+      );
+    }
+    throw connectionFailure;
+  }
+  return Object.freeze({ closed, close: () => beginShutdown(true) });
 }
 
 const MCP_DURABLE_JOB_V2_SUPERVISOR_OPTIONS = Object.freeze({
@@ -249,6 +334,9 @@ export async function startMcpStdioServer(
     authority: options.authority,
     defaultScope: options.defaultScope,
   });
+  if (options.durableJobV2 && options.workerOwnership !== "direct-diagnostic") {
+    throw new Error("MCP durable worker ownership requires explicit direct-diagnostic mode");
+  }
   const durableJobV2 = validatedDurableJobV2Capability(options.durableJobV2);
   const { server } = createMcpStdioServer(options);
   const transport = dependencies.transport ?? new StdioServerTransport();

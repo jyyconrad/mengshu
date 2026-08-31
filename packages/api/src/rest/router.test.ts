@@ -111,6 +111,266 @@ class FakeMemoryService implements MemoryService {
 }
 
 describe("REST router", () => {
+  test("runtime-owned MCP facade exposes immutable descriptors and delegates calls", async () => {
+    const callTool = vi.fn(async (name: string) => ({ name, ok: true }));
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      runtimeControl: {
+        snapshot: () => ({
+          protocolVersion: 1, ownerId: "runtime-owner", homeFingerprint: "a".repeat(64),
+          generation: 1, state: "ready", ready: true, accepting: true, workerOwner: true,
+        }),
+      },
+      runtimeMcp: {
+        listTools: () => [{
+          name: "memory_health", description: "Health", inputSchema: { type: "object" },
+        }],
+        callTool,
+      },
+    });
+
+    await expect(router.handle({
+      method: "GET", path: "/v1/runtime/mcp-tools", headers: {},
+    })).resolves.toMatchObject({
+      status: 200,
+      body: { tools: [{ name: "memory_health", inputSchema: { type: "object" } }] },
+    });
+    await expect(router.handle({
+      method: "POST", path: "/v1/runtime/mcp-call", headers: {},
+      body: { name: "memory_health", arguments: {} },
+    })).resolves.toEqual({ status: 200, body: { name: "memory_health", ok: true } });
+    expect(callTool).toHaveBeenCalledWith("memory_health", {});
+    await expect(router.handle({
+      method: "POST", path: "/v1/runtime/mcp-call", headers: {},
+      body: { name: "memory_health", arguments: {}, authority: attackerScope },
+    })).resolves.toMatchObject({ status: 400 });
+  });
+
+  test("curated Skill import delegates through the server-owned exact scope", async () => {
+    const importCurated = vi.fn(async (input: { scope: unknown }) => ({
+      artifact: { skillId: "skill-curated", version: 1, status: "draft", scope: input.scope },
+      receipt: { operation: "propose" },
+      replayed: false,
+    }));
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      skillArtifacts: { importCurated } as never,
+    });
+
+    const response = await router.handle({
+      method: "POST",
+      path: "/v1/skills/import-curated",
+      headers: {},
+      body: {
+        scope: attackerScope,
+        ownerUserId: "server-user",
+        skillId: "skill-curated",
+        expectedLatestVersion: 0,
+        title: "Curated release",
+        description: "A source procedure",
+        triggerConditions: ["release"], preconditions: ["green"], steps: ["approve"],
+        successSignals: ["healthy"], antiPatterns: ["bypass"],
+        riskBoundaries: ["no direct edits"], evidenceMemoryIds: ["memory-1"],
+        evidenceChunkIds: ["evidence-1"],
+        manifest: [{
+          path: "SKILL.md", contentHash: "a".repeat(64), sizeBytes: 1,
+          mimeType: "text/markdown", executable: false, provenanceRef: "source-1",
+        }],
+        expectedOutcomePolicyVersion: "outcome-v1",
+        provenanceRef: "source-1",
+        license: { spdxId: "Apache-2.0", sourceUrl: "https://example.test/skill" },
+        idempotencyKey: "curated-import-1",
+      },
+    });
+
+    expect(response).toMatchObject({ status: 201, body: { artifact: { status: "draft" } } });
+    expect(importCurated).toHaveBeenCalledWith(expect.objectContaining({
+      scope: expect.objectContaining({
+        tenantId: "server-tenant", userId: "server-user", appId: "rest",
+        projectId: "project-1", visibility: "private",
+      }),
+    }));
+  });
+
+  test("temporal history/as-of/expire/revoke/purge 全部使用 server-owned exact scope", async () => {
+    const captured: unknown[] = [];
+    const memoryEvolution = {
+      history: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { lineageId: "release", versions: [], head: {}, scope: input.scope };
+      }),
+      recallAsOf: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { lineageId: "release", revision: 1, historical: true };
+      }),
+      expire: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { receipt: { transitionType: "expired" } };
+      }),
+      revoke: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { receipt: { transitionType: "revoked" } };
+      }),
+      purge: vi.fn(async (input: { scope: unknown }) => {
+        captured.push(input.scope);
+        return { operationId: "purge-1", purgedVersions: 2 };
+      }),
+    };
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      memoryEvolution: memoryEvolution as never,
+    });
+    const requests = [
+      { path: "/v1/memories/history", body: { lineageId: "release", scope: attackerScope } },
+      { path: "/v1/recall/as-of", body: { lineageId: "release", asOf: 100, scope: attackerScope } },
+      { path: "/v1/memories/expire", body: {
+        lineageId: "release", expectedHeadRevision: 2, validTo: 200,
+        idempotencyKey: "expire-1", scope: attackerScope,
+      } },
+      { path: "/v1/memories/revoke", body: {
+        lineageId: "release", expectedHeadRevision: 2, reason: "withdrawn",
+        idempotencyKey: "revoke-1", scope: attackerScope,
+      } },
+      { path: "/v1/memories/purge", body: {
+        lineageId: "release", confirmation: "PURGE",
+        idempotencyKey: "purge-1", scope: attackerScope,
+      } },
+    ];
+
+    const responses = await Promise.all(requests.map(({ path, body }) =>
+      router.handle({ method: "POST", path, headers: {}, body })));
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200, 200]);
+    expect(memoryEvolution.history).toHaveBeenCalledOnce();
+    expect(memoryEvolution.recallAsOf).toHaveBeenCalledOnce();
+    expect(memoryEvolution.expire).toHaveBeenCalledOnce();
+    expect(memoryEvolution.revoke).toHaveBeenCalledOnce();
+    expect(memoryEvolution.purge).toHaveBeenCalledOnce();
+    for (const resolved of captured) {
+      expect(resolved).toMatchObject({
+        tenantId: "server-tenant",
+        userId: "server-user",
+        appId: "rest",
+        projectId: "project-1",
+        visibility: "private",
+      });
+    }
+  });
+
+  test("evolve/correct/restore delegate text changes to the governed Write Kernel", async () => {
+    const commands: MemoryWriteCommand[] = [];
+    const executeMemoryWrite = vi.fn(async (command: MemoryWriteCommand) => {
+      commands.push(command);
+      return {
+        status: "persisted" as const,
+        route: "active" as const,
+        recordType: "memory" as const,
+        memoryId: "version-new",
+        stored: true,
+      };
+    });
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      memoryWrite: { executeMemoryWrite },
+      memoryEvolution: {
+        history: vi.fn(), recallAsOf: vi.fn(), expire: vi.fn(), purge: vi.fn(),
+      } as never,
+    });
+    const common = {
+      scope: attackerScope,
+      lineageId: "release-process",
+      expectedHeadRevision: 2,
+      expectedHeadVersionId: "11111111-1111-4111-8111-111111111112",
+      validFrom: 300,
+      text: "CI approval release",
+      kind: "decision",
+      semanticType: "rules",
+      evidenceIds: ["evidence-3"],
+      idempotencyKey: "transition-3",
+    };
+    const responses = await Promise.all([
+      router.handle({ method: "POST", path: "/v1/memories/evolve", headers: {}, body: common }),
+      router.handle({ method: "POST", path: "/v1/memories/correct", headers: {}, body: {
+        ...common, idempotencyKey: "correct-3", reason: "old content was wrong",
+      } }),
+      router.handle({ method: "POST", path: "/v1/memories/restore", headers: {}, body: {
+        ...common,
+        expectedHeadVersionId: undefined,
+        sourceVersionId: "11111111-1111-4111-8111-111111111111",
+        idempotencyKey: "restore-3",
+      } }),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([201, 201, 201]);
+    expect(commands.map((command) => command.type)).toEqual([
+      "correctMemory", "correctMemory", "correctMemory",
+    ]);
+    expect(commands.map((command) => command.type === "correctMemory" &&
+      command.correctionKind === "replaceText" ? command.temporal?.transitionType : undefined))
+      .toEqual(["evolved", "corrected", "restored"]);
+    for (const command of commands) {
+      expect(command.clientScope).toMatchObject({
+        tenantId: "server-tenant", userId: "server-user", visibility: "private",
+      });
+    }
+  });
+
+  test("as-of temporal expressions return their absolute resolution receipt", async () => {
+    const recallAsOfResolved = vi.fn(async (input: { asOf: string; timezoneOffsetMinutes?: number }) => ({
+      memory: { revision: 1, historical: true },
+      asOfResolution: { original: input.asOf, timezoneOffsetMinutes: input.timezoneOffsetMinutes },
+    }));
+    const router = createRestRouter({
+      service: new FakeMemoryService(),
+      authority: transportAuthority,
+      memoryEvolution: {
+        recallAsOfResolved,
+        history: vi.fn(), recallAsOf: vi.fn(), expire: vi.fn(), revoke: vi.fn(), purge: vi.fn(),
+      } as never,
+    });
+    const response = await router.handle({
+      method: "POST",
+      path: "/v1/recall/as-of",
+      headers: {},
+      body: { lineageId: "release", asOf: "昨天", timezoneOffsetMinutes: 480 },
+    });
+    expect(response).toMatchObject({
+      status: 200,
+      body: { asOfResolution: { original: "昨天", timezoneOffsetMinutes: 480 } },
+    });
+    expect(recallAsOfResolved).toHaveBeenCalledWith(expect.objectContaining({
+      asOf: "昨天", timezoneOffsetMinutes: 480,
+    }));
+  });
+
+  test("RuntimeHost 控制面只返回脱敏 owner/home/generation 快照", async () => {
+    const runtimeSnapshot = {
+      protocolVersion: 1 as const,
+      ownerId: "runtime-owner-1",
+      homeFingerprint: "a".repeat(64),
+      generation: 4,
+      state: "ready" as const,
+      ready: true,
+      accepting: true,
+      workerOwner: true,
+    };
+    const router = createRestRouter({
+      unsafeLegacyScope: true,
+      service: new FakeMemoryService(),
+      runtimeControl: { snapshot: () => runtimeSnapshot },
+    });
+
+    await expect(router.handle({ method: "GET", path: "/v1/runtime", headers: {} }))
+      .resolves.toEqual({ status: 200, body: runtimeSnapshot });
+    await expect(router.handle({ method: "POST", path: "/v1/runtime", headers: {} }))
+      .resolves.toEqual({ status: 405, body: { error: "Method not allowed" } });
+    expect(JSON.stringify(runtimeSnapshot)).not.toContain("/.mengshu");
+  });
+
   test("server-owned workspace/session are preserved and client overrides are rejected", async () => {
     const executeMemoryWrite = vi.fn(async (): Promise<MemoryWriteKernelResult> => ({
       status: "persisted",

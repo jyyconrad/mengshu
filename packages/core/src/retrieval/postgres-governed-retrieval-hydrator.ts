@@ -21,7 +21,7 @@ import type {
   MemorySemanticType,
   RecordProvenance,
 } from "../domain/types.js";
-import { computeContentHash } from "../scoring/hash-utils.js";
+import { matchesContentHash } from "../scoring/hash-utils.js";
 import type {
   GovernedRetrievalCandidate,
   GovernedRetrievalHydration,
@@ -49,7 +49,6 @@ export type PostgresGovernedRetrievalHydrationRequest = GovernedRetrievalHydrati
 };
 
 const SAFE_ID = /^[^\s\p{Cc}]{1,256}$/u;
-const CONTENT_HASH = /^[0-9a-f]{32}$/;
 const KINDS = new Set<MemoryKind>([
   "preference", "decision", "entity", "fact", "task", "plan", "goal",
   "document", "knowledge", "observation", "other",
@@ -87,11 +86,36 @@ const MEMORY_SESSION_SQL = `COALESCE(
   ''
 )`;
 
+const EFFECTIVE_MEMORY_LIFECYCLE_SQL = `CASE
+  WHEN temporal_activation_state = 'staged'
+    AND valid_from <= CURRENT_TIMESTAMP
+    AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
+  THEN 'active'
+  ELSE lifecycle_status
+END`;
+
+const CURRENT_MEMORY_VERSION_SQL = `(lineage_id IS NULL OR id = (
+  SELECT current_version.id
+  FROM memories AS current_version
+  WHERE current_version.scope_fingerprint = memories.scope_fingerprint
+    AND current_version.lineage_id = memories.lineage_id
+    AND current_version.valid_from <= CURRENT_TIMESTAMP
+    AND (current_version.valid_to IS NULL OR current_version.valid_to > CURRENT_TIMESTAMP)
+    AND current_version.temporal_invalidated IS NOT TRUE
+    AND current_version.temporal_purge_pending IS NOT TRUE
+    AND ((current_version.lifecycle_status = 'active'
+        AND current_version.temporal_activation_state = 'active')
+      OR (current_version.lifecycle_status = 'archived'
+        AND current_version.temporal_activation_state = 'staged'))
+  ORDER BY current_version.valid_from DESC, current_version.revision DESC
+  LIMIT 1
+))`;
+
 const READ_MEMORY_SQL = `SELECT
   id::text AS id,
   text,
   content_hash,
-  importance,
+  importance::double precision AS importance,
   category,
   data_type,
   floor(extract(epoch FROM created_at) * 1000)::text AS created_at_ms,
@@ -105,7 +129,7 @@ const READ_MEMORY_SQL = `SELECT
   visibility,
   COALESCE(workspace_id, '') AS workspace_id,
   ${MEMORY_SESSION_SQL} AS session_id,
-  lifecycle_status,
+  ${EFFECTIVE_MEMORY_LIFECYCLE_SQL} AS lifecycle_status,
   legacy_quarantine_reason,
   metadata
 FROM memories
@@ -120,9 +144,16 @@ WHERE tenant_id = $1
   AND ${MEMORY_SESSION_SQL} = $9
   AND id::text = $10
   AND data_type = 'memory'
-  AND lifecycle_status IN ('active', 'archived')
+  AND ${EFFECTIVE_MEMORY_LIFECYCLE_SQL} IN ('active', 'archived')
   AND metadata->>'admissionRoute' IN ('active', 'lookup_only')
   AND legacy_quarantine_reason IS NULL
+  AND temporal_invalidated IS NOT TRUE
+  AND temporal_purge_pending IS NOT TRUE
+  AND (lineage_id IS NULL OR (
+    valid_from <= CURRENT_TIMESTAMP
+    AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
+  ))
+  AND ${CURRENT_MEMORY_VERSION_SQL}
   AND (
     metadata->>'sessionId' IS NULL
     OR metadata #>> '{governance,provenance,sessionId}' IS NULL
@@ -365,10 +396,10 @@ function decodeMemory(
   const row = exactRow(value, MEMORY_ROW_KEYS);
   if (!row || row.id !== authoritativeRecordId || !sameScopeRow(row, scope) ||
       typeof row.text !== "string" || row.text.trim().length === 0 ||
-      typeof row.content_hash !== "string" || !CONTENT_HASH.test(row.content_hash) ||
-      row.content_hash !== computeContentHash(row.text) ||
+      typeof row.content_hash !== "string" || !matchesContentHash(row.text, row.content_hash) ||
       !score(row.importance) || typeof row.category !== "string" ||
-      !CATEGORIES.has(row.category as MemoryCategory) || row.data_type !== "memory" ||
+      row.category.trim().length === 0 || row.category !== row.category.trim() ||
+      row.data_type !== "memory" ||
       row.legacy_quarantine_reason !== null) return invalid();
   const createdAt = millis(row.created_at_ms);
   const updatedAt = millis(row.updated_at_ms);
@@ -443,7 +474,9 @@ function decodeMemory(
       text: row.text,
       contentHash: row.content_hash,
       importance: row.importance,
-      category: row.category as MemoryCategory,
+      category: CATEGORIES.has(row.category as MemoryCategory)
+        ? row.category as MemoryCategory
+        : "other",
       dataType: "memory",
       metadata: metadataSnapshot as Record<string, unknown>,
       provenance: provenanceSnapshot as RecordProvenance,

@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   evaluateDocumentGovernanceProposal,
+  resolveDocumentOrganizationPolicy,
   type DocumentGovernanceProposal,
 } from "./index.js";
 
@@ -185,6 +186,40 @@ describe("document governance deterministic gates", () => {
     })).toMatchObject({
       decision: "review",
       reasonCodes: ["RISK_REVIEW_REQUIRED", "MODEL_REVIEW_REQUIRED"],
+    });
+  });
+
+  test("document overlay context is rendered once and its receipt is scope/layer checked", async () => {
+    const receipt = {
+      scopeFingerprint: "a".repeat(64),
+      layer: "document_organization" as const,
+      overlayId: "document-policy",
+      overlayVersion: 2,
+      contentHash: "b".repeat(64),
+      guardVersion: "memory-policy-guard-v1" as const,
+      resolutionHash: "c".repeat(64),
+    };
+    const context = await resolveDocumentOrganizationPolicy({
+      resolve: async () => ({
+        source: "overlay" as const,
+        policy: { focusHints: [], ignoreHints: [], aggregationHints: ["按主题组织"] },
+        rendered: "DOCUMENT_POLICY_WITH_GUARD",
+        warnings: [],
+        receipt,
+      }),
+    }, {
+      tenantId: "tenant-1", userId: "user-1", appId: "codex", projectId: "project-1",
+      agentId: "agent-1", namespace: "memories", visibility: "private",
+    });
+    expect(context.systemPromptSuffix).toContain("DOCUMENT_POLICY_WITH_GUARD");
+    expect(evaluateDocumentGovernanceProposal({ ...input, policyResolution: receipt }))
+      .toMatchObject({ decision: "auto_apply", policyResolution: receipt });
+    expect(evaluateDocumentGovernanceProposal({
+      ...input,
+      policyResolution: { ...receipt, layer: "tree_summary" },
+    })).toMatchObject({
+      decision: "quarantine",
+      reasonCodes: ["POLICY_RESOLUTION_INVALID"],
     });
   });
 });
