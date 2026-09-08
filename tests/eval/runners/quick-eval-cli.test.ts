@@ -30,29 +30,31 @@ afterEach(() => {
 });
 
 describe("quick-eval CLI fail-closed", () => {
-  test("无参数默认执行完整 11 suite，offline quality 通过 exit 0，但不冒充 production gate", () => {
+  test("无参数默认执行完整 12 suite，offline quality 通过 exit 0，但不冒充 production gate", () => {
     const result = runCli([]);
 
     expect(result.status).toBe(0);
     expect(result.stderr).not.toMatch(/未实现 runner|missing runner/i);
     expect(result.stdout).toContain("mengshu-v0.1");
     expect(result.stdout).toContain("mengshu-skill-candidate");
-    expect(result.stdout).toContain("release gate: PASS");
+    expect(result.stdout).toContain("quality gate: PASS");
+    expect(result.stdout).toContain("version release gate: FAIL");
+    expect(result.stdout).not.toMatch(/\n\s+release gate: PASS/);
     expect(result.stdout).toContain("production release gate: FAIL");
     expect(result.stdout).toMatch(/production gate reason:.*offline-component/);
   });
 
-  test("all 写出完整 11 suite report，全部 offline quality gate 通过，production gate 仍失败", () => {
+  test("all 写出完整 12 suite report，全部 offline quality gate 通过，production gate 仍失败", () => {
     const out = makeTempDir();
     const result = runCli(["all", "--out", out]);
 
     expect(result.status).toBe(0);
     expect(result.stderr).not.toMatch(/未实现 runner/);
     const report = JSON.parse(readFileSync(path.join(out, "report.json"), "utf8"));
-    expect(report.suites).toHaveLength(11);
+    expect(report.suites).toHaveLength(12);
     expect(report.releaseGatePassed).toBe(true);
     expect(report.productionReleaseGatePassed).toBe(false);
-    expect(report.manifest.suites).toHaveLength(11);
+    expect(report.manifest.suites).toHaveLength(12);
     expect(report.manifest.suites).toEqual(expect.arrayContaining([
       expect.objectContaining({
         name: "mengshu-extraction",
@@ -62,7 +64,7 @@ describe("quick-eval CLI fail-closed", () => {
     ]));
     const extensions = report.suites.filter((suite: { suite: string }) =>
       !suite.suite.startsWith("mengshu-v0.1") && suite.suite !== "mengshu-safety");
-    expect(extensions).toHaveLength(9);
+    expect(extensions).toHaveLength(10);
     expect(extensions.find((suite: { suite: string }) => suite.suite === "mengshu-extraction"))
       .toMatchObject({ gatePassed: true });
     expect(extensions.every((suite: { gatePassed: boolean }) => suite.gatePassed === true))
@@ -131,7 +133,7 @@ describe("quick-eval CLI fail-closed", () => {
     const invalidManifest = path.join(dir, "manifest.json");
     writeFileSync(
       invalidManifest,
-      JSON.stringify({ schemaVersion: 1, suites: { broken: { file: "x.jsonl" } } }),
+      JSON.stringify({ schemaVersion: 2, suites: { broken: { file: "x.jsonl" } } }),
       "utf8",
     );
 

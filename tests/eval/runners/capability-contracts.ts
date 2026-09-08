@@ -16,6 +16,15 @@ import type {
   MemoryScope,
   MemorySemanticType,
 } from "../../../packages/core/src/domain/types.js";
+import type { AuthorityScope } from
+  "../../../packages/core/src/domain/authority-scope.js";
+import {
+  computeCanonicalContentHash,
+  computeContentHash,
+  matchesContentHash,
+} from "../../../packages/core/src/scoring/hash-utils.js";
+import { projectWorkspaceBindings } from
+  "../../../packages/core/src/runtime/registry.js";
 import { AgentLoadoutAssembler } from
   "../../../packages/core/src/loadout/assembler.js";
 import { applyLoadoutAssemblyToContext } from
@@ -37,6 +46,10 @@ import type {
   HonestExtensionCaseResult,
   HonestExtensionRun,
 } from "./extension-runner-adapters.js";
+import {
+  resolveMcpAuthorityScope,
+  snapshotMcpProjectWorkspaceBindings,
+} from "../../../packages/mcp/src/authority.js";
 
 const SCOPE: MemoryScope & { visibility: "private" } = Object.freeze({
   tenantId: "eval",
@@ -70,6 +83,33 @@ const SLOT_LOADOUT_SCENARIOS = new Set([
   "revoked_asset_denied",
   "budget_downgrade_navigation",
 ]);
+const IMPORT_COMPAT_SCENARIOS = new Set([
+  "canonical_sha256_normalization",
+  "legacy_md5_accepted",
+  "unverifiable_hash_rejected",
+  "registry_workspace_mapping",
+  "fixed_workspace_precedence",
+  "client_workspace_spoof_rejected",
+]);
+
+const IMPORT_AUTHORITY: AuthorityScope = Object.freeze({
+  tenantId: "eval",
+  userId: "import-user",
+  allow: Object.freeze({
+    appIds: Object.freeze(["codex"]),
+    projectIds: Object.freeze(["memory-autodb"]),
+    agentIds: Object.freeze(["default"]),
+    namespaces: Object.freeze(["working-context"]),
+    visibilities: Object.freeze(["private" as const]),
+  }),
+});
+const IMPORT_CLIENT_SCOPE = Object.freeze({
+  appId: "codex",
+  projectId: "memory-autodb",
+  agentId: "default",
+  namespace: "working-context",
+  visibility: "private" as const,
+});
 
 interface CapabilityCase {
   readonly id: string;
@@ -117,6 +157,81 @@ function loadCapabilityCases(
 
 function check(failures: string[], condition: unknown, message: string): void {
   if (!condition) failures.push(message);
+}
+
+async function evaluateImportCompatCase(
+  goldenCase: CapabilityCase,
+): Promise<HonestExtensionCaseResult> {
+  const failures: string[] = [];
+  switch (goldenCase.scenario) {
+    case "canonical_sha256_normalization": {
+      const imported = "line one\r\nCafe\u0301";
+      const canonical = "line one\nCaf\u00e9";
+      check(failures,
+        computeCanonicalContentHash(imported) === computeCanonicalContentHash(canonical) &&
+          matchesContentHash(imported, computeCanonicalContentHash(canonical)),
+        "canonical SHA-256 did not normalize line endings and Unicode");
+      break;
+    }
+    case "legacy_md5_accepted": {
+      const text = "  legacy imported memory  ";
+      check(failures, matchesContentHash(text, computeContentHash(text)),
+        "legacy MD5 content hash was not accepted");
+      break;
+    }
+    case "unverifiable_hash_rejected": {
+      check(failures, !matchesContentHash("imported memory", "a".repeat(36)),
+        "unverifiable placeholder hash was accepted");
+      break;
+    }
+    case "registry_workspace_mapping": {
+      const registryBindings = projectWorkspaceBindings({
+        projects: {
+          "memory-autodb": {
+            workspaceId: "memory-autodb",
+            manifestPath: "/srv/mengshu/manifest.json",
+          },
+        },
+      });
+      const snapshot = snapshotMcpProjectWorkspaceBindings(IMPORT_AUTHORITY, registryBindings);
+      const resolved = resolveMcpAuthorityScope(
+        IMPORT_AUTHORITY,
+        IMPORT_CLIENT_SCOPE,
+        snapshot,
+      );
+      check(failures, resolved.workspaceId === "memory-autodb",
+        "authorized project did not inherit its server-owned workspace binding");
+      break;
+    }
+    case "fixed_workspace_precedence": {
+      const authority = { ...IMPORT_AUTHORITY, workspaceId: "workspace-fixed" };
+      const resolved = resolveMcpAuthorityScope(
+        authority,
+        IMPORT_CLIENT_SCOPE,
+        { "memory-autodb": "workspace-registry" },
+      );
+      check(failures, resolved.workspaceId === "workspace-fixed",
+        "fixed authority workspace did not override the registry binding");
+      break;
+    }
+    case "client_workspace_spoof_rejected": {
+      let rejected = false;
+      try {
+        resolveMcpAuthorityScope(
+          IMPORT_AUTHORITY,
+          { ...IMPORT_CLIENT_SCOPE, workspaceId: "workspace-attacker" },
+          { "memory-autodb": "memory-autodb" },
+        );
+      } catch {
+        rejected = true;
+      }
+      check(failures, rejected, "client-provided workspaceId was not rejected");
+      break;
+    }
+    default:
+      failures.push(`unsupported scenario: ${goldenCase.scenario}`);
+  }
+  return { caseId: goldenCase.id, passed: failures.length === 0, failures };
 }
 
 function baseContext(): ContextFastResponse {
@@ -663,5 +778,15 @@ export function runSlotLoadoutSuite(fixturePath: string): Promise<HonestExtensio
     "slot-loadout-v1",
     SLOT_LOADOUT_SCENARIOS,
     evaluateSlotLoadoutCase,
+  );
+}
+
+export function runImportCompatSuite(fixturePath: string): Promise<HonestExtensionRun> {
+  return runCapabilitySuite(
+    fixturePath,
+    "mengshu-import-compat",
+    "production-data-compat-v1",
+    IMPORT_COMPAT_SCENARIOS,
+    evaluateImportCompatCase,
   );
 }

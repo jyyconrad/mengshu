@@ -143,13 +143,15 @@ describe("recall-explain-v1 honest component runner", () => {
     const adapted = adaptExtensionRun(custom);
     const report = buildReport([adapted.summary], [], [{
       name: "mengshu-recall-explain",
+      track: "quality",
+      datasetVersion: "q-test-v1",
       kind: "extension",
       runner: "recall-explain-v1",
       caseCount: 1,
       sha256: "0".repeat(64),
       metrics: ["breakdown_output_rate"],
       gate: { breakdown_output_rate: 1 },
-      manifestSchemaVersion: 1,
+      manifestSchemaVersion: 2,
       manifestVersion: "test",
     }]);
 

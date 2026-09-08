@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mengshu.local/schemas/private-dataset-manifest-v1.json",
+  "title": "Mengshu Private Evaluation Dataset Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "datasetId", "status", "caseCount", "targetCaseCount",
+    "countsByCohort", "countsByCapability", "crossDistribution", "casesSha256",
+    "privacyScan", "annotation", "blockers"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1" },
+    "datasetId": { "const": "mengshu-private-v1" },
+    "status": { "enum": ["collecting", "frozen"] },
+    "caseCount": { "type": "integer", "minimum": 0 },
+    "targetCaseCount": { "const": 500 },
+    "countsByCohort": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "countsByCapability": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "crossDistribution": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "casesSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "privacyScan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "findingCount"],
+      "properties": {
+        "passed": { "type": "boolean" },
+        "findingCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "annotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requiredAnnotators", "minimumKappa", "verifiedCaseCount"],
+      "properties": {
+        "requiredAnnotators": { "const": 2 },
+        "minimumKappa": { "const": 0.85 },
+        "verifiedCaseCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "blockers": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+  }
+}

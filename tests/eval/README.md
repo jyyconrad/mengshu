@@ -1,261 +1,199 @@
-# mengshu 评测基础设施
+# Mengshu 评测体系
 
-本目录提供 mengshu 的评测黄金集、runner 与开源数据集 adapter。
+> 协议版本：v2（G/P/Q 三轨）
+> 代码快照：2026-08-31
+> 设计真源：`.memory-docs/original-docs/07-test/memory-evaluation-plan.md`
 
-设计依据：
+本目录承载 Mengshu 的效果评测、工程质量门禁、数据冻结、报告完整性和回归比较。三条轨道回答不同问题，禁止互相替代：
 
-- [docs/07-test/memory-evaluation-plan.md](../../docs/07-test/memory-evaluation-plan.md)
-- [docs/07-test/openclaw-history-eval-plan.md](../../docs/07-test/openclaw-history-eval-plan.md)
+| 轨道 | 产物 | 回答的问题 | 当前状态 |
+|------|------|------------|----------|
+| G - General | GMS + 分 benchmark/capability 报告 | 通用长期记忆效果是否不回归 | G0 runner 已有；当前离线 lexical 仅为 diagnostic |
+| P - Private | PMS + cohort/capability/slice 报告 | Mengshu 真实数据分布上是否不回归 | `private-v1` collecting，目标 500 例 |
+| Q - Quality | pass/block | contract、安全、算法和 runtime 工程质量是否达标 | 12 套 deterministic suite，358 case |
 
-## 目录结构
+`npm run eval:quick` 只运行 Q 轨。Q 轨通过不能表述为 GMS/PMS 提升，也不能单独得出版本可发布结论。
 
-```
+## 目录
+
+```text
 tests/eval/
-├── goldens/                  # 黄金集 jsonl 与 manifest
-│   ├── mengshu-v0.1.jsonl
-│   ├── mengshu-safety.jsonl
-│   └── manifest.json
-├── runners/                  # 评测 runner 与 vitest 集成
-│   ├── types.ts
-│   ├── load-jsonl.ts
-│   ├── judge.ts
-│   ├── quick-eval.ts
-│   └── quick-eval.test.ts
-├── adapters/                 # 开源数据集 adapter（占位实现）
-│   ├── longmemeval.ts
-│   └── longmemeval.test.ts
-├── fixtures/                 # adapter 测试用最小样例
-│   └── longmemeval-mini.json
-└── results/                  # runner 输出（gitignore）
+├── goldens/                 # Q 轨 deterministic JSONL + manifest v2
+├── runtime-e2e/             # Q 轨生产运行合同 fixture
+├── public/                  # G 轨公开 benchmark registry、adapter、scorer bridge、kb-pilot 同步集
+├── private/                 # P 轨 cohort registry、manifest、脱敏构建工具
+├── selfbuilt/               # 自建 diagnostic 数据与 runner（SBS）
+├── runners/                 # 三轨协议、quick/general/compare/gate runner
+├── adapters/                # legacy/兼容 adapter
+├── fixtures/                # 小型单测 fixture，不等于正式数据集
+└── results/                 # 本地运行产物，默认不作为源码提交
 ```
 
-## 黄金集 schema
+## Q 轨：工程质量门禁
 
-每行一条 JSON，严格按 `runners/types.ts::GoldenCase`：
+`goldens/manifest.json` 使用 schema v2。每个 suite 必须声明：
 
-```json
-{
-  "id": "v01-rules-001",
-  "suite": "mengshu-v0.1",
-  "task": "...",
-  "scope": { "tenantId": "...", "appId": "...", "userId": "...", "workspaceId": "...", "projectId": "...", "namespace": "..." },
-  "seedMemories": [
-    { "id": "m1", "kind": "decision", "semanticType": "rules", "body": "..." }
-  ],
-  "query": "...",
-  "expected": {
-    "requiredMemoryIds": ["m1"],
-    "forbiddenMemoryIds": [],
-    "requiredSlots": ["rules"],
-    "answerMustContain": ["..."],
-    "mustEscapeMaxCount": [{ "tag": "</relevant-memories>", "max": 1 }],
-    "expectSensitiveBlocked": false
-  },
-  "metrics": ["slot_recall", "wrong_injection", "latency"]
-}
-```
+- `track: "quality"`
+- `datasetVersion`
+- runner、指标、case 数、字节数和 SHA-256
+- suite 级 gate
 
-注释行：以 `#` 或 `//` 开头的行会被 loader 跳过，方便人工标注。
+当前登记：
 
-## 当前规模
+| Suite | Case | 主要合同 |
+|-------|-----:|----------|
+| `mengshu-v0.1` | 30 | 5 槽位召回与 scope |
+| `mengshu-safety` | 40 | wrong injection、敏感与转义 |
+| `mengshu-extraction` | 100 | type/evidence/over-capture |
+| `mengshu-dedup` | 80 | lexical/duplicate/false merge |
+| `mengshu-recall-explain` | 60 | 6 因子解释 |
+| `mengshu-conflict` | 10 | rules 冲突 |
+| `mengshu-tree-summary` | 8 | summary faithfulness |
+| `mengshu-skill-candidate` | 8 | 候选而非可执行 skill |
+| `mengshu-progressive-disclosure` | 5 | R0-R4 导航 |
+| `mengshu-asset-promotion` | 5 | Asset 晋升 |
+| `mengshu-slot-loadout` | 6 | Loadout 槽位与预算 |
+| `mengshu-import-compat` | 6 | SHA-256/legacy MD5 与 project-workspace 作用域 |
 
-| 套件 | 条数 | 覆盖 |
-|------|------|------|
-| `mengshu-v0.1` | 30 | profile / rules / experience workspace 复用，task_context / resource project 隔离，lookup-only 无 semanticType |
-| `mengshu-safety` | 40 | private 跨用户隔离、revoked / archived 不进 fast、5 类敏感属性拦截、prompt 注入转义、forbidden ids |
-| `mengshu-openclaw-history` | 规划中 | 基于 OpenClaw 真实历史数据，覆盖用户偏好、任务状态、Skill 噪声、slot 路由、标识符治理、记忆树关系和证据忠实度 |
-
-详见 `goldens/manifest.json`。
-
-## 怎么跑
-
-### 一次性评测（命令行）
+运行全部或指定 suite：
 
 ```bash
-# 默认跑 v0.1
 npm run eval:quick
-
-# 指定 suite
 npm run eval:quick -- mengshu-safety
-
-# 跑全部 suite
-npm run eval:quick -- all
-
-# 自定义输出目录
-npm run eval:quick -- mengshu-v0.1 --out tests/eval/results/manual-run
 ```
 
-输出：`tests/eval/results/<timestamp>/report.md` + `report.json`。
+报告中的关键字段：
 
-### 通过 vitest 跑（CI / 回归）
+- `qualityGatePassed`：Q 轨 suite gate 是否全部通过。
+- `releaseGatePassed`：兼容字段，当前等同 Q 轨，不能解释为版本发布结论。
+- `versionReleaseGatePassed`：quick runner 固定 fail-closed，因为它没有运行正式 G/P。
+- `productionReleaseGatePassed`：只在满足 production eligibility 的 Q 轨组合上有意义，不替代 live production test。
+
+Vitest 回归：
 
 ```bash
-npx vitest run tests/eval/runners/quick-eval.test.ts
+npx vitest run tests/eval/runners/quick-eval.test.ts tests/eval/runners/quick-eval-cli.test.ts tests/eval/runners/evaluation-protocol.test.ts tests/eval/runners/eval-manifest.test.ts
 ```
 
-每条 case 都会变成一个 vitest test 条目，套件级断言会校验 release gate。
+## G 轨：公开通用评测
 
-## release gate（v0.1）
+`public/registry.json` 固定公开数据仓库 revision、文件 SHA-256、license SHA-256 和 scorer 状态。当前 registry 覆盖 LongMemEval cleaned、LoCoMo、MemoryAgentBench，以及按 kb-pilot 协议同步的 RAG-Multi-Corpus G1 diagnostic。
 
-由 `runners/quick-eval.ts::buildReport` 实现：
-
-1. `mengshu-safety.wrongInjectionRate === 0`
-2. 其他套件 `passRate >= 0.8`
-
-任意一项失败，CLI 进程 exit code 设为 1，便于 CI 拒绝合并。
-
-## 接入开源测试集
-
-适配优先级（详见 `docs/07-test/memory-evaluation-plan.md` §4）：
-
-| 数据集 | License | 用途 | 是否进 v0.1 必跑 |
-|--------|---------|------|------------------|
-| [LongMemEval](https://github.com/xiaowu0162/LongMemEval) | MIT | 跨会话推理、abstention、知识更新 | 否（v0.2 接入） |
-| [LoCoMo](https://github.com/snap-research/locomo) | Apache 2.0 | 长对话记忆 | 否（v0.2 接入） |
-| [PerLTQA](https://github.com/Elvin-Yiming-Du/PerLTQA) | 见仓库 | 个人偏好长期 QA | 否（v0.3 参考） |
-| BEIR 子集（scifact 等） | 各子集独立 | 通用检索能力 | 否（仅作 retrieval baseline） |
-
-接入流程：
-
-1. 下载数据集到本机（不入仓）。例如 LongMemEval：
-   ```bash
-   git clone https://github.com/xiaowu0162/LongMemEval ~/datasets/longmemeval
-   ```
-2. 用 adapter 转换：
-   ```typescript
-   import { loadLongMemEval } from "./adapters/longmemeval.js";
-   const cases = loadLongMemEval("~/datasets/longmemeval/data/longmemeval_s.json", {
-     suite: "longmemeval-s",
-     limit: 50,
-   });
-   ```
-3. 把转换结果写到 `tests/eval/goldens/longmemeval-s.jsonl`，再用 `quick-eval` 跑。
-
-注意：
-
-- 默认 v0.1 release gate 不要求开源 benchmark。LongMemEval / LoCoMo 的接入是为
-  v0.2+ 做准备。
-- `tests/eval/fixtures/longmemeval-mini.json` 仅用于 adapter 单元测试，**不**是真实数据集。
-
-## 开发指引
-
-### 新增黄金集 case
-
-1. 复制现有 jsonl 行为模板修改字段；
-2. 跑一遍 `npm run eval:quick -- <suite>` 确认通过；
-3. 重新计算 sha256：`shasum -a 256 tests/eval/goldens/*.jsonl`；
-4. 更新 `tests/eval/goldens/manifest.json` 的 size 与 sha256；
-5. 提交。
-
-### 新增指标
-
-在 `runners/types.ts` 加 `GoldenMetric` 枚举，并在 `runners/judge.ts::defaultJudge` 中加判定分支。
-
----
-
-## 人工标注流程（v2.0 - 从经验值到验证值）
-
-> **目标**：将经验值 golden set 扩充为经过人工标注验证的评测集（按设计 §15.5）
-
-### 标注工具
-
-位于 `tests/eval/tools/annotator.js`，支持：
-- 双人独立标注
-- 一致性计算（Cohen's Kappa）
-- 仲裁分歧样例
-- 合并标注结果
-
-### 标注流程（以 mengshu-dedup 为例）
-
-#### 1. 双人独立标注
-
-**Annotator 1**:
-```bash
-node tests/eval/tools/annotator.js annotate \
-  --suite mengshu-dedup \
-  --annotator human_001
-```
-
-**Annotator 2**:
-```bash
-node tests/eval/tools/annotator.js annotate \
-  --suite mengshu-dedup \
-  --annotator human_002
-```
-
-输出文件：
-- `tests/eval/results/human_001_mengshu-dedup_<timestamp>.jsonl`
-- `tests/eval/results/human_002_mengshu-dedup_<timestamp>.jsonl`
-
-#### 2. 计算一致性
+G0 使用冻结后的 `EvalCaseV2` 数据验证 runner、检索 diagnostic、对照组与两轮稳定性：
 
 ```bash
-node tests/eval/tools/annotator.js consistency \
-  --suite mengshu-dedup \
-  --file1 tests/eval/results/human_001_mengshu-dedup_1718611200000.jsonl \
-  --file2 tests/eval/results/human_002_mengshu-dedup_1718611200000.jsonl
+# 先按 public/tools/prepare-g0.ts 冻结数据到 ~/.mengshu/eval-datasets/public/frozen/g0-v1
+npm run eval:g0:round1
+npm run eval:g0:round2
+npm run eval:g0:finalize
 ```
 
-输出：
-- Cohen's Kappa 值
-- 观察一致率 (P_o)
-- 分歧样例列表（自动导出到 `tests/eval/results/conflicts_mengshu-dedup_<timestamp>.json`）
+两轮报告默认写入：
 
-**门禁**：
-- Kappa >= 0.85：直接合并
-- 0.70 <= Kappa < 0.85：仲裁分歧样例
-- Kappa < 0.70：重新标注
+```text
+~/.mengshu/eval-results/g0-v1/
+├── round-1/report.json
+├── round-2/report.json
+├── stability-comparison.json
+├── no-memory-ablation.json
+├── efficiency.json
+└── release-gate.json
+```
 
-#### 3. 仲裁（如有分歧）
+当前 `GeneralEvaluationReport` 明确写入：
+
+- `scoreAuthority="diagnostic"`
+- `officialAnswerScoring="not_run"`
+- `formalScoreEligible=false`
+
+因此 G0 的 lexical score 只用于开发诊断。在 official answer scorer、required controls 和 paired baseline/candidate 未齐备前，不得称为正式 GMS。
+
+### kb-pilot / RAG-Multi-Corpus
+
+`public/kb-pilot/data/rag-multi-corpus-v1/` 保存上游实际使用的 236 篇 Markdown、1088 行原始 CSV 和去重后的 907 题。902 题证据文件完整；5 题引用缺失的 `Account Close Guide.md`，保留用于审计但不进入评分。
 
 ```bash
-node tests/eval/tools/annotator.js arbitrate \
-  --conflicts tests/eval/results/conflicts_mengshu-dedup_1718611200000.json \
-  --arbitrator human_003
+npm run eval:rag-multi:sync -- --source /absolute/path/to/RAG-Multi-Corpus --force
+npx vitest run tests/eval/public/kb-pilot/dataset-integrity.test.ts tests/eval/public/adapters/rag-multi-corpus.test.ts
 ```
 
-仲裁人逐条审核分歧样例，给出最终标注 + 理由。
+完整协议、上游结果边界和不可复现项见 [public/kb-pilot/PROTOCOL.md](public/kb-pilot/PROTOCOL.md)。该数据集没有 reference answer 和版本化 scorer，当前 `formalScoreEligible=false`，不能把 kb-pilot 自报的 99.1% 直接当作 Mengshu 基线。
 
-#### 4. 合并标注结果
+## P 轨：私有冻结集
+
+`private/cohort-registry.json` 固定 `mengshu-private-v1` 的治理合同：
+
+| Cohort | 配额 |
+|--------|-----:|
+| governed canonical | 200 |
+| fresh holdout | 150 |
+| legacy paired | 100 |
+| adversarial | 50 |
+
+总目标为 500 例，要求双人独立标注且 Cohen's Kappa 不低于 0.85。构建器只接受通过治理状态、隐私扫描、配额和 schema 校验的输入：
 
 ```bash
-node tests/eval/tools/annotator.js merge \
-  --suite mengshu-dedup \
-  --file1 tests/eval/results/human_001_mengshu-dedup_1718611200000.jsonl \
-  --file2 tests/eval/results/human_002_mengshu-dedup_1718611200000.jsonl \
-  --arbitrated tests/eval/results/arbitrated_1718611200000.json \
-  --output tests/eval/goldens/mengshu-dedup-annotated.jsonl
+npm run eval:private:prepare
 ```
 
-生成带标注元数据的最终 jsonl 文件。
+当前 `private-v1.collecting.json` 仍为 collecting 状态。P-FRESH 少于 150、独立标注未完成或总数不足时，release gate 必须保持 blocked。
 
-#### 5. 更新 manifest
+## SBS：自建诊断集
+
+`selfbuilt/data/mengshu-selfbuilt-v1/` 包含 360 例确定性自建数据，覆盖 6 个能力族 × 6 个场景；72 例 dev、288 例 test。它不读取生产私有正文，也不依赖公开 benchmark。
 
 ```bash
-# 计算新 sha256
-shasum -a 256 tests/eval/goldens/mengshu-dedup-annotated.jsonl
-
-# 手动更新 tests/eval/goldens/manifest.json
+npm run eval:selfbuilt:prepare
+npm run eval:selfbuilt:round1
+npm run eval:selfbuilt:round2
+npm run eval:selfbuilt:finalize
 ```
 
-### 标注规范
+SBS 的 `formalReleaseEligible=false`。它是开发诊断分，不是 G/P/Q 之外的第四条发布轨，也不能替代 GMS、PMS 或 P-FRESH。
 
-详见 `tests/eval/ANNOTATION_GUIDE.md`，包括：
-- extraction 三要素（type/targetScope/evidence）
-- dedup 关系枚举（duplicate/update/conflict/related/distinct）
-- 边界样例判定准则
-- 常见问题 FAQ
+## 版本发布门禁
 
-### 扩充计划
+`runners/gate-runner.ts` 采用 fail-closed 合同。版本结论为 pass 需要同时满足：
 
-详见 `tests/eval/EXPANSION_PLAN.md`，包括：
-- P0-c：提取 100 条 + 去重 80 条（双人标注）
-- P1：摘要 50 条 + 冲突 30 条
-- P2：主动学习采样（每周 25 条）
+1. Q 轨通过。
+2. 数据与报告完整性通过。
+3. G 轨具有 formal eligible report，且 baseline/candidate paired gate 通过。
+4. P 轨 paired gate 通过。
+5. P-FRESH 至少 150 例。
 
-### 质量保障
+缺少任一输入都生成 blocker，不使用其它轨道的分数补齐。live production gate 还需单独显式运行：
 
-1. **双人标注 + 仲裁**：确保标注质量
-2. **一致性门禁**：Kappa < 0.8 必须重新标注
-3. **边界样例额外审核**：第三人审核通过才入库
-4. **持续监控**：P2 主动学习采样，持续改进
+```bash
+MENGSHU_RUN_LIVE_TESTS=1 npm run test:production-gate
+```
+
+## 可复现性与完整性
+
+正式运行记录 `EvalRunSpec`，包括 candidate/baseline version、dataset hash、governance snapshot、配置指纹、数据库 schema、模型、prompt hash、随机种子、token budget、topK 和 cache mode。RunSpec、dataset 与 report 都有 SHA-256 身份。
+
+paired comparison 要求：
+
+- baseline/candidate case id 完全一致；
+- capability 不得在两轮间漂移；
+- 使用固定随机种子 bootstrap；
+- 总体和每个 capability 都检查回归容忍线；
+- cold/warm 两轮不得改动 dataset、protocol 或 worktree 身份。
+
+## 新增或修改 Q 轨 Suite
+
+1. 在 `goldens/` 增加或修改 JSONL。
+2. 更新 `goldens/manifest.json` 的 `track`、`datasetVersion`、case 数、bytes、SHA-256、metrics 与 gate。
+3. 在 runner adapter 中实现确定性判定，不把 LLM 输出作为最终 gate。
+4. 运行指定 suite 与 manifest/integrity 测试。
+5. 阈值、权重或 prompt 变化时运行全部 Q 轨，并按需要运行 G/P paired evaluation。
+
+计算 fixture 身份：
+
+```bash
+wc -c tests/eval/goldens/*.jsonl
+shasum -a 256 tests/eval/goldens/*.jsonl
+```
+
+人工标注规范见 [ANNOTATION_GUIDE.md](ANNOTATION_GUIDE.md)，扩充计划见 [EXPANSION_PLAN.md](EXPANSION_PLAN.md)。
+
+**最后更新**：2026-08-31

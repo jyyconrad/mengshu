@@ -1,10 +1,12 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "createdAt": "2026-06-10",
-  "version": "v0.3-MG009",
-  "updatedAt": "2026-08-16",
+  "version": "v0.5-eval-tracks",
+  "updatedAt": "2026-08-30",
   "suites": {
     "mengshu-v0.1": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "baseline",
       "runner": "slot-context-v1",
       "file": "mengshu-v0.1.jsonl",
@@ -22,6 +24,8 @@
       "metrics": ["slot_recall", "wrong_injection", "latency"]
     },
     "mengshu-safety": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "baseline",
       "runner": "slot-context-v1",
       "file": "mengshu-safety.jsonl",
@@ -43,6 +47,8 @@
       "metrics": ["wrong_injection", "sensitive_blocked", "must_escape", "latency"]
     },
     "mengshu-extraction": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "candidate-extraction-v1",
       "file": "mengshu-extraction.jsonl",
@@ -70,6 +76,8 @@
       }
     },
     "mengshu-dedup": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "semantic-dedup-v1",
       "file": "mengshu-dedup.jsonl",
@@ -93,6 +101,8 @@
       "notes": "验证 D-06 中文短文本 0.88 / 英文 0.85 阈值"
     },
     "mengshu-recall-explain": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "recall-explain-v1",
       "file": "mengshu-recall-explain.jsonl",
@@ -115,6 +125,8 @@
       }
     },
     "mengshu-conflict": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "conflict-detection-v1",
       "file": "mengshu-conflict.jsonl",
@@ -136,6 +148,8 @@
       "notes": "P1/P3 待扩充至 50 条"
     },
     "mengshu-tree-summary": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "tree-summary-v1",
       "file": "mengshu-tree-summary.jsonl",
@@ -158,6 +172,8 @@
       "notes": "P3 待扩充至 50 条"
     },
     "mengshu-skill-candidate": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "skill-candidate-v1",
       "file": "mengshu-skill-candidate.jsonl",
@@ -180,6 +196,8 @@
       "notes": "P4 待扩充至 30 条"
     },
     "mengshu-progressive-disclosure": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "progressive-disclosure-v1",
       "file": "mengshu-progressive-disclosure.jsonl",
@@ -201,6 +219,8 @@
       }
     },
     "mengshu-asset-promotion": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "asset-promotion-v1",
       "file": "mengshu-asset-promotion.jsonl",
@@ -221,6 +241,8 @@
       }
     },
     "mengshu-slot-loadout": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
       "kind": "extension",
       "runner": "slot-loadout-v1",
       "file": "mengshu-slot-loadout.jsonl",
@@ -241,6 +263,30 @@
       "gate": {
         "case_pass_rate": 1.0
       }
+    },
+    "mengshu-import-compat": {
+      "track": "quality",
+      "datasetVersion": "q-contract-v1",
+      "kind": "extension",
+      "runner": "production-data-compat-v1",
+      "file": "mengshu-import-compat.jsonl",
+      "caseCount": 6,
+      "bytes": 596,
+      "sha256": "13bd4ba010fc0491877b0d96d9218386a70a8d416b73ac778caa440aa7e6b6a3",
+      "coverage": {
+        "canonical_sha256": 1,
+        "legacy_md5": 1,
+        "invalid_hash": 1,
+        "registry_workspace": 1,
+        "fixed_workspace": 1,
+        "workspace_spoof": 1
+      },
+      "metrics": ["case_pass_rate"],
+      "description": "生产 Markdown 导入哈希兼容与 MCP 服务端 project-to-workspace 作用域合同",
+      "phase": "production-import",
+      "gate": {
+        "case_pass_rate": 1.0
+      }
     }
   },
   "notes": [
@@ -248,6 +294,8 @@
     "release gate：safety wrong_injection_rate=0；v0.1 pass rate>=80%。",
     "P0-c 新增 6 个 suite：extraction(100)、dedup(80)、recall-explain(60) 充分样例；conflict(10)、tree-summary(8)、skill-candidate(8) 骨架占位。",
     "MG-009 新增 3 个 deterministic component suite：progressive-disclosure(5)、asset-promotion(5)、slot-loadout(6)。",
+    "生产导入新增 import-compat(6)：覆盖 SHA-256/legacy MD5 与 MCP project-to-workspace 权限边界。",
+    "评测协议 v2：现有 12 套确定性 suite 全部归类为 Q 轨，不计入 GMS/PMS。",
     "P0-c gate：extraction type precision>=0.85、extraction precision>=0.80、over-capture<=0.10；dedup duplicate precision>=0.90、false merge<=0.03；recall-explain breakdown 输出率=1.0。"
   ]
 }

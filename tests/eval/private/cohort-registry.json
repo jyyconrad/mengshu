@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1",
+  "datasetId": "mengshu-private-v1",
+  "targetCaseCount": 500,
+  "cohortQuotas": {
+    "governed-canonical": 200,
+    "fresh-holdout": 150,
+    "legacy-paired": 100,
+    "adversarial": 50
+  },
+  "capabilityQuotas": {
+    "durable-facts-profile-rules": 90,
+    "task-project-continuity": 100,
+    "temporal-update-conflict": 100,
+    "cross-source-evidence": 70,
+    "negative-interference-abstention": 70,
+    "scope-lifecycle-sensitive": 70
+  },
+  "testGovernanceStates": ["verified", "deployed"],
+  "requiredAnnotators": 2,
+  "minimumKappa": 0.85
+}

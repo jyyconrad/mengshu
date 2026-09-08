@@ -1,0 +1,122 @@
+{
+  "schemaVersion": "1",
+  "benchmarks": [
+    {
+      "id": "longmemeval-cleaned",
+      "tier": ["G0", "G1"],
+      "repository": "https://github.com/xiaowu0162/longmemeval",
+      "revision": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+      "licenseSha256": "d3c4b9aa54759df6ded337978a6f3b55b75615e5e4525c3b82d7e2627d4b9732",
+      "files": [
+        {
+          "path": "longmemeval-cleaned/longmemeval_oracle.json",
+          "sha256": "821a2034d219ab45846873dd14c14f12cfe7776e73527a483f9dac095d38620c",
+          "sizeBytes": 15388478
+        },
+        {
+          "path": "longmemeval-cleaned/longmemeval_s_cleaned.json",
+          "sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+          "sizeBytes": 267781711
+        }
+      ],
+      "scorers": [
+        {
+          "path": "src/evaluation/evaluate_qa.py",
+          "sha256": "ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251"
+        },
+        {
+          "path": "src/retrieval/eval_utils.py",
+          "sha256": "c98b8d1096877a15aa755c9de44fe33c195298466a2eb6f3c0f9f6bde8c72349"
+        }
+      ]
+    },
+    {
+      "id": "locomo",
+      "tier": ["G1"],
+      "repository": "https://github.com/snap-research/locomo",
+      "revision": "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376",
+      "licenseSha256": "41003d4a74749c0220e33dd415042164b5a1093ed401f36277234f772d22d3d0",
+      "files": [
+        {
+          "path": "locomo-3eb6f2c/data/locomo10.json",
+          "sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
+        }
+      ],
+      "scorers": [
+        {
+          "path": "task_eval/evaluate_qa.py",
+          "sha256": "dde7c1c6b5501486f96ce31398d6e49de76abbfa656e980b137e54fc69e9f6ee"
+        }
+      ]
+    },
+    {
+      "id": "memoryagentbench",
+      "tier": ["G0", "G1"],
+      "repository": "https://github.com/hust-ai-hyz/memoryagentbench",
+      "revision": "fe1735de8cf8b9908e1e3d3b5612afc815698062",
+      "licenseSha256": "94d735aad92355b4880c969fa309e824eb12fdeeb271ae51cf6143866cf78cf7",
+      "files": [
+        {
+          "path": "memoryagentbench-data/Accurate_Retrieval.parquet",
+          "sha256": "56c3cd80fb6731a3e53cd1a6be3148f54df60ff2d290ee50e28f8acebf9655c1",
+          "sizeBytes": 20024386
+        },
+        {
+          "path": "memoryagentbench-data/Test_Time_Learning.parquet",
+          "sha256": "5338753be48f925d03318eed66117286e3489025fabe050a547bd086cd7d79c0",
+          "sizeBytes": 3947476
+        },
+        {
+          "path": "memoryagentbench-data/Long_Range_Understanding.parquet",
+          "sha256": "5ab175461954db67770d4a4cb69e569b513ebb96aceb9ee79b57f67488bcd539",
+          "sizeBytes": 49342452
+        },
+        {
+          "path": "memoryagentbench-data/Conflict_Resolution.parquet",
+          "sha256": "24d5c3f09ce0ce15625cb9f8a98f44f0d864ca6c94d7b4ad04eb697ca3a5ff45",
+          "sizeBytes": 1491588
+        }
+      ],
+      "scorers": [
+        {
+          "path": "utils/eval_other_utils.py",
+          "sha256": "d77976be409298970614d477a9d8003850caddb0510e56a7e821a037d98493a2"
+        },
+        {
+          "path": "llm_based_eval/longmem_qa_evaluate.py",
+          "sha256": "ceca59bddea4203a78b417be635e63fe3f685bd957e3df12150978e21972c540"
+        }
+      ]
+    },
+    {
+      "id": "rag-multi-corpus-kb-pilot",
+      "tier": ["G1"],
+      "role": "diagnostic",
+      "repository": "https://github.com/udayallu/RAG-Multi-Corpus",
+      "revision": "39071af3f4dd25e59f5c59a6f9b6e8e99cd643b3",
+      "licenseSha256": "98800da81937e7e782491cd00623c39f6958cf031e36441f9ed604997921a140",
+      "files": [
+        {
+          "path": "bechmark/bechmark-agentic-references/Dataset categories - queries.csv",
+          "sha256": "58be4e8ebe96147ab63b159b3166357ad905989023956038ed563f9b88c2d24e",
+          "sizeBytes": 526122
+        }
+      ],
+      "scorers": [],
+      "scorerStatus": "manual-unversioned",
+      "formalScoreEligible": false,
+      "protocol": {
+        "repository": "https://github.com/waylondev/kb-pilot",
+        "revision": "a987183b1ff3c983775d4eff14e012baf811f080",
+        "localSourceManifest": "tests/eval/public/kb-pilot/source-manifest.json"
+      },
+      "synchronizedDataset": {
+        "path": "tests/eval/public/kb-pilot/data/rag-multi-corpus-v1",
+        "sourceRows": 1088,
+        "caseCount": 907,
+        "completeCaseCount": 902,
+        "documentCount": 236
+      }
+    }
+  ]
+}

@@ -271,8 +271,16 @@ export function renderReport(report: EvalReport): string {
   lines.push(`- 总 case 数：${report.totalCases}`);
   lines.push(`- 通过：${report.totalPassed}`);
   lines.push(`- 失败：${report.totalFailed}`);
+  lines.push(`- GMS：${report.tracks.general.effectScore ?? "未运行"}`);
+  lines.push(`- PMS：${report.tracks.private.effectScore ?? "未运行"}`);
   lines.push(
-    `- release gate：${report.releaseGatePassed ? "通过" : "未通过"}`,
+    `- Q 轨 quality gate：${report.qualityGatePassed ? "通过" : "未通过"}`,
+  );
+  lines.push(
+    `- 版本发布门禁：${report.versionReleaseGatePassed ? "通过" : "未通过（G/P 未完成）"}`,
+  );
+  lines.push(
+    `- release gate（兼容字段，等同 Q 轨）：${report.releaseGatePassed ? "通过" : "未通过"}`,
   );
   lines.push(
     `- production release gate：${report.productionReleaseGatePassed ? "通过" : "未通过"}`,
@@ -377,6 +385,8 @@ export function buildReport(
     Pick<
       EvalSuitePlan,
       | "name"
+      | "track"
+      | "datasetVersion"
       | "kind"
       | "runner"
       | "caseCount"
@@ -436,10 +446,14 @@ export function buildReport(
   const totalCases = evaluated.reduce((sum, s) => sum + s.total, 0);
   const totalPassed = evaluated.reduce((sum, s) => sum + s.passed, 0);
   const totalFailed = evaluated.reduce((sum, s) => sum + s.failed, 0);
-  const releaseGatePassed =
-    evaluated.length > 0 && evaluated.every((suite) => suite.gatePassed);
+  const qualitySuites = evaluated.filter((suite) =>
+    planByName.get(suite.suite)?.track === "quality");
+  const qualityGatePassed = qualitySuites.length > 0 &&
+    qualitySuites.every((suite) => suite.gatePassed);
+  const releaseGatePassed = qualityGatePassed;
   const productionReleaseGatePassed =
-    releaseGatePassed && isProductionReleaseEligible(evaluated);
+    qualityGatePassed && qualitySuites.length === evaluated.length &&
+    isProductionReleaseEligible(qualitySuites);
   const manifestSchemaVersions = new Set(
     suitePlans.map((plan) => plan.manifestSchemaVersion),
   );
@@ -452,6 +466,8 @@ export function buildReport(
     const gate = plan.gate ?? null;
     const requiredProductionStages = plan.requiredProductionStages ?? null;
     const gateIdentity = createHash("sha256").update(JSON.stringify({
+      track: plan.track,
+      datasetVersion: plan.datasetVersion,
       kind: plan.kind,
       metrics: plan.metrics,
       gate,
@@ -459,6 +475,8 @@ export function buildReport(
     })).digest("hex");
     return {
       name: plan.name,
+      track: plan.track,
+      datasetVersion: plan.datasetVersion,
       kind: plan.kind,
       runner: plan.runner,
       fixtureCaseCount: plan.caseCount,
@@ -468,6 +486,29 @@ export function buildReport(
       requiredProductionStages,
       gateIdentity,
     };
+  });
+
+  const trackSummary = (
+    track: "general" | "private" | "quality",
+  ) => {
+    const members = evaluated.filter((suite) => planByName.get(suite.suite)?.track === track);
+    return Object.freeze({
+      track,
+      suiteCount: members.length,
+      totalCases: members.reduce((sum, suite) => sum + suite.total, 0),
+      totalPassed: members.reduce((sum, suite) => sum + suite.passed, 0),
+      totalFailed: members.reduce((sum, suite) => sum + suite.failed, 0),
+      scoreName: track === "general" ? "GMS" as const
+        : track === "private" ? "PMS" as const
+          : null,
+      effectScore: null,
+      gatePassed: track === "quality" ? qualityGatePassed : null,
+    });
+  };
+  const tracks = Object.freeze({
+    general: trackSummary("general"),
+    private: trackSummary("private"),
+    quality: trackSummary("quality"),
   });
 
   return {
@@ -481,6 +522,9 @@ export function buildReport(
     totalCases,
     totalPassed,
     totalFailed,
+    tracks,
+    qualityGatePassed,
+    versionReleaseGatePassed: false,
     releaseGatePassed,
     productionReleaseGatePassed,
     notes,
@@ -609,7 +653,10 @@ async function main(argv: string[]): Promise<void> {
     }
   }
   console.log(
-    `  release gate: ${report.releaseGatePassed ? "PASS" : "FAIL"}`,
+    `  quality gate: ${report.qualityGatePassed ? "PASS" : "FAIL"}`,
+  );
+  console.log(
+    `  version release gate: ${report.versionReleaseGatePassed ? "PASS" : "FAIL"}`,
   );
   console.log(
     `  production release gate: ${report.productionReleaseGatePassed ? "PASS" : "FAIL"}`,

@@ -31,10 +31,12 @@ function writeValidFixtureManifest(
   writeFileSync(path.join(dir, "suite.jsonl"), content, "utf8");
   const file = path.join(dir, "manifest.json");
   writeFileSync(file, JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     version: "test-v1",
     suites: {
       suite: {
+        track: "quality",
+        datasetVersion: "q-test-v1",
         kind: "extension",
         runner: "test-runner-v1",
         file: "suite.jsonl",
@@ -57,13 +59,25 @@ afterEach(() => {
 });
 
 describe("eval manifest", () => {
-  test("当前 manifest 明确登记 2 套 baseline 与 9 套 extension", () => {
+  test("当前 manifest 明确登记 2 套 baseline 与 10 套 extension", () => {
     const manifest = loadEvalManifest(manifestPath);
     const suites = Object.values(manifest.suites);
 
-    expect(suites).toHaveLength(11);
+    expect(suites).toHaveLength(12);
     expect(suites.filter((suite) => suite.kind === "baseline")).toHaveLength(2);
-    expect(suites.filter((suite) => suite.kind === "extension")).toHaveLength(9);
+    expect(suites.filter((suite) => suite.kind === "extension")).toHaveLength(10);
+    expect(suites.every((suite) => suite.track === "quality")).toBe(true);
+    expect(suites.every((suite) => suite.datasetVersion.length > 0)).toBe(true);
+  });
+
+  test.each([
+    ["track 缺失", { track: undefined }],
+    ["track 非法", { track: "effect" }],
+    ["datasetVersion 缺失", { datasetVersion: undefined }],
+    ["datasetVersion 空白", { datasetVersion: " " }],
+  ])("suite %s时 fail-closed", (_label, overrides) => {
+    expect(() => loadEvalManifest(writeValidFixtureManifest(overrides)))
+      .toThrow(/track|datasetVersion/i);
   });
 
   test("all 完全由 manifest 展开，不允许硬编码漏跑", () => {
@@ -84,9 +98,11 @@ describe("eval manifest", () => {
 
   test("manifest schema 缺 runner 时立即失败", () => {
     const invalidPath = writeManifest({
-      schemaVersion: 1,
+      schemaVersion: 2,
       suites: {
         "broken-suite": {
+          track: "quality",
+          datasetVersion: "q-test-v1",
           kind: "extension",
           file: "broken.jsonl",
         },
@@ -113,9 +129,11 @@ describe("eval manifest", () => {
     writeFileSync(
       file,
       JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: 2,
         suites: {
           suite: {
+            track: "quality",
+            datasetVersion: "q-test-v1",
             kind: "baseline",
             runner: "slot-context-v1",
             file: "suite.jsonl",
@@ -159,8 +177,10 @@ describe("eval manifest", () => {
     const plan = selectEvalSuites(manifest, "mengshu-v0.1", manifestPath)[0];
 
     expect(plan).toMatchObject({
-      manifestSchemaVersion: 1,
-      manifestVersion: "v0.3-MG009",
+      manifestSchemaVersion: 2,
+      manifestVersion: "v0.5-eval-tracks",
+      track: "quality",
+      datasetVersion: "q-contract-v1",
       runner: "slot-context-v1",
       caseCount: 30,
       sha256: "082bd7165c76ab17639cabf00d10ca7280d8bc0696d4717eb03b96e9027278dc",

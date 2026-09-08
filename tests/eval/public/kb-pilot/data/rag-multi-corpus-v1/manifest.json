@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "1",
+  "datasetId": "rag-multi-corpus-kb-pilot-v1",
+  "track": "general",
+  "formalScoreEligible": false,
+  "source": {
+    "repository": "https://github.com/udayallu/RAG-Multi-Corpus",
+    "revision": "39071af3f4dd25e59f5c59a6f9b6e8e99cd643b3",
+    "queryCsv": "bechmark/bechmark-agentic-references/Dataset categories - queries.csv",
+    "queryCsvSha256": "58be4e8ebe96147ab63b159b3166357ad905989023956038ed563f9b88c2d24e",
+    "licenseSha256": "98800da81937e7e782491cd00623c39f6958cf031e36441f9ed604997921a140"
+  },
+  "kbPilot": {
+    "repository": "https://github.com/waylondev/kb-pilot",
+    "revision": "a987183b1ff3c983775d4eff14e012baf811f080",
+    "reportedUniqueQuestions": 907
+  },
+  "sourceRowCount": 1088,
+  "caseCount": 907,
+  "completeCaseCount": 902,
+  "invalidMissingDocumentCaseCount": 5,
+  "documentCount": 236,
+  "queriesSha256": "283dc0a5b96ff307dec7ffa5b41db40c5a025db53971d15e99c2b6bcba06a74d",
+  "corpusManifestSha256": "9acc738341077f6d10295abf2d7bed6afdb24a03c908c5666e33bea789007bdd",
+  "limitations": [
+    "The upstream QA file contains supporting facts but no reference answers.",
+    "The upstream answer grader was manual and is not published as a versioned scorer.",
+    "Cases with unresolved evidence documents are retained but excluded from scoring."
+  ]
+}

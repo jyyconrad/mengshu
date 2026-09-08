@@ -1,0 +1,1658 @@
+{
+  "schemaVersion": "1",
+  "documentCount": 236,
+  "documents": [
+    {
+      "path": "datasets/Aventro Motors/md/ Aventro Motors- How to Change a Tyre.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": " Aventro Motors- How to Change a Tyre.md",
+      "bytes": 3654,
+      "sha256": "eafdb4ce66adde7e8056ab0af80efc423b4a4167fd9e33c17fb29982601a2a99"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/ AventroZoom SUV.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": " AventroZoom SUV.md",
+      "bytes": 3124,
+      "sha256": "67c0f0bfcc4c82b64a8b6488dac208ff5da08a189462891e6de4e03d1e34aa47"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/About Aventro Motors.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "About Aventro Motors.md",
+      "bytes": 4096,
+      "sha256": "96a87c7b6f6ea8663614bf67df4ea1bf1238e5e5c41f013ac5fe4e8393cbf474"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Adaptive Cruise Control (ACC).md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Adaptive Cruise Control (ACC).md",
+      "bytes": 4218,
+      "sha256": "6e79eb55fa36f6e9580ab3c9aab6777e87380923bbdf92ffebdb743353f80940"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Adjusting the Seat Positions.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Adjusting the Seat Positions.md",
+      "bytes": 3548,
+      "sha256": "ffa3b84589ad4365594b007c708a87a5cf4b393c4b00003087e15055abfec280"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Adjusting the Steering Wheel.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Adjusting the Steering Wheel.md",
+      "bytes": 2627,
+      "sha256": "f4a3259b1b6e5564af2c15176ddd113992cb915e6c0379acc45686f8087fc595"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Advice for Pregnant Women While in a Car.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Advice for Pregnant Women While in a Car.md",
+      "bytes": 3182,
+      "sha256": "a5e4b782e51f743817f03e952b9c9c1640d1cbc4b761bf06c7e75cdded5917e3"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro  Awards & Recognitions.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro  Awards & Recognitions.md",
+      "bytes": 2880,
+      "sha256": "02c290148ad04b0a4959ce739f796ca9982935c5a9ee8e3bc9fc4af28cea0008"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro  Connectivity.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro  Connectivity.md",
+      "bytes": 4751,
+      "sha256": "aa55861122cb2a4252d807e11e1af86e582bff57a61dd3a0742ee1466bad934d"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Aero.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Aero.md",
+      "bytes": 3871,
+      "sha256": "2d1809c0abb128b823f9bcfb2febb42bd08921fecdb0dd3ca18d6090dfb69789"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Bolt Sedan.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Bolt Sedan.md",
+      "bytes": 4512,
+      "sha256": "e235729276b67bf14b4568d4e9b86b6f8cb0649af07b5cb0fcbe55a663c8155e"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Edge Sedan.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Edge Sedan.md",
+      "bytes": 5327,
+      "sha256": "5c84b7d04fe2668ca5c4b29c9d9cc9919f1fb18c3b0e123b61bea421dec04b1b"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Glory SUV.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Glory SUV.md",
+      "bytes": 4188,
+      "sha256": "12deb466308282af3c80919a6563ea5b7a7094e9f9c3b309959bf23f532be7ce"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Grand SUV.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Grand SUV.md",
+      "bytes": 4301,
+      "sha256": "c51bf4f1e0bbb34ed007a9e217447a8054c80b41bd81a3525511ef3b1305db36"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Motors Variants & Pricing.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Motors Variants & Pricing.md",
+      "bytes": 6488,
+      "sha256": "0e13739019e628ad0e86472b02d950a359011a472e20788bd64a582deaf6875f"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Prime Sedan.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Prime Sedan.md",
+      "bytes": 4270,
+      "sha256": "48de092ede86750b9de770b292ce4b019a9a14eb600a22f6ead8e951df0335dc"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Pulse Hatchback.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Pulse Hatchback.md",
+      "bytes": 3988,
+      "sha256": "0a03cce183f544e537ad03347104a6aeacf370f0a2a06cc393d9fe1cadce6bf4"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Service Center Locations.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Service Center Locations.md",
+      "bytes": 3877,
+      "sha256": "11ed190ca3fd2d8bf37ab0ce5f97f254a41f72a76263397f2db0f79cdef78d21"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Spark Hatchback.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Spark Hatchback.md",
+      "bytes": 4864,
+      "sha256": "5ed9bfdcf280496b7a2235bb5617bee8793b15f4d90c396b1b6f975563a0c8dc"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Storm SUV.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Storm SUV.md",
+      "bytes": 4435,
+      "sha256": "7b9907fe7a19283e4478e95c649921c36c812bee218696be241eaf126cf24e59"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Aventro Swift Sedan.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Aventro Swift Sedan.md",
+      "bytes": 4269,
+      "sha256": "d9cc12be28e8420d84006005c1bef7ffb4323df2451dea14695ad1618815957e"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Best Ways to Maintain Good Mileage.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Best Ways to Maintain Good Mileage.md",
+      "bytes": 3124,
+      "sha256": "0ac5d30e2951f4c6fde0c35386a3e2d9c4f7bbe157ad1d33a31f38d5e2ac80f0"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Best Ways to Use Your Car AC.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Best Ways to Use Your Car AC.md",
+      "bytes": 2933,
+      "sha256": "3e2033e6cce646fefe04bdda8b8fecf39c75fa33950dc7e1cf1797e23c5a3204"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Best Ways to Use Your headlamps.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Best Ways to Use Your headlamps.md",
+      "bytes": 4747,
+      "sha256": "5d8991226a460ce4bc199986ecf30fa32029669b0a5f7f988f0644cd6c20878c"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Careers.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Careers.md",
+      "bytes": 3754,
+      "sha256": "6cbaa35e15f1624e0f5f7d2ee8559a2c9ed5c5c9c5cf0adf6bfe2378102d8fb0"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Discounts.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Discounts.md",
+      "bytes": 2785,
+      "sha256": "43231c144f75569e46642b210c2388051f9f6f68c448d168cdeb532238f7c30a"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Do and Donts About 3rd Party.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Do and Donts About 3rd Party.md",
+      "bytes": 4136,
+      "sha256": "bc21c4a5c68757d0d7944f99672d1ea312dc7e3511269d425cefe731b9f06c6b"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Faq part-1.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Faq part-1.md",
+      "bytes": 544,
+      "sha256": "f744cd8802b20fc9dc0a5f0b87e3c51a4a8da2997cbd3875ae218348ea32e9a2"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/How to Handle Engine Wont Start Issue.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "How to Handle Engine Wont Start Issue.md",
+      "bytes": 2573,
+      "sha256": "ef45e38ea3806cd8eb7f9caf6f559d9fbf182d8e93c266b5ba6b9ea6bce6f751"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/How to Open the Door When the Car Key Remote Battery is Dead.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "How to Open the Door When the Car Key Remote Battery is Dead.md",
+      "bytes": 1789,
+      "sha256": "2470bcb853d721e0daf43de336afbfe2a9c0beba00ece2bedf480ec4ced55366"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/How to Open the Fuel Knob in Aventro Cars.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "How to Open the Fuel Knob in Aventro Cars.md",
+      "bytes": 1984,
+      "sha256": "94c83248d81e71b6fb95d0dd8038257db0f28d6f8ca650822cece214a03161fe"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/How to Open the Hood of an Aventro Vehicle.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "How to Open the Hood of an Aventro Vehicle.md",
+      "bytes": 2121,
+      "sha256": "4db76b75c2642d82e652662a2037ad85d8114b37b1fa3f776e82f826bcf84954"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/How to Start Your Aventro Car.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "How to Start Your Aventro Car.md",
+      "bytes": 2339,
+      "sha256": "ef467f488697a6897cc8dc3ff005f0cd5f3cdbead741628c940589398b964211"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/How to Tow Your Aventro Car.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "How to Tow Your Aventro Car.md",
+      "bytes": 2874,
+      "sha256": "9b8dfc4becf789a45aab2ad0cd9ea1c531b4a2033119318af4e38773640d2231"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Instrument Cluster Warning Alerts.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Instrument Cluster Warning Alerts.md",
+      "bytes": 3610,
+      "sha256": "3a8effa9233a272d2c41be42f4f36a59bd692c762ef132a732882661b3f0a9e5"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Lane Keeping Assist System.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Lane Keeping Assist System.md",
+      "bytes": 3631,
+      "sha256": "9fa73d7153b137b58566d57f8cd7658a2b665f428990c7dcfc8673dfaf109421"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Opening and Closing the Boot.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Opening and Closing the Boot.md",
+      "bytes": 2355,
+      "sha256": "c2804f265ab0ee355b6a6f9f7c053bfd7b8758603f48443a861d3a056a1213e1"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Parta-1.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Parta-1.md",
+      "bytes": 2314,
+      "sha256": "a8f2bdc723726c60bb8694148d1f282657ae4fce64e3fd01f85b68fa35f24d87"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Parts-2.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Parts-2.md",
+      "bytes": 2638,
+      "sha256": "8542fca7088bda1fb6ba33fcfdeb1e7894476bc8a3a2009847d4615811817402"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Parts-3.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Parts-3.md",
+      "bytes": 2284,
+      "sha256": "b070d0ce51204c6900553b8c538ccc8fbdca8e5714f189fa4aa30695b1b52fe4"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Parts-4.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Parts-4.md",
+      "bytes": 2403,
+      "sha256": "fd79ef64fd7357a57cb58d80e605d4579bcbf33b8594abec82a604ac99ae8206"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Parts-5.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Parts-5.md",
+      "bytes": 4633,
+      "sha256": "cc952a97702ba33aa7875fb70a5531b2c08ab159b0f424f0e18b9c382f5db289"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Parts-6.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Parts-6.md",
+      "bytes": 4193,
+      "sha256": "28c2d8c1c737c667c4a9769f1d91ea4520e64a1027bf911021acb5efb9cbfb80"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Pre-Owned Certified Cars.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Pre-Owned Certified Cars.md",
+      "bytes": 4063,
+      "sha256": "edad991ac7d6a9e169473fc543006e6935e11d89e000b4182e3d6ba81d3fd27c"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Safe Driving Checklist.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Safe Driving Checklist.md",
+      "bytes": 2695,
+      "sha256": "c76009ef31b5147184e5be3d12954635a3988aa573433aa81c65f04bdd036fd2"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Sell Your Car in 3 Easy Steps.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Sell Your Car in 3 Easy Steps.md",
+      "bytes": 2407,
+      "sha256": "e4e6815a7e6ab3b8a09d6268b67a0fa8e508ac398c190e476a197e98036d677a"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Test Drive at Your Doorstep.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Test Drive at Your Doorstep.md",
+      "bytes": 1299,
+      "sha256": "ec971b59addcc76870dfaf7eb2c0475e0e7236133bc84a630dfb8e673500d067"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/Traction Control.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "Traction Control.md",
+      "bytes": 3947,
+      "sha256": "e31b3d659c800eb7c53e938a95f65a19943863e3f0c64444b1dc86ad69e57630"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/What is ABS.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "What is ABS.md",
+      "bytes": 3285,
+      "sha256": "8f66a76f73d43cdbab34502dfd7e32fbe7ce8c66ddd32a8144e581ce218463e8"
+    },
+    {
+      "path": "datasets/Aventro Motors/md/loans.md",
+      "enterpriseName": "Aventro Motors",
+      "filename": "loans.md",
+      "bytes": 2962,
+      "sha256": "38080bb832baab4bc36583a2a9ef332db62c34d676cc4e1da3f600776aeeeda3"
+    },
+    {
+      "path": "datasets/Cendara University/md/academic_calendar.md",
+      "enterpriseName": "Cendara University",
+      "filename": "academic_calendar.md",
+      "bytes": 5981,
+      "sha256": "8bc32c867c9d6b5fa4595ffd076cad09a996c12ffbee756dadda8f0f20fce4ca"
+    },
+    {
+      "path": "datasets/Cendara University/md/accreditation_status.md",
+      "enterpriseName": "Cendara University",
+      "filename": "accreditation_status.md",
+      "bytes": 3795,
+      "sha256": "57f634d13d877250637a81f64fe71b338f342fbe3149fff643994df5296c80bf"
+    },
+    {
+      "path": "datasets/Cendara University/md/alumni_directory.md",
+      "enterpriseName": "Cendara University",
+      "filename": "alumni_directory.md",
+      "bytes": 4571,
+      "sha256": "b3f3fb47152029c689ce4de34ff5d2a9574f47223d24a58c42a784ee38c128da"
+    },
+    {
+      "path": "datasets/Cendara University/md/awards_and_recognition.md",
+      "enterpriseName": "Cendara University",
+      "filename": "awards_and_recognition.md",
+      "bytes": 4155,
+      "sha256": "d016debd9c443d160997b6ab8684099b73dc2b45497f9eb4c6116a45cc84074f"
+    },
+    {
+      "path": "datasets/Cendara University/md/campus_map.md",
+      "enterpriseName": "Cendara University",
+      "filename": "campus_map.md",
+      "bytes": 6917,
+      "sha256": "9fd45a49002119df115c7a446a6fa38fc149ad6fe838818a11a18449452943d8"
+    },
+    {
+      "path": "datasets/Cendara University/md/campus_overview.md",
+      "enterpriseName": "Cendara University",
+      "filename": "campus_overview.md",
+      "bytes": 6446,
+      "sha256": "391c386ca363f117acc2b90ec1d67b17cc8d221d2f19e51c0e957dc865f4d85d"
+    },
+    {
+      "path": "datasets/Cendara University/md/cocurricular_acitivities.md",
+      "enterpriseName": "Cendara University",
+      "filename": "cocurricular_acitivities.md",
+      "bytes": 6855,
+      "sha256": "d65a45c8be18833b9e127e5c1264e24ab69ceb4a1e36510e8858503dd294049a"
+    },
+    {
+      "path": "datasets/Cendara University/md/contact_information.md",
+      "enterpriseName": "Cendara University",
+      "filename": "contact_information.md",
+      "bytes": 3361,
+      "sha256": "7e487320dbe9710c481b8c8e9d4073ac4f2330a2954a05a86c74391fed108257"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Biology_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Biology_Catalog.md",
+      "bytes": 7622,
+      "sha256": "e508f9540cc025db812c7360f6703f4d14192653be298a10c2ec01474ac9e32b"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Chemistry_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Chemistry_Catalog.md",
+      "bytes": 7289,
+      "sha256": "de1e52320cd26ae6b28a102b03d19c418c3dabbbb7874430a687d915247708fe"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Computer_Science_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Computer_Science_Catalog.md",
+      "bytes": 9111,
+      "sha256": "bd540d924f83389eb0bc900057ded92578d917d4b1753665777783ee3438af7a"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Curriclumn_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Curriclumn_Catalog.md",
+      "bytes": 7380,
+      "sha256": "d2425a43dc70f653a9ea5c91c6fe302e3497fe83858eb6c2337212b34eda4fe3"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Economics_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Economics_Catalog.md",
+      "bytes": 7775,
+      "sha256": "759bcff89c9853a540543fd1ce8114429cc6faba287a9b8e090a2592849e0b60"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_English_and_Comp_Litreature_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_English_and_Comp_Litreature_Catalog.md",
+      "bytes": 7260,
+      "sha256": "6bcfe044aa570e5c1cfdd6c350361ecc59644c50de9c8a1c8ebc4136aab74833"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Finance_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Finance_Catalog.md",
+      "bytes": 5741,
+      "sha256": "da484ed3eee270e1ae51958db7a79a0017aea45cfb553c17b5a8be2fbf6aa185"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_History_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_History_Catalog.md",
+      "bytes": 6232,
+      "sha256": "ca6f9c2cd6277f2dbd2573d96958c3821b9115ef6dbc1b4c98b8f1f74762ecb5"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Management_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Management_Catalog.md",
+      "bytes": 6785,
+      "sha256": "6bd8ec7183ee0407dee579078b609dfea17f3ef31420c3235cfc8de2a0a0d4ab"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Math_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Math_Catalog.md",
+      "bytes": 9396,
+      "sha256": "3ddfacacfbdfcf3d9819a41db086f36a13793e1e50f9a3c5c4c32c5c2d46c036"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Mechanical_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Mechanical_Catalog.md",
+      "bytes": 8742,
+      "sha256": "1486514f61b78711502f4e26ce76544b1b148cd392c2f4e48bf4f0b59089b9f5"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Nursing_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Nursing_Catalog.md",
+      "bytes": 7052,
+      "sha256": "4ec0fe502915ba1e096bd242c2e8cdc5c0d76216cd0e846d7547fea39ee27f7b"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Philosophy_catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Philosophy_catalog.md",
+      "bytes": 8661,
+      "sha256": "ded66517faa80c2448fafbf4e044e19746ca7e4613e7e6b6bbfa2578a6732cb7"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Psychology_Catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Psychology_Catalog.md",
+      "bytes": 7366,
+      "sha256": "77a1d3bdc857e1819a1d8717fdbb483b914e3a05c2dd9c7d3810193c220e48a2"
+    },
+    {
+      "path": "datasets/Cendara University/md/dept_of_Public_Health.md",
+      "enterpriseName": "Cendara University",
+      "filename": "dept_of_Public_Health.md",
+      "bytes": 10225,
+      "sha256": "87589336d689ec7f66c52dd4c6de516c1f18333a24f4fd0ef4858d8b64b2e3e4"
+    },
+    {
+      "path": "datasets/Cendara University/md/diversity_and_inclusion.md",
+      "enterpriseName": "Cendara University",
+      "filename": "diversity_and_inclusion.md",
+      "bytes": 7222,
+      "sha256": "505bfc18854fbebc3470bbabf3270259fe056906a252976b9969f0acd7fef267"
+    },
+    {
+      "path": "datasets/Cendara University/md/employee_handbook.md",
+      "enterpriseName": "Cendara University",
+      "filename": "employee_handbook.md",
+      "bytes": 8648,
+      "sha256": "3518b5e2d815d13c938419376ec3164d24cbef8754ca8d14bc27adc25adae3ff"
+    },
+    {
+      "path": "datasets/Cendara University/md/enrollment_process.md",
+      "enterpriseName": "Cendara University",
+      "filename": "enrollment_process.md",
+      "bytes": 7883,
+      "sha256": "b22bcbc26e98673a7abfc86f21e75064273d8761a3df9c4530356cfd6fb4ed6b"
+    },
+    {
+      "path": "datasets/Cendara University/md/entrance_exxam_guidelines.md",
+      "enterpriseName": "Cendara University",
+      "filename": "entrance_exxam_guidelines.md",
+      "bytes": 7758,
+      "sha256": "a3ba805dc27ceff2214383b70b1c0a959d547dbddef8e112a8af44cabeda5274"
+    },
+    {
+      "path": "datasets/Cendara University/md/faculty_directory.md",
+      "enterpriseName": "Cendara University",
+      "filename": "faculty_directory.md",
+      "bytes": 9536,
+      "sha256": "edddcd0cb34b215e25588b4ab769f0add0e7e7374185ad1dfb7669f13d53f3ce"
+    },
+    {
+      "path": "datasets/Cendara University/md/fee_structure.md",
+      "enterpriseName": "Cendara University",
+      "filename": "fee_structure.md",
+      "bytes": 6520,
+      "sha256": "9b1b9fd0eb254da508dc85a677da0ed15e109f5bfe281671c7b71e51a730a54e"
+    },
+    {
+      "path": "datasets/Cendara University/md/financial_aid.md",
+      "enterpriseName": "Cendara University",
+      "filename": "financial_aid.md",
+      "bytes": 10943,
+      "sha256": "1158493607749ece6c7f192fe2420c8d4d036bf6660881607f5a194c519925ce"
+    },
+    {
+      "path": "datasets/Cendara University/md/infrastructure.md",
+      "enterpriseName": "Cendara University",
+      "filename": "infrastructure.md",
+      "bytes": 6063,
+      "sha256": "f4bfbaa57ae28fb1197fab20f8910c3190a864b01e35e424ebfaa60aa9cde528"
+    },
+    {
+      "path": "datasets/Cendara University/md/international_student_guide.md",
+      "enterpriseName": "Cendara University",
+      "filename": "international_student_guide.md",
+      "bytes": 11028,
+      "sha256": "e3014496c3a4f419e33081057df7726cc7ed7b4cff0bdb236ef6806c85ab8938"
+    },
+    {
+      "path": "datasets/Cendara University/md/placement_report.md",
+      "enterpriseName": "Cendara University",
+      "filename": "placement_report.md",
+      "bytes": 8012,
+      "sha256": "d654f387f5edd4c0cb7acb5c97e5df581dcbcd6fd9e9f1d8ddd8b3c473dd900f"
+    },
+    {
+      "path": "datasets/Cendara University/md/professional_development_policy.md",
+      "enterpriseName": "Cendara University",
+      "filename": "professional_development_policy.md",
+      "bytes": 4974,
+      "sha256": "f5d5ff066debc39e97a774ea2bb6bd09d31a8c1704254cc558da61ec1ebe39af"
+    },
+    {
+      "path": "datasets/Cendara University/md/program_catalog.md",
+      "enterpriseName": "Cendara University",
+      "filename": "program_catalog.md",
+      "bytes": 8418,
+      "sha256": "89082e3dd3f82ccc005b8ecee73b64c9e0e3e52f10d1fc25a322f99539be2d55"
+    },
+    {
+      "path": "datasets/Cendara University/md/research_overview.md",
+      "enterpriseName": "Cendara University",
+      "filename": "research_overview.md",
+      "bytes": 8145,
+      "sha256": "a8319da059d3bf10b62995ef736771b426badc02e469d654857d601322779a5d"
+    },
+    {
+      "path": "datasets/Cendara University/md/sports_programs.md",
+      "enterpriseName": "Cendara University",
+      "filename": "sports_programs.md",
+      "bytes": 6764,
+      "sha256": "2b276915682be79d4050f6dc5f85f814c2727e50044ff73bb1a1ceb0bc104030"
+    },
+    {
+      "path": "datasets/Cendara University/md/student_exchange_program.md",
+      "enterpriseName": "Cendara University",
+      "filename": "student_exchange_program.md",
+      "bytes": 6241,
+      "sha256": "04d194642959cd5718fa8086f2cc3d9cca0f38cc29b93cbd244094383fb5169a"
+    },
+    {
+      "path": "datasets/Cendara University/md/student_handbook.md",
+      "enterpriseName": "Cendara University",
+      "filename": "student_handbook.md",
+      "bytes": 10675,
+      "sha256": "f2d418a2aad4a401e8cf0d7612357b017b2ae7924640550d958ad94d9cb39b54"
+    },
+    {
+      "path": "datasets/Cendara University/md/university_overview.md",
+      "enterpriseName": "Cendara University",
+      "filename": "university_overview.md",
+      "bytes": 5168,
+      "sha256": "45810bc27e962ec8bcfee472e390219914485ecfe9f05393dfb3f4e381421be6"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/ Fine-Dining Menus.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": " Fine-Dining Menus.md",
+      "bytes": 3241,
+      "sha256": "4ad22d3178f11a61ab8b8528bc22cc1614436f1453c41bdc35344a2b3647cbe3"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Airbus A350.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Airbus A350.md",
+      "bytes": 2540,
+      "sha256": "679b6625ce925e7533f15f7b2661d69f65932fe8e9c14022020f5096ee95b419"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Airbus A380.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Airbus A380.md",
+      "bytes": 2892,
+      "sha256": "f96f49ebd4a5f085afe446448bdb2b1e8724d3c0d0a29a69d27fa4ca443e1c02"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Armed Forces Discount Program.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Armed Forces Discount Program.md",
+      "bytes": 2390,
+      "sha256": "8d4635818eb85dc30c352fc7b8bfc0328e23a96c23965c609b5593917a92b280"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Awards & Recognitions.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Awards & Recognitions.md",
+      "bytes": 1758,
+      "sha256": "0bdc0568959f5429024fc04360d90a01b09d9087e264f9e05e76ae122fb71d86"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Baggage Allowance.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Baggage Allowance.md",
+      "bytes": 2749,
+      "sha256": "7b74f1eece94d2fc2c86a450d157efbd1e5f1942b2dc7cebd203009a0ab7b7e7"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Boarding Process.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Boarding Process.md",
+      "bytes": 2988,
+      "sha256": "ba5d17bf76736a7c2787bc5e99abd065251f2d3191b7e3e0605aa3ce19d857ad"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Boeing 787 Dreamliner.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Boeing 787 Dreamliner.md",
+      "bytes": 2601,
+      "sha256": "53aa56685bea75717eba64411b14109fc0ba125f4199c56b5ec3fb33949755a9"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Cancel Your Booking.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Cancel Your Booking.md",
+      "bytes": 2184,
+      "sha256": "b6e88dd3924abd4185e226cee0069f8adbe9b37c8c1629ea5e1348345a45c2c5"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Careers at CloudWay 24.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Careers at CloudWay 24.md",
+      "bytes": 16688,
+      "sha256": "2f64fb8146b7476f815ca0a9f824994747988e0f034fc2593bcc61094badc456"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Change Your Seat.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Change Your Seat.md",
+      "bytes": 2114,
+      "sha256": "31ffc85334245082fb5df1af5080867436fa1330f89426da7010860849d02090"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Check Your Visa and Passport Requirements.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Check Your Visa and Passport Requirements.md",
+      "bytes": 5476,
+      "sha256": "5899ec9435aaea3c11c13f07223e04e67d464ae991316e57849d89b9d9d7aa54"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/CloudWay 24 – Passenger Rights.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "CloudWay 24 – Passenger Rights.md",
+      "bytes": 3252,
+      "sha256": "fcb0b0e88f630fd967ca5b5c3b6c8c4909cd1be77ab0f306cef2f7d797b15a89"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Co-brand Credit Cards.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Co-brand Credit Cards.md",
+      "bytes": 1822,
+      "sha256": "5d13f700e4277c4004e9469cf198999d6a7e46afa042ff3e4695a67ced1a20be"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Damaged Baggage Policy.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Damaged Baggage Policy.md",
+      "bytes": 2596,
+      "sha256": "5b8f035717f1e84ecdb772f326403559a58860304ad0a1995a552af8ee74ff92"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Dangerous Goods Policy.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Dangerous Goods Policy.md",
+      "bytes": 4483,
+      "sha256": "d85af175718ef8857181786707fde92f395459e7f9351d55ea0f482504b51eb1"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Delayed Baggage.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Delayed Baggage.md",
+      "bytes": 2255,
+      "sha256": "77b5e814402c68e5354e4e16df7c0e2b5fca383fc7aa8e66d76520bc0c95d7d5"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Employee Free Tickets & Discounts Policy.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Employee Free Tickets & Discounts Policy.md",
+      "bytes": 2360,
+      "sha256": "10a00869d2a52838645b3bc69df4f9108e13e44b74c0d9f137db131c8e8cf37c"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Employee Insurance Policy.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Employee Insurance Policy.md",
+      "bytes": 2960,
+      "sha256": "8c6446b0eb9f120b1a95dd9ea825e9ada46f007940922749e011f1623b47dcac"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Feedback or Complaints.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Feedback or Complaints.md",
+      "bytes": 2429,
+      "sha256": "226d44b4a5588b77db8e003b0be1eba14d026ba26b8f75a029b29a95d37b120f"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Flying with Children.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Flying with Children.md",
+      "bytes": 2920,
+      "sha256": "9c9d57b9533f35fb259ad4a37faea47574b137449613577b8ae05aee85ad188f"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/How to Book a Flight.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "How to Book a Flight.md",
+      "bytes": 2162,
+      "sha256": "5236c3d8324a9f4709f355f7d2b9f1823d89f2b08920fac01ef7c65b4186e496"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/How to Earn SkyPoints.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "How to Earn SkyPoints.md",
+      "bytes": 3000,
+      "sha256": "f604e201f1e5421ab3ff02ca4b8b10ec466c0aefa385955f6ee826a20c8de659"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Lounge Access.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Lounge Access.md",
+      "bytes": 2442,
+      "sha256": "de3b0541f5e236d1361f388efed4245170cb51698f9bb711a574ade3a0a66ee5"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Modify Trip Dates.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Modify Trip Dates.md",
+      "bytes": 2191,
+      "sha256": "7a7f1350853bedcf1e30fb154255b81582320004407fa3982acd1c4d04e4acfd"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Mumbai Inbound & Outbound Flights.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Mumbai Inbound & Outbound Flights.md",
+      "bytes": 21856,
+      "sha256": "4e075e97da33944282c5be5f7b9cf92fac37e5076d3bd1d15247296e328cb795"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Special Assistance.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Special Assistance.md",
+      "bytes": 2724,
+      "sha256": "ee9ff37cabc8b5d8034f647d5d504731d793ea3be78fccb23939710f910c5ffe"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Special Baggage Policy.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Special Baggage Policy.md",
+      "bytes": 3686,
+      "sha256": "a2b6b1fcdc606e7b49efaef21acc868e2518c5fbf6512bc9a727de91dde905d9"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Staff (Pilots and Cabin Crew) Cab Policy.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Staff (Pilots and Cabin Crew) Cab Policy.md",
+      "bytes": 2711,
+      "sha256": "8a57d7b9e312d4a95c8d03334a118400d97d86fbd58568c1286c1a2bbb2e4231"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Staff Accommodation Policy.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Staff Accommodation Policy.md",
+      "bytes": 2160,
+      "sha256": "5ee99fae54c7375ba7c68a4c19a948dcbd6b4e1b523511815ada638e8dc8aed6"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Staff Expense Claim Procedure.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Staff Expense Claim Procedure.md",
+      "bytes": 2586,
+      "sha256": "c4dfd7a62df9ed3d342e309306c490fbedfa50c63d03f7c945e6de709b06a9ca"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Student Offers.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Student Offers.md",
+      "bytes": 2551,
+      "sha256": "f0aebebf3eac4e131535ac98f3721abfad9d4d994950258eb8db85c4d972ea82"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Trainee Pilot Programme.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Trainee Pilot Programme.md",
+      "bytes": 2132,
+      "sha256": "96a1347f9ef1584d822fca0da3d59cc960920f1a3301a2b3fc9857a4f49b0cde"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Upgrade Your Seat.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Upgrade Your Seat.md",
+      "bytes": 2466,
+      "sha256": "a6f7d35ed784a61ae45d8bce276fb6261bbb596b5619b89c630760a92739b7cf"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Visa and Passport Requirements Asia.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Visa and Passport Requirements Asia.md",
+      "bytes": 3383,
+      "sha256": "a07fb10481213eae93fcf9bef421af14f79745273a466054414d83bd2151edb6"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/Web Check-In Guide.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "Web Check-In Guide.md",
+      "bytes": 2470,
+      "sha256": "11f9f83a6252fd1fbc484f1624693cac18db9fd51602c9844ac2fb40c8a24c95"
+    },
+    {
+      "path": "datasets/CloudWay-24/md/ravelling with Pets.md",
+      "enterpriseName": "CloudWay-24",
+      "filename": "ravelling with Pets.md",
+      "bytes": 3120,
+      "sha256": "19468eea467ef649b8106d42aac977efc4db7ee0c9bb46a272511d4b7a58b6f7"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/accessories.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "accessories.md",
+      "bytes": 4944,
+      "sha256": "51c61cf1bafc5b5babb63ff3b9d3256ef7e7d2797b3e9933a11f316f3e66c666"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/audio_catalog.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "audio_catalog.md",
+      "bytes": 1203,
+      "sha256": "eb81c439b2af364315944f6078bb301be2695da82388bcb2ab88dac6d79ae9b7"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/audio_usage_guide.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "audio_usage_guide.md",
+      "bytes": 4993,
+      "sha256": "93b0e852c490e5c24d058b837d22de1c4d54dc04c180458e49daf4441900e3eb"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/awards_and_recognition.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "awards_and_recognition.md",
+      "bytes": 4962,
+      "sha256": "87e91083023e08d3e9204bb31fceb292f3fef71709c5f577c1806c86badd86e3"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/build_your_own.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "build_your_own.md",
+      "bytes": 15123,
+      "sha256": "c79fbad6d0ae64a338a0f4f1978f15d849acd764a679cd52082f728956910d98"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/contact_info.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "contact_info.md",
+      "bytes": 1176,
+      "sha256": "4909bf1fbb1decb5099147396358290472c79e1350defc7b6af41492b04fcea3"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/corporate_booking.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "corporate_booking.md",
+      "bytes": 6633,
+      "sha256": "bb4ef6ba1f03469b4f5706333639436b1a861d341b46b4cc09a43e8372ecfdf6"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/corporate_booking_faqs.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "corporate_booking_faqs.md",
+      "bytes": 953,
+      "sha256": "d702bc9f2185c2490e3db90dac4b63b57e92206f4d6a33037ec53640005b8dd3"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/environmental_policy.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "environmental_policy.md",
+      "bytes": 3157,
+      "sha256": "29a796e5f9a4e1f608466a6f185ec8cce2bab245e890cb4c09549a3fb5d22ae8"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/phone_catalog.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "phone_catalog.md",
+      "bytes": 7825,
+      "sha256": "9cc4ae7ebd2507efeaaf98cb2745b5465f1e2940c0a6d0da8829b70a48e199ce"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/phone_usage_guide.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "phone_usage_guide.md",
+      "bytes": 5076,
+      "sha256": "9c32751122f5dec56224ff4fbfdaafb2d1d57e5bc0ef51fac079af19e3e7b1d2"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/productivity_tools_usage_guide.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "productivity_tools_usage_guide.md",
+      "bytes": 2003,
+      "sha256": "51fe6c869b8d747ff1ffdd702ea1b90f25591a4dad113b725509912c8ee3e521"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/promotional_offers.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "promotional_offers.md",
+      "bytes": 1789,
+      "sha256": "1ed4634dc0488aaa30c2b9c0931922c82d2fa9d8cdc556c8037412d8de866a31"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/purchasing.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "purchasing.md",
+      "bytes": 4017,
+      "sha256": "f1f7873db67cce3d39d36a27a9eed4fc20f055b0d44a076add00225ca6d033de"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/servicing_details.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "servicing_details.md",
+      "bytes": 3214,
+      "sha256": "9b3104acf68606008d28b94023008c3850512c544cbb25e337fa0e777391314a"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/software_upgrade_policy.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "software_upgrade_policy.md",
+      "bytes": 3362,
+      "sha256": "b5892fb7a59ad8541cd94da650598984c5ee1f31b31c76558c63a7d7494fbc04"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/special_editions.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "special_editions.md",
+      "bytes": 5117,
+      "sha256": "41ea221d4def724a1dccaacf489bf8e61f43ad1c344c464d0695326da2b1a223"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/store_locations.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "store_locations.md",
+      "bytes": 6108,
+      "sha256": "40758f825a484416d9c7b7daa661aff43a1133b801b526f1fdc6966118ef97fb"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/tablet_catalog.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "tablet_catalog.md",
+      "bytes": 1620,
+      "sha256": "4dd4034b4e6f1fc96144656bd4c00b98b3094f9507160d56754d40c625380af0"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/tablet_usage_guide.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "tablet_usage_guide.md",
+      "bytes": 6937,
+      "sha256": "5ee8554d9b5fb33ace9a91202f0d9cb964584ba6942d8dde2ea83e671afe89dd"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/terms_and_conditions.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "terms_and_conditions.md",
+      "bytes": 3032,
+      "sha256": "9296241485fedc37a865b443e787969957004dc895ebd8c58ad686de5add715b"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/usage_guide.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "usage_guide.md",
+      "bytes": 3085,
+      "sha256": "8b0c78baa321eeed3bfe117f61e47f507c1ac9efdd7f4ce1bb590601fe9d8c74"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/usage_guide_chargers.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "usage_guide_chargers.md",
+      "bytes": 4006,
+      "sha256": "1c3f95ce78bdf1187920cfbc878cb7fc0ca31e79dda5163ec4f27c18037598eb"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velevra_company.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velevra_company.md",
+      "bytes": 14825,
+      "sha256": "e2d069cc7af9ba049c76d7a2a41f3e10e90eb25e6bc9dbcf3ca0d708fb39fbd5"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velevra_start.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velevra_start.md",
+      "bytes": 5089,
+      "sha256": "28ff8ea1b7262051976084fd4a61dac2b8902fbb15406fc81176b21dd9183ca6"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_audio.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_audio.md",
+      "bytes": 5430,
+      "sha256": "75d3706d7b8d892d36061dc7a338e11db483d830bf2c8f2b34a7c8e78308e971"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_core.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_core.md",
+      "bytes": 5285,
+      "sha256": "1e7c6791664f0318ad47416aa6462ce45bed2ac79ccff0f5ec7f6718f93a3df5"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_edge.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_edge.md",
+      "bytes": 4176,
+      "sha256": "cbfffad16c485de442323ff8f8792caf8072fae4aca3a9982cf98ec4b759eab7"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_nexus.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_nexus.md",
+      "bytes": 5535,
+      "sha256": "f83cb441aa5bfb4c4349f6803b9077064d2710ca724dc0bf961a30a26b25646f"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_one.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_one.md",
+      "bytes": 2944,
+      "sha256": "7607e0f21ff3a4df63363c8cce62746edbe4c1d341fcd8561c46a464d60127c9"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_one_pro.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_one_pro.md",
+      "bytes": 3367,
+      "sha256": "f9de052501b01d14c38de3929943f244350af8ff42417aef21fd9c7274dac5ac"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_one_ultra.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_one_ultra.md",
+      "bytes": 3921,
+      "sha256": "2c3da21576168e45038f06ab0697fa9533ded4402f0eb3404bd5c6064a4ef390"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_pad.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_pad.md",
+      "bytes": 5071,
+      "sha256": "2d830ae23b2ceacced00e68612a1e88570451dc0a538b5a1dcbd1bef8979f127"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_plus.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_plus.md",
+      "bytes": 5884,
+      "sha256": "a82e8dd25aea78c04f424e8facbdce811c5cc03376de05329cbb72dbd8fd7f0f"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvera_watch.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvera_watch.md",
+      "bytes": 6159,
+      "sha256": "a23b8d4525cd5ad6bb36b162e0af3dd1909f625e729aa13c6d64b75ea02d03ee"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/velvra_expanded_catalog.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "velvra_expanded_catalog.md",
+      "bytes": 14552,
+      "sha256": "0aefba6ba56064717b789faf346e26d091a62c454bdecfe215908f832e95eb0e"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/warranty_and_service.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "warranty_and_service.md",
+      "bytes": 3529,
+      "sha256": "0e2d63faae0a6e0cbfc818fdbc473e0a6bce5514e2226cfeee6f1b8533fa2ca4"
+    },
+    {
+      "path": "datasets/Velvera Technologies/md/watch_usage_guide.md",
+      "enterpriseName": "Velvera Technologies",
+      "filename": "watch_usage_guide.md",
+      "bytes": 6022,
+      "sha256": "187c745ba4e33ad3594d9056b10103dab03661b8acaebff79b70641d569d4d75"
+    },
+    {
+      "path": "datasets/ZX Bank/md/(UPI) – ZX Bank Asia.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "(UPI) – ZX Bank Asia.md",
+      "bytes": 2443,
+      "sha256": "a7ec618bf3ac964f57051ff0fb4ecc586ef8ddf01b072435189a649126de244c"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ASK Zia – Your 24:7 Banking Assistant.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ASK Zia – Your 24:7 Banking Assistant.md",
+      "bytes": 2009,
+      "sha256": "536c2d7133d2a3dec87145559807e93b29667f785e6af025c50c1611eef2f296"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATM Locations at Major Hospitals.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATM Locations at Major Hospitals.md",
+      "bytes": 4659,
+      "sha256": "e6fcf9f1486994b4eff882317f9662c43fcc3e9390e0780ef635011647e7f2c8"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATM Locations at Major Movie Theaters.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATM Locations at Major Movie Theaters.md",
+      "bytes": 10578,
+      "sha256": "d7ae0250fd36da297ceaa571e4e940e1b9c78e996324de6fc89ff0cd69e1e757"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATM Locations at Major Petrol Pumps.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATM Locations at Major Petrol Pumps.md",
+      "bytes": 14907,
+      "sha256": "1bbf591bbec515d3a98e91f2589df51ae7cce74280d3585b3481f3d452279ffc"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATM Locations at Major Shopping Malls.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATM Locations at Major Shopping Malls.md",
+      "bytes": 5557,
+      "sha256": "d7c5648844757fa4fd4230458e4804fa3088105a6e45937a382f9848125cf143"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATM Locations at Tech Parks in Major Indian Cities.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATM Locations at Tech Parks in Major Indian Cities.md",
+      "bytes": 6095,
+      "sha256": "d7f63a49269d49b7e88bf40f7eee81bb357f4c6c735ab2531a67e8c02de2f068"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATM Locations in Sri Lanka.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATM Locations in Sri Lanka.md",
+      "bytes": 1818,
+      "sha256": "e77dbc5c7c16dcc67f0b0175c443363029b74b14317c23c86910f3f4fdf2da17"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATMs at Famous Restaurants.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATMs at Famous Restaurants.md",
+      "bytes": 19239,
+      "sha256": "2d12065ac027e8a9c047d460859a37205e4729573af29ad44830a6f2eec6b8a5"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATMs at Major Colleges & Universities.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATMs at Major Colleges & Universities.md",
+      "bytes": 5568,
+      "sha256": "a1fd07eca8d5a495031ba032921c76a2b82006526ef82bb9f9e58753094981ae"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ATMs at Railway Stations and Airports.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ATMs at Railway Stations and Airports.md",
+      "bytes": 3901,
+      "sha256": "6ecda478998d5a68aa506364b054f41191eeec1085079c3341cf5d24c0f94a0e"
+    },
+    {
+      "path": "datasets/ZX Bank/md/About ZX Bank Ltd.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "About ZX Bank Ltd.md",
+      "bytes": 2186,
+      "sha256": "ca79d2199ad9fb3459bfe2cb470fdb1b8ea585c6501cdb176535610ec8a43cfc"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Agra Branch Network Overview.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Agra Branch Network Overview.md",
+      "bytes": 2906,
+      "sha256": "6bd44c3cc614227ccd8dfe3f4c45e331d5ebdf05c41c657710f6d055f86ded84"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Agriculture Loan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Agriculture Loan.md",
+      "bytes": 2323,
+      "sha256": "a57dd6f84a830e7ba13811ad8af2c8141656831be3058a639d8a4d1fb3e378a9"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Ahmedabad Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Ahmedabad Branch Network.md",
+      "bytes": 3314,
+      "sha256": "64033a31e2c8b1074f6775a03ea1fbd313d358ac5166f17484d03f7417c03b87"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Apply for a Cheque Book.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Apply for a Cheque Book.md",
+      "bytes": 2326,
+      "sha256": "00555dbc3183e44d5eb8e32b2cf715e166ac22261a884024970cc87a3b4591c6"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Awards & Recognitions.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Awards & Recognitions.md",
+      "bytes": 1711,
+      "sha256": "06a6960b4bdbc627a86cb6a230bf94a0ff7c09ea9f42ffbe0c2bcab44dadc61d"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Bangalore Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Bangalore Branch Network.md",
+      "bytes": 4943,
+      "sha256": "83eb2be9d08c8d8e64476e634c441276bfa2aa7b7298687413723cbe60665386"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Bangladesh ATM Locations.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Bangladesh ATM Locations.md",
+      "bytes": 1880,
+      "sha256": "8ffa1ac89c57f2e2f6550b56e2a61eb9834b1071cba5551969ba951ca6ce0569"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Bangladesh Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Bangladesh Branch Network.md",
+      "bytes": 3040,
+      "sha256": "c9b2b3118bd5530c9688848a74cacc3b6a4f2ab569eb702f0a87b7a0a329c506"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Bank ATMs in Bhutan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Bank ATMs in Bhutan.md",
+      "bytes": 2072,
+      "sha256": "c6cc1fe5d3c4115e583ee0dfd143df860df84989d69552b2d761df2740c6c8f7"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Bank Branches in Patna.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Bank Branches in Patna.md",
+      "bytes": 2431,
+      "sha256": "df478694f98fe746b457bbd1c1963e6260b55ad6cb224bb6d5773f6bd0cb5e7c"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Beach Road ATMs List (Major Indian Cities).md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Beach Road ATMs List (Major Indian Cities).md",
+      "bytes": 3602,
+      "sha256": "bfcf54f898ff3ce94e6ed539e10fa77fc875f6e79da161608289d505a1939c0e"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Bill Payments.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Bill Payments.md",
+      "bytes": 2304,
+      "sha256": "73b7a4214fec84e13c4b1e56e7909d4f4193972a5a8acee050f34fe8a040c7cf"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Branch Network in Bhopal.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Branch Network in Bhopal.md",
+      "bytes": 2255,
+      "sha256": "043d2d76cb88da170534ec082f2aa89575bb8554a35c28d71558f5e3b7a569fd"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Branch Network in Bhutan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Branch Network in Bhutan.md",
+      "bytes": 2133,
+      "sha256": "2b8d54b9fff302463359b9fab32724d2fa19ad9095110cd57140e5819eb71eab"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Branch Network in Delhi.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Branch Network in Delhi.md",
+      "bytes": 6277,
+      "sha256": "849f73bd5ba235823084a6edf4749c290d020d6028fcd15f4717907004cdbdfc"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Branch Network in Indore.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Branch Network in Indore.md",
+      "bytes": 2260,
+      "sha256": "9b3220a3b1ca9b2d60e840e9c6e83dbaf7fcf9ebee4d9f9d9249b8badbeb34be"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Branch Network in Nepal.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Branch Network in Nepal.md",
+      "bytes": 3065,
+      "sha256": "0c98a9c23187d951d7ffa72359776da2b03fd8fd8da2a8a8dfb24ed1a8003acb"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Branches in Kolkata.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Branches in Kolkata.md",
+      "bytes": 3216,
+      "sha256": "96c21abcfe965fb16f34f96a2e0c9ed10952cac783218e5b03ad39a3a0ed372a"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Branches in Nagpur.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Branches in Nagpur.md",
+      "bytes": 2226,
+      "sha256": "846d16eaedeb1ce50da9378ee588e19cb70aeded4f533de63d4f4f5ed89d2a27"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Cross-Border Payments.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Cross-Border Payments.md",
+      "bytes": 2317,
+      "sha256": "472bb80a7bcfff8bc26e4181588f303e1a151413ebe19795099a27778131d67a"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Current Account Overview.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Current Account Overview.md",
+      "bytes": 3113,
+      "sha256": "6faca1f4f569c72736bcd987557e2ca20a9417c242af229c04e8ec2619e38427"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Fraud Transaction.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Fraud Transaction.md",
+      "bytes": 1920,
+      "sha256": "d58790a13f4ee73140a2957e8e5e5a1d76264df218ca90e84b0213930cce99f8"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Health Insurance.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Health Insurance.md",
+      "bytes": 3659,
+      "sha256": "3cc376a7d03337b238e111e65924882503d76ac63d1550303545e0af722bf5ba"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Hyderabad Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Hyderabad Branch Network.md",
+      "bytes": 4150,
+      "sha256": "74463590794482a9a419b75a9ee13c3d14a9c7ea68fc15bb2f76fefa2e2a2c3b"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Jaipur Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Jaipur Branch Network.md",
+      "bytes": 3994,
+      "sha256": "bf0834bb68e5487788826728e63c52360957e7b5f7b84f133bbf83dcddc1b061"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Kanpur Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Kanpur Branch Network.md",
+      "bytes": 3437,
+      "sha256": "599b8cace461cbd84113c78750bd10dbb19b4200ed167bce5f411243eaf2a76d"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Lucknow Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Lucknow Branch Network.md",
+      "bytes": 3801,
+      "sha256": "818015da2de9f0e3581b074161a01e6b5ae793bff210bb8d474cb23a2f4dbcbb"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Nepal ATM Locations.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Nepal ATM Locations.md",
+      "bytes": 1610,
+      "sha256": "bf03cffc4db323796b6c451fb5dcdbb0a441962ccf05b20e10e78b5bd18787b8"
+    },
+    {
+      "path": "datasets/ZX Bank/md/NetBanking Guide.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "NetBanking Guide.md",
+      "bytes": 2615,
+      "sha256": "76c4cc39caacff402bee9a8afafdc769a1d8beaf6e05a0bd70998e63079af778"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Network in Chennai.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Network in Chennai.md",
+      "bytes": 5133,
+      "sha256": "46bec8108bdc8f14fd98cf1f41a0a2b41e09fbb1040530e271d92f2d9ad1886e"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Network in Coimbatore.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Network in Coimbatore.md",
+      "bytes": 2636,
+      "sha256": "72e34319381b4145eeab453cd43aea773497b9712a473dc64002914d0665a22c"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Network in Ludhiana.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Network in Ludhiana.md",
+      "bytes": 2620,
+      "sha256": "b29455c27a636a5d111ca70258586843da681ab060cd7b3734fcf80bdbdf6cb8"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Network in Mumbai.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Network in Mumbai.md",
+      "bytes": 5027,
+      "sha256": "407e2f1167ffbf41673d670f9562fcbaf429b17ddde157ea1f56fa9750108f76"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Open a Locker.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Open a Locker.md",
+      "bytes": 2654,
+      "sha256": "941ca98c61a2d2ab6c40579af28ce822c70c6d72d8a40e0edc909841a2ba785e"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Personal Loan Information.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Personal Loan Information.md",
+      "bytes": 2583,
+      "sha256": "8554afccdeef2844f1a68cd35101bac810568b4683d1b7365b872fd0ad026acd"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Personal Loan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Personal Loan.md",
+      "bytes": 2583,
+      "sha256": "8554afccdeef2844f1a68cd35101bac810568b4683d1b7365b872fd0ad026acd"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Personal Relationship Manager Assistant Program.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Personal Relationship Manager Assistant Program.md",
+      "bytes": 3663,
+      "sha256": "082e107dc47deae27f0262d7485a0d89727871aeb918f1174a1642f1748f10dc"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Pune Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Pune Branch Network.md",
+      "bytes": 5431,
+      "sha256": "93a669aa8da5e773e7bd48d2c03de1c8695b5a8123104f1c3e4c8f2eda289515"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Safety Features.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Safety Features.md",
+      "bytes": 2622,
+      "sha256": "c5b9c74695f067dd8340e251d0685fd0909c4d7a5332350464c7a17d3d854be9"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Safety Practices to Protect Yourself.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Safety Practices to Protect Yourself.md",
+      "bytes": 2054,
+      "sha256": "012fa534ee147057cfa868139b4fab05f2c8ef3595ded12c3dcea73ad4098caa"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Salary Account to a Savings Account.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Salary Account to a Savings Account.md",
+      "bytes": 2725,
+      "sha256": "db095abcb044747f55bfd7585d4ba1a1b06f8c1317fc00f546c78d136106c04e"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Salary Saving Account.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Salary Saving Account.md",
+      "bytes": 3187,
+      "sha256": "35d476edd0ba1f2e944cca0d165246d26d9cdacdf0bac06da0848854dd92c5e8"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Savings Account Overview.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Savings Account Overview.md",
+      "bytes": 3429,
+      "sha256": "90b1b29fbe5faa35932a59afaa14fa0d02454f08e030d329dbb2d259e0a69f72"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Savings Account to a Salary Account.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Savings Account to a Salary Account.md",
+      "bytes": 2914,
+      "sha256": "686d6e8ddf0603e7d0d43c240665041bd7518b96c2df005da1601473c4bac161"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Sri Lanka Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Sri Lanka Branch Network.md",
+      "bytes": 4385,
+      "sha256": "5fb1ce268e1ef0cb3fc52d3907b028421d1cd178ee48681f9cde4744e9c7288c"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Surat Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Surat Branch Network.md",
+      "bytes": 3365,
+      "sha256": "f9451eded52e55a57a157eb376a1b40beebcf46d56f6c59a611412abe199aafa"
+    },
+    {
+      "path": "datasets/ZX Bank/md/Visakhapatnam Branch Network.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "Visakhapatnam Branch Network.md",
+      "bytes": 2346,
+      "sha256": "028c1860e3d66ebe15de9aaddd935d84fd4ecd3b69377580e770eac064cbfe1c"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank ATM Network at Major Parks – India.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank ATM Network at Major Parks – India.md",
+      "bytes": 11453,
+      "sha256": "82d21add18edd82de118b6ef08939ee1992f9841d028f635fd0a6cec21039f3b"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank ATMs at Major Bus Stands (India).md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank ATMs at Major Bus Stands (India).md",
+      "bytes": 11566,
+      "sha256": "8ad3640b803639aba0d14d81369e5cabcc5557f096ac5bceb5366fa9ae4bfcdf"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank Agriculture Loan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank Agriculture Loan.md",
+      "bytes": 2323,
+      "sha256": "a57dd6f84a830e7ba13811ad8af2c8141656831be3058a639d8a4d1fb3e378a9"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank Asia Mobile App Guide.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank Asia Mobile App Guide.md",
+      "bytes": 3714,
+      "sha256": "86b9d76e81c84b588fcf81d71370c3ddc80944538521da2e1b38239205b3171c"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank Bike Loan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank Bike Loan.md",
+      "bytes": 2250,
+      "sha256": "2c026c05e12d6030dd41ad6d460c42d6f117e39cd6e51f54e3f5d64c13da8e79"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank Car Loan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank Car Loan.md",
+      "bytes": 2607,
+      "sha256": "d3955a50a3bf2d9a880261ff70eecd7fae5873aced2849b3acf0c358f340b4ed"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank Credit Card Help.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank Credit Card Help.md",
+      "bytes": 2229,
+      "sha256": "1806d3ae717f89a6c2a326d74d09f2081313797ffca7a9206be3b940e08db06f"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank Credit Card.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank Credit Card.md",
+      "bytes": 3633,
+      "sha256": "70c48796769973ea60dce1df881f7a80d2bcf7567255e241e709262897754609"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank Fixed Deposits.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank Fixed Deposits.md",
+      "bytes": 3526,
+      "sha256": "5528507ee9696c8430b6b092bc44bc67b6fa9177ef3162670f87ddebcef7f7f0"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank Gold Loan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank Gold Loan.md",
+      "bytes": 2267,
+      "sha256": "e94503a90978eaf15a27ddfec437e8eb07846481d32ee077c5a1d703b75b43b0"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank House Loan.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank House Loan.md",
+      "bytes": 2324,
+      "sha256": "ddaba9ab820071e68a27ce052e346625a523a4c92694ec7a2049cfae18f366f1"
+    },
+    {
+      "path": "datasets/ZX Bank/md/ZX Bank – Business Loans.md",
+      "enterpriseName": "ZX Bank",
+      "filename": "ZX Bank – Business Loans.md",
+      "bytes": 2714,
+      "sha256": "e9ea717017681de158e339ef4c086a1ad693d21a4a3f47a55997f985a9e251aa"
+    }
+  ]
+}

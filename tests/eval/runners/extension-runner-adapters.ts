@@ -1,6 +1,7 @@
 import { runCandidateExtractionSuite } from "./candidate-extraction.js";
 import {
   runAssetPromotionSuite,
+  runImportCompatSuite,
   runProgressiveDisclosureSuite,
   runSlotLoadoutSuite,
 } from "./capability-contracts.js";
@@ -111,4 +112,5 @@ export const EXTENSION_RUNNER_REGISTRY: ReadonlyMap<string, QuickEvalRunner> = n
   ["progressive-disclosure-v1", extensionRunner(runProgressiveDisclosureSuite)],
   ["asset-promotion-v1", extensionRunner(runAssetPromotionSuite)],
   ["slot-loadout-v1", extensionRunner(runSlotLoadoutSuite)],
+  ["production-data-compat-v1", extensionRunner(runImportCompatSuite)],
 ]);

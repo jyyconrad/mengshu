@@ -16,7 +16,12 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
-import { loadLongMemEval, rawToGoldenCase } from "./longmemeval.js";
+import {
+  assertLongMemEvalOfficialScoreEligible,
+  loadLongMemEval,
+  LONGMEMEVAL_ADAPTER_STATUS,
+  rawToGoldenCase,
+} from "./longmemeval.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -65,5 +70,15 @@ describe("longmemeval adapter", () => {
     expect(gc.id).toBe("robust-001");
     expect(gc.query).toBe("");
     expect(gc.seedMemories).toEqual([]);
+  });
+
+  test("占位 adapter 明确拒绝正式 G 轨评分，且缺失 id 的转换仍然确定", () => {
+    expect(LONGMEMEVAL_ADAPTER_STATUS).toMatchObject({
+      protocol: "placeholder",
+      officialScoreEligible: false,
+    });
+    expect(() => assertLongMemEvalOfficialScoreEligible()).toThrow(/placeholder|official scorer/i);
+    expect(rawToGoldenCase({ question: "same", answer: "same" }).id)
+      .toBe(rawToGoldenCase({ question: "same", answer: "same" }).id);
   });
 });

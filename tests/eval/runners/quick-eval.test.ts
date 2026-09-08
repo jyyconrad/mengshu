@@ -414,11 +414,23 @@ describe("T500-0 baseline gate 与报告兼容", async () => {
     expect(markdown).toContain("run mode：offline-component");
     expect(markdown).toContain("numerator=");
     expect(markdown).toContain("direction=");
-    expect(markdown).toContain("manifest schema：1");
-    expect(markdown).toContain("manifest version：v0.3-MG009");
+    expect(markdown).toContain("manifest schema：2");
+    expect(markdown).toContain("manifest version：v0.5-eval-tracks");
+    expect(markdown).toContain("GMS：未运行");
+    expect(markdown).toContain("PMS：未运行");
+    expect(markdown).toContain("Q 轨 quality gate：通过");
+    expect(report.qualityGatePassed).toBe(true);
+    expect(report.versionReleaseGatePassed).toBe(false);
+    expect(report.tracks).toMatchObject({
+      general: { suiteCount: 0, effectScore: null, gatePassed: null },
+      private: { suiteCount: 0, effectScore: null, gatePassed: null },
+      quality: { suiteCount: 2, effectScore: null, gatePassed: true },
+    });
     expect(report.manifest.suites).toEqual(expect.arrayContaining([
       expect.objectContaining({
         name: "mengshu-v0.1",
+        track: "quality",
+        datasetVersion: "q-contract-v1",
         runner: "slot-context-v1",
         fixtureSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
         gateIdentity: expect.stringMatching(/^[a-f0-9]{64}$/),

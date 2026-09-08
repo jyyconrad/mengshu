@@ -31,6 +31,7 @@ import type { CompleteRecallScoreBreakdown } from
   "../../../packages/core/src/domain/recall-scoring.js";
 import type { MemoryTreeType } from
   "../../../packages/core/src/tree/types.js";
+import type { EvalTrack } from "./evaluation-protocol.js";
 
 // ===== OpenClaw history 评估扩展类型（P0-1）=====
 
@@ -501,7 +502,7 @@ export interface ProductionPendingCandidateSnapshot {
   activeContentHash: string;
   evidenceIds: string[];
   memoryKind: MemoryKind;
-  semanticType: "rules";
+  semanticType: MemorySemanticType;
   admissionRoute: "candidate" | "candidate_low_priority";
   valueScore: number;
   importance: number;
@@ -801,6 +802,8 @@ export interface SuiteSummary {
 /** report 内嵌的 manifest/gate 复现身份。 */
 export interface EvalReportManifestSuite {
   name: string;
+  track: EvalTrack;
+  datasetVersion: string;
   kind: "baseline" | "extension";
   runner: string;
   fixtureCaseCount: number;
@@ -817,6 +820,19 @@ export interface EvalReportManifestMetadata {
   suites: EvalReportManifestSuite[];
 }
 
+export interface EvalTrackReportSummary {
+  track: EvalTrack;
+  suiteCount: number;
+  totalCases: number;
+  totalPassed: number;
+  totalFailed: number;
+  scoreName: "GMS" | "PMS" | null;
+  /** Q 轨没有效果分；G/P 在官方/私有 effect runner 未运行时也必须为 null。 */
+  effectScore: number | null;
+  /** null 表示该轨尚未执行可发布门禁，不能用其它轨的结果补齐。 */
+  gatePassed: boolean | null;
+}
+
 /** runner 一次跑出的整体报告。 */
 export interface EvalReport {
   generatedAt: string;
@@ -825,6 +841,15 @@ export interface EvalReport {
   totalCases: number;
   totalPassed: number;
   totalFailed: number;
+  tracks: Readonly<{
+    general: EvalTrackReportSummary;
+    private: EvalTrackReportSummary;
+    quality: EvalTrackReportSummary;
+  }>;
+  /** Q 轨独立工程门禁；不代表记忆效果。 */
+  qualityGatePassed: boolean;
+  /** G/P/Q 均完成且分别通过时才为 true；quick-eval 只跑 Q，因此固定 fail-closed。 */
+  versionReleaseGatePassed: boolean;
   /** suite manifest metric + case contract 的质量 gate；不代表 production E2E 资格。 */
   releaseGatePassed: boolean;
   /**

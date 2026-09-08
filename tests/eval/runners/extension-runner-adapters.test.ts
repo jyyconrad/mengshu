@@ -94,7 +94,7 @@ describe("honest extension runner adapter", () => {
     expect(() => adaptExtensionRun(run(overrides))).toThrow(/extension runner|inconsistent|不一致/i);
   });
 
-  test("registry 精确注册 manifest 九个 runner id", () => {
+  test("registry 精确注册 manifest 十个 runner id", () => {
     expect([...EXTENSION_RUNNER_REGISTRY.keys()]).toEqual([
       "candidate-extraction-v1",
       "semantic-dedup-v1",
@@ -105,6 +105,7 @@ describe("honest extension runner adapter", () => {
       "progressive-disclosure-v1",
       "asset-promotion-v1",
       "slot-loadout-v1",
+      "production-data-compat-v1",
     ]);
   });
 });

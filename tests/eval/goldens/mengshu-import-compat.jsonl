@@ -1,0 +1,6 @@
+{"id":"import-compat-001","suite":"mengshu-import-compat","scenario":"canonical_sha256_normalization"}
+{"id":"import-compat-002","suite":"mengshu-import-compat","scenario":"legacy_md5_accepted"}
+{"id":"import-compat-003","suite":"mengshu-import-compat","scenario":"unverifiable_hash_rejected"}
+{"id":"import-compat-004","suite":"mengshu-import-compat","scenario":"registry_workspace_mapping"}
+{"id":"import-compat-005","suite":"mengshu-import-compat","scenario":"fixed_workspace_precedence"}
+{"id":"import-compat-006","suite":"mengshu-import-compat","scenario":"client_workspace_spoof_rejected"}

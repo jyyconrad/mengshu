@@ -869,6 +869,26 @@ describe("production release eligibility", () => {
     expect(isProductionReleaseEligible([summary({ execution: invalidExecution })])).toBe(false);
   });
 
+  test("同一 active memory 可作为多个 topic tree 的 leaf", () => {
+    const valid = eligibleExecution();
+    const tree = valid.productionStageEvidence!.tree!;
+    tree.topicJobIds.push("topic-job-2");
+    tree.topicLeafIds.push("active-1");
+    tree.topicTreeKeys.push("mengshu");
+    tree.bufferBindings.push({
+      jobId: "topic-job-2", treeType: "topic", treeKey: "mengshu",
+      bufferId: "topic-buffer-2", leafId: "active-1",
+    });
+    tree.receiptIds.push("topic-job-2", "topic-buffer-2");
+    const restart = valid.productionRestartReplayEvidence!;
+    restart.effectReceiptIdsBeforeRestart.push("topic-job-2:build_tree.persist.v1");
+    restart.effectReceiptIdsAfterRestart.push("topic-job-2:build_tree.persist.v1");
+    restart.effectReceiptCountBeforeRestart += 1;
+    restart.effectReceiptCountAfterRestart += 1;
+
+    expect(isProductionReleaseEligible([summary({ execution: valid })])).toBe(true);
+  });
+
   test("active candidate semanticType 接受任一合法类型且必须与 validator audit 一致", () => {
     expect(isProductionReleaseEligible([
       summary({ execution: sourceOnlyExecution() }),
@@ -878,6 +898,20 @@ describe("production release eligibility", () => {
     (mismatched.productionStageEvidence!.candidate!.validatorAudit as
       Record<string, unknown>).semanticType = "rules";
     expect(isProductionReleaseEligible([summary({ execution: mismatched })])).toBe(false);
+  });
+
+  test("pending candidate 接受任一合法五槽类型，非法类型继续 fail-closed", () => {
+    const valid = sourceOnlyExecution();
+    valid.productionStageEvidence!.candidate!.pending!.candidate.semanticType = "experience";
+    valid.productionRestartReplayEvidence!.pending.candidateBeforeRestart.semanticType =
+      "experience";
+    valid.productionRestartReplayEvidence!.pending.candidateAfterRestart.semanticType =
+      "experience";
+    expect(isProductionReleaseEligible([summary({ execution: valid })])).toBe(true);
+
+    const invalid = sourceOnlyExecution();
+    invalid.productionStageEvidence!.candidate!.pending!.candidate.semanticType = "unknown" as never;
+    expect(isProductionReleaseEligible([summary({ execution: invalid })])).toBe(false);
   });
 
   test.each([
@@ -953,6 +987,27 @@ describe("production release eligibility", () => {
       completeRecallBreakdown(), completeRecallBreakdown(),
     ])).toBe(true);
     expect(isProductionReleaseEligible([summary({ execution: invalidExecution })])).toBe(false);
+  });
+
+  test("breakdown 对来源集合顺序和微小 provider 浮点抖动保持等价", () => {
+    const first = {
+      ...completeRecallBreakdown(),
+      matchedBy: ["vector", "text"] as const,
+      sourceSignals: { vector: 0.5, bm25: 0.4 },
+    };
+    const second = {
+      ...completeRecallBreakdown(),
+      matchedBy: ["text", "vector"] as const,
+      sourceSignals: { bm25: 0.40005, vector: 0.50005 },
+    };
+
+    expect(sameCompleteRecallBreakdowns([first, second])).toBe(true);
+
+    const drifted = {
+      ...second,
+      sourceSignals: { ...second.sourceSignals, vector: 0.5002 },
+    };
+    expect(sameCompleteRecallBreakdowns([first, drifted])).toBe(false);
   });
 
   test("restart effect/ledger 未变但五槽 sourceIds 漂移时仍 fail-closed", () => {

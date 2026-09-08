@@ -1,8 +1,10 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "version": "v3-runtime-e2e",
   "suites": {
     "mengshu-runtime-rest": {
+      "track": "quality",
+      "datasetVersion": "q-runtime-e2e-v1",
       "kind": "extension",
       "runner": "production-rest-runtime-host-v3",
       "file": "mengshu-runtime-rest.jsonl",

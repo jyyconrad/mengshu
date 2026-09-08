@@ -27,6 +27,7 @@
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 import type { GoldenCase, SeedMemorySpec } from "../runners/types.js";
 
@@ -61,6 +62,19 @@ export interface LoadLongMemEvalOptions {
   limit?: number;
 }
 
+export const LONGMEMEVAL_ADAPTER_STATUS = Object.freeze({
+  protocol: "placeholder" as const,
+  officialScoreEligible: false as const,
+  preservesOfficialEvidence: false as const,
+  runsOfficialScorer: false as const,
+});
+
+export function assertLongMemEvalOfficialScoreEligible(): never {
+  throw new Error(
+    "LongMemEval adapter is a placeholder converter and has no official scorer; it cannot produce a formal general-track score",
+  );
+}
+
 /**
  * 把 answer 文本分词成关键字数组（用于 answerMustContain 的字面比较）。
  * 仅做最简单的分词：中英文标点切分，过滤短词。
@@ -85,7 +99,7 @@ export function rawToGoldenCase(
   const id =
     raw.question_id ??
     raw.id ??
-    `lme-${Math.random().toString(36).slice(2, 10)}`;
+    `lme-${createHash("sha256").update(JSON.stringify(raw)).digest("hex").slice(0, 12)}`;
   const query = raw.question ?? raw.query ?? "";
   const answer = raw.answer ?? (raw.answers?.[0] ?? "");
 

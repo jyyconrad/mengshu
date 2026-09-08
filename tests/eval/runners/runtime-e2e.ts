@@ -744,7 +744,9 @@ LIMIT 1`, [
         typeof row.content_hash !== "string" || row.active_content_hash !== row.content_hash ||
         !evidenceIds || evidenceIds.length !== 1 || evidenceIds[0] !== evidenceId ||
         typeof row.kind !== "string" || !MEMORY_KINDS.has(row.kind as MemoryKind) ||
-        row.semantic_type !== "rules" || typeof row.confidence !== "number" ||
+        typeof row.semantic_type !== "string" ||
+        !SEMANTIC_TYPE_SET.has(row.semantic_type as MemorySemanticType) ||
+        typeof row.confidence !== "number" ||
         (admissionRoute !== "candidate" && admissionRoute !== "candidate_low_priority") ||
         !proposalReceipts ||
         proposalReceipts[0]?.admission.route !== admissionRoute ||
@@ -776,7 +778,8 @@ LIMIT 1`, [
         scope: candidateScope as RuntimePendingCandidateEvidence["candidate"]["scope"],
         status: "pending", promotedToMemoryId: null,
         contentHash: row.content_hash, activeContentHash: row.active_content_hash,
-        evidenceIds, memoryKind: row.kind as MemoryKind, semanticType: "rules",
+        evidenceIds, memoryKind: row.kind as MemoryKind,
+        semanticType: row.semantic_type as MemorySemanticType,
         admissionRoute, valueScore: metadata.valueScore,
         importance: metadata.importance, confidence: row.confidence,
         validationReceipt: validationReceipt as never,
@@ -829,7 +832,22 @@ async function waitForPendingCandidateEvidence(
   candidate.id AS candidate_id,
   candidate.status AS candidate_status,
   candidate.promoted_to_memory_id,
-  candidate.metadata->>'admissionRoute' AS admission_route
+  candidate.metadata->>'admissionRoute' AS admission_route,
+  candidate.semantic_type,
+  candidate.kind,
+  candidate.confidence,
+  candidate.content_hash,
+  candidate.active_content_hash,
+  candidate.evidence_ids,
+  jsonb_build_object(
+    'valueScoreType', jsonb_typeof(candidate.metadata->'valueScore'),
+    'importanceType', jsonb_typeof(candidate.metadata->'importance'),
+    'nativeKind', candidate.metadata #>> '{governance,native,kind}',
+    'validationReceiptType', jsonb_typeof(
+      candidate.metadata #> '{governance,candidate,validationReceipt}'
+    )
+  ) AS metadata_contract,
+  receipt.result->'proposalReceipts' AS proposal_receipts
 FROM mengshu_jobs_v2 job
 LEFT JOIN mengshu_job_v2_effect_receipts receipt
   ON receipt.job_id = job.id AND receipt.effect_key = '${CANDIDATE_EFFECT_KEY}'
@@ -1981,10 +1999,10 @@ function recallBreakdownDiagnostic(hit: RuntimeRecallHit | undefined): Readonly<
     present: true,
     scoreConsistent: isRecallScoreBreakdown(breakdown) &&
       Math.abs(hit.score - breakdown.score) <= 1e-9,
+    score: isRecallScoreBreakdown(breakdown) ? breakdown.score : null,
+    factors: isRecallScoreBreakdown(breakdown) ? breakdown.factors : null,
     matchedBy: isRecallScoreBreakdown(breakdown) ? [...breakdown.matchedBy].sort() : [],
-    sourceSignals: isRecallScoreBreakdown(breakdown)
-      ? Object.keys(breakdown.sourceSignals).sort()
-      : [],
+    sourceSignals: isRecallScoreBreakdown(breakdown) ? breakdown.sourceSignals : {},
   });
 }
 

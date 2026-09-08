@@ -4,6 +4,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   runAssetPromotionSuite,
+  runImportCompatSuite,
   runProgressiveDisclosureSuite,
   runSlotLoadoutSuite,
 } from "./capability-contracts.js";
@@ -27,6 +28,12 @@ describe.each([
     "mengshu-slot-loadout",
     "mengshu-slot-loadout.jsonl",
     runSlotLoadoutSuite,
+    6,
+  ],
+  [
+    "mengshu-import-compat",
+    "mengshu-import-compat.jsonl",
+    runImportCompatSuite,
     6,
   ],
 ])("%s deterministic capability runner", (suite, fixture, run, expectedCount) => {

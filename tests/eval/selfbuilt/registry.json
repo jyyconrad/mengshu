@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "1",
+  "datasetId": "mengshu-selfbuilt-v1",
+  "datasetVersion": "template-v1",
+  "targetCaseCount": 360,
+  "casesPerCapability": 60,
+  "casesPerScenario": 60,
+  "casesPerCapabilityScenario": 10,
+  "devCasesPerCapabilityScenario": 2,
+  "capabilities": [
+    "durable-facts-profile-rules",
+    "task-project-continuity",
+    "temporal-update-conflict",
+    "cross-source-evidence",
+    "negative-interference-abstention",
+    "scope-lifecycle-sensitive"
+  ],
+  "scenarios": [
+    "direct-recall",
+    "temporal-update",
+    "cross-source",
+    "scope-isolation",
+    "lifecycle-block",
+    "hydration-fallback"
+  ]
+}

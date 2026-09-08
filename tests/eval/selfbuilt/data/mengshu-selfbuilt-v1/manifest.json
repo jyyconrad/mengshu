@@ -1,0 +1,83 @@
+{
+  "schemaVersion": "mengshu.selfbuilt-dataset/v1",
+  "datasetId": "mengshu-selfbuilt-v1",
+  "datasetVersion": "template-v1",
+  "status": "frozen",
+  "sourceType": "deterministic-synthetic",
+  "scoreAuthority": "selfbuilt-diagnostic",
+  "formalReleaseEligible": false,
+  "generatorVersion": "selfbuilt-generator/v1",
+  "randomSeed": 42,
+  "caseCount": 360,
+  "splitCounts": {
+    "dev": 72,
+    "test": 288
+  },
+  "countsByCapability": {
+    "durable-facts-profile-rules": 60,
+    "task-project-continuity": 60,
+    "temporal-update-conflict": 60,
+    "cross-source-evidence": 60,
+    "negative-interference-abstention": 60,
+    "scope-lifecycle-sensitive": 60
+  },
+  "countsByScenario": {
+    "direct-recall": 60,
+    "temporal-update": 60,
+    "cross-source": 60,
+    "scope-isolation": 60,
+    "lifecycle-block": 60,
+    "hydration-fallback": 60
+  },
+  "crossDistribution": {
+    "durable-facts-profile-rules": {
+      "direct-recall": 10,
+      "temporal-update": 10,
+      "cross-source": 10,
+      "scope-isolation": 10,
+      "lifecycle-block": 10,
+      "hydration-fallback": 10
+    },
+    "task-project-continuity": {
+      "direct-recall": 10,
+      "temporal-update": 10,
+      "cross-source": 10,
+      "scope-isolation": 10,
+      "lifecycle-block": 10,
+      "hydration-fallback": 10
+    },
+    "temporal-update-conflict": {
+      "direct-recall": 10,
+      "temporal-update": 10,
+      "cross-source": 10,
+      "scope-isolation": 10,
+      "lifecycle-block": 10,
+      "hydration-fallback": 10
+    },
+    "cross-source-evidence": {
+      "direct-recall": 10,
+      "temporal-update": 10,
+      "cross-source": 10,
+      "scope-isolation": 10,
+      "lifecycle-block": 10,
+      "hydration-fallback": 10
+    },
+    "negative-interference-abstention": {
+      "direct-recall": 10,
+      "temporal-update": 10,
+      "cross-source": 10,
+      "scope-isolation": 10,
+      "lifecycle-block": 10,
+      "hydration-fallback": 10
+    },
+    "scope-lifecycle-sensitive": {
+      "direct-recall": 10,
+      "temporal-update": 10,
+      "cross-source": 10,
+      "scope-isolation": 10,
+      "lifecycle-block": 10,
+      "hydration-fallback": 10
+    }
+  },
+  "casesSha256": "4034f5acf4b5c213467220c712e279cfd07201fcfdca4ed330c88beb89ec4162"
+}

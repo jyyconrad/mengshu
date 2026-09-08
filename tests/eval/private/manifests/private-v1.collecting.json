@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "1",
+  "datasetId": "mengshu-private-v1",
+  "status": "collecting",
+  "caseCount": 0,
+  "targetCaseCount": 500,
+  "countsByCohort": {
+    "governed-canonical": 0,
+    "fresh-holdout": 0,
+    "legacy-paired": 0,
+    "adversarial": 0
+  },
+  "countsByCapability": {
+    "durable-facts-profile-rules": 0,
+    "task-project-continuity": 0,
+    "temporal-update-conflict": 0,
+    "cross-source-evidence": 0,
+    "negative-interference-abstention": 0,
+    "scope-lifecycle-sensitive": 0
+  },
+  "crossDistribution": {
+    "governed-canonical": {},
+    "fresh-holdout": {},
+    "legacy-paired": {},
+    "adversarial": {}
+  },
+  "casesSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "privacyScan": { "passed": true, "findingCount": 0 },
+  "annotation": { "requiredAnnotators": 2, "minimumKappa": 0.85, "verifiedCaseCount": 0 },
+  "blockers": [
+    "private_fresh_quota_not_met",
+    "independent_annotation_incomplete",
+    "target_case_count_unmet"
+  ]
+}

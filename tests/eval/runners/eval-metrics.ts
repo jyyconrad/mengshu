@@ -6,6 +6,7 @@ import type {
   GoldenCase,
   ProductionRuntimeStage,
   ProductionStageEvidence,
+  ProductionTreeReceipt,
   SuiteSummary,
 } from "./types.js";
 import type {
@@ -13,7 +14,10 @@ import type {
   MemorySemanticType,
 } from "../../../packages/core/src/domain/types.js";
 import type { MemoryTreeType } from "../../../packages/core/src/tree/types.js";
-import { isRecallScoreBreakdown } from
+import {
+  isRecallScoreBreakdown,
+  type CompleteRecallScoreBreakdown,
+} from
   "../../../packages/core/src/domain/recall-scoring.js";
 
 export const REQUIRED_PRODUCTION_STAGES: readonly ProductionRuntimeStage[] = Object.freeze([
@@ -326,23 +330,47 @@ function plainRecord(value: unknown): value is Readonly<Record<string, unknown>>
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
-  }
-  if (plainRecord(value)) {
-    return `{${Object.keys(value).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
 export function sameCompleteRecallBreakdowns(values: readonly unknown[]): boolean {
   if (values.length < 2 || values.some((value) => !isRecallScoreBreakdown(value))) {
     return false;
   }
-  const expected = canonicalJson(values[0]);
-  return values.slice(1).every((value) => canonicalJson(value) === expected);
+  const [expected, ...remaining] = values as readonly CompleteRecallScoreBreakdown[];
+  const numericKeys = [
+    "relevance", "scopeFit", "importance", "confidence", "evidenceWeight", "recency",
+  ] as const;
+  const importanceKeys = [
+    "salience_llm", "sourceAuthority", "explicitnessBonus", "typePrior",
+  ] as const;
+  const near = (left: number, right: number): boolean => Math.abs(left - right) <= 1e-4;
+  const sameStringSet = (left: readonly string[], right: readonly string[]): boolean =>
+    left.length === right.length && new Set(left).size === left.length &&
+    new Set(right).size === right.length && left.every((item) => right.includes(item));
+  const sameSignals = (
+    left: Readonly<Record<string, number>>,
+    right: Readonly<Record<string, number>>,
+  ): boolean => {
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    return JSON.stringify(leftKeys) === JSON.stringify(rightKeys) &&
+      leftKeys.every((key) => near(left[key]!, right[key]!));
+  };
+  const sameImportance = (
+    left: CompleteRecallScoreBreakdown["importanceBreakdown"],
+    right: CompleteRecallScoreBreakdown["importanceBreakdown"],
+  ): boolean => left === null || right === null
+    ? left === right
+    : importanceKeys.every((key) => near(left[key], right[key]));
+
+  return remaining.every((value) =>
+    near(expected!.score, value.score) &&
+    near(expected!.scopeFit, value.scopeFit) &&
+    near(expected!.composite, value.composite) &&
+    numericKeys.every((key) => near(expected!.weights[key], value.weights[key]) &&
+      near(expected!.factors[key], value.factors[key]) &&
+      near(expected!.contributions[key], value.contributions[key])) &&
+    sameImportance(expected!.importanceBreakdown, value.importanceBreakdown) &&
+    sameStringSet(expected!.matchedBy, value.matchedBy) &&
+    sameSignals(expected!.sourceSignals, value.sourceSignals));
 }
 
 function validHotnessEvidence(value: unknown): boolean {
@@ -466,7 +494,7 @@ function validProductionPendingCandidate(value: unknown): boolean {
       !Array.isArray(candidate.evidenceIds) ||
       !sameIds(candidate.evidenceIds as string[], [value.evidenceId as string]) ||
       !MEMORY_KINDS.has(candidate.memoryKind as MemoryKind) ||
-      candidate.semanticType !== "rules" ||
+      !isMemorySemanticType(candidate.semanticType) ||
       (candidate.admissionRoute !== "candidate" &&
         candidate.admissionRoute !== "candidate_low_priority") ||
       !score01(candidate.valueScore) || !score01(candidate.importance) ||
@@ -504,6 +532,106 @@ function validProductionPendingCandidate(value: unknown): boolean {
     value.jobId as string, value.effectKey as string, value.evidenceId as string,
     candidate.candidateId as string,
   ]);
+}
+
+/** Return stable reason codes for the production tree receipt contract. */
+export function findProductionTreeReceiptIssues(value: unknown): string[] {
+  if (!plainRecord(value)) return ["shape"];
+  const receipt = value as unknown as ProductionTreeReceipt;
+  const issues: string[] = [];
+  if (receipt.executed !== true || !denseProductionIds(receipt.receiptIds) ||
+      !validProductionReceiptId(receipt.evidenceId) ||
+      !validProductionReceiptId(receipt.activeMemoryId)) issues.push("base");
+  if (receipt.effectKey !== "build_tree.persist.v1" ||
+      !Array.isArray(receipt.expectedTreeTypes) ||
+      receipt.expectedTreeTypes.some((treeType) => !isMemoryTreeType(treeType)) ||
+      new Set(receipt.expectedTreeTypes).size !== receipt.expectedTreeTypes.length ||
+      !receipt.expectedTreeTypes.includes("source")) issues.push("routing");
+  if (!Array.isArray(receipt.bufferBindings) || !Array.isArray(receipt.topicJobIds) ||
+      !Array.isArray(receipt.topicLeafIds) || !Array.isArray(receipt.topicTreeKeys)) {
+    return [...issues, "arrays"];
+  }
+
+  const expectsGlobal = receipt.expectedTreeTypes.includes("global");
+  const expectsTopic = receipt.expectedTreeTypes.includes("topic");
+  const globalBindings = receipt.bufferBindings.filter(({ treeType }) => treeType === "global");
+  const topicBindings = receipt.bufferBindings.filter(({ treeType }) => treeType === "topic");
+  if (!validProductionReceiptId(receipt.sourceJobId) ||
+      !validProductionReceiptId(receipt.sourceTreeKey) ||
+      receipt.sourceLeafId !== receipt.activeMemoryId) issues.push("source_identity");
+  if (expectsGlobal
+    ? !validProductionReceiptId(receipt.globalJobId) ||
+      !validProductionReceiptId(receipt.globalLeafId) ||
+      receipt.sourceJobId === receipt.globalJobId || globalBindings.length !== 1 ||
+      receipt.globalLeafId !== receipt.activeMemoryId
+    : receipt.globalJobId !== null || receipt.globalLeafId !== null ||
+      globalBindings.length !== 0) issues.push("global_identity");
+  if (expectsTopic
+    ? !denseProductionIds(receipt.topicJobIds) ||
+      receipt.topicLeafIds.length === 0 ||
+      receipt.topicLeafIds.some((leafId) => !validProductionReceiptId(leafId)) ||
+      !denseProductionIds(receipt.topicTreeKeys) ||
+      receipt.topicJobIds.length !== receipt.topicLeafIds.length ||
+      receipt.topicJobIds.length !== receipt.topicTreeKeys.length ||
+      receipt.topicLeafIds.some((leafId) => leafId !== receipt.activeMemoryId)
+    : receipt.topicJobIds.length !== 0 || receipt.topicLeafIds.length !== 0 ||
+      receipt.topicTreeKeys.length !== 0 || topicBindings.length !== 0) {
+    issues.push("topic_identity");
+  }
+
+  const expectedBindingCount = 1 + (expectsGlobal ? 1 : 0) +
+    (expectsTopic ? receipt.topicJobIds.length : 0);
+  if (receipt.bufferBindings.length !== expectedBindingCount ||
+      new Set(receipt.bufferBindings.map(({ jobId }) => jobId)).size !==
+        receipt.bufferBindings.length ||
+      new Set(receipt.bufferBindings.map(({ bufferId }) => bufferId)).size !==
+        receipt.bufferBindings.length ||
+      receipt.bufferBindings.some(({ leafId, bufferId, treeKey }) =>
+        leafId !== receipt.activeMemoryId || !validProductionReceiptId(bufferId) ||
+        !validProductionReceiptId(treeKey))) issues.push("buffer_bindings");
+  if (!receipt.bufferBindings.some(({ jobId, treeType, treeKey }) =>
+    jobId === receipt.sourceJobId && treeType === "source" &&
+    treeKey === receipt.sourceTreeKey)) issues.push("source_binding");
+  if (expectsGlobal && !globalBindings.some(({ jobId, treeKey }) =>
+    jobId === receipt.globalJobId && /^\d{4}-\d{2}-\d{2}$/.test(treeKey))) {
+    issues.push("global_binding");
+  }
+  if (topicBindings.length !== receipt.topicJobIds.length ||
+      topicBindings.some(({ jobId, treeKey }) => !receipt.topicJobIds.includes(jobId) ||
+        !receipt.topicTreeKeys.includes(treeKey))) issues.push("topic_bindings");
+  if (!Array.isArray(receipt.coldTopicJobIds) || receipt.coldTopicJobIds.length !== 0 ||
+      !Array.isArray(receipt.coldTopicBufferIds) || receipt.coldTopicBufferIds.length !== 0) {
+    issues.push("cold_topic_noop");
+  }
+  if (!validProductionReceiptId(receipt.hotness?.topicEntityId) ||
+      receipt.hotness?.threshold !== 6 ||
+      !validHotnessEvidence(receipt.hotness?.beforeRecall) ||
+      !validHotnessEvidence(receipt.hotness?.afterRecall) ||
+      receipt.hotness.beforeRecall.score >= receipt.hotness.threshold ||
+      receipt.hotness.afterRecall.score < receipt.hotness.threshold ||
+      receipt.hotness.afterRecall.queryHits30d <= receipt.hotness.beforeRecall.queryHits30d) {
+    issues.push("hotness");
+  }
+  if (!validProductionSealedSummary(receipt.sealedSummary)) issues.push("sealed_summary");
+  if (receipt.topicJobIds.some((jobId) => jobId === receipt.sourceJobId ||
+      (expectsGlobal && jobId === receipt.globalJobId))) issues.push("job_identity_overlap");
+  if (!sameIds(
+    Array.from(new Set(receipt.bufferBindings.map(({ treeType }) => treeType))),
+    receipt.expectedTreeTypes,
+  )) issues.push("tree_type_bindings");
+
+  const requiredReceiptIds = [
+    receipt.effectKey,
+    receipt.sourceJobId,
+    receipt.sourceLeafId,
+    ...(expectsGlobal
+      ? [receipt.globalJobId as string, receipt.globalLeafId as string]
+      : []),
+    ...receipt.topicJobIds,
+    ...receipt.bufferBindings.map(({ bufferId }) => bufferId),
+  ];
+  if (!receiptContains(receipt.receiptIds, requiredReceiptIds)) issues.push("receipt_ids");
+  return issues;
 }
 
 function validProductionStage(
@@ -589,86 +717,7 @@ function validProductionStage(
     }
     case "tree": {
       const receipt = evidence?.tree;
-      if (!receipt || !validBase(receipt)) return false;
-      if (!Array.isArray(receipt.expectedTreeTypes) ||
-          receipt.expectedTreeTypes.some((treeType) => !isMemoryTreeType(treeType)) ||
-          new Set(receipt.expectedTreeTypes).size !== receipt.expectedTreeTypes.length ||
-          !receipt.expectedTreeTypes.includes("source")) return false;
-      if (!Array.isArray(receipt.bufferBindings) ||
-          !Array.isArray(receipt.topicJobIds) ||
-          !Array.isArray(receipt.topicLeafIds) ||
-          !Array.isArray(receipt.topicTreeKeys)) return false;
-      const expectsGlobal = receipt.expectedTreeTypes.includes("global");
-      const expectsTopic = receipt.expectedTreeTypes.includes("topic");
-      const globalBindings = receipt.bufferBindings.filter(({ treeType }) => treeType === "global");
-      const topicBindings = receipt.bufferBindings.filter(({ treeType }) => treeType === "topic");
-      const expectedBindingCount = 1 + (expectsGlobal ? 1 : 0) +
-        (expectsTopic ? receipt.topicJobIds.length : 0);
-      const requiredReceiptIds = [
-        receipt.effectKey,
-        receipt.sourceJobId,
-        receipt.sourceLeafId,
-        ...(expectsGlobal
-          ? [receipt.globalJobId as string, receipt.globalLeafId as string]
-          : []),
-        ...receipt.topicJobIds,
-        ...receipt.bufferBindings.map(({ bufferId }) => bufferId),
-      ];
-      return receipt.effectKey === "build_tree.persist.v1" &&
-        validProductionReceiptId(receipt.sourceJobId) &&
-        validProductionReceiptId(receipt.sourceTreeKey) &&
-        (expectsGlobal
-          ? validProductionReceiptId(receipt.globalJobId) &&
-            validProductionReceiptId(receipt.globalLeafId) &&
-            receipt.sourceJobId !== receipt.globalJobId && globalBindings.length === 1
-          : receipt.globalJobId === null && receipt.globalLeafId === null &&
-            globalBindings.length === 0) &&
-        (expectsTopic
-          ? denseProductionIds(receipt.topicJobIds) &&
-            denseProductionIds(receipt.topicLeafIds) &&
-            denseProductionIds(receipt.topicTreeKeys) &&
-            receipt.topicJobIds.length === receipt.topicLeafIds.length &&
-            receipt.topicJobIds.length === receipt.topicTreeKeys.length
-          : Array.isArray(receipt.topicJobIds) && receipt.topicJobIds.length === 0 &&
-            Array.isArray(receipt.topicLeafIds) && receipt.topicLeafIds.length === 0 &&
-            Array.isArray(receipt.topicTreeKeys) && receipt.topicTreeKeys.length === 0 &&
-            topicBindings.length === 0) &&
-        receipt.bufferBindings.length === expectedBindingCount &&
-        new Set(receipt.bufferBindings.map(({ jobId }) => jobId)).size ===
-          receipt.bufferBindings.length &&
-        new Set(receipt.bufferBindings.map(({ bufferId }) => bufferId)).size ===
-          receipt.bufferBindings.length &&
-        receipt.bufferBindings.every(({ leafId, bufferId, treeKey }) =>
-          leafId === receipt.activeMemoryId && validProductionReceiptId(bufferId) &&
-          validProductionReceiptId(treeKey)) &&
-        receipt.bufferBindings.some(({ jobId, treeType, treeKey }) =>
-          jobId === receipt.sourceJobId && treeType === "source" &&
-          treeKey === receipt.sourceTreeKey) &&
-        (!expectsGlobal || globalBindings.some(({ jobId, treeKey }) =>
-          jobId === receipt.globalJobId && /^\d{4}-\d{2}-\d{2}$/.test(treeKey))) &&
-        topicBindings.length === receipt.topicJobIds.length &&
-        topicBindings.every(
-          ({ jobId, treeKey }) => receipt.topicJobIds.includes(jobId) &&
-            receipt.topicTreeKeys.includes(treeKey),
-        ) &&
-        Array.isArray(receipt.coldTopicJobIds) && receipt.coldTopicJobIds.length === 0 &&
-        Array.isArray(receipt.coldTopicBufferIds) && receipt.coldTopicBufferIds.length === 0 &&
-        validProductionReceiptId(receipt.hotness?.topicEntityId) &&
-        receipt.hotness.threshold === 6 && validHotnessEvidence(receipt.hotness.beforeRecall) &&
-        validHotnessEvidence(receipt.hotness.afterRecall) &&
-        receipt.hotness.beforeRecall.score < receipt.hotness.threshold &&
-        receipt.hotness.afterRecall.score >= receipt.hotness.threshold &&
-        receipt.hotness.afterRecall.queryHits30d > receipt.hotness.beforeRecall.queryHits30d &&
-        validProductionSealedSummary(receipt.sealedSummary) &&
-        receipt.topicJobIds.every((jobId) =>
-          jobId !== receipt.sourceJobId && (!expectsGlobal || jobId !== receipt.globalJobId)) &&
-        receipt.sourceLeafId === receipt.activeMemoryId &&
-        (!expectsGlobal || receipt.globalLeafId === receipt.activeMemoryId) &&
-        receipt.topicLeafIds.every((leafId) => leafId === receipt.activeMemoryId) &&
-        sameIds(
-          Array.from(new Set(receipt.bufferBindings.map(({ treeType }) => treeType))),
-          receipt.expectedTreeTypes,
-        ) && receiptContains(receipt.receiptIds, requiredReceiptIds);
+      return receipt !== undefined && findProductionTreeReceiptIssues(receipt).length === 0;
     }
     case "context_recall": {
       const receipt = evidence?.context_recall;

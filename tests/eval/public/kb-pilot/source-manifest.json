@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "1",
+  "kbPilot": {
+    "repository": "https://github.com/waylondev/kb-pilot",
+    "revision": "a987183b1ff3c983775d4eff14e012baf811f080",
+    "currentConclusion": {
+      "path": "docs/testing/test_conclusion.md",
+      "sha256": "3bd4faec4b7aec7aa6cf7b692eb9d19fbb621fe7b50c79c0cda5bbb1defca5df"
+    },
+    "historicalProtocol": {
+      "revision": "e7265b25c698e8daddd79b7e718cdd17a3f05880",
+      "path": "tests/e2e_test_prompt.md",
+      "sha256": "f204ad081a8d59d88e3630b6c0dff401fa9601146a1a0aa4be9d60e44caa3a1d"
+    },
+    "licenseDeclaration": "README.md declares MIT; the repository has no LICENSE file at the pinned revision"
+  },
+  "dataset": {
+    "repository": "https://github.com/udayallu/RAG-Multi-Corpus",
+    "revision": "39071af3f4dd25e59f5c59a6f9b6e8e99cd643b3",
+    "queryFile": {
+      "path": "bechmark/bechmark-agentic-references/Dataset categories - queries.csv",
+      "bytes": 526122,
+      "sha256": "58be4e8ebe96147ab63b159b3166357ad905989023956038ed563f9b88c2d24e"
+    },
+    "license": {
+      "path": "LICENSE",
+      "bytes": 1066,
+      "sha256": "98800da81937e7e782491cd00623c39f6958cf031e36441f9ed604997921a140"
+    }
+  },
+  "synchronized": {
+    "sourceRows": 1088,
+    "uniqueCases": 907,
+    "completeCases": 902,
+    "invalidMissingDocumentCases": 5,
+    "markdownDocuments": 236,
+    "queriesSha256": "283dc0a5b96ff307dec7ffa5b41db40c5a025db53971d15e99c2b6bcba06a74d",
+    "corpusManifestSha256": "9acc738341077f6d10295abf2d7bed6afdb24a03c908c5666e33bea789007bdd"
+  }
+}

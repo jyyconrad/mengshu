@@ -6,10 +6,13 @@ import {
   REQUIRED_PRODUCTION_STAGES,
 } from "./eval-metrics.js";
 import type { ProductionRuntimeStage } from "./types.js";
+import type { EvalTrack } from "./evaluation-protocol.js";
 
 export type EvalSuiteKind = "baseline" | "extension";
 
 export interface EvalSuiteDefinition {
+  track: EvalTrack;
+  datasetVersion: string;
   kind: EvalSuiteKind;
   file: string;
   runner: string;
@@ -44,7 +47,7 @@ function requireProductionStages(
 }
 
 export interface EvalManifest {
-  schemaVersion: 1;
+  schemaVersion: 2;
   version?: string;
   suites: Record<string, EvalSuiteDefinition>;
   [key: string]: unknown;
@@ -53,7 +56,7 @@ export interface EvalManifest {
 export interface EvalSuitePlan extends EvalSuiteDefinition {
   name: string;
   filePath: string;
-  manifestSchemaVersion: 1;
+  manifestSchemaVersion: 2;
   manifestVersion: string | null;
 }
 
@@ -191,8 +194,8 @@ export function loadEvalManifest(manifestPath: string): EvalManifest {
   }
 
   if (!isRecord(raw)) fail(absolutePath, "根节点必须为对象");
-  if (raw.schemaVersion !== 1) {
-    fail(absolutePath, "schemaVersion 必须为 1");
+  if (raw.schemaVersion !== 2) {
+    fail(absolutePath, "schemaVersion 必须为 2");
   }
   if (!isRecord(raw.suites) || Object.keys(raw.suites).length === 0) {
     fail(absolutePath, "suites 必须为非空对象");
@@ -202,6 +205,15 @@ export function loadEvalManifest(manifestPath: string): EvalManifest {
   for (const [name, value] of Object.entries(raw.suites)) {
     if (!isRecord(value)) fail(absolutePath, `suite '${name}' 必须为对象`);
 
+    const track = requireString(value.track, `suite '${name}'.track`, absolutePath);
+    if (track !== "general" && track !== "private" && track !== "quality") {
+      fail(absolutePath, `suite '${name}'.track 必须为 general、private 或 quality`);
+    }
+    const datasetVersion = requireString(
+      value.datasetVersion,
+      `suite '${name}'.datasetVersion`,
+      absolutePath,
+    );
     const kind = requireString(value.kind, `suite '${name}'.kind`, absolutePath);
     if (kind !== "baseline" && kind !== "extension") {
       fail(absolutePath, `suite '${name}'.kind 必须为 baseline 或 extension`);
@@ -235,6 +247,8 @@ export function loadEvalManifest(manifestPath: string): EvalManifest {
 
     suites[name] = {
       ...value,
+      track,
+      datasetVersion,
       kind,
       file,
       runner,
@@ -248,7 +262,7 @@ export function loadEvalManifest(manifestPath: string): EvalManifest {
     verifySuiteFile(name, suites[name], absolutePath);
   }
 
-  return { ...raw, schemaVersion: 1, suites } as EvalManifest;
+  return { ...raw, schemaVersion: 2, suites } as EvalManifest;
 }
 
 export function selectEvalSuites(
