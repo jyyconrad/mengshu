@@ -5,7 +5,7 @@
  * 1. createManifest 幂等（同一目录两次创建得到相同 workspaceId/projectId）。
  * 2. readManifest 不存在返回 null、解析失败抛带路径错误。
  * 3. writeManifest + readManifest 往返一致。
- * 4. manifestToScope 映射正确（appId/tenantId 固定，visibility/workspace/project 来自 manifest）。
+ * 4. manifestToScope 组合产品可信 scope 与 manifest project identity，不硬编码 appId。
  * 5. 目录移动 identity 不变（manifest 内记录的 id 随指针文件保留，readManifest 不重算）。
  *
  * v0.1.2 新增：
@@ -119,7 +119,7 @@ describe("writeManifest + readManifest 往返", () => {
 });
 
 describe("manifestToScope", () => {
-  test("映射 appId=openclaw、tenantId=local，workspace/project/userId/visibility 来自 manifest", () => {
+  test("项目 manifest 不硬编码 Agent 产品，产品 scope 由调用方提供", () => {
     const manifest = createManifest({
       dir: workDir,
       workspaceId: "ws-acme",
@@ -127,23 +127,36 @@ describe("manifestToScope", () => {
       userId: "user-1",
       defaultVisibility: "workspace",
     });
-    const scope = manifestToScope(manifest);
+    const scope = manifestToScope(manifest, {
+      tenantId: "tenant-codex",
+      userId: "user-codex",
+      appId: "codex",
+      agentId: "codex-agent",
+      namespace: "working-context",
+    });
 
-    expect(scope.appId).toBe("openclaw");
-    expect(scope.tenantId).toBe("local");
+    expect(scope.appId).toBe("codex");
+    expect(scope.tenantId).toBe("tenant-codex");
+    expect(scope.userId).toBe("user-codex");
+    expect(scope.agentId).toBe("codex-agent");
+    expect(scope.namespace).toBe("working-context");
     expect(scope.workspaceId).toBe("ws-acme");
     expect(scope.projectId).toBe("proj-acme");
-    expect(scope.userId).toBe("user-1");
-    expect(scope.namespace).toBe("memories");
     expect(scope.visibility).toBe("workspace");
   });
 
-  test("overrides 覆盖 manifest 推导的 scope 字段", () => {
+  test("产品 scope 不能覆盖 manifest 的 project/workspace identity", () => {
     const manifest = createManifest({ dir: workDir, projectId: "proj-acme" });
-    const scope = manifestToScope(manifest, { agentId: "agent-x", namespace: "knowledge" });
+    const scope = manifestToScope(manifest, {
+      projectId: "other-project",
+      workspaceId: "other-workspace",
+      agentId: "agent-x",
+      namespace: "knowledge",
+    });
     expect(scope.agentId).toBe("agent-x");
     expect(scope.namespace).toBe("knowledge");
     expect(scope.projectId).toBe("proj-acme");
+    expect(scope.workspaceId).toBe(manifest.workspaceId);
   });
 });
 

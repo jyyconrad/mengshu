@@ -12,6 +12,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentFastPathService } from "../../api/src/agent-fast-path/index.js";
+import { buildEvolutionTools } from "./evolution-tools.js";
 import type {
   AgentEvidenceReadRequest,
   AgentLookupRequest,
@@ -170,6 +171,7 @@ export function freezeMcpToolRegistry(
 }
 
 export interface McpMemoryToolsOptions {
+  continuousMemoryEvolution?: import("../../api/src/evolution.js").EvolutionBatchCapability;
   service: MemoryService;
   /** Runtime-owned F0 write capability. Production writes fail closed when absent. */
   memoryWrite?: MemoryWriteCommandExecutor;
@@ -980,6 +982,10 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
       },
     },
   ];
+
+  if (options.continuousMemoryEvolution) {
+    baseTools.splice(baseTools.length - 1, 0, ...buildEvolutionTools(options.continuousMemoryEvolution, options.authority));
+  }
 
   if (options.temporalMemory) {
     baseTools.splice(

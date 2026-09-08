@@ -146,6 +146,11 @@ export function registerOpenClawAdapter(
       );
     }
     const authority = snapshotOpenClawAuthority(options.authority);
+    const externalWorkerOwner = config.server?.workerOwnership === "external-runtime-host";
+    if ((config.features?.continuousMemoryEvolution === true || options.runtime?.continuousMemoryEvolution) &&
+        (config.mode !== "server" || externalWorkerOwner)) {
+      throw new Error("OpenClaw evolution requires an explicit server mode RuntimeHost owner");
+    }
     const resolvedDbPath = config.dbType === "postgres"
       ? ""
       : resolveOpenClawDbPath(config.dbPath ?? "~/.mengshu/memory/lancedb", (path) => api.resolvePath(path));
@@ -154,10 +159,19 @@ export function registerOpenClawAdapter(
       resolvedDbPath,
       appId: "openclaw",
       ...(options.defaultScope === undefined ? {} : { defaultScope: options.defaultScope }),
+      ...(config.features?.continuousMemoryEvolution === true ? { continuousMemoryEvolutionHost: { authority, config } } : {}),
       logger: api.logger,
     });
     // Validate identity alignment and every allowlist before registering any host surface.
     resolveOpenClawAuthorityScope(authority, runtime.defaultScope);
+    if (externalWorkerOwner && runtime.config.dbType === "postgres" && runtime.backgroundWork?.snapshot().mode !== "paused") {
+      throw new Error("OpenClaw external RuntimeHost owner requires paused background work");
+    }
+    let ownedHost: ReturnType<typeof createServeRuntimeHost> | undefined;
+    const ownerHost = () => {
+      if (externalWorkerOwner) throw new Error("OpenClaw background work belongs to an external RuntimeHost owner");
+      return ownedHost ??= createServeRuntimeHost(runtime, { authority });
+    };
     bindOpenClawPipelineAuthority(runtime.ingestionPipeline, authority, runtime.defaultScope);
     const forgetService = transactionalForgetCapability(runtime);
     const memoryWrite = runtimeMemoryWriteCapability(runtime);
@@ -168,9 +182,9 @@ export function registerOpenClawAdapter(
     }
 
     registerOpenClawTools(api, runtime, authority, forgetService, memoryWrite);
-    registerOpenClawCli(api, runtime, authority, forgetService, options.startServer);
+    registerOpenClawCli(api, runtime, authority, forgetService, options.startServer, ownerHost);
     registerOpenClawHooks(api, runtime, authority, memoryWrite);
-    registerOpenClawService(api, runtime, authority);
+    registerOpenClawService(api, runtime, externalWorkerOwner ? undefined : ownerHost);
     registerOpenClawMemoryRuntime(api, runtime);
     return runtime;
   } catch (error) {
@@ -391,6 +405,7 @@ function registerOpenClawCli(
   authority: AuthorityScope,
   forgetService: MemoryServiceWithForget | undefined,
   startServer: RegisterMemoryServerCliOptions["startServer"],
+  ownerHost: NonNullable<RegisterMemoryServerCliOptions["runtimeHostFactory"]>,
 ): void {
   resolveOpenClawAuthorityScope(authority, runtime.defaultScope);
   api.registerCli(
@@ -401,10 +416,16 @@ function registerOpenClawCli(
         defaultScope: runtime.defaultScope,
         config: runtime.config,
         service: runtime.memoryService,
+        memoryWrite: runtimeMemoryWriteCapability(runtime),
+        memoryEvolution: runtime.memoryEvolution,
+        continuousMemoryEvolution: runtime.continuousMemoryEvolution,
+        backgroundWork: runtime.backgroundWork,
+        foregroundActivity: runtime.evolutionActivity,
+        evolutionMaintenance: runtime.evolutionMaintenance,
         startServer,
         console: runtime.consoleApi,
         agentFastPath: runtime.agentFastPath,
-        runtimeHostFactory: () => createServeRuntimeHost(runtime, { authority }),
+        runtimeHostFactory: ownerHost,
         getTableStats: runtime.db.getTableStats ? () => runtime.db.getTableStats!() : undefined,
         schemaCutover: runtime.db instanceof PostgresProvider
           ? {
@@ -414,9 +435,27 @@ function registerOpenClawCli(
           : undefined,
       });
       registerProjectCliCommands(memory, {
-        authority,
-        defaultScope: runtime.defaultScope,
         service: runtime.memoryService,
+        resolveProjectIdentity: ({ requested, suggested }) => ({
+          ...suggested,
+          workspaceId: requested.workspaceId ?? runtime.defaultScope.workspaceId ?? suggested.workspaceId,
+          projectId: requested.projectId ?? runtime.defaultScope.projectId ?? suggested.projectId,
+          defaultVisibility:
+            requested.defaultVisibility ?? runtime.defaultScope.visibility ?? suggested.defaultVisibility,
+        }),
+        resolveMemoryScope: (manifest) => {
+          if (authority.workspaceId !== undefined && authority.workspaceId !== manifest.workspaceId) {
+            throw new Error("OpenClaw project workspace does not match server authority");
+          }
+          const scope = resolveOpenClawAuthorityScope(authority, runtime.defaultScope, {
+            projectId: manifest.projectId,
+            visibility: manifest.defaultVisibility,
+          });
+          return Object.freeze({
+            ...scope,
+            workspaceId: authority.workspaceId ?? manifest.workspaceId,
+          });
+        },
       });
       registerMigrateHomeCommand(memory);
       registerDoctorCliCommands(memory, {
@@ -576,10 +615,10 @@ function registerOpenClawHooks(
 function registerOpenClawService(
   api: OpenClawPluginApi,
   runtime: MengshuRuntime,
-  authority: AuthorityScope,
+  ownerHost?: NonNullable<RegisterMemoryServerCliOptions["runtimeHostFactory"]>,
 ): void {
-  const serviceHost = runtime.config.dbType === "postgres" && runtime.db instanceof PostgresProvider
-    ? createServeRuntimeHost(runtime, { authority })
+  const serviceHost = ownerHost && runtime.config.dbType === "postgres" && runtime.db instanceof PostgresProvider
+    ? ownerHost()
     : runtime;
   api.registerService({
     id: OPENCLAW_MEMORY_PLUGIN_ID,
@@ -596,7 +635,9 @@ function registerOpenClawService(
         `writeMode=${embeddingStatus.writeMode}, ` +
         `embeddingReadMode=${embeddingStatus.embeddingReadMode}, ` +
         `lifecycleState=${embeddingStatus.lifecycleState}, ` +
-        `lifecycleReady=${embeddingStatus.lifecycleReady}`;
+        `lifecycleReady=${embeddingStatus.lifecycleReady}, ` +
+        `workerOwnership=${ownerHost ? "runtime-host" : "external-runtime-host"}, ` +
+        `background=${runtime.backgroundWork?.snapshot().state ?? "unavailable"}`;
       if (embeddingStatus.lifecycleState === "degraded") {
         api.logger.warn?.(
           `${OPENCLAW_MEMORY_PLUGIN_ID}: initialized degraded/read-only (${detail})`,

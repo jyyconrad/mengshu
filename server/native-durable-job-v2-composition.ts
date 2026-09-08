@@ -11,7 +11,6 @@ import type { EntityGraphEmbeddingBatch } from
 import type { GraphEntityRecord } from "../packages/core/src/graph/types.js";
 import type { LlmClient } from "../packages/core/src/runtime/llm/llm-client.js";
 import {
-  DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
   type DurableJobV2Scope,
 } from "../packages/core/src/storage/repositories/job-v2.js";
 import {
@@ -32,6 +31,7 @@ import {
   createAuthoritativeDurableJobV2WorkerHandlerRegistry,
   type DurableJobV2AuthoritativeHandlerRegistry,
 } from "./workers-v2.js";
+import { assertEvolutionRuntimeOwner, type EvolutionRuntime } from "./evolution-runtime.js";
 
 export interface NativeDurableJobV2CompositionInput {
   readonly runtimeBundle: PostgresDurableJobV2RuntimeBundle;
@@ -47,6 +47,7 @@ export interface NativeDurableJobV2CompositionInput {
   readonly deriveCommittedActive: NativeCommittedActiveDerivation;
   readonly onCommittedActiveDerivationWarning?: () => void | Promise<void>;
   readonly llmClient: LlmClient;
+  readonly evolution?: EvolutionRuntime;
 }
 export interface NativeDurableJobV2Composition {
   readonly runtimeBundle: PostgresDurableJobV2RuntimeBundle;
@@ -54,7 +55,7 @@ export interface NativeDurableJobV2Composition {
   readonly serveCapability: DurableJobV2ServeCapability;
 }
 
-/** 生产 exact-three handler registry 的唯一深组合入口。 */
+/** The complete native registry is three jobs, or four with the host evolution capability. */
 export function createNativeDurableJobV2Composition(
   input: NativeDurableJobV2CompositionInput,
 ): NativeDurableJobV2Composition {
@@ -85,7 +86,11 @@ export function createNativeDurableJobV2Composition(
   if (typeof input?.prepareEntityEmbeddings !== "function") {
     throw new Error("Native Entity Graph embedding preparation dependency is required");
   }
+  const evolutionEnabled = (runtimeBundle.handlerTypes as readonly string[]).includes("evolve_memory_batch");
+  const evolution = evolutionEnabled ? assertEvolutionRuntimeOwner(input.evolution, runtimeBundle, input.scope) : undefined;
+  if (!evolutionEnabled && input.evolution) throw new Error("EVOLUTION_PROVIDER_CAPABILITY_UNAVAILABLE");
   const registry = createAuthoritativeDurableJobV2WorkerHandlerRegistry({
+    ...(evolution ? { evolve_memory_batch: evolution.handler } : {}),
     build_tree: createProviderOwnedNativeBuildTreeHandler({ runtimeBundle }),
     extract_candidate: createNativeExtractCandidateHandler({
       runtimeBundle,
@@ -102,9 +107,9 @@ export function createNativeDurableJobV2Composition(
       prepareEntityEmbeddings: input.prepareEntityEmbeddings,
     }),
   });
-  if (registry.types.length !== DURABLE_JOB_V2_AUTHORITATIVE_TYPES.length ||
-      registry.types.some((type, index) => type !== DURABLE_JOB_V2_AUTHORITATIVE_TYPES[index])) {
-    throw new Error("Native durable job v2 handler registry is not exact-three");
+  if (registry.types.length !== runtimeBundle.handlerTypes.length ||
+      registry.types.some((type, index) => type !== runtimeBundle.handlerTypes[index])) {
+    throw new Error("Native durable job v2 handler registry does not match provider capability");
   }
   const serveCapability = createNativeDurableJobV2ServeCapability({
     repository: runtimeBundle.repository,

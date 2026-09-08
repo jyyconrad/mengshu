@@ -30,7 +30,7 @@ import type { LlmClient } from "../../core/src/runtime/llm/llm-client.js";
 import type { AuthorityScope } from "../../core/src/domain/authority-scope.js";
 import type { MemoryScope } from "../../core/src/domain/types.js";
 import type { McpProjectWorkspaceBindings } from "./authority.js";
-import { DURABLE_JOB_V2_AUTHORITATIVE_TYPES } from
+import { isDurableJobV2AuthoritativeTypes } from
   "../../core/src/storage/repositories/job-v2.js";
 import { PostgresDurableJobV2Repository } from
   "../../core/src/storage/repositories/postgres-job-v2.js";
@@ -56,6 +56,7 @@ import {
 } from "./tools.js";
 import { parseMcpServerAuthorityConfig } from "./server.js";
 import { formatMcpToolError } from "./tool-error.js";
+import { isEvolutionGovernanceOwnerTool } from "../../api/src/evolution-control.js";
 import type { RuntimeMcpFacade } from "../../api/src/rest/types.js";
 
 const SERVER_NAME = "mengshu";
@@ -69,6 +70,7 @@ export interface McpDurableJobV2Capability {
 }
 
 export interface McpStdioServerOptions {
+  continuousMemoryEvolution?: import("../../api/src/evolution.js").EvolutionBatchCapability;
   service: MemoryService;
   memoryWrite?: MemoryWriteCommandExecutor;
   forgetCapability?: AuthorityScopedForgetCapability;
@@ -171,7 +173,7 @@ export function createMcpStdioServer(options: McpStdioServerOptions): {
   const tools = freezeMcpToolRegistry(createMcpMemoryTools({
     ...options,
     ...authorityConfig,
-  }));
+  }).filter(tool => !isEvolutionGovernanceOwnerTool(tool.name)));
   return createMcpToolRegistryServer(tools);
 }
 
@@ -288,14 +290,11 @@ function validatedDurableJobV2Capability(
         !(raw.repository instanceof PostgresDurableJobV2Repository) ||
         typeof raw.repository.listRunnableScopes !== "function" ||
         raw.registry?.authoritative !== true || !Array.isArray(raw.registry.types) ||
-        raw.registry.types.length !== DURABLE_JOB_V2_AUTHORITATIVE_TYPES.length ||
-        raw.registry.types.some(
-          (type, index) => type !== DURABLE_JOB_V2_AUTHORITATIVE_TYPES[index],
-        ) || typeof raw.registry.get !== "function") {
+        !isDurableJobV2AuthoritativeTypes(raw.registry.types) || typeof raw.registry.get !== "function") {
       throw new Error("invalid capability");
     }
     const handlers = new Map<string, ReturnType<typeof raw.registry.get>>();
-    for (const type of DURABLE_JOB_V2_AUTHORITATIVE_TYPES) {
+    for (const type of raw.registry.types) {
       const handler = raw.registry.get(type);
       if (typeof handler !== "function") throw new Error("invalid handler");
       handlers.set(type, handler);
@@ -304,7 +303,7 @@ function validatedDurableJobV2Capability(
       repository: raw.repository,
       registry: Object.freeze({
         authoritative: true as const,
-        types: DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
+        types: Object.freeze([...raw.registry.types]),
         get: (type: string) => handlers.get(type),
       }),
     });

@@ -1,0 +1,2 @@
+{"type":"response_item","timestamp":"2026-06-01T00:00:00.000Z","payload":{"type":"message","id":"acceptance-msg-001","role":"user","content":[{"type":"input_text","text":"Record release approval in the project audit log. Do not bypass approval for emergency releases."}]}}
+{"type":"response_item","timestamp":"2026-06-01T00:01:00.000Z","payload":{"type":"message","id":"acceptance-msg-002","role":"user","content":[{"type":"input_text","text":"Keep the approval audit log for 30 days."}]}}

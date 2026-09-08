@@ -1,5 +1,12 @@
 export * from "./agent-fast-path/index.js";
+export * from "./cli/project.js";
 export * from "./rest/router.js";
 export * from "./rest/types.js";
 export * from "./runtime-client.js";
 export * from "./sdk/index.js";
+export type { EvolutionBatchCapability } from "./evolution.js";
+export type { EvolutionGovernanceControlCapability } from "./evolution-control.js";
+export type { EvolutionReviewCapability } from "./evolution-review.js";
+export type { EvolutionSourceControlCapability, EvolutionSourceControlReceipt } from "./evolution-source-control.js";
+export type { EvolutionReuseControlCapability, EvolutionReuseGrantsRequest } from "./evolution-reuse-control.js";
+export type { RuntimeBackgroundWorkConfig, RuntimeBackgroundWorkUpdate, RuntimeBackgroundWorkSnapshot, RuntimeBackgroundWorkCapability } from "../../core/src/runtime/background-work.js";

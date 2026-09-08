@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -23,6 +23,8 @@ import {
 } from "./ms.js";
 import { Command } from "commander";
 import { CURRENT_SCHEMA_VERSION } from "../../../core/src/db/migrations/schema-migrations.js";
+import { RuntimeClient } from "../runtime-client.js";
+import { DatabaseFactory } from "../../../core/src/db/factory.js";
 
 let cliHome: string | undefined;
 
@@ -80,6 +82,21 @@ function validLanceConfig() {
 }
 
 describe("ms serve RuntimeHost composition", () => {
+  test("ms evolve proxies to the existing host before constructing any database/runtime owner", async () => {
+    setupCliHome({});
+    writeFileSync(join(cliHome!, "config.json"), JSON.stringify({ ...validLanceConfig(), features: { continuousMemoryEvolution: true } }));
+    const invoke = vi.spyOn(RuntimeClient.prototype, "invoke").mockResolvedValue({ batchId: "batch", status: "queued" });
+    const createProvider = vi.spyOn(DatabaseFactory, "createProvider");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await runMengshuCli(["node", "ms", "evolve", "inventory", "--propose", "--idempotency-key", "one"]);
+      expect(createProvider).not.toHaveBeenCalled();
+      expect(invoke).toHaveBeenCalledWith({ method: "POST", path: "/v1/evolution/run", body: {
+        input: { mode: "inventory", selection: "baseline" }, action: "propose", idempotencyKey: "one",
+      } });
+      expect(existsSync(join(cliHome!, "evolution"))).toBe(false);
+    } finally { invoke.mockRestore(); createProvider.mockRestore(); log.mockRestore(); }
+  });
   test("asset explain/revoke 使用 exact scope，并把状态变更交给治理 service", async () => {
     const scope = {
       tenantId: "tenant-cli", userId: "user-cli", appId: "mengshu",
@@ -699,10 +716,54 @@ describe("ms serve RuntimeHost composition", () => {
   test("普通短命令不被 server authority 前置条件误伤", async () => {
     expect(requiresServerAuthority(["node", "ms", "stats"])).toBe(false);
     expect(requiresServerAuthority(["node", "ms", "health"])).toBe(false);
+    expect(requiresServerAuthority(["node", "ms", "init"])).toBe(false);
+    expect(requiresServerAuthority(["node", "ms", "project", "status"])).toBe(false);
+    expect(requiresServerAuthority(["node", "ms", "project", "context"])).toBe(true);
+    expect(requiresServerAuthority(["node", "ms", "project", "lookup"])).toBe(true);
     setupCliHome("invalid-short-command-config");
 
     await expect(runMengshuCli(["node", "ms", "stats"]))
       .rejects.not.toThrow(/authority/i);
+  });
+
+  test("ms init 不读取 runtime 配置或 authority，只初始化目标项目", async () => {
+    setupCliHome("invalid-config-must-not-be-read");
+    const projectDir = mkdtempSync(join(tmpdir(), "mengshu-init-product-neutral-"));
+    try {
+      await expect(runMengshuCli(["node", "ms", "init", projectDir])).resolves.toBeUndefined();
+      expect(existsSync(join(projectDir, ".mengshu.json"))).toBe(true);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  test("ms project status 只读取本地 identity，不解析 runtime 配置", async () => {
+    setupCliHome("invalid-config-must-not-be-read");
+    const projectDir = mkdtempSync(join(tmpdir(), "mengshu-status-product-neutral-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await runMengshuCli(["node", "ms", "init", projectDir]);
+      await expect(runMengshuCli(["node", "ms", "project", "status", projectDir]))
+        .resolves.toBeUndefined();
+      expect(log.mock.calls.map((call) => String(call[0])).join("\n"))
+        .toContain("Project Workspace Status");
+    } finally {
+      log.mockRestore();
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  test("configless init help 展示项目身份参数，不再描述为全局配置", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await runMengshuCli(["node", "ms", "init", "--help"]);
+      const output = log.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(output).toContain("Usage: ms init [options] [dir]");
+      expect(output).toContain("--project-id <id>");
+      expect(output).toContain("Initialize a product-neutral project memory workspace");
+    } finally {
+      log.mockRestore();
+    }
   });
 
   test("standalone health 无 scope authority 仍可执行 host readiness", async () => {

@@ -1159,6 +1159,99 @@ describe("Broad-authority Durable Job v2 supervisor", () => {
     };
   }
 
+  test("host maintenance uses the existing idle tick and never overlaps concurrent polls", async () => {
+    const scheduler = new ManualScheduler();
+    const repository = new FakeBroadAuthorityRepository();
+    let release!: () => void;
+    const onIdle = vi.fn(async (_signal: AbortSignal) => new Promise<void>(resolve => { release = resolve; }));
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(scheduler), onIdle,
+    });
+    expect(scheduler.pending).toBe(1);
+    const first = supervisor.tick();
+    expect(supervisor.tick()).toBe(first);
+    await flush();
+    expect(onIdle).toHaveBeenCalledTimes(1);
+    expect(scheduler.pending).toBe(1);
+    release();
+    await first;
+    repository.listRunnableScopes.mockResolvedValue([scope]);
+    await supervisor.tick();
+    expect(onIdle).toHaveBeenCalledTimes(1);
+    await supervisor.stop();
+    expect(scheduler.pending).toBe(0);
+  });
+
+  test("stop aborts idle maintenance without leasing or leaving another timer", async () => {
+    const scheduler = new ManualScheduler();
+    const repository = new FakeBroadAuthorityRepository();
+    let signal!: AbortSignal;
+    const onIdle = vi.fn(async (value: AbortSignal) => {
+      signal = value;
+      await new Promise<void>(resolve => value.addEventListener("abort", () => resolve(), { once: true }));
+    });
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(scheduler), onIdle,
+    });
+    const tick = supervisor.tick();
+    await flush();
+    await expect(supervisor.stop()).resolves.toEqual({ status: "stopped" });
+    await tick;
+    expect(signal.aborted).toBe(true);
+    expect(repository.lease).not.toHaveBeenCalled();
+    expect(scheduler.pending).toBe(0);
+    await supervisor.tick();
+    expect(onIdle).toHaveBeenCalledTimes(1);
+  });
+
+  test("maintenance errors are observable without poisoning ordinary worker discovery", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const onIdleError = vi.fn();
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(), onIdle: async () => { throw new Error("private path"); }, onIdleError,
+    });
+    await expect(supervisor.tick()).resolves.toEqual([]);
+    expect(onIdleError).toHaveBeenCalledExactlyOnceWith("MAINTENANCE_TICK_FAILED");
+    repository.listRunnableScopes.mockResolvedValue([scope]);
+    await expect(supervisor.tick()).resolves.toEqual([{ status: "idle" }]);
+    expect(repository.lease).toHaveBeenCalledTimes(1);
+    await supervisor.stop();
+  });
+
+  test("paused host keeps the full registry but never discovers, mutates, or schedules background work", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const onIdle = vi.fn();
+    const release = vi.fn();
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(), onIdle, selectWork: async () => ({ mode: "paused" as const, release }),
+    });
+    await expect(supervisor.tick()).resolves.toEqual([]);
+    expect(repository.listRunnableScopes).not.toHaveBeenCalled();
+    expect(repository.reap).not.toHaveBeenCalled();
+    expect(repository.quarantineUnknown).not.toHaveBeenCalled();
+    expect(repository.lease).not.toHaveBeenCalled();
+    expect(onIdle).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+    await supervisor.stop();
+  });
+
+  test("controlled evolution polling uses only explicit job IDs and bypasses the old runnable backlog", async () => {
+    const repository = new FakeBroadAuthorityRepository();
+    const onIdle = vi.fn();
+    const supervisor = startBroadAuthorityDurableJobV2Supervisor(repository, {
+      ...supervisorOptions(), onIdle,
+      registry: createAuthoritativeDurableJobV2WorkerHandlerRegistry({ work: async () => undefined, evolve_memory_batch: async () => undefined }),
+      selectWork: async () => ({ mode: "evolution_only" as const, scope, jobIds: ["explicit-evolution-job"] }),
+    });
+    await expect(supervisor.tick()).resolves.toEqual([{ status: "idle" }]);
+    expect(repository.listRunnableScopes).not.toHaveBeenCalled();
+    for (const method of [repository.reap, repository.quarantineUnknown, repository.lease]) {
+      expect(method).toHaveBeenCalledWith(expect.objectContaining({ scope, idAllowlist: ["explicit-evolution-job"] }));
+    }
+    expect(onIdle).not.toHaveBeenCalled();
+    await supervisor.stop();
+  });
+
   test("只消费 provider 发现的 exact scopes，不展开 allowlist 笛卡尔积，并限制 scopes/jobs", async () => {
     const repository = new FakeBroadAuthorityRepository();
     const second: DurableJobV2Scope = {

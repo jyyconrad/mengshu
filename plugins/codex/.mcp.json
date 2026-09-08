@@ -6,7 +6,8 @@
       "args": ["./mcp/server.mjs"],
       "env": {
         "MENGSHU_HOME": "${HOME}/.mengshu",
-        "MENGSHU_AUTHORITY_FILE": "${HOME}/.mengshu/authority.json"
+        "MENGSHU_AUTHORITY_FILE": "${HOME}/.mengshu/authority.json",
+        "MENGSHU_MCP_MODE": "standalone"
       }
     }
   }

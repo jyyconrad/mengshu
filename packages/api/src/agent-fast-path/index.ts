@@ -170,10 +170,22 @@ export interface AgentSessionCommitResponse {
   jobs: string[];
 }
 
+export interface AgentFastPathReadBoundary {
+  resolveScope(requested?: MemoryScopeInput): MemoryScope;
+  checkpoint(scope: MemoryScope): Promise<object>;
+  revalidate(scope: MemoryScope, checkpoint: object): Promise<boolean>;
+  rehydrate(scope: MemoryScope, hits: readonly RecallHit[], intent: "lookup" | "context"): Promise<RecallHit[]>;
+  reference(hit: RecallHit): string;
+  readEvidence(scope: MemoryScope, refs: readonly string[]): Promise<AgentEvidenceItem[]>;
+  navigate(scope: MemoryScope, input: { ref: string; level?: DisclosureLevel; limit: number }): Promise<AgentNavigationItem[]>;
+}
+
 /**
  * 任务调度依赖（外部注入）
  */
 export interface AgentFastPathDeps {
+  /** Authenticated host-only E4 gate; ordinary request fields cannot install or replace it. */
+  readBoundary?: AgentFastPathReadBoundary;
   /** F0 生产路径：按当前 task 在 scope 内加载带完整六因子回执的已治理命中。 */
   loadRecallHitsForScope?(scope: MemoryScope, query: string): Promise<RecallHit[]>;
   /** legacy adapter 降级路径；RuntimeHost 生产组合不得使用。 */
@@ -347,13 +359,16 @@ export class AgentFastPathService {
    * 任务启动：获取 5 槽位上下文
    */
   async context(request: AgentTaskContextRequest): Promise<ContextFastResponse> {
-    const scope = normalizeScope(request.scope, this.deps.defaultScope);
+    const scope = this.resolveScope(request.scope);
+    const checkpoint = await this.deps.readBoundary?.checkpoint(scope);
     const productionRecallPath = Boolean(this.deps.loadRecallHitsForScope);
+    if (this.deps.readBoundary && !productionRecallPath) throw new Error("CONTEXT_RECALL_CAPABILITY_REQUIRED");
     let selectedLoadout: AgentLoadout | undefined;
     const preAssemblyWarnings: string[] = [];
     if (productionRecallPath && this.deps.resolveLoadout) {
       try {
-        selectedLoadout = await this.deps.resolveLoadout(scope);
+        const loadout = await this.deps.resolveLoadout(scope);
+        selectedLoadout = this.deps.readBoundary ? structuredClone(loadout) : loadout;
       } catch (error) {
         preAssemblyWarnings.push(
           `asset_enhancement_disabled: ${error instanceof Error ? error.message : "unavailable"}`,
@@ -380,6 +395,7 @@ export class AgentFastPathService {
             : Math.min(budget, requestedPerSlotBudget)]))
       : undefined;
     const buildOptions = {
+      ...(this.deps.readBoundary ? { useCache: false } : {}),
       latencyBudgetMs: request.latencyBudgetMs,
       tokenBudgetPerSlot: requestedPerSlotBudget,
       tokenBudgetBySlot,
@@ -388,9 +404,10 @@ export class AgentFastPathService {
       treeDepth: selectedLoadout?.nativeMemoryPolicy.treeDepth ?? "global" as const,
       task: request.task,
     };
-    const governedHits = productionRecallPath
+    let governedHits = productionRecallPath
       ? await this.deps.loadRecallHitsForScope!(scope, request.task)
       : undefined;
+    if (this.deps.readBoundary) governedHits = await this.deps.readBoundary.rehydrate(scope, governedHits!, "context");
     let response = productionRecallPath
       ? await this.builder.buildSlotContextFromRecallHits(scope, governedHits!, buildOptions)
       : await this.builder.buildSlotContext(
@@ -404,16 +421,18 @@ export class AgentFastPathService {
     }
 
     let selectedAssembly: LoadoutAssemblyResult | undefined;
+    let selectedCandidates: readonly LoadoutAssetCandidate[] | undefined;
     if (productionRecallPath && selectedLoadout) {
       try {
         if (!this.deps.resolveLoadoutAssetCandidates) {
           throw new Error("asset resolver unavailable");
         }
-        const candidates = await this.deps.resolveLoadoutAssetCandidates(
+        const resolvedCandidates = await this.deps.resolveLoadoutAssetCandidates(
           scope,
           selectedLoadout,
           governedHits!,
         );
+        const candidates = this.deps.readBoundary ? structuredClone(resolvedCandidates) : resolvedCandidates;
         const assembly = (this.deps.loadoutAssembler ?? new AgentLoadoutAssembler())
           .assemble(selectedLoadout, candidates, {
             nativeTokenUsage: Object.fromEntries(Object.entries(response.slots)
@@ -422,6 +441,7 @@ export class AgentFastPathService {
         response = applyLoadoutAssemblyToContext(response, selectedLoadout, assembly, request.task);
         requireContextFastRecallReceipts(response);
         selectedAssembly = assembly;
+        if (assembly.enhancementEnabled && assembly.contributions.length > 0) selectedCandidates = candidates;
       } catch (error) {
         // Asset/Loadout is an optional overlay. A required binding fails the
         // overlay closed, but must never make native five-slot context unavailable.
@@ -452,6 +472,13 @@ export class AgentFastPathService {
     }
 
     response.actions = this.collectActions(scope, request.task, response);
+    if (this.deps.readBoundary) {
+      response.actions = [{ type: "lookup", label: "lookup_more", input: { query: request.task, scope } },
+        ...governedHits!.slice(0, 5).map(hit => ({ type: "drill_down" as const, label: "read_evidence",
+          input: { ref: this.deps.readBoundary!.reference(hit), level: "R4", scope } }))];
+      await this.finishAssets(scope, selectedLoadout, selectedCandidates, governedHits!);
+      await this.finishRead(scope, checkpoint, governedHits!, "context");
+    }
 
     if (productionRecallPath && response.assemblyPlan && scope.sessionId) {
       try {
@@ -473,6 +500,8 @@ export class AgentFastPathService {
       }
     }
 
+    await this.finishAssets(scope, selectedLoadout, selectedCandidates, governedHits ?? []);
+    await this.finishRead(scope, checkpoint, governedHits ?? [], "context");
     return response;
   }
 
@@ -482,7 +511,7 @@ export class AgentFastPathService {
   async observeLight(
     request: AgentObserveLightRequest
   ): Promise<AgentObserveLightResponse> {
-    const scope = normalizeScope(request.scope, this.deps.defaultScope);
+    const scope = this.resolveScope(request.scope);
     const traceId = randomUUID();
 
     if (request.intent === "ignore") {
@@ -605,7 +634,8 @@ export class AgentFastPathService {
    */
   async lookup(request: AgentLookupRequest): Promise<AgentLookupResponse> {
     const startedAt = Date.now();
-    const scope = normalizeScope(request.scope, this.deps.defaultScope);
+    const scope = this.resolveScope(request.scope);
+    const checkpoint = await this.deps.readBoundary?.checkpoint(scope);
     const limit = request.limit ?? 5;
     const mode = request.mode ?? "fast";
 
@@ -649,7 +679,9 @@ export class AgentFastPathService {
     }
 
     const hits: AgentLookupResponse["hits"] = [];
-    for (const hit of result.hits.filter((item): item is RecallHit => Boolean(item))) {
+    const governedHits = this.deps.readBoundary
+      ? await this.deps.readBoundary.rehydrate(scope, result.hits, "lookup") : result.hits;
+    for (const hit of governedHits.filter((item): item is RecallHit => Boolean(item))) {
       hits.push(await this.shapeHit(scope, hit));
     }
 
@@ -667,6 +699,7 @@ export class AgentFastPathService {
       }
     }
 
+    await this.finishRead(scope, checkpoint, governedHits, "lookup");
     return {
       hits,
       ...(result.filtered === undefined ? {} : { filtered: result.filtered }),
@@ -676,30 +709,37 @@ export class AgentFastPathService {
   }
 
   async navigate(request: AgentNavigateRequest): Promise<AgentNavigateResponse> {
-    const scope = normalizeScope(request.scope, this.deps.defaultScope);
-    if (!this.deps.navigate) throw new Error("MEMORY_NAVIGATION_CAPABILITY_REQUIRED");
+    const scope = this.resolveScope(request.scope);
+    const checkpoint = await this.deps.readBoundary?.checkpoint(scope);
+    const navigate = this.deps.readBoundary?.navigate ?? this.deps.navigate;
+    if (!navigate) throw new Error("MEMORY_NAVIGATION_CAPABILITY_REQUIRED");
     const ref = this.safeRef(request.ref);
     const limit = request.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new Error("MEMORY_NAVIGATION_INPUT_INVALID");
     }
-    const items = await this.deps.navigate(scope, {
+    const items = await navigate(scope, {
       ref,
       ...(request.level === undefined ? {} : { level: request.level }),
       limit,
     });
+    await this.finishRead(scope, checkpoint);
     return { ref, items };
   }
 
   async evidenceRead(request: AgentEvidenceReadRequest): Promise<AgentEvidenceReadResponse> {
-    const scope = normalizeScope(request.scope, this.deps.defaultScope);
-    if (!this.deps.readEvidence) throw new Error("MEMORY_EVIDENCE_READ_CAPABILITY_REQUIRED");
+    const scope = this.resolveScope(request.scope);
+    const checkpoint = await this.deps.readBoundary?.checkpoint(scope);
+    const readEvidence = this.deps.readBoundary?.readEvidence ?? this.deps.readEvidence;
+    if (!readEvidence) throw new Error("MEMORY_EVIDENCE_READ_CAPABILITY_REQUIRED");
     if (!Array.isArray(request.refs) || request.refs.length < 1 || request.refs.length > 50) {
       throw new Error("MEMORY_EVIDENCE_READ_INPUT_INVALID");
     }
     const refs = request.refs.map((ref) => this.safeRef(ref));
     if (new Set(refs).size !== refs.length) throw new Error("MEMORY_EVIDENCE_READ_INPUT_INVALID");
-    return { evidence: await this.deps.readEvidence(scope, refs) };
+    const evidence = await readEvidence(scope, refs);
+    await this.finishRead(scope, checkpoint);
+    return { evidence };
   }
 
   /**
@@ -708,7 +748,7 @@ export class AgentFastPathService {
   async sessionCommit(
     request: AgentSessionCommitRequest
   ): Promise<AgentSessionCommitResponse> {
-    const scope = normalizeScope(request.scope, this.deps.defaultScope);
+    const scope = this.resolveScope(request.scope);
     const traceId = randomUUID();
     const jobs: string[] = [];
     this.builder.invalidateCache(scope);
@@ -824,9 +864,11 @@ export class AgentFastPathService {
     const scoreBreakdown = requireRecallHitReceipt(hit);
     const record = hit.record as MemoryRecord;
     const preview = "text" in record ? record.text.slice(0, 240) : "";
-    const evidenceRefs = [...new Set(record.sourceNodeIds ?? [])];
-    const evidence = this.deps.readEvidence && evidenceRefs.length > 0
-      ? await this.deps.readEvidence(scope, evidenceRefs)
+    const evidenceRefs = this.deps.readBoundary ? [this.deps.readBoundary.reference(hit)]
+      : [...new Set(record.sourceNodeIds ?? [])];
+    const readEvidence = this.deps.readBoundary?.readEvidence ?? this.deps.readEvidence;
+    const evidence = readEvidence && evidenceRefs.length > 0
+      ? await readEvidence(scope, evidenceRefs)
       : [];
     return {
       id: record.id,
@@ -841,11 +883,44 @@ export class AgentFastPathService {
   }
 
   private safeRef(value: unknown): string {
-    if (typeof value !== "string" || value.length < 1 || value.length > 512 ||
+    if (typeof value !== "string" || value.length < 1 || value.length > (this.deps.readBoundary ? 4096 : 512) ||
         value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value)) {
       throw new Error("MEMORY_REFERENCE_INVALID");
     }
     return value;
+  }
+
+  private resolveScope(requested?: MemoryScopeInput): MemoryScope {
+    return this.deps.readBoundary?.resolveScope(requested) ?? normalizeScope(requested, this.deps.defaultScope);
+  }
+
+  private async finishAssets(scope: MemoryScope, loadout: AgentLoadout | undefined,
+    candidates: readonly LoadoutAssetCandidate[] | undefined, hits: readonly RecallHit[]): Promise<void> {
+    if (!this.deps.readBoundary || !loadout || !candidates) return;
+    try {
+      const currentLoadout = await this.deps.resolveLoadout!(scope);
+      if (!currentLoadout || JSON.stringify(loadout) !== JSON.stringify(currentLoadout)) throw new Error();
+      const current = await this.deps.resolveLoadoutAssetCandidates!(scope, currentLoadout, hits);
+      const snapshot = (items: readonly LoadoutAssetCandidate[]) => JSON.stringify([...items].sort((a, b) =>
+        a.assetKind.localeCompare(b.assetKind) || a.assetId.localeCompare(b.assetId) || a.assetVersion - b.assetVersion));
+      if (snapshot(candidates) !== snapshot(current)) throw new Error();
+    } catch {
+      // An already rendered overlay cannot degrade to native-only after its authority changes.
+      throw new Error("REUSE_READ_CHANGED");
+    }
+  }
+
+  private async finishRead(scope: MemoryScope, checkpoint: object | undefined,
+    hits?: readonly RecallHit[], intent: "context" | "lookup" = "lookup"): Promise<void> {
+    const boundary = this.deps.readBoundary;
+    if (!boundary || !checkpoint) return;
+    if (hits) {
+      const current = await boundary.rehydrate(scope, hits, intent);
+      const records = (values: readonly RecallHit[]) => JSON.stringify(values.map(hit => hit.record)
+        .sort((left, right) => left.id.localeCompare(right.id)));
+      if (records(hits) !== records(current)) throw new Error("REUSE_READ_CHANGED");
+    }
+    if (!await boundary.revalidate(scope, checkpoint)) throw new Error("REUSE_READ_CHANGED");
   }
 
   /**

@@ -148,6 +148,7 @@ export interface RunNextDurableJobV2Options {
   readonly idPrefix?: string;
   readonly excludeIdPrefix?: string;
   readonly idAllowlist?: readonly string[];
+  readonly requiredJobType?: "evolve_memory_batch";
   readonly registry: DurableJobV2AuthoritativeHandlerRegistry;
   readonly scheduler?: DurableJobV2Scheduler;
   readonly clock?: () => number;
@@ -581,6 +582,9 @@ export async function runNextDurableJobV2(
   let job: DurableJobV2 | undefined;
   try {
     job = validateLeasedJob(rawLeaseResult, scope, options.workerId, idAllowlist);
+    if (job && options.requiredJobType !== undefined && job.type !== options.requiredJobType) {
+      throw new Error("durable job escaped controlled type");
+    }
   } catch {
     return protocolError("lease");
   }
@@ -912,6 +916,11 @@ export function startDurableJobV2WorkerLoop(
   };
 }
 
+export type DurableJobV2PollSelection = (
+  | { readonly mode: "all" | "paused" }
+  | { readonly mode: "evolution_only"; readonly scope: DurableJobV2Scope; readonly jobIds: readonly string[] }
+) & { readonly signal?: AbortSignal; readonly release?: () => void };
+
 export interface BroadAuthorityDurableJobV2SupervisorOptions {
   readonly authority: AuthorityScope;
   readonly workerId: string;
@@ -931,6 +940,11 @@ export interface BroadAuthorityDurableJobV2SupervisorOptions {
   readonly circuitResetMs?: number;
   readonly jitterRatio?: number;
   readonly random?: () => number;
+  /** Host-owned bounded maintenance, using this supervisor's timer and stop signal. */
+  readonly onIdle?: (signal: AbortSignal) => Promise<void>;
+  readonly onIdleError?: (code: "MAINTENANCE_TICK_FAILED") => void;
+  /** Host-owned deployment gate. It narrows work selection, never the authoritative registry. */
+  readonly selectWork?: (signal: AbortSignal) => Promise<DurableJobV2PollSelection>;
 }
 
 export interface BroadAuthorityDurableJobV2SupervisorHandle {
@@ -1074,7 +1088,10 @@ export function startBroadAuthorityDurableJobV2Supervisor(
         !validPositiveInteger(circuitFailureThreshold) ||
         !validPositiveInteger(circuitResetMs) ||
         !Number.isFinite(jitterRatio) || jitterRatio < 0 || jitterRatio > 1 ||
-        typeof random !== "function") {
+        typeof random !== "function" ||
+        (options.onIdle !== undefined && typeof options.onIdle !== "function") ||
+        (options.onIdleError !== undefined && typeof options.onIdleError !== "function") ||
+        (options.selectWork !== undefined && typeof options.selectWork !== "function")) {
       throw new Error("invalid supervisor options");
     }
   } catch {
@@ -1241,8 +1258,8 @@ export function startBroadAuthorityDurableJobV2Supervisor(
   options.signal?.addEventListener("abort", onExternalAbort, { once: true });
   if (options.signal?.aborted) onExternalAbort();
 
-  const drain = async (): Promise<RunNextDurableJobV2Result[]> => {
-    if (supervisorAbort.signal.aborted) return [{ status: "aborted" }];
+  const drainAll = async (signal: AbortSignal): Promise<RunNextDurableJobV2Result[]> => {
+    if (signal.aborted) return [{ status: "aborted" }];
     if (providerFailure.consecutiveFailures > 0 && now() < providerFailure.nextRetryAt) return [];
     let rawScopes: unknown;
     try {
@@ -1254,7 +1271,7 @@ export function startBroadAuthorityDurableJobV2Supervisor(
           )
         : await repository.listRunnableScopes(authority, options.maxScopesPerTick);
     } catch {
-      if (supervisorAbort.signal.aborted) return [{ status: "aborted" }];
+      if (signal.aborted) return [{ status: "aborted" }];
       recordProviderFailure();
       return [{
             status: "uncertain",
@@ -1262,7 +1279,7 @@ export function startBroadAuthorityDurableJobV2Supervisor(
             code: "REPOSITORY_OUTCOME_UNCERTAIN",
           }];
     }
-    if (supervisorAbort.signal.aborted) return [{ status: "aborted" }];
+    if (signal.aborted) return [{ status: "aborted" }];
     let scopes: readonly DurableJobV2Scope[];
     try {
       scopes = validateDiscoveredScopes(rawScopes, authority, options.maxScopesPerTick);
@@ -1286,7 +1303,7 @@ export function startBroadAuthorityDurableJobV2Supervisor(
     const results: RunNextDurableJobV2Result[] = [];
     const seenJobs = new Set<string>();
     while (queue.length > 0 && results.length < options.maxJobsPerTick &&
-        !supervisorAbort.signal.aborted) {
+        !signal.aborted) {
       const scope = queue.shift()!;
       const result = await runNextDurableJobV2(repository, {
         scope,
@@ -1297,7 +1314,7 @@ export function startBroadAuthorityDurableJobV2Supervisor(
         scheduler,
         ...(options.clock === undefined ? {} : { clock: options.clock }),
         excludeIdPrefix: "history-job:",
-        signal: supervisorAbort.signal,
+        signal,
       });
       results.push(result);
       if (result.status === "uncertain" || result.status === "error") {
@@ -1314,7 +1331,47 @@ export function startBroadAuthorityDurableJobV2Supervisor(
       }
       queue.push(scope);
     }
+    if (results.length === 0 && scopes.length === 0 && !signal.aborted && options.onIdle) {
+      try { await options.onIdle(signal); }
+      catch {
+        if (!signal.aborted) {
+          try { options.onIdleError?.("MAINTENANCE_TICK_FAILED"); }
+          catch { /* Diagnostics must not prevent the next ordinary worker poll. */ }
+        }
+      }
+    }
     return results;
+  };
+
+  const drain = async (): Promise<RunNextDurableJobV2Result[]> => {
+    if (supervisorAbort.signal.aborted) return [{ status: "aborted" }];
+    if (!options.selectWork) return drainAll(supervisorAbort.signal);
+    const selection = await options.selectWork(supervisorAbort.signal);
+    try {
+      const signal = selection.signal ? AbortSignal.any([supervisorAbort.signal, selection.signal]) : supervisorAbort.signal;
+      if (signal.aborted) return [{ status: "aborted" }];
+      if (selection.mode === "paused") return [];
+      if (selection.mode === "all") return await drainAll(signal);
+      if (selection.mode !== "evolution_only" || !options.registry.types.includes("evolve_memory_batch")) {
+        throw new Error("BACKGROUND_SELECTION_INVALID");
+      }
+      const [scope] = validateDiscoveredScopes([selection.scope], authority, 1);
+      if (!Array.isArray(selection.jobIds)) throw new Error("BACKGROUND_SELECTION_INVALID");
+      if (selection.jobIds.length === 0) return [];
+      const idAllowlist = canonicalIdAllowlist(selection.jobIds);
+      const results: RunNextDurableJobV2Result[] = [];
+      for (let index = 0; index < Math.min(options.maxJobsPerTick, selection.jobIds.length) && !signal.aborted; index++) {
+        const result = await runNextDurableJobV2(repository, {
+          scope: scope!, workerId: options.workerId, leaseMs: options.leaseMs,
+          heartbeatIntervalMs: options.heartbeatIntervalMs, registry: options.registry,
+          scheduler, signal, idAllowlist, requiredJobType: "evolve_memory_batch",
+          ...(options.clock === undefined ? {} : { clock: options.clock }),
+        });
+        results.push(result);
+        if (result.status !== "completed") break;
+      }
+      return results;
+    } finally { selection.release?.(); }
   };
 
   const tick = (): Promise<RunNextDurableJobV2Result[]> => {

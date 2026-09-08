@@ -20,6 +20,12 @@ import {
 import { createMengshuRuntime } from "../../../../runtime.js";
 import type { MengshuRuntime } from "../../../../runtime.js";
 import { authorizeRestRequest } from "./auth.js";
+import { EvolutionTransportError, invokeEvolutionCapability } from "../evolution.js";
+import { invokeEvolutionControl, isEvolutionControlOperation, isEvolutionOwnerTool } from "../evolution-review.js";
+import { invokeEvolutionSourceControl, isEvolutionSourceControlOperation } from "../evolution-source-control.js";
+import { invokeEvolutionReuseControl, isEvolutionReuseOperation } from "../evolution-reuse-control.js";
+import { invokeEvolutionGovernanceControl, isEvolutionGovernanceOperation, isEvolutionGovernanceOwnerTool } from "../evolution-control.js";
+import { EVOLUTION_OWNER_HEADER, withAuthenticatedEvolutionOwner } from "../evolution-owner-auth.js";
 import type { RestRequest, RestResponse, RestRouterOptions } from "./types.js";
 import type { MemoryWriteKernelResult } from "../../../core/src/service/write-kernel.js";
 import type { RecallResult } from "../../../../core/types.js";
@@ -67,6 +73,7 @@ import type {
 } from "../../../core/src/skills/types.js";
 import type { AppendMemoryPolicyOverlayInput, MemoryPolicyLayer } from
   "../../../core/src/policy/types.js";
+import { RuntimeBackgroundWorkError } from "../../../core/src/runtime/background-work.js";
 
 export interface RestRouter {
   handle(request: RestRequest): Promise<RestResponse>;
@@ -99,6 +106,7 @@ export function createRestApi(
     resolvedDbPath,
     appId: defaultScope.appId,
     defaultScope,
+    continuousMemoryEvolutionHost: { authority, config },
   });
   return {
     runtime,
@@ -106,6 +114,11 @@ export function createRestApi(
       service: runtime.memoryService,
       memoryWrite: runtimeMemoryWriteCapability(runtime),
       memoryEvolution: runtime.memoryEvolution,
+      continuousMemoryEvolution: runtime.continuousMemoryEvolution,
+      evolutionOwnerSecret: config.evolution?.control?.ownerSecret,
+      backgroundWork: runtime.backgroundWork,
+      foregroundActivity: runtime.evolutionActivity,
+      evolutionMaintenance: runtime.evolutionMaintenance,
       sessionWorkingSet: runtime.sessionWorkingSet,
       sessionWorkingSetMemoryBridge: runtime.sessionWorkingSetMemoryBridge,
       skillArtifacts: runtime.skillArtifacts,
@@ -290,7 +303,7 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
   if (!options.authority && options.unsafeLegacyScope !== true) {
     throw new Error("REST authority is required; unsafeLegacyScope is test-only and deprecated");
   }
-  return {
+  const router: RestRouter = {
     async handle(request: RestRequest): Promise<RestResponse> {
       const auth = authorizeRestRequest({
         remoteAddress: request.remoteAddress,
@@ -312,10 +325,93 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
         }
       }
 
+      if (request.path === "/v1/runtime/background") {
+        if (!options.backgroundWork) return notFound();
+        if (request.method === "GET") return { status: 200, body: options.backgroundWork.snapshot() };
+        if (request.method !== "POST") return methodNotAllowed();
+        try {
+          if (!options.authority) throw new EvolutionTransportError(403, "EVOLUTION_OWNER_REQUIRED");
+          return { status: 200, body: await withAuthenticatedEvolutionOwner({
+            headers: request.headers, secret: options.evolutionOwnerSecret, owner: options.authority,
+          }, () => options.backgroundWork!.update(request.body)) };
+        } catch (error) {
+          if (error instanceof EvolutionTransportError) return { status: error.status, body: { error: error.code } };
+          if (error instanceof RuntimeBackgroundWorkError) return {
+            status: ["BACKGROUND_CONFIG_INVALID", "BACKGROUND_REVISION_INVALID"].includes(error.code) ? 400 : 409,
+            body: { error: error.code },
+          };
+          return { status: 503, body: { error: "BACKGROUND_CONTROL_UNAVAILABLE" } };
+        }
+      }
+
+      if (request.path === "/v1/runtime/maintenance") {
+        if (!options.evolutionMaintenance) return notFound();
+        if (request.method !== "GET") return methodNotAllowed();
+        return { status: 200, body: options.evolutionMaintenance.maintenanceStatus() };
+      }
+
+      if (request.path.startsWith("/v1/evolution/")) {
+        if (!options.continuousMemoryEvolution) return notFound();
+        if (request.method !== "POST") return methodNotAllowed();
+        const operation = request.path.slice("/v1/evolution/".length);
+        if (operation !== "run" && operation !== "status" && operation !== "resume" && !isEvolutionControlOperation(operation) && !isEvolutionSourceControlOperation(operation) && !isEvolutionReuseOperation(operation) && !isEvolutionGovernanceOperation(operation)) return notFound();
+        try {
+          if (operation === "resume" && Object.keys(request.headers ?? {}).some(name => name.toLowerCase() === EVOLUTION_OWNER_HEADER)) {
+            if (!options.authority) throw new EvolutionTransportError(403, "EVOLUTION_OWNER_REQUIRED");
+            return { status: 200, body: await withAuthenticatedEvolutionOwner({ headers: request.headers,
+              secret: options.evolutionOwnerSecret, owner: options.authority,
+            }, () => invokeEvolutionCapability(options.continuousMemoryEvolution!, "resume", request.body)) };
+          }
+          if (isEvolutionGovernanceOperation(operation)) {
+            if (!options.authority) throw new EvolutionTransportError(403, "EVOLUTION_OWNER_REQUIRED");
+            return { status: 200, body: await withAuthenticatedEvolutionOwner({ headers: request.headers,
+              secret: options.evolutionOwnerSecret, owner: options.authority,
+            }, () => invokeEvolutionGovernanceControl(options.continuousMemoryEvolution!, operation, request.body)) };
+          }
+          if (isEvolutionReuseOperation(operation)) {
+            if (!options.authority) throw new EvolutionTransportError(403, "EVOLUTION_OWNER_REQUIRED");
+            return { status: 200, body: await withAuthenticatedEvolutionOwner({ headers: request.headers,
+              secret: options.evolutionOwnerSecret, owner: options.authority,
+            }, () => invokeEvolutionReuseControl(options.continuousMemoryEvolution!, operation, request.body)) };
+          }
+          if (isEvolutionSourceControlOperation(operation)) {
+            if (!options.authority) throw new EvolutionTransportError(403, "EVOLUTION_OWNER_REQUIRED");
+            return { status: 200, body: await withAuthenticatedEvolutionOwner({ headers: request.headers,
+              secret: options.evolutionOwnerSecret, owner: options.authority,
+            }, () => invokeEvolutionSourceControl(options.continuousMemoryEvolution!, operation, request.body)) };
+          }
+          if (isEvolutionControlOperation(operation)) {
+            if (!options.authority) throw new EvolutionTransportError(403, "EVOLUTION_OWNER_REQUIRED");
+            return { status: 200, body: await withAuthenticatedEvolutionOwner({
+              headers: request.headers, secret: options.evolutionOwnerSecret, owner: options.authority,
+            }, () => invokeEvolutionControl(options.continuousMemoryEvolution!, operation, request.body)) };
+          }
+          return { status: 200, body: await invokeEvolutionCapability(
+            options.continuousMemoryEvolution, operation, request.body,
+          ) };
+        } catch (error) {
+          if (error instanceof EvolutionTransportError) {
+            return { status: error.status, body: { error: error.code } };
+          }
+          return { status: 500, body: { error: "EVOLUTION_OPERATION_FAILED" } };
+        }
+      }
+
       if (request.path === "/v1/runtime/mcp-tools") {
         if (!options.runtimeControl || !options.runtimeMcp) return notFound();
         if (request.method !== "GET") return methodNotAllowed();
-        return { status: 200, body: { tools: options.runtimeMcp.listTools() } };
+        if (!Object.keys(request.headers ?? {}).some(name => name.toLowerCase() === EVOLUTION_OWNER_HEADER)) {
+          return { status: 200, body: { tools: options.runtimeMcp.listTools().filter(tool => !isEvolutionOwnerTool(tool.name) && !isEvolutionGovernanceOwnerTool(tool.name)) } };
+        }
+        try {
+          if (!options.authority) throw new EvolutionTransportError(403, "EVOLUTION_OWNER_REQUIRED");
+          return { status: 200, body: await withAuthenticatedEvolutionOwner({
+            headers: request.headers, secret: options.evolutionOwnerSecret, owner: options.authority,
+          }, async () => ({ tools: options.runtimeMcp!.listTools() })) };
+        } catch (error) {
+          if (error instanceof EvolutionTransportError) return { status: error.status, body: { error: error.code } };
+          return { status: 503, body: { error: "EVOLUTION_CONTROL_UNAVAILABLE" } };
+        }
       }
 
       if (request.path === "/v1/runtime/mcp-call") {
@@ -328,8 +424,16 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
           return badRequest("runtime MCP call is invalid");
         }
         try {
+          if (isEvolutionOwnerTool(body.name) || isEvolutionGovernanceOwnerTool(body.name) ||
+              body.name === "memory_evolution_resume" && Object.keys(request.headers ?? {}).some(name => name.toLowerCase() === EVOLUTION_OWNER_HEADER)) {
+            if (!options.authority) throw new EvolutionTransportError(403, "EVOLUTION_OWNER_REQUIRED");
+            return { status: 200, body: await withAuthenticatedEvolutionOwner({
+              headers: request.headers, secret: options.evolutionOwnerSecret, owner: options.authority,
+            }, () => options.runtimeMcp!.callTool(body.name as string, args)) };
+          }
           return { status: 200, body: await options.runtimeMcp.callTool(body.name, args) };
-        } catch {
+        } catch (error) {
+          if (error instanceof EvolutionTransportError) return { status: error.status, body: { error: error.code } };
           return { status: 500, body: { error: "Runtime MCP operation failed" } };
         }
       }
@@ -1083,4 +1187,9 @@ export function createRestRouter(options: RestRouterOptions): RestRouter {
       return notFound();
     },
   };
+  return options.foregroundActivity ? { handle: async request => {
+    const poll = request.method === "GET" && ["/v1/health", "/v1/runtime", "/v1/runtime/background", "/v1/runtime/maintenance"].includes(request.path);
+    const end = poll ? undefined : options.foregroundActivity!.begin();
+    try { return await router.handle(request); } finally { end?.(); }
+  } } : router;
 }

@@ -438,7 +438,10 @@ function resolveDoctorScope(
   appId?: string,
 ): MemoryScope {
   const requested = manifest
-    ? manifestToScope(manifest, { appId: appId ?? deps.defaultScope!.appId })
+    ? manifestToScope(manifest, {
+        ...deps.defaultScope!,
+        appId: appId ?? deps.defaultScope!.appId,
+      })
     : deps.defaultScope!;
   return resolveOpenClawCliScope(deps, {
     appId: appId ?? requested.appId,

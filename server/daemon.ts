@@ -25,6 +25,11 @@ import type { RuntimeHostControlPlane } from
   "../packages/core/src/runtime/host-contract.js";
 
 export interface StartMemoryServerOptions {
+  continuousMemoryEvolution?: RestRouterOptions["continuousMemoryEvolution"];
+  evolutionOwnerSecret?: RestRouterOptions["evolutionOwnerSecret"];
+  backgroundWork?: RestRouterOptions["backgroundWork"];
+  foregroundActivity?: RestRouterOptions["foregroundActivity"];
+  evolutionMaintenance?: RestRouterOptions["evolutionMaintenance"];
   service: MemoryService;
   /** Runtime 持有的统一 Write Kernel 能力；缺失时 REST 写入保持 fail-closed。 */
   memoryWrite?: RestRouterOptions["memoryWrite"];
@@ -587,6 +592,11 @@ class MemoryServerDaemonController implements MemoryServerDaemon {
         sessionWorkingSet: this.options.sessionWorkingSet,
         sessionWorkingSetMemoryBridge: this.options.sessionWorkingSetMemoryBridge,
         skillArtifacts: this.options.skillArtifacts,
+        continuousMemoryEvolution: this.options.continuousMemoryEvolution,
+        evolutionOwnerSecret: this.options.evolutionOwnerSecret,
+        backgroundWork: this.options.backgroundWork,
+        foregroundActivity: this.options.foregroundActivity,
+        evolutionMaintenance: this.options.evolutionMaintenance,
         memoryPolicyOverlays: this.options.memoryPolicyOverlays,
         memoryPolicyResolver: this.options.memoryPolicyResolver,
         forgetService: typeof (this.options.service as unknown as { forget?: unknown }).forget === "function"

@@ -27,6 +27,7 @@ import {
   createServeRuntimeHost,
   type DurableJobV2ServeCapability,
 } from "./runtime-host-factory.js";
+import { RuntimeBackgroundWork } from "./background-work.js";
 
 const scope: DurableJobV2Scope = {
   tenantId: "tenant-a",
@@ -169,6 +170,47 @@ function runtime(
 }
 
 describe("createServeRuntimeHost", () => {
+  test("paused native host remains ready without discovering or mutating the old queue", async () => {
+    const { provider, bundle } = providerBundle();
+    const source = { ...runtime("postgres", mintedCapability(authoritativeRegistry(), scope, bundle.repository), bundle, true, provider),
+      backgroundWork: new RuntimeBackgroundWork({ scope, config: { mode: "paused", allowedBatchIds: [] } }),
+      evolutionMaintenance: { onIdle: vi.fn(async () => undefined) } };
+    const discovery = vi.spyOn(bundle.repository, "listRunnableScopes").mockRejectedValue(new Error("old queue must remain untouched"));
+    const reap = vi.spyOn(bundle.repository, "reap"), quarantine = vi.spyOn(bundle.repository, "quarantineUnknown"), lease = vi.spyOn(bundle.repository, "lease");
+    let worker!: BroadAuthorityDurableJobV2SupervisorHandle;
+    const { startBroadAuthorityDurableJobV2Supervisor } = await import("./workers-v2.js");
+    const host = createServeRuntimeHost(source, { authority: broadAuthority, startSupervisor: (repository, options) => {
+      worker = startBroadAuthorityDurableJobV2Supervisor(repository, options);
+      return worker;
+    } });
+    try {
+      await host.start();
+      expect(host.snapshot().ready).toBe(true);
+      await worker.tick();
+      expect(discovery).not.toHaveBeenCalled();
+      expect(reap).not.toHaveBeenCalled();
+      expect(quarantine).not.toHaveBeenCalled();
+      expect(lease).not.toHaveBeenCalled();
+      expect(source.evolutionMaintenance.onIdle).not.toHaveBeenCalled();
+    } finally { await host.stop(); }
+  });
+  test("native host uses the existing supervisor idle callback for maintenance", async () => {
+    const { provider, bundle } = providerBundle();
+    const source = { ...runtime("postgres", mintedCapability(authoritativeRegistry(), scope, bundle.repository), bundle, true, provider),
+      backgroundWork: new RuntimeBackgroundWork({ scope, config: { mode: "all", allowedBatchIds: [] } }),
+      evolutionMaintenance: { onIdle: vi.fn(async (_signal: AbortSignal) => undefined) } };
+    vi.spyOn(bundle.repository, "listRunnableScopes").mockResolvedValue([]);
+    const { startBroadAuthorityDurableJobV2Supervisor } = await import("./workers-v2.js");
+    let worker!: BroadAuthorityDurableJobV2SupervisorHandle;
+    const host = createServeRuntimeHost(source, { authority: broadAuthority, startSupervisor: (repository, options) => {
+      worker = startBroadAuthorityDurableJobV2Supervisor(repository, options); return worker;
+    } });
+    try {
+      await host.start(); await worker.tick();
+      expect(source.evolutionMaintenance.onIdle).toHaveBeenCalledWith(expect.any(AbortSignal));
+      expect(source.evolutionMaintenance.onIdle.mock.calls.every(([signal]) => !signal.aborted)).toBe(true);
+    } finally { await host.stop(); }
+  });
   test("有效 production composition 缺 authority 时在启动副作用前 fail-closed", () => {
     const { provider, bundle } = providerBundle();
     const source = runtime(

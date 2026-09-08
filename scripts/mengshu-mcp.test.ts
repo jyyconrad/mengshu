@@ -4,9 +4,37 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { resolveMcpRuntimeSocketPath, resolveMcpRuntimeUrl } from "./mengshu-mcp.js";
+import {
+  resolveMcpRuntimeMode,
+  resolveMcpRuntimeSocketPath,
+  resolveMcpRuntimeUrl,
+} from "./mengshu-mcp.js";
 
 describe("Mengshu MCP RuntimeClient target", () => {
+  test.each([
+    [{}, "proxy"],
+    [{ MENGSHU_MCP_MODE: "proxy" }, "proxy"],
+    [{ MENGSHU_MCP_MODE: "standalone" }, "standalone"],
+    [{ MENGSHU_MCP_DIRECT_DIAGNOSTIC: "1" }, "standalone"],
+  ])("resolves the explicit MCP runtime mode", (env, expected) => {
+    expect(resolveMcpRuntimeMode(env)).toBe(expected);
+  });
+
+  test.each(["direct", "embedded", "invalid"])(
+    "rejects unsupported MCP runtime mode %s",
+    (mode) => {
+      expect(() => resolveMcpRuntimeMode({ MENGSHU_MCP_MODE: mode }))
+        .toThrow(/MENGSHU_MCP_MODE/);
+    },
+  );
+
+  test("rejects conflicting explicit and legacy modes", () => {
+    expect(() => resolveMcpRuntimeMode({
+      MENGSHU_MCP_MODE: "proxy",
+      MENGSHU_MCP_DIRECT_DIAGNOSTIC: "1",
+    })).toThrow(/conflicts/);
+  });
+
   test.each([
     [{}, undefined, "http://127.0.0.1:3847/"],
     [{ server: { host: "0.0.0.0", port: 4000 } }, undefined, "http://127.0.0.1:4000/"],

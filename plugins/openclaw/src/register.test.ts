@@ -210,6 +210,39 @@ function deferred<T>() {
 }
 
 describe("registerOpenClawAdapter", () => {
+  test("external RuntimeHost ownership keeps Gateway reads ready without polling old jobs", async () => {
+    vi.useFakeTimers();
+    try {
+      const db = durableRegistryFakeDb();
+      const externalConfig: MemoryConfig = { ...postgresConfig, server: { workerOwnership: "external-runtime-host" } };
+      const runtime = createMengshuRuntime({ config: externalConfig, resolvedDbPath: "", appId: "openclaw", db });
+      db.getActiveEmbeddingSpace.mockResolvedValue(runtime.embeddingSpace);
+      const discover = vi.spyOn(runtime.durableJobV2RuntimeBundle!.repository, "listRunnableScopes").mockResolvedValue([]);
+      const startServer = vi.fn();
+      const { api, services, clis } = makeApi();
+      registerOpenClawAdapter(api, externalConfig, { runtime, authority: registeredAuthority(runtime), startServer });
+      await services[0]!.start();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(runtime.lifecycle.snapshot().ready).toBe(true);
+      expect(runtime.backgroundWork?.snapshot()).toMatchObject({ mode: "paused", active: 0 });
+      expect(discover).not.toHaveBeenCalled();
+      const ms = registeredMsCommand(clis);
+      await expect(ms.subcommands.find(command => command.name === "serve")?.actionHandler?.({})).rejects.toThrow(/external.*owner|external.*host/i);
+      expect(startServer).not.toHaveBeenCalled();
+      await services[0]!.stop();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  test("embedded evolution cannot silently become another scheduler owner", () => {
+    const runtime = createMengshuRuntime({ config, resolvedDbPath: config.dbPath!, appId: "openclaw", db: new FakeDb() });
+    for (const extra of [{}, { mode: "server" as const, server: { workerOwnership: "external-runtime-host" as const } }]) {
+      const { api, services, tools } = makeApi();
+      expect(() => registerOpenClawAdapter(api, { ...config, ...extra, features: { continuousMemoryEvolution: true } }, { runtime, authority: registeredAuthority(runtime) })).toThrow(/evolution.*owner|owner.*evolution/i);
+      expect(services).toEqual([]);
+      expect(tools).toEqual([]);
+    }
+  });
   test("self-created runtime 缺少显式 authenticated authority 时在任何 host/path 副作用前拒绝", () => {
     const { api, tools, clis, services, hooks } = makeApi();
     const resolvePath = vi.spyOn(api, "resolvePath");

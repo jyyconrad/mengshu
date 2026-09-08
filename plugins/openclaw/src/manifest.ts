@@ -7,7 +7,7 @@
  * 核心流程：
  * 1. createManifest：缺省 id 时由目录路径派生稳定 hash（同目录幂等）。
  * 2. read/writeManifest：以 2 空格缩进 JSON 落地，缺失返回 null，损坏抛带路径错误。
- * 3. manifestToScope：把 manifest 映射为 MemoryScope（appId/tenantId 固定，其余来自 manifest）。
+ * 3. manifestToScope：把产品可信 scope 与 project manifest 组合为 MemoryScope。
  *
  * 关键边界（A2-lite）：
  * - identity 稳定性靠两层保证：同目录 createManifest 幂等（路径 hash）；
@@ -50,7 +50,7 @@ export interface MemoryAutodbManifest {
   workspaceId: string;
   /** task_context/resource 默认隔离边界 id */
   projectId: string;
-  /** 可选用户 id（缺省走 scope 默认值） */
+  /** 旧 manifest 的可选用户 id；新初始化不写入，运行时身份由 Agent 产品提供。 */
   userId?: string;
   /** 新记忆默认可见性，默认 workspace */
   defaultVisibility: MemoryVisibility;
@@ -270,22 +270,18 @@ export function writeManifest(dir: string, manifest: MemoryAutodbManifest): void
 }
 
 /**
- * manifest 映射为 MemoryScope。
- * appId 固定 openclaw、tenantId 固定 local、namespace 默认 memories；
- * workspaceId/projectId/userId/visibility 来自 manifest；overrides 优先覆盖。
+ * 把 Agent 产品提供的可信 scope 与项目 manifest 组合为 MemoryScope。
+ * tenant/user/app/agent/namespace 属于产品运行时；workspace/project 属于本地项目 manifest。
  */
 export function manifestToScope(
   manifest: MemoryAutodbManifest,
-  overrides: MemoryScopeInput = {},
+  productScope: MemoryScopeInput = {},
 ): MemoryScope {
   return normalizeScope({
-    tenantId: "local",
-    appId: "openclaw",
-    userId: manifest.userId,
+    ...productScope,
+    userId: productScope.userId ?? manifest.userId,
     projectId: manifest.projectId,
     workspaceId: manifest.workspaceId,
-    namespace: "memories",
     visibility: manifest.defaultVisibility,
-    ...overrides,
   });
 }

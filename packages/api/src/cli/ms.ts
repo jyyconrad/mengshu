@@ -23,7 +23,7 @@ import {
 import { registerDoctorCliCommands } from "../../../../adapters/openclaw/cli-doctor.js";
 import { registerForgetCliCommands } from "../../../../adapters/openclaw/cli-forget.js";
 import { registerMigrateHomeCommand } from "../../../../adapters/openclaw/cli-migrate-home.js";
-import { registerProjectCliCommands } from "../../../../adapters/openclaw/cli-project.js";
+import { registerProjectCliCommands } from "./project.js";
 import { registerRecallCliCommands } from "../../../../adapters/openclaw/cli-recall.js";
 import { runInteractiveSetup } from "../../../../adapters/openclaw/cli-setup.js";
 import { registerWhyCliCommands } from "../../../../adapters/openclaw/cli-why.js";
@@ -35,6 +35,14 @@ import {
 import { registerEmbeddingSpaceCliCommands } from "./embedding-space.js";
 import { registerEvalCliCommands } from "./eval.js";
 import { registerRuntimeCostCliCommands } from "./runtime-cost.js";
+import { registerEvolutionCliCommands } from "./evolve.js";
+import {
+  RuntimeClient,
+  createFetchRuntimeClientTransport,
+  createUnixSocketRuntimeClientTransport,
+} from "../runtime-client.js";
+import { fingerprintRuntimeHome } from "../../../core/src/runtime/host-contract.js";
+import { resolveHomeDir } from "../../../core/src/runtime/paths.js";
 import { JsonlRuntimeCostLedger } from "../../../core/src/cost/runtime-cost-ledger.js";
 import { describeOpenClawEmbeddingStatus } from "../../../../plugins/openclaw/src/embedding-status.js";
 import {
@@ -54,6 +62,7 @@ import {
 import { PostgresProvider } from "../../../core/src/db/providers/postgres.js";
 import type { MemoryScope, MemorySemanticType } from "../../../core/src/domain/types.js";
 import type { AuthorityScope } from "../../../core/src/domain/authority-scope.js";
+import { resolveAuthorityScope } from "../../../core/src/domain/authority-scope.js";
 import type { MemoryViewAssetService } from
   "../../../core/src/assets/memory-view-service.js";
 import type { AgentLoadoutService } from "../../../core/src/loadout/service.js";
@@ -129,7 +138,13 @@ function printConfiglessHelp(argv: string[]): void {
     return;
   }
 
-  program.command("init").description("Initialize mengshu global/project configuration");
+  program
+    .command("init [dir]")
+    .description("Initialize a product-neutral project memory workspace")
+    .option("--workspace-id <id>", "Workspace id selected by the Agent product")
+    .option("--project-id <id>", "Project id selected by the Agent product")
+    .option("--visibility <level>", "Default visibility: private | workspace | team | public")
+    .option("--force", "Overwrite an existing project manifest", false);
   program.command("setup").description("Interactive setup wizard for global mengshu configuration");
   program.command("doctor [dir]").description("Diagnose config, DB, embedding, disk and manifest health");
   program.command("demo [dir]").description("Seed sample working context and demo context/lookup");
@@ -138,6 +153,9 @@ function printConfiglessHelp(argv: string[]): void {
   program.command("serve").description("Start the local memory REST server");
   program.command("status").description("Show memory middleware status");
   program.command("health").description("Show memory service health as JSON");
+  registerEvolutionCliCommands(program, {
+    client: { invoke: async () => { throw new Error("Runtime client is required"); } },
+  });
   const migrate = program.command("migrate")
     .description("Inspect or apply the PostgreSQL schema/canonical-scope cutover")
     .option(
@@ -439,7 +457,9 @@ export async function dispatchHistoryRebuildAndDrainTrees(
 
 /** 这些命令开放 server/host surface，必须在读取 config 或创建 runtime 前获得 host-owned authority。 */
 export function requiresServerAuthority(argv: string[]): boolean {
-  return SERVER_AUTHORITY_COMMANDS.has(argv[2] ?? "");
+  const command = argv[2] ?? "";
+  if (SERVER_AUTHORITY_COMMANDS.has(command)) return true;
+  return command === "project" && ["context", "lookup"].includes(argv[3] ?? "");
 }
 
 type RuntimeForgetCapability = AuthorityScopedForgetCapability;
@@ -482,6 +502,7 @@ export function createCliMcpStdioServerOptions(
     memoryAssets: runtime.memoryViewAssets,
     knowledgeResources: runtime.knowledgeResources,
     temporalMemory: runtime.memoryEvolution,
+    continuousMemoryEvolution: runtime.continuousMemoryEvolution,
     sessionWorkingSet: runtime.sessionWorkingSet,
     sessionWorkingSetBridge: runtime.sessionWorkingSetMemoryBridge,
     skillArtifacts: runtime.skillArtifacts,
@@ -783,7 +804,8 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
       if (!result.configWritten) {
         return;
       }
-      console.log("\n配置完成，启动 MCP server...\n");
+      console.log("\n配置完成。下一步在项目目录运行 `ms init`；启动 MCP 前请配置 Agent 产品 authority。\n");
+      return;
     }
 
     const { runStandaloneMcpServer } = await import("../../../../scripts/mengshu-mcp.js");
@@ -810,6 +832,27 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
   // Help/version are pure CLI surfaces. Never parse config, authority, or start runtime.
   if (wantsHelpOrVersion(argv)) {
     printConfiglessHelp(argv);
+    return;
+  }
+
+  // Project identity is local metadata. It must remain usable before config,
+  // provider, runtime, or any product-specific authority is constructed.
+  if (argv[2] === "init") {
+    const initProgram = new Command().name("ms");
+    registerProjectCliCommands(initProgram, {});
+    await initProgram.parseAsync(argv);
+    return;
+  }
+
+  if (argv[2] === "project" && argv[3] === "status") {
+    const statusProgram = new Command().name("ms");
+    registerProjectCliCommands(statusProgram, {});
+    await statusProgram.parseAsync(argv);
+    return;
+  }
+
+  if (argv[2] === "setup") {
+    await runInteractiveSetup();
     return;
   }
 
@@ -877,6 +920,30 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
   const rawConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const cfg = memoryConfigSchema.parse(rawConfig);
 
+  if (argv[2] === "evolve") {
+    const { resolveMcpRuntimeUrl, resolveMcpRuntimeSocketPath } =
+      await import("../../../../scripts/mengshu-mcp.js");
+    const socketPath = resolveMcpRuntimeSocketPath();
+    const ownerToken = ["proposals", "proposal", "review", "review-status", "approve", "reject", "apply", "cancel", "background",
+      "source-attest", "source-revoke-attestation", "reuse-status", "reuse-grants", "reuse-evaluate",
+      "control", "undo-preview", "undo-approve", "resume"].includes(argv[3] ?? "")
+      ? cfg.evolution?.control?.ownerSecret : undefined;
+    const client = new RuntimeClient({
+      expectedHomeFingerprint: fingerprintRuntimeHome(resolveHomeDir()),
+      transport: socketPath
+        ? createUnixSocketRuntimeClientTransport({
+            socketPath, bearerToken: cfg.server?.secret, ownerToken, timeoutMs: 310_000,
+          })
+        : createFetchRuntimeClientTransport({
+            baseUrl: resolveMcpRuntimeUrl(cfg), bearerToken: cfg.server?.secret, ownerToken, timeoutMs: 310_000,
+          }),
+    });
+    const evolutionProgram = new Command().name("ms");
+    registerEvolutionCliCommands(evolutionProgram, { client });
+    await evolutionProgram.parseAsync(argv);
+    return;
+  }
+
   if (isMcpCommand(argv) && process.env.MENGSHU_MCP_DIRECT_DIAGNOSTIC !== "1") {
     const { runStandaloneMcpServer } = await import("../../../../scripts/mengshu-mcp.js");
     await runStandaloneMcpServer();
@@ -900,6 +967,7 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
     resolvedDbPath,
     appId: "mengshu",
     defaultScope,
+    ...(serverAuthority ? { continuousMemoryEvolutionHost: { authority: serverAuthority.authority, config: cfg } } : {}),
     logger: {
       warn: (message) => console.warn(`[mengshu] ${message}`),
     },
@@ -953,6 +1021,10 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
     service: runtime.memoryService,
     memoryWrite: resolveRuntimeMemoryWriteCapability(runtime),
     memoryEvolution: runtime.memoryEvolution,
+    continuousMemoryEvolution: runtime.continuousMemoryEvolution,
+    backgroundWork: runtime.backgroundWork,
+    foregroundActivity: runtime.evolutionActivity,
+    evolutionMaintenance: runtime.evolutionMaintenance,
     sessionWorkingSet: runtime.sessionWorkingSet,
     sessionWorkingSetMemoryBridge: runtime.sessionWorkingSetMemoryBridge,
     skillArtifacts: runtime.skillArtifacts,
@@ -986,6 +1058,27 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
 
   registerProjectCliCommands(program, {
     service: runtime.memoryService,
+    ...(serverAuthority
+      ? {
+          resolveMemoryScope: (manifest) => {
+            if (serverAuthority.authority.workspaceId !== undefined &&
+                serverAuthority.authority.workspaceId !== manifest.workspaceId) {
+              throw new Error("Project workspace does not match server authority");
+            }
+            const scope = resolveAuthorityScope(serverAuthority.authority, {
+              appId: serverAuthority.defaultScope.appId,
+              projectId: manifest.projectId,
+              agentId: serverAuthority.defaultScope.agentId,
+              namespace: serverAuthority.defaultScope.namespace,
+              visibility: manifest.defaultVisibility,
+            });
+            return Object.freeze({
+              ...scope,
+              workspaceId: serverAuthority.authority.workspaceId ?? manifest.workspaceId,
+            });
+          },
+        }
+      : {}),
     getRecordCount: () => runtime.db.count(),
     embeddings: runtime.embeddings,
     llmClient: runtime.llmClient,

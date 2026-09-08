@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { RuntimeBackgroundWork } from "./server/background-work.js";
+import { assertEvolutionOwnerRequest } from "./packages/api/src/evolution-owner-auth.js";
 import { vectorDimsForModel, type MemoryConfig } from "./config.js";
 import { DatabaseFactory } from "./db/factory.js";
 import type { DatabaseProvider } from "./db/types.js";
@@ -21,9 +23,20 @@ import {
   MemoryWriteKernel,
   type MemoryWriteCommand,
   type MemoryWriteKernelResult,
+  type MemoryWriteKernelDependencies,
   type ValidatedWriteCandidate,
   type WriteScope,
 } from "./packages/core/src/service/write-kernel.js";
+import type { PostgresEvolutionVerifiedInput } from "./packages/core/src/evolution/governed-writer.js";
+import { resolveAuthorityScope, type AuthorityScope } from "./packages/core/src/domain/authority-scope.js";
+import { authorityScopeFingerprint } from "./packages/core/src/domain/authority-scope-fingerprint.js";
+import { createEvolutionRuntime, type EvolutionRuntime } from "./server/evolution-runtime.js";
+import { createGlobalEvolutionLlm, loadGlobalEvolutionConfig } from "./server/evolution-config.js";
+import { createEvolutionHostControl, type EvolutionHostControl } from "./server/evolution-control.js";
+import { createHostReuseRuntimeRouter } from "./server/reuse-runtime.js";
+import { createEvolutionReuseRuntime } from "./server/evolution-reuse.js";
+import { EvolutionActivity } from "./server/evolution-activity.js";
+import { resolveHomeDir } from "./packages/core/src/runtime/paths.js";
 import { Embeddings } from "./processing/embeddings.js";
 import { computeContentHash } from "./processing/hash-utils.js";
 import { createLlmClient, type LlmClient } from "./processing/llm-client.js";
@@ -212,6 +225,8 @@ export interface RuntimeOptions {
   runtimeCostLedger?: RuntimeCostLedger;
   /** 显式版本化价格快照；未配置时事件保留为 unpriced。 */
   runtimePricingSnapshot?: RuntimePricingSnapshot;
+  /** Trusted RuntimeHost startup snapshot, never a scanned project's configuration. */
+  continuousMemoryEvolutionHost?: { authority: AuthorityScope; config: MemoryConfig };
   treeRepository?: TreeRepository;
   /** Trusted native-v2 composition only; structural/legacy-handler capabilities are rejected. */
   durableJobV2ServeCapability?: DurableJobV2ServeCapability;
@@ -245,6 +260,13 @@ function warnCommittedActiveDerivation(logger: RuntimeLogger | undefined): void 
 }
 
 export interface MengshuRuntime {
+  backgroundWork?: RuntimeBackgroundWork;
+  continuousMemoryEvolution?: import("./packages/api/src/evolution.js").EvolutionBatchCapability;
+  evolutionHostControl?: EvolutionHostControl;
+  governedReuse?: ReturnType<typeof createHostReuseRuntimeRouter>;
+  evolutionReuse?: ReturnType<typeof createEvolutionReuseRuntime>;
+  evolutionActivity?: EvolutionActivity;
+  evolutionMaintenance?: Pick<EvolutionRuntime, "onIdle" | "maintenanceStatus">;
   config: MemoryConfig;
   resolvedDbPath: string;
   appId: string;
@@ -736,6 +758,31 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     "runtime cost ledger append failed; provider result was preserved",
   );
   const db = options.db ?? DatabaseFactory.createProvider(options.config, options.resolvedDbPath);
+  const evolutionEnabled = options.config.features?.continuousMemoryEvolution === true;
+  const evolutionActivity = evolutionEnabled ? new EvolutionActivity(resolveHomeDir()) : undefined;
+  const evolutionAuthority = options.continuousMemoryEvolutionHost?.authority ?? options.config.authority;
+  if (evolutionEnabled && (!(db instanceof PostgresProvider) || options.config.dbType !== "postgres" || !evolutionAuthority)) {
+    throw new Error("EVOLUTION_HOST_CAPABILITY_UNAVAILABLE");
+  }
+  const evolutionConfig = evolutionEnabled ? loadGlobalEvolutionConfig({
+    authority: evolutionAuthority!, scope: runtimeDefaultScope,
+    hostConfig: options.continuousMemoryEvolutionHost?.config,
+  }) : undefined;
+  const evolutionHostControl = evolutionConfig && db instanceof PostgresProvider ? createEvolutionHostControl({
+    persistence: db.createEvolutionPersistence(runtimeDefaultScope), authority: evolutionAuthority!,
+    scope: runtimeDefaultScope, config: evolutionConfig,
+  }) : undefined;
+  const governedReuse = evolutionHostControl && db instanceof PostgresProvider ? createHostReuseRuntimeRouter({
+    authority: evolutionAuthority!, boundScope: runtimeDefaultScope,
+    stateForScope: evolutionHostControl.stateForScope, readTarget: evolutionHostControl.readTarget,
+    hydrator: readOptions => assertPostgresProviderOwnsGovernedRetrievalHydrator(db, db.createGovernedRetrievalHydrator(readOptions)),
+    candidateSource: readOptions => assertPostgresProviderOwnsGovernedRetrievalCandidateSource(db, db.createGovernedRetrievalCandidateSource(readOptions)),
+  }) : undefined;
+  const evolutionLlm = evolutionConfig ? createGlobalEvolutionLlm(evolutionConfig, runtimeCostLedger, runtimeDefaultScope, { onCostLedgerError }) : undefined;
+  const evolutionReuse = evolutionHostControl && evolutionConfig && governedReuse && db instanceof PostgresProvider ? createEvolutionReuseRuntime({
+    control: evolutionHostControl, config: evolutionConfig, router: governedReuse, llmClient: evolutionLlm!,
+    pool: db.createEvolutionPersistence(runtimeDefaultScope).repository.pool, repository: db.createSkillArtifactRepository(),
+  }) : undefined;
   const embeddings = options.embeddings ?? new Embeddings(
     options.config.embedding,
     options.config.batchProcessing,
@@ -935,6 +982,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
           },
         },
         maxResourceBytes: options.config.skillArtifacts?.maxResourceBytes,
+        ...(governedReuse ? { targetCompatibility: governedReuse.compatibility } : {}),
         ...(memoryPolicyResolver ? { policyResolver: memoryPolicyResolver } : {}),
       })
     : undefined;
@@ -1027,18 +1075,18 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     : undefined;
   const forgetTransactions = postgresForgetTransactionPort(options.config, db);
   const atomicStore = postgresAtomicMemoryStorePort(options.config, db);
-  const governedRetrieval = options.config.dbType === "postgres" && db instanceof PostgresProvider
+  const governedRetrieval = governedReuse?.engine ?? (options.config.dbType === "postgres" && db instanceof PostgresProvider
     ? new GovernedRetrievalEngine(assertPostgresProviderOwnsGovernedRetrievalHydrator(
         db,
         db.createGovernedRetrievalHydrator(),
       ))
-    : undefined;
-  const governedCandidateSource = options.config.dbType === "postgres" && db instanceof PostgresProvider
+    : undefined);
+  const governedCandidateSource = governedReuse?.candidateSource ?? (options.config.dbType === "postgres" && db instanceof PostgresProvider
     ? assertPostgresProviderOwnsGovernedRetrievalCandidateSource(
         db,
         db.createGovernedRetrievalCandidateSource(),
       )
-    : undefined;
+    : undefined);
   const memoryService = new DefaultMemoryService({
     repository: memoryRepository,
     embeddings,
@@ -1085,9 +1133,10 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     candidateDedupReadsByRequest.set(candidate, pending);
     return pending;
   };
-  const memoryWriteKernel = memoryWriteKernelTransactions
-    ? new MemoryWriteKernel({
-        temporalMemoryEnabled: options.config.features?.temporalMemory === true,
+  const createMemoryWriteDependencies = (
+    evolution?: PostgresEvolutionVerifiedInput,
+  ): Omit<MemoryWriteKernelDependencies, "transaction"> => ({
+        temporalMemoryEnabled: options.config.features?.temporalMemory === true || evolution !== undefined,
         resolveAuthority: ({ serverAuthority, clientScope }) =>
           trustedRuntimeWriteScope(clientScope, serverAuthority),
         normalize: ({ command, scope }) => {
@@ -1124,15 +1173,19 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
           }
           if (command.type === "correctMemory" &&
               (command.correctionKind !== "replaceText" || command.temporal === undefined ||
-                options.config.features?.temporalMemory !== true)) {
+                (options.config.features?.temporalMemory !== true && evolution === undefined))) {
             return { accepted: false as const, reason: "runtime_correction_requires_forget_capability" };
           }
           if (command.semanticType === undefined) {
-            if (command.type !== "saveExplicit") {
+            const verifiedKindOnlyCorrection = evolution !== undefined && command.type === "correctMemory" &&
+              evolution.validation.outcome === "allowed" && !evolution.validation.contextEligible &&
+              evolution.context.proposal.proposedText === normalized.text &&
+              evolution.context.proposal.kind === command.kind;
+            if (command.type !== "saveExplicit" && !verifiedKindOnlyCorrection) {
               return { accepted: false as const, reason: "unknown_semantic_type" };
             }
             const compatibility = runtimeKindOnlyExplicitCandidate(
-              command,
+              { ...command, type: "saveExplicit" },
               scope,
               normalized.text,
             );
@@ -1176,8 +1229,12 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
           }
           if (command.type === "correctMemory") {
             if (command.correctionKind !== "replaceText" || command.temporal === undefined ||
-                options.config.features?.temporalMemory !== true) {
+                (options.config.features?.temporalMemory !== true && evolution === undefined)) {
               return { route: "drop" as const, valueScore: 0, reason: "unsupported_runtime_command" };
+            }
+            if (evolution !== undefined && !evolution.validation.contextEligible &&
+                candidate.compatibility === "kind_only_explicit") {
+              return { route: "lookup_only" as const, valueScore: 0.5, reason: "governed_kind_only_lookup" };
             }
             const validatedCandidate = candidate as unknown as ValidatedCandidate;
             const sourceKind = runtimeWriteSourceKind(command);
@@ -1328,10 +1385,14 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
             ? { duplicate: true, duplicateOf: result.duplicateOf, layer: result.layer }
             : { duplicate: false };
         },
-        transaction: (work) => memoryWriteKernelTransactions.transaction(work),
         ack: () => undefined,
         createId: randomUUID,
         now: Date.now,
+      });
+  const memoryWriteKernel = memoryWriteKernelTransactions
+    ? new MemoryWriteKernel({
+        ...createMemoryWriteDependencies(),
+        transaction: (work) => memoryWriteKernelTransactions.transaction(work),
       })
     : undefined;
   const evidenceFirstMemoryWriteExecutor = memoryWriteKernel
@@ -1494,6 +1555,10 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
 
   let rawDurableJobV2ServeCapability = options.durableJobV2ServeCapability;
   let durableJobV2RuntimeBundle = options.durableJobV2RuntimeBundle;
+  let continuousEvolutionRuntime: EvolutionRuntime | undefined;
+  if (evolutionEnabled && (rawDurableJobV2ServeCapability || durableJobV2RuntimeBundle)) {
+    throw new Error("EVOLUTION_REQUIRES_NATIVE_RUNTIME_COMPOSITION");
+  }
   if (!rawDurableJobV2ServeCapability && !durableJobV2RuntimeBundle &&
       options.config.dbType === "postgres" && db instanceof PostgresProvider &&
       runtimeDefaultScope.visibility !== undefined) {
@@ -1501,14 +1566,35 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
       clock: Date.now,
       tokenFactory: randomUUID,
       backoffMs: (attempts) => Math.min(60_000, 1_000 * (2 ** Math.max(0, attempts - 1))),
+      ...(evolutionEnabled ? { enableMemoryEvolution: true } : {}),
     });
     deriveCommittedActive = createNativeCommittedActiveDerivation({
       readPort: activeMemoryDerivationReadPort!,
       workMemoryGraph: workMemoryGraphRepository!,
       repository: runtimeBundle.repository,
     });
+    if (evolutionConfig) {
+      continuousEvolutionRuntime = createEvolutionRuntime({
+        runtimeBundle, authority: evolutionAuthority!, scope: runtimeDefaultScope, config: evolutionConfig,
+        hostControl: evolutionHostControl,
+        llmClient: evolutionLlm!, reuse: evolutionReuse!.capability,
+        maintenanceHost: { activity: evolutionActivity!, backgroundMode: () => backgroundWork?.snapshot().mode ?? "paused" },
+        kernelDependencies: (verified) => ({
+          ...createMemoryWriteDependencies(verified),
+          // Raw imports and canonical writes request selectors; identity remains host-owned.
+          resolveAuthority: ({ serverAuthority, clientScope }) =>
+            Object.freeze(resolveAuthorityScope(serverAuthority as AuthorityScope, clientScope)),
+        }),
+        onCommitted: () => {
+          // The original write transaction already emits the durable derivation outbox.
+          agentFastPath.invalidateContextCacheFingerprint(authorityScopeFingerprint(runtimeDefaultScope));
+        },
+        onWarning: () => warnCommittedActiveDerivation(options.logger),
+      });
+    }
     const composition = createNativeDurableJobV2Composition({
       runtimeBundle,
+      ...(continuousEvolutionRuntime ? { evolution: continuousEvolutionRuntime } : {}),
       scope: {
         tenantId: runtimeDefaultScope.tenantId,
         userId: runtimeDefaultScope.userId,
@@ -1705,6 +1791,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
 
   const agentFastPath = new AgentFastPathService({
     defaultScope: runtimeDefaultScope,
+    ...(governedReuse ? { readBoundary: governedReuse.fastPathReadBoundary } : {}),
     loadRecallHitsForScope: async (resolvedScope, query) => {
       const result = await memoryService.recall({
         query,
@@ -2004,6 +2091,24 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     }
   };
 
+  const backgroundServer = (options.continuousMemoryEvolutionHost?.config ?? options.config).server;
+  const externalWorkerOwner = backgroundServer?.workerOwnership === "external-runtime-host";
+  if (externalWorkerOwner && (continuousEvolutionRuntime || backgroundServer?.backgroundWork && backgroundServer.backgroundWork.mode !== "paused")) {
+    throw new Error("BACKGROUND_EXTERNAL_OWNER_CONFLICT");
+  }
+  const backgroundConfig = externalWorkerOwner ? { mode: "paused" as const, allowedBatchIds: [] } : backgroundServer?.backgroundWork;
+  if (backgroundConfig && !durableJobV2ServeCapability) throw new Error("BACKGROUND_NATIVE_HOST_REQUIRED");
+  const backgroundWork = durableJobV2ServeCapability ? new RuntimeBackgroundWork({
+    scope: runtimeDefaultScope, config: backgroundConfig,
+    ...(continuousEvolutionRuntime ? { resolveBatch: (batchId: string) => continuousEvolutionRuntime!.capability.status(batchId) } : {}),
+    authorizeUpdate: () => {
+      assertEvolutionOwnerRequest(runtimeDefaultScope);
+      if (externalWorkerOwner) throw new Error("BACKGROUND_EXTERNAL_OWNER");
+    },
+  }) : undefined;
+  const controlBackgroundLoop = (loop: { start(): void; stop(): Promise<void> }) => backgroundWork?.manageLoop(loop) ?? {
+    start: () => loop.start(), stop: () => loop.stop(),
+  };
   const lifecycle = new RuntimeLifecycle([
     {
       name: "database",
@@ -2018,6 +2123,11 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         resetEmbeddingGuards();
       },
     },
+    ...(continuousEvolutionRuntime ? [{
+      name: "continuous-memory-evolution",
+      start: () => continuousEvolutionRuntime!.assertReady(),
+      stop: async () => undefined,
+    }] : []),
     {
       name: "tree",
       start: async () => {
@@ -2058,35 +2168,38 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     ...(temporalActivationLoop
       ? [{
           name: "temporal-activation",
-          start: () => temporalActivationLoop.start(),
-          stop: () => temporalActivationLoop.stop(),
+          ...controlBackgroundLoop(temporalActivationLoop),
         }]
       : []),
     ...(workingSetRetentionLoop
       ? [{
           name: "working-set-retention",
-          start: () => workingSetRetentionLoop.start(),
-          stop: () => workingSetRetentionLoop.stop(),
+          ...controlBackgroundLoop(workingSetRetentionLoop),
         }]
       : []),
     ...(skillCandidateAggregationLoop
       ? [{
           name: "skill-candidate-aggregation",
-          start: () => skillCandidateAggregationLoop.start(),
-          stop: () => skillCandidateAggregationLoop.stop(),
+          ...controlBackgroundLoop(skillCandidateAggregationLoop),
         }]
       : []),
     ...(activeDerivationOutboxLoop
       ? [{
           name: "active-derivation-outbox",
-          start: () => activeDerivationOutboxLoop.start(),
-          stop: () => activeDerivationOutboxLoop.stop(),
+          ...controlBackgroundLoop(activeDerivationOutboxLoop),
         }]
       : []),
   ]);
 
   return {
     config: options.config,
+    ...(evolutionHostControl ? { evolutionHostControl } : {}),
+    ...(governedReuse ? { governedReuse } : {}),
+    ...(evolutionReuse ? { evolutionReuse } : {}),
+    ...(evolutionActivity ? { evolutionActivity } : {}),
+    ...(continuousEvolutionRuntime ? { evolutionMaintenance: {
+      onIdle: continuousEvolutionRuntime.onIdle, maintenanceStatus: continuousEvolutionRuntime.maintenanceStatus,
+    } } : {}),
     resolvedDbPath: options.resolvedDbPath,
     appId,
     defaultScope: runtimeDefaultScope,
@@ -2104,6 +2217,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     authorityScopedForgetCapability,
     durableJobV2ServeCapability,
     durableJobV2RuntimeBundle,
+    ...(backgroundWork ? { backgroundWork } : {}),
     ingestionStore: persistentRepos,
     ingestionPipeline,
     candidateRepository,
@@ -2121,6 +2235,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     ...(knowledgeResources ? { knowledgeResources } : {}),
     ...(contextAssemblyReceipts ? { contextAssemblyReceipts } : {}),
     ...(memoryEvolution ? { memoryEvolution } : {}),
+    ...(continuousEvolutionRuntime ? { continuousMemoryEvolution: continuousEvolutionRuntime.capability } : {}),
     ...(sessionWorkingSet ? { sessionWorkingSet } : {}),
     ...(sessionWorkingSetMemoryBridge ? { sessionWorkingSetMemoryBridge } : {}),
     ...(skillCandidates ? { skillCandidates } : {}),

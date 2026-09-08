@@ -28,6 +28,18 @@ OpenClaw 插件 id 为 `mengshu-openclaw`，旧 id `memory-autodb` 和 `mengshu`
             "password": "${PG_PASSWORD}",
             "ssl": false
           },
+          "authority": {
+            "tenantId": "local",
+            "userId": "owner",
+            "allow": {
+              "appIds": ["openclaw"],
+              "projectIds": ["project-api"],
+              "agentIds": ["main", "coder"],
+              "namespaces": ["working-context"],
+              "visibilities": ["private"]
+            }
+          },
+          "defaultAgentId": "main",
           "autoCapture": true,
           "autoRecall": true
         }
@@ -38,6 +50,11 @@ OpenClaw 插件 id 为 `mengshu-openclaw`，旧 id `memory-autodb` 和 `mengshu`
 ```
 
 `~/.mengshu/config.json` 是跨产品共享配置；记忆数据写入 OpenClaw 配置中的 PostgreSQL 库。`dbPath` 仅在显式选择 `dbType=lancedb` 时使用。
+
+`ms init` 是产品无关的项目初始化入口，不要求 OpenClaw。通过 OpenClaw CLI 调用时，
+OpenClaw 用自己的可信 `defaultScope` 选择项目 identity；普通 Codex、Claude Code 或本地
+CLI 项目不需要配置 OpenClaw authority。项目 identity 与运行时 authority 的区别见
+[项目身份与运行时 Authority](../../docs/guides/authority-and-project-scope.md)。
 
 LanceDB 本地单机配置：
 

@@ -160,6 +160,7 @@ describe("Codex MCP plugin smoke", () => {
     expect(manifest.mcpServers?.mengshu?.env).toMatchObject({
       MENGSHU_HOME: "${HOME}/.mengshu",
       MENGSHU_AUTHORITY_FILE: "${HOME}/.mengshu/authority.json",
+      MENGSHU_MCP_MODE: "standalone",
     });
   });
 
@@ -304,7 +305,7 @@ describe("Codex MCP plugin smoke", () => {
     }
   });
 
-  test("lists bundled tools through the explicit direct-diagnostic packaging path", async () => {
+  test("lists bundled tools without requiring a separately managed RuntimeHost", async () => {
     const temp = mkdtempSync(join(tmpdir(), "mengshu-codex-mcp-"));
     try {
       const binDir = join(temp, "bin");
@@ -332,9 +333,7 @@ describe("Codex MCP plugin smoke", () => {
           MENGSHU_HOME: homeDir,
           MENGSHU_AUTHORITY_JSON: JSON.stringify(authorityConfig),
           MENGSHU_AUTHORITY_FILE: "",
-          // RuntimeHost proxy behavior has its own live smoke. This case only
-          // proves that the packaged launcher can resolve and start its runtime.
-          MENGSHU_MCP_DIRECT_DIAGNOSTIC: "1",
+          MENGSHU_MCP_MODE: "standalone",
           PATH: process.env.PATH ?? "",
           MENGSHU_CODEX_MS_PATH: join(binDir, "ms"),
         },

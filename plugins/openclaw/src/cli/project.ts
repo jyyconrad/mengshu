@@ -1,5 +1,5 @@
 /**
- * OpenClaw `ms init` 与 `ms project` 子命令（A2-lite）。
+ * 产品无关的 `ms init` 与 `ms project` 子命令（A2-lite）。
  *
  * 本文件做什么：在 cli.ts 的 server 命令之外，注册 project scope identity 入口：
  * - `ms init [dir]`：创建 .mengshu.json（默认幂等不覆盖，--force 覆盖）。
@@ -12,27 +12,18 @@
  *
  * 关键边界（v0.1）：
  * - 不强制目录索引；缺少 authority-scoped count 时 status 不读取库级总数。
- * - 与 cli.ts 共用 CommanderLike 鸭子类型，避免引入 commander 硬依赖。
+ * - Agent 产品通过 resolver 注入项目 identity 与可信 memory scope，不在这里绑定 OpenClaw。
  * - 所有命令对缺失 manifest / 缺失 service 做友好提示，不抛未捕获异常。
  */
 
 import { basename, resolve } from "node:path";
-import {
-  requireOpenClawCliAuthority,
-  resolveOpenClawCliScope,
-  type CommanderLike,
-  type OpenClawCliAuthorityContext,
-} from "./index.js";
 import type { MemoryService } from "../../../../core/service-types.js";
-import type { MemoryVisibility } from "../../../../core/types.js";
-import { scopeToKey } from "../../../../core/scope.js";
-import { scopeToWorkspaceKey } from "../../../../core/scope-policy.js";
+import type { MemoryScope, MemoryVisibility } from "../../../../core/types.js";
 import { buildAgentService } from "./agent-service-helper.js";
 import {
   MANIFEST_FILENAME,
   createManifest,
   manifestPath,
-  manifestToScope,
   readProjectManifest,
   writeProjectIdentity,
   type MemoryAutodbManifest,
@@ -41,8 +32,35 @@ import { readRegistry, writeRegistry, upsertProject, touchProjectOpenedAt } from
 import { resolveProjectManifestPath, type HomePathOptions } from "../../../../core/paths.js";
 import { isGlobalConfigReady, runInteractiveSetup } from "./setup.js";
 
-/** project 命令依赖注入。所有 identity 在访问 memory service 前经过 authority allowlist。 */
-export interface ProjectCliDeps extends OpenClawCliAuthorityContext {
+export interface CommanderLike {
+  command(name: string): CommanderLike;
+  description(text: string): CommanderLike;
+  option(flag: string, description: string, defaultValue?: unknown): CommanderLike;
+  action(handler: (...args: unknown[]) => unknown): CommanderLike;
+}
+
+export interface ProjectIdentity {
+  workspaceId: string;
+  projectId: string;
+  defaultVisibility: MemoryVisibility;
+}
+
+export interface ProjectIdentityRequest {
+  dir: string;
+  requested: Partial<ProjectIdentity>;
+  suggested: ProjectIdentity;
+}
+
+export type ProjectIdentityResolver = (
+  request: ProjectIdentityRequest,
+) => ProjectIdentity | Promise<ProjectIdentity>;
+
+/** project 命令依赖注入。项目 identity 与 memory authority 是两个独立边界。 */
+export interface ProjectCliDeps {
+  /** Agent 产品可覆盖目录派生结果，提供自己识别的 workspace/project identity。 */
+  resolveProjectIdentity?: ProjectIdentityResolver;
+  /** 只有访问记忆库时才需要；由 Agent 产品用自己的可信 authority 实现。 */
+  resolveMemoryScope?: (manifest: MemoryAutodbManifest) => MemoryScope;
   /** 用于 context/lookup 的召回服务（需 embedding）。 */
   service?: MemoryService;
   /** Deprecated raw count dependency; deliberately not consumed by authority-safe commands. */
@@ -77,17 +95,14 @@ function resolveDir(positional: unknown, options: { dir?: string } = {}, deps: P
   return resolve(base);
 }
 
-/** 打印 workspace/project identity 与 scope key。 */
+/** 打印产品无关的 workspace/project identity。 */
 function printIdentity(manifest: MemoryAutodbManifest): void {
-  const scope = manifestToScope(manifest);
   console.log(`- workspaceId: ${manifest.workspaceId}`);
   console.log(`- projectId:   ${manifest.projectId}`);
   if (manifest.userId) {
     console.log(`- userId:      ${manifest.userId}`);
   }
   console.log(`- visibility:  ${manifest.defaultVisibility}`);
-  console.log(`- workspace key: ${scopeToWorkspaceKey(scope)}`);
-  console.log(`- project key:   ${scopeToKey(scope)}`);
 }
 
 function printReusePolicy(manifest: MemoryAutodbManifest): void {
@@ -98,15 +113,46 @@ function printReusePolicy(manifest: MemoryAutodbManifest): void {
   }
 }
 
-async function handleInit(positional: unknown, options: InitOptions, deps: ProjectCliDeps): Promise<void> {
-  const serverScope = requireOpenClawCliAuthority(deps);
-  if (options.userId !== undefined) {
-    throw new Error("OpenClaw --user-id is server-owned and cannot be set by CLI input");
+function projectIdentityFromManifest(manifest: MemoryAutodbManifest): ProjectIdentity {
+  return {
+    workspaceId: manifest.workspaceId,
+    projectId: manifest.projectId,
+    defaultVisibility: manifest.defaultVisibility,
+  };
+}
+
+function requestedProjectIdentity(options: InitOptions): Partial<ProjectIdentity> {
+  return {
+    ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
+    ...(options.projectId === undefined ? {} : { projectId: options.projectId }),
+    ...(options.visibility === undefined ? {} : { defaultVisibility: options.visibility }),
+  };
+}
+
+function validateProjectIdentity(identity: ProjectIdentity): ProjectIdentity {
+  const safeId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+  for (const [field, value] of [
+    ["workspaceId", identity.workspaceId],
+    ["projectId", identity.projectId],
+  ] as const) {
+    if (typeof value !== "string" || !safeId.test(value)) {
+      throw new Error(`${field} 必须是安全的非空项目标识，且不能包含路径分隔符`);
+    }
   }
-  const scope = resolveOpenClawCliScope(deps, {
-    projectId: options.projectId ?? serverScope.projectId,
-    visibility: options.visibility ?? serverScope.visibility ?? "private",
-  });
+  if (!["private", "workspace", "team", "public"].includes(identity.defaultVisibility)) {
+    throw new Error("defaultVisibility 非法");
+  }
+  return {
+    workspaceId: identity.workspaceId,
+    projectId: identity.projectId,
+    defaultVisibility: identity.defaultVisibility,
+  };
+}
+
+async function handleInit(positional: unknown, options: InitOptions, deps: ProjectCliDeps): Promise<void> {
+  if (options.userId !== undefined) {
+    throw new Error("ms init 不接受 --user-id；用户身份必须由 Agent 产品的可信运行时提供");
+  }
   // 首次使用时引导全局配置
   if (!isGlobalConfigReady(deps.homePathOptions)) {
     console.log("首次使用梦枢，需要先完成全局配置。\n");
@@ -117,7 +163,6 @@ async function handleInit(positional: unknown, options: InitOptions, deps: Proje
   const dir = resolveDir(positional, options, deps);
   const existing = readProjectManifest(dir, deps.homePathOptions);
   if (existing && !options.force) {
-    resolveManifestScope(existing, deps);
     console.log(`manifest 已存在（${manifestPath(dir)}），保留原 identity。使用 --force 覆盖。`);
     printIdentity(existing);
     // 更新 registry 的 lastOpenedAt
@@ -131,13 +176,22 @@ async function handleInit(positional: unknown, options: InitOptions, deps: Proje
     return;
   }
 
-  const manifest = createManifest({
+  const suggestedManifest = createManifest({
     dir,
     workspaceId: options.workspaceId,
-    projectId: scope.projectId,
-    userId: scope.userId,
-    defaultVisibility: scope.visibility,
+    projectId: options.projectId,
+    defaultVisibility: options.visibility,
   });
+  const identity = validateProjectIdentity(
+    deps.resolveProjectIdentity
+      ? await deps.resolveProjectIdentity({
+          dir,
+          requested: requestedProjectIdentity(options),
+          suggested: projectIdentityFromManifest(suggestedManifest),
+        })
+      : projectIdentityFromManifest(suggestedManifest),
+  );
+  const manifest = createManifest({ dir, ...identity });
   writeProjectIdentity(dir, manifest, deps.homePathOptions);
   console.log(`已创建 ${MANIFEST_FILENAME}（${manifestPath(dir)}）`);
   printIdentity(manifest);
@@ -160,15 +214,12 @@ async function handleInit(positional: unknown, options: InitOptions, deps: Proje
 }
 
 async function handleStatus(positional: unknown, options: DirOptions, deps: ProjectCliDeps): Promise<void> {
-  requireOpenClawCliAuthority(deps);
   const dir = resolveDir(positional, options, deps);
   const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
     console.log(`未找到 ${MANIFEST_FILENAME}，请先运行 \`ms init\`。`);
     return;
   }
-  resolveManifestScope(manifest, deps);
-
   console.log("Project Workspace Status:");
   printIdentity(manifest);
   printReusePolicy(manifest);
@@ -182,7 +233,6 @@ async function handleContext(
   options: DirOptions & { task?: string },
   deps: ProjectCliDeps,
 ): Promise<void> {
-  requireOpenClawCliAuthority(deps);
   const dir = resolveDir(positional, options, deps);
   const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
@@ -190,7 +240,6 @@ async function handleContext(
     return;
   }
 
-  const scope = resolveManifestScope(manifest, deps);
   console.log("Project 5-Slot Context:");
   console.log(`- workspaceId: ${manifest.workspaceId}`);
   console.log(`- projectId:   ${manifest.projectId}`);
@@ -200,6 +249,7 @@ async function handleContext(
     return;
   }
 
+  const scope = resolveManifestScope(manifest, deps);
   const task = options.task ?? "项目当前工作上下文";
   try {
     const agentService = buildAgentService(scope, task, deps.service);
@@ -219,7 +269,6 @@ async function handleContext(
 }
 
 async function handleLookup(query: unknown, options: DirOptions, deps: ProjectCliDeps): Promise<void> {
-  requireOpenClawCliAuthority(deps);
   const dir = resolveDir(undefined, options, deps);
   const manifest = readProjectManifest(dir, deps.homePathOptions);
   if (!manifest) {
@@ -255,10 +304,10 @@ async function handleLookup(query: unknown, options: DirOptions, deps: ProjectCl
 export function registerProjectCliCommands(memory: CommanderLike, deps: ProjectCliDeps): void {
   memory
     .command("init [dir]")
-    .description("Initialize project memory workspace (.mengshu.json)")
+    .description("Initialize a product-neutral project memory workspace (.mengshu.json)")
     .option("--workspace-id <id>", "Explicit workspace id")
     .option("--project-id <id>", "Explicit project id")
-    .option("--user-id <id>", "Disabled: user identity is server-owned")
+    .option("--user-id <id>", "Disabled: identity comes from the Agent product runtime")
     .option("--visibility <level>", "Default visibility: private | workspace | team | public")
     .option("--force", "Overwrite existing manifest", false)
     .action(async (...args: unknown[]) => {
@@ -307,15 +356,11 @@ export function registerProjectCliCommands(memory: CommanderLike, deps: ProjectC
 function resolveManifestScope(
   manifest: MemoryAutodbManifest,
   deps: ProjectCliDeps,
-) {
-  const requested = manifestToScope(manifest);
-  return resolveOpenClawCliScope(deps, {
-    appId: requested.appId,
-    projectId: requested.projectId,
-    agentId: requested.agentId,
-    namespace: requested.namespace,
-    visibility: requested.visibility ?? "private",
-  });
+): MemoryScope {
+  if (!deps.resolveMemoryScope) {
+    throw new Error("访问项目记忆需要 Agent 产品提供可信 scope resolver");
+  }
+  return deps.resolveMemoryScope(manifest);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

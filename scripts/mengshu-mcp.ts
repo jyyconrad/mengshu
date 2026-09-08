@@ -63,6 +63,27 @@ const DEFAULT_OPENCLAW_PLUGIN_CONFIG_PATH = path.join(resolveLegacyHomeDir(), "c
 const LEGACY_ENV_PATH = path.join(resolveLegacyHomeDir(), ".env");
 const OPENCLAW_PLUGIN_CONFIG_KEYS = ["mengshu-openclaw", "memory-autodb", "mengshu"] as const;
 
+export type McpRuntimeMode = "proxy" | "standalone";
+
+/**
+ * Generic `ms mcp` deployments keep proxy mode so RuntimeHost remains the single
+ * worker owner. Self-contained product plugins can opt into standalone mode.
+ */
+export function resolveMcpRuntimeMode(
+  env: Record<string, string | undefined> = process.env,
+): McpRuntimeMode {
+  const explicit = env.MENGSHU_MCP_MODE?.trim();
+  const legacyStandalone = env.MENGSHU_MCP_DIRECT_DIAGNOSTIC === "1";
+  if (!explicit) return legacyStandalone ? "standalone" : "proxy";
+  if (explicit !== "proxy" && explicit !== "standalone") {
+    throw new Error("MENGSHU_MCP_MODE must be proxy or standalone");
+  }
+  if (legacyStandalone && explicit !== "standalone") {
+    throw new Error("MENGSHU_MCP_MODE conflicts with MENGSHU_MCP_DIRECT_DIAGNOSTIC");
+  }
+  return explicit;
+}
+
 export function resolveMcpRuntimeUrl(
   cfg: Pick<MemoryConfig, "server">,
   explicit = process.env.MENGSHU_RUNTIME_URL,
@@ -389,7 +410,7 @@ export async function runStandaloneMcpServer(): Promise<void> {
   const rawConfig = readConfig(configPath);
   const cfg = memoryConfigSchema.parse(rawConfig);
   const defaultScope: MemoryScope = authorityConfig.defaultScope;
-  if (process.env.MENGSHU_MCP_DIRECT_DIAGNOSTIC !== "1") {
+  if (resolveMcpRuntimeMode() === "proxy") {
     const socketPath = resolveMcpRuntimeSocketPath();
     const client = new RuntimeClient({
       transport: socketPath
@@ -437,7 +458,7 @@ export async function runStandaloneMcpServer(): Promise<void> {
       embeddingModel: cfg.embedding.model,
     });
 
-    process.stderr.write(`mengshu MCP direct diagnostic started (${configPath})\n`);
+    process.stderr.write(`mengshu MCP standalone started (${configPath})\n`);
     running = await startMcpStdioServer(
       createStandaloneMcpStdioServerOptions(
         runtime,

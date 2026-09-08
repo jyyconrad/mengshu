@@ -150,6 +150,7 @@ export class RuntimeClient {
 export function createFetchRuntimeClientTransport(input: {
   readonly baseUrl: string;
   readonly bearerToken?: string;
+  readonly ownerToken?: string;
   readonly timeoutMs?: number;
   readonly fetch?: typeof globalThis.fetch;
 }): RuntimeClientTransport {
@@ -167,13 +168,19 @@ export function createFetchRuntimeClientTransport(input: {
   }
   return Object.freeze({
     async request(request: RuntimeClientRequest): Promise<RuntimeClientResponse> {
+      if (!request.path.startsWith("/") || request.path.startsWith("//") || /[\\\u0000-\u001f\u007f]/.test(request.path)) {
+        throw new RuntimeClientError("RUNTIME_PROTOCOL_INVALID");
+      }
       const url = new URL(request.path, baseUrl);
+      if (url.origin !== baseUrl.origin) throw new RuntimeClientError("RUNTIME_PROTOCOL_INVALID");
       const response = await fetchImpl(url, {
         method: request.method,
+        redirect: "error",
         headers: {
           accept: "application/json",
           ...(request.body === undefined ? {} : { "content-type": "application/json" }),
           ...(input.bearerToken ? { authorization: `Bearer ${input.bearerToken}` } : {}),
+          ...(input.ownerToken ? { "x-mengshu-owner-token": input.ownerToken } : {}),
         },
         ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
         signal: AbortSignal.timeout(timeoutMs),
@@ -196,6 +203,7 @@ export function createFetchRuntimeClientTransport(input: {
 export function createUnixSocketRuntimeClientTransport(input: {
   readonly socketPath: string;
   readonly bearerToken?: string;
+  readonly ownerToken?: string;
   readonly timeoutMs?: number;
 }): RuntimeClientTransport {
   if (!isAbsolute(input.socketPath) || /[\u0000-\u001f\u007f]/.test(input.socketPath)) {
@@ -232,6 +240,7 @@ export function createUnixSocketRuntimeClientTransport(input: {
             accept: "application/json",
             ...(request.body === undefined ? {} : { "content-type": "application/json" }),
             ...(input.bearerToken ? { authorization: `Bearer ${input.bearerToken}` } : {}),
+            ...(input.ownerToken ? { "x-mengshu-owner-token": input.ownerToken } : {}),
           },
         }, (response) => {
           const chunks: Buffer[] = [];

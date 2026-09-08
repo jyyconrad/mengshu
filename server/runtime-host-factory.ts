@@ -1,5 +1,6 @@
 import {
   DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
+  isDurableJobV2AuthoritativeTypes,
   createDurableJobHandlerRegistry,
   deriveDurableJobV2ScopedDedupeKey,
   type DurableJobV2Scope,
@@ -15,6 +16,8 @@ import {
   type ClientAuthorityScopeRequest,
 } from "../packages/core/src/domain/authority-scope.js";
 import { RuntimeHost } from "./runtime-host.js";
+import { RuntimeBackgroundWork } from "./background-work.js";
+import type { RuntimeBackgroundWorkConfig } from "../packages/core/src/runtime/background-work.js";
 import {
   startBroadAuthorityDurableJobV2Supervisor,
   type BroadAuthorityDurableJobV2SupervisorOptions,
@@ -28,7 +31,8 @@ export type RuntimeHostFactoryErrorCode =
   | "DURABLE_JOB_V2_RUNTIME_BUNDLE_REQUIRED"
   | "DURABLE_JOB_V2_RUNTIME_BUNDLE_INVALID"
   | "DURABLE_JOB_V2_AUTHORITY_REQUIRED"
-  | "DURABLE_JOB_V2_AUTHORITY_INVALID";
+  | "DURABLE_JOB_V2_AUTHORITY_INVALID"
+  | "DURABLE_JOB_V2_EXTERNAL_OWNER";
 
 export class RuntimeHostFactoryError extends Error {
   readonly code: RuntimeHostFactoryErrorCode;
@@ -59,7 +63,9 @@ export { DURABLE_JOB_V2_AUTHORITATIVE_TYPES } from
   "../packages/core/src/storage/repositories/job-v2.js";
 
 export interface ServeRuntimeHostSource {
-  readonly config: { readonly dbType?: string };
+  readonly config: { readonly dbType?: string; readonly server?: { readonly backgroundWork?: RuntimeBackgroundWorkConfig; readonly workerOwnership?: "runtime-host" | "external-runtime-host" } };
+  readonly backgroundWork?: RuntimeBackgroundWork;
+  readonly evolutionMaintenance?: { onIdle(signal: AbortSignal): Promise<void> };
   readonly db?: unknown;
   readonly durableJobV2ServeCapability?: DurableJobV2ServeCapability;
   readonly durableJobV2RuntimeBundle?: PostgresDurableJobV2RuntimeBundle;
@@ -168,8 +174,7 @@ function validateServeAuthority(
 const RUNTIME_MINTED_CAPABILITIES = new WeakSet<object>();
 
 function hasExactAuthoritativeTypes(types: readonly string[]): boolean {
-  return types.length === DURABLE_JOB_V2_AUTHORITATIVE_TYPES.length &&
-    DURABLE_JOB_V2_AUTHORITATIVE_TYPES.every((type, index) => types[index] === type);
+  return isDurableJobV2AuthoritativeTypes(types);
 }
 
 function validateCapabilityStructure(raw: unknown): DurableJobV2ServeCapability {
@@ -190,7 +195,7 @@ function validateCapabilityStructure(raw: unknown): DurableJobV2ServeCapability 
       throw new RuntimeHostFactoryError("DURABLE_JOB_V2_CAPABILITY_INVALID");
     }
   }
-  const contract = createDurableJobHandlerRegistry(DURABLE_JOB_V2_AUTHORITATIVE_TYPES);
+  const contract = createDurableJobHandlerRegistry(capability.registry.types);
   if (contract.types.length !== capability.registry.types.length ||
       contract.types.some((type, index) => type !== capability.registry!.types[index])) {
     throw new RuntimeHostFactoryError("DURABLE_JOB_V2_CAPABILITY_INVALID");
@@ -221,7 +226,7 @@ export function createNativeDurableJobV2ServeCapability(input: {
       throw new RuntimeHostFactoryError("DURABLE_JOB_V2_CAPABILITY_INVALID");
     }
     const handlers = new Map<string, ReturnType<typeof input.registry.get>>();
-    for (const type of DURABLE_JOB_V2_AUTHORITATIVE_TYPES) {
+    for (const type of input.registry.types) {
       const handler = input.registry.get(type);
       if (typeof handler !== "function") {
         throw new RuntimeHostFactoryError("DURABLE_JOB_V2_CAPABILITY_INVALID");
@@ -240,7 +245,7 @@ export function createNativeDurableJobV2ServeCapability(input: {
     deriveDurableJobV2ScopedDedupeKey(scope, "serve-capability-construction");
     const registry = Object.freeze({
       authoritative: true as const,
-      types: Object.freeze([...DURABLE_JOB_V2_AUTHORITATIVE_TYPES]),
+      types: Object.freeze([...input.registry.types]),
       get: (type: string) => handlers.get(type),
     });
     const capability = {
@@ -284,7 +289,9 @@ function validateRuntimeBundle(
   try {
     const bundle = assertPostgresProviderOwnsDurableJobV2RuntimeBundle(provider, raw);
     if (bundle.contract !== "mengshu.postgres-durable-job-v2/v1" ||
-        bundle.handlerTypes !== DURABLE_JOB_V2_AUTHORITATIVE_TYPES ||
+        !isDurableJobV2AuthoritativeTypes(bundle.handlerTypes) ||
+        ((bundle.handlerTypes as readonly string[]).includes("evolve_memory_batch") !==
+          (typeof bundle.createEvolutionPersistence === "function")) ||
         typeof bundle.executeBuildTreeEffect !== "function" ||
         typeof bundle.executeCandidateEffect !== "function" ||
         typeof bundle.executeGraphEffect !== "function" ||
@@ -311,6 +318,9 @@ export function createServeRuntimeHost(
   if (!runtime || runtime.config?.dbType !== "postgres") {
     throw new RuntimeHostFactoryError("DURABLE_JOB_V2_POSTGRES_REQUIRED");
   }
+  if (runtime.config.server?.workerOwnership === "external-runtime-host") {
+    throw new RuntimeHostFactoryError("DURABLE_JOB_V2_EXTERNAL_OWNER");
+  }
   if (typeof runtime.start !== "function" || typeof runtime.stop !== "function" ||
       typeof runtime.lifecycle?.snapshot !== "function") {
     throw new RuntimeHostFactoryError("DURABLE_JOB_V2_CAPABILITY_INVALID");
@@ -319,10 +329,13 @@ export function createServeRuntimeHost(
   if (options.authority !== undefined) validateServeAuthority(options.authority);
   const bundle = validateRuntimeBundle(runtime.db, runtime.durableJobV2RuntimeBundle);
   const capability = validateCapability(runtime.durableJobV2ServeCapability);
-  if (capability.repository !== bundle.repository) {
+  if (capability.repository !== bundle.repository ||
+      capability.registry.types.length !== bundle.handlerTypes.length ||
+      capability.registry.types.some((type, index) => type !== bundle.handlerTypes[index])) {
     throw new RuntimeHostFactoryError("DURABLE_JOB_V2_RUNTIME_BUNDLE_INVALID");
   }
   const authority = validateServeAuthority(options.authority, capability.scope);
+  const backgroundWork = runtime.backgroundWork ?? new RuntimeBackgroundWork({ scope: capability.scope, config: runtime.config.server?.backgroundWork });
   const startSupervisor = options.startSupervisor ?? startBroadAuthorityDurableJobV2Supervisor;
   const supervisorOptions: BroadAuthorityDurableJobV2SupervisorOptions = {
     authority,
@@ -334,6 +347,8 @@ export function createServeRuntimeHost(
     maxJobsPerTick: options.maxJobsPerTick ?? options.maxPerTick ?? 100,
     stopTimeoutMs: options.stopTimeoutMs ?? 5_000,
     registry: capability.registry,
+    selectWork: signal => backgroundWork.select(signal),
+    ...(runtime.evolutionMaintenance ? { onIdle: (signal: AbortSignal) => runtime.evolutionMaintenance!.onIdle(signal) } : {}),
   };
 
   return new RuntimeHost({

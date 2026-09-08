@@ -58,7 +58,7 @@ export function resolveOpenClawCliScope(
 }
 
 export interface RegisterMemoryServerCliOptions extends OpenClawCliAuthorityContext {
-  config: Pick<MemoryConfig, "dbType" | "dbPath" | "server">;
+  config: Pick<MemoryConfig, "dbType" | "dbPath" | "server" | "evolution">;
   service: MemoryService;
   getTableStats?: () => Promise<TableStats[]>;
   startServer?: typeof startMemoryServer;
@@ -66,6 +66,10 @@ export interface RegisterMemoryServerCliOptions extends OpenClawCliAuthorityCont
   /** Runtime 持有的统一 Write Kernel 能力；serve 只负责透传。 */
   memoryWrite?: StartMemoryServerOptions["memoryWrite"];
   memoryEvolution?: StartMemoryServerOptions["memoryEvolution"];
+  continuousMemoryEvolution?: StartMemoryServerOptions["continuousMemoryEvolution"];
+  backgroundWork?: StartMemoryServerOptions["backgroundWork"];
+  foregroundActivity?: StartMemoryServerOptions["foregroundActivity"];
+  evolutionMaintenance?: StartMemoryServerOptions["evolutionMaintenance"];
   sessionWorkingSet?: StartMemoryServerOptions["sessionWorkingSet"];
   sessionWorkingSetMemoryBridge?: StartMemoryServerOptions["sessionWorkingSetMemoryBridge"];
   skillArtifacts?: StartMemoryServerOptions["skillArtifacts"];
@@ -186,6 +190,11 @@ export function registerMemoryServerCliCommands(
         service: options.service,
         memoryWrite: options.memoryWrite,
         memoryEvolution: options.memoryEvolution,
+        continuousMemoryEvolution: options.continuousMemoryEvolution,
+        backgroundWork: options.backgroundWork,
+        foregroundActivity: options.foregroundActivity,
+        evolutionMaintenance: options.evolutionMaintenance,
+        evolutionOwnerSecret: options.config.evolution?.control?.ownerSecret,
         sessionWorkingSet: options.sessionWorkingSet,
         sessionWorkingSetMemoryBridge: options.sessionWorkingSetMemoryBridge,
         skillArtifacts: options.skillArtifacts,

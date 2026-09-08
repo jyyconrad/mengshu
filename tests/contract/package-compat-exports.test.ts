@@ -18,10 +18,12 @@ describe("package layer compatibility exports", () => {
     const rest = await import("../../adapters/rest/router.js");
     const sdk = await import("../../adapters/sdk/index.js");
     const cli = await import("../../packages/api/src/cli/ms.js");
+    const projectCli = await import("../../packages/api/src/cli/project.js");
 
     expect(fastPath.AgentFastPathService).toBe(pkg.AgentFastPathService);
     expect(rest.createRestRouter).toBe(pkg.createRestRouter);
     expect(sdk.MemoryClient).toBe(pkg.MemoryClient);
+    expect(projectCli.registerProjectCliCommands).toBe(pkg.registerProjectCliCommands);
     expect(cli.runMengshuCli).toBeTypeOf("function");
   });
 

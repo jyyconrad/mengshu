@@ -66,6 +66,11 @@ export interface RestResponse {
 export type RestServerConfig = NonNullable<MemoryConfig["server"]>;
 
 export interface RestRouterOptions {
+  foregroundActivity?: { begin(): () => void };
+  evolutionMaintenance?: { maintenanceStatus(): unknown };
+  continuousMemoryEvolution?: import("../evolution.js").EvolutionBatchCapability;
+  evolutionOwnerSecret?: string;
+  backgroundWork?: import("../../../core/src/runtime/background-work.js").RuntimeBackgroundWorkCapability;
   service: MemoryService;
   /** Shared RuntimeHost owner/readiness/generation control plane. */
   runtimeControl?: RuntimeHostControlPlane;
