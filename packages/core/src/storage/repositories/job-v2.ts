@@ -23,6 +23,18 @@ export const DURABLE_JOB_V2_AUTHORITATIVE_TYPES = Object.freeze([
   "extract_graph",
 ] as const);
 
+/** The opt-in extension is a complete registry, not an independently owned worker pool. */
+export const DURABLE_JOB_V2_EVOLUTION_TYPES = Object.freeze([
+  "build_tree", "evolve_memory_batch", "extract_candidate", "extract_graph",
+] as const);
+export type DurableJobV2AuthoritativeTypes =
+  typeof DURABLE_JOB_V2_AUTHORITATIVE_TYPES | typeof DURABLE_JOB_V2_EVOLUTION_TYPES;
+
+export function isDurableJobV2AuthoritativeTypes(types: readonly string[]): boolean {
+  return [DURABLE_JOB_V2_AUTHORITATIVE_TYPES, DURABLE_JOB_V2_EVOLUTION_TYPES].some(expected =>
+    types.length === expected.length && expected.every((type, index) => types[index] === type));
+}
+
 /**
  * Provider 持久队列只接受 authority 已解析完成的 canonical scope。
  * 可选 workspace/session 不是 v2 队列隔离键，调用方不得把未解析 client scope 传入。

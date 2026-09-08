@@ -26,6 +26,7 @@ import { PostgresContextAssemblyReceiptRepository } from
   "../../context/postgres-assembly-receipt.js";
 import { PostgresTemporalMemoryRepository } from
   "../../temporal/postgres-repository.js";
+import { HostManagedReuseAuthorizer } from "../../evolution/reuse/explicit-reuse-authorizer.js";
 import { PostgresActiveDerivationOutboxRepository } from
   "../../../../../server/postgres-active-derivation-outbox.js";
 import { isProviderOwnedDuplicateEvidenceLinkPort } from
@@ -60,7 +61,30 @@ function result(rows: readonly Record<string, unknown>[] = []) {
 }
 
 describe("PostgresProvider F0 factories", () => {
-  test("M1 temporal repository reuses provider pool and requires the current temporal schema", async () => {
+  test("both provider-owned governed factories consume the same live host reuse reader", async () => {
+    const scope = { tenantId: "tenant-a", userId: "user-a", appId: "codex", projectId: "project-a",
+      agentId: "agent-a", namespace: "memory", visibility: "private" as const };
+    const authority = { tenantId: scope.tenantId, userId: scope.userId, allow: { appIds: ["codex", "openclaw"],
+      projectIds: [scope.projectId], agentIds: [scope.agentId], namespaces: [scope.namespace], visibilities: [scope.visibility] } };
+    const read = vi.fn(async () => ({ authority, revision: "1", grants: [] }));
+    const reuseAuthorizer = new HostManagedReuseAuthorizer({ read });
+    const sources = vi.spyOn(reuseAuthorizer, "sources"), authorize = vi.spyOn(reuseAuthorizer, "authorize");
+    const pool = { query: vi.fn(async () => result()), connect: vi.fn(), end: vi.fn() };
+    const provider = providerWithPool(pool, 37);
+    const options = { reuseAuthorizer };
+    await provider.createGovernedRetrievalCandidateSource(options).search({ scope, query: "postgres", limit: 5 });
+    expect(sources).toHaveBeenCalledExactlyOnceWith(scope);
+    const sourceScope = { ...scope, appId: "openclaw" };
+    await provider.createGovernedRetrievalHydrator(options).hydrate({ scope, authoritativeRecordId: "memory-a",
+      candidates: [{ candidateId: "candidate-a", authoritativeRecordId: "memory-a", scope: sourceScope,
+        source: "lexical", nodeType: "memory", evidenceIds: ["evidence-a"] }] });
+    expect(authorize).toHaveBeenCalledWith(sourceScope, scope);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(pool.query).toHaveBeenCalledOnce();
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  test("M1 temporal repository reuses provider pool and requires schema v35", async () => {
     const pool = {
       query: vi.fn(async () => result()),
       connect: vi.fn(),
@@ -71,7 +95,7 @@ describe("PostgresProvider F0 factories", () => {
       projectId: "project-a", agentId: "agent-a", namespace: "memories",
       visibility: "private" as const,
     };
-    const repository = providerWithPool(pool, CURRENT_SCHEMA_VERSION)
+    const repository = providerWithPool(pool, 35)
       .createTemporalMemoryRepository();
 
     expect(repository).toBeInstanceOf(PostgresTemporalMemoryRepository);
@@ -79,13 +103,10 @@ describe("PostgresProvider F0 factories", () => {
     expect(pool.query).toHaveBeenCalledOnce();
 
     const stalePool = { query: vi.fn(), connect: vi.fn(), end: vi.fn() };
-    const stale = providerWithPool(stalePool, CURRENT_SCHEMA_VERSION - 1)
+    const stale = providerWithPool(stalePool, 34)
       .createTemporalMemoryRepository();
     await expect(stale.getHead(scope, "release-process"))
-      .rejects.toThrow(new RegExp(
-        `temporal memory repository.*schema v${CURRENT_SCHEMA_VERSION}`,
-        "i",
-      ));
+      .rejects.toThrow(/temporal memory repository.*schema v35/i);
     expect(stalePool.query).not.toHaveBeenCalled();
   });
 

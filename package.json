@@ -1,7 +1,7 @@
 {
   "name": "@mengshu/core",
   "version": "1.0.7",
-  "description": "Local-first memory middleware (mengshu) for OpenClaw-type Agent Runtime products with auto-recall/capture",
+  "description": "Local-first memory middleware for multi-product Agent Runtimes with governed recall and capture",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/jyyconrad/mengshu#readme",
@@ -99,7 +99,8 @@
     "p-limit": "^6.1.0",
     "p-retry": "^6.2.0",
     "pg": "^8.16.0",
-    "seedrandom": "^3.0.5"
+    "seedrandom": "^3.0.5",
+    "undici": "^6.28.1"
   },
   "devDependencies": {
     "@types/node": "^25.3.1",
@@ -148,6 +149,16 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "eval:quick": "tsx tests/eval/runners/quick-eval.ts",
+    "eval:g0:round1": "tsx tests/eval/runners/run-g0-evaluation.ts --round 1 --cache cold",
+    "eval:g0:round2": "tsx tests/eval/runners/run-g0-evaluation.ts --round 2 --cache warm",
+    "eval:g0:finalize": "tsx tests/eval/runners/finalize-g0-evaluation.ts",
+    "eval:rag-multi:sync": "python3 tests/eval/public/tools/sync-rag-multi-corpus.py",
+    "eval:kb-pilot:mengshu": "tsx tests/eval/public/kb-pilot/mengshu-e2e.ts",
+    "eval:private:prepare": "tsx tests/eval/private/tools/build-private-v1.ts",
+    "eval:selfbuilt:prepare": "tsx tests/eval/selfbuilt/tools/prepare-selfbuilt.ts",
+    "eval:selfbuilt:round1": "tsx tests/eval/selfbuilt/tools/run-selfbuilt-evaluation.ts --round 1 --cache cold",
+    "eval:selfbuilt:round2": "tsx tests/eval/selfbuilt/tools/run-selfbuilt-evaluation.ts --round 2 --cache warm",
+    "eval:selfbuilt:finalize": "tsx tests/eval/selfbuilt/tools/finalize-selfbuilt-evaluation.ts",
     "migrate:topic-tree": "tsx scripts/operator-topic-tree-migrate.ts",
     "migrate:history": "tsx scripts/operator-history-rebuild.ts"
   },

@@ -718,6 +718,48 @@ describe("DefaultMemoryService", () => {
     expect(recalled.hits.find((hit) => hit.record.id === ungrounded.id)).toBeUndefined();
   });
 
+  test("Governed Retrieval 保留 authority-filtered knowledge/document 向量命中", async () => {
+    const document = makeRecord({
+      id: "knowledge-document",
+      kind: "document",
+      dataType: "document",
+      tableName: "knowledge",
+      text: "ZX Bank received the Financial Inclusion Leadership Award in 2023.",
+      metadata: { filePath: "/corpus/datasets/ZX Bank/md/Awards.md" },
+      provenance: { source: "scan", filePath: "/corpus/datasets/ZX Bank/md/Awards.md" },
+    });
+    const requests: GovernedRetrievalRequest[] = [];
+    const governedRetrieval = new GovernedRetrievalEngine({ hydrate: async () => undefined });
+    const retrieve = governedRetrieval.retrieve.bind(governedRetrieval);
+    governedRetrieval.retrieve = async (request) => {
+      requests.push(request);
+      return retrieve(request);
+    };
+    const service = new DefaultMemoryService({
+      repository: new FakeRepository([{ ...document, score: 0.95 }]),
+      embeddings: new FakeEmbeddings(),
+      governedRetrieval,
+    });
+
+    const result = await service.recall({
+      query: "Which award did ZX Bank receive?",
+      scope: document.scope,
+      limit: 1,
+      minScore: 0,
+      tableName: "knowledge",
+      dataTypes: ["document"],
+    });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].candidates).toEqual([]);
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0]).toMatchObject({
+      record: { id: document.id, dataType: "document" },
+      source: "vector",
+    });
+    expect(isRecallScoreBreakdown(result.hits[0].scoreBreakdown)).toBe(true);
+  });
+
   test("production governed recall 合并 provider-owned 多来源候选后只计算一次六因子", async () => {
     const active = makeRecord({
       id: "active-from-lexical",

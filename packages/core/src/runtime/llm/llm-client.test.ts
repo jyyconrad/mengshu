@@ -185,15 +185,15 @@ describe("OpenAiLlmClient - abort signal and timeout", () => {
     const client: ChatCompletionClient = {
       chat: {
         completions: {
-          async create(params) {
+          async create(_params, requestOptions) {
             // 模拟检查 signal
-            if (params.signal?.aborted) {
+            if (requestOptions?.signal?.aborted) {
               throw Object.assign(new Error("Request aborted"), { name: "AbortError" });
             }
             // 模拟异步操作中被 abort
             await new Promise((resolve, reject) => {
               const timer = setTimeout(resolve, 100);
-              params.signal?.addEventListener("abort", () => {
+              requestOptions?.signal?.addEventListener("abort", () => {
                 clearTimeout(timer);
                 reject(Object.assign(new Error("Request aborted"), { name: "AbortError" }));
               });
@@ -210,18 +210,18 @@ describe("OpenAiLlmClient - abort signal and timeout", () => {
 
     await expect(
       llm.complete([{ role: "user", content: "x" }], { signal: controller.signal }),
-    ).rejects.toThrow("Request aborted");
+    ).rejects.toMatchObject({ name: "AbortError" });
   });
 
   test("complete respects timeout option", async () => {
     const client: ChatCompletionClient = {
       chat: {
         completions: {
-          async create(params) {
+          async create(_params, requestOptions) {
             // 模拟长时间操作
             await new Promise((resolve, reject) => {
               const timer = setTimeout(resolve, 1000);
-              params.signal?.addEventListener("abort", () => {
+              requestOptions?.signal?.addEventListener("abort", () => {
                 clearTimeout(timer);
                 reject(Object.assign(new Error("Request aborted"), { name: "AbortError" }));
               });
@@ -250,8 +250,8 @@ describe("OpenAiLlmClient - abort signal and timeout", () => {
     const client: ChatCompletionClient = {
       chat: {
         completions: {
-          async create(params) {
-            receivedSignal = params.signal;
+          async create(_params, requestOptions) {
+            receivedSignal = requestOptions?.signal;
             return { choices: [{ message: { content: "ok" } }] };
           },
         },
@@ -273,13 +273,13 @@ describe("OpenAiLlmClient - abort signal and timeout", () => {
     const client: ChatCompletionClient = {
       chat: {
         completions: {
-          async create(params) {
-            if (params.signal?.aborted) {
+          async create(_params, requestOptions) {
+            if (requestOptions?.signal?.aborted) {
               throw Object.assign(new Error("Request aborted"), { name: "AbortError" });
             }
             await new Promise((resolve, reject) => {
               const timer = setTimeout(resolve, 100);
-              params.signal?.addEventListener("abort", () => {
+              requestOptions?.signal?.addEventListener("abort", () => {
                 clearTimeout(timer);
                 reject(Object.assign(new Error("Request aborted"), { name: "AbortError" }));
               });
@@ -299,7 +299,7 @@ describe("OpenAiLlmClient - abort signal and timeout", () => {
         { required: ["name"] },
         { signal: controller.signal },
       ),
-    ).rejects.toThrow("Request aborted");
+    ).rejects.toMatchObject({ name: "AbortError" });
   });
 });
 
@@ -1062,9 +1062,9 @@ describe("OpenAiLlmClient - default timeout", () => {
       chat: {
         completions: {
           // 永久挂起的请求；只有当合并后的 signal abort 时才 reject。
-          create(params) {
+          create(_params, requestOptions) {
             return new Promise((_resolve, reject) => {
-              params.signal?.addEventListener("abort", () => {
+              requestOptions?.signal?.addEventListener("abort", () => {
                 abortReason = "aborted-by-default-timeout";
                 reject(Object.assign(new Error("Request aborted"), { name: "AbortError" }));
               });
@@ -1101,9 +1101,9 @@ describe("OpenAiLlmClient - default timeout", () => {
     const client: ChatCompletionClient = {
       chat: {
         completions: {
-          create(params) {
+          create(_params, requestOptions) {
             return new Promise((_resolve, reject) => {
-              params.signal?.addEventListener("abort", () => {
+              requestOptions?.signal?.addEventListener("abort", () => {
                 aborted = true;
                 reject(Object.assign(new Error("Request aborted"), { name: "AbortError" }));
               });

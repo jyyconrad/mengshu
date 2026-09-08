@@ -18,6 +18,34 @@ function migration(version: number, name = `migration-${version}`): SchemaMigrat
 }
 
 describe("schema migration registry", () => {
+  test("v37 adds bounded governance metadata and per-event evolution consumption without rewriting v36", () => {
+    const change = SCHEMA_MIGRATIONS.find((item) => item.version === 37);
+    expect(change?.name).toBe("add-evolution-governance-and-maintenance");
+    expect(change?.kind).toBe("expand");
+    const sql = change?.statements.join("\n") ?? "";
+    for (const value of ["mengshu_evolution_reviews", "evolution_consumed_at", "evolution_origin", "evolution_review_due_at",
+      "relation_state", "root_evidence_id", "mengshu_evolution_source_dispositions", "mengshu_evolution_operation_receipts", "mengshu_evolution_budget_reservations",
+      "mengshu_evolution_host_state", "mengshu_evolution_host_receipts", "value_hash", "consumed_by", "UNIQUE (owner_key, scope_fingerprint, receipt_id)"]) expect(sql).toContain(value);
+    expect(sql).not.toMatch(/\b(?:DELETE|TRUNCATE|UPDATE|DROP)\b/i);
+    expect(sql).toContain("octet_length");
+    expect(sql).not.toContain("source_text");
+    expect(SCHEMA_MIGRATIONS.find((item) => item.version === 36)?.name).toBe("add-memory-evolution-batches");
+  });
+  test("v36 isolates evolution state, receipts and processed fingerprints without canonical evidence writes", () => {
+    const migration = SCHEMA_MIGRATIONS.find((item) => item.version === 36);
+    expect(migration?.name).toBe("add-memory-evolution-batches");
+    const sql = migration?.statements.join("\n") ?? "";
+    for (const name of ["mengshu_evolution_batches", "mengshu_evolution_apply_receipts", "mengshu_evolution_processed_inputs"]) {
+      expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${name}`);
+    }
+    expect(sql).toContain("fencing_token BIGINT");
+    expect(sql).toContain("UNIQUE (scope_fingerprint, idempotency_key)");
+    expect(sql).toContain("PRIMARY KEY (scope_fingerprint, input_fingerprint, action)");
+    expect(sql).toContain("octet_length");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME|INSERT)\b/i);
+    expect(sql).not.toContain("ALTER TABLE mengshu_memory_evidence_links");
+  });
+
   test("v35 persists content-free purge retry requests with backoff state", () => {
     const v35 = SCHEMA_MIGRATIONS.find((item) => item.version === 35);
     const sql = v35?.statements.join("\n") ?? "";

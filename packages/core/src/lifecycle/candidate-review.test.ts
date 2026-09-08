@@ -42,6 +42,23 @@ describe("candidate-review public candidateToMemoryRecord", () => {
 });
 
 describe("CandidateReviewService approval capability", () => {
+  test.each([{ version: 1, operation: "evolve" }, null, false])(
+    "ordinary approvals reject isolated evolution metadata: %j",
+    async (evolution) => {
+      const isolated = { ...candidate, metadata: { evolution } };
+      const setStatus = vi.fn();
+      const promoteCandidate = vi.fn();
+      const service = new CandidateReviewService({
+        repository: { get: async () => isolated, list: async () => [isolated], setStatus },
+        promoteCandidate,
+      });
+      await expect(service.review({ action: "approve_by_filter", filter: {} }))
+        .resolves.toEqual({ affected: 0, promoted: [], errors: [`evolution_review_required:${candidate.id}`] });
+      expect(promoteCandidate).not.toHaveBeenCalled();
+      expect(setStatus).not.toHaveBeenCalled();
+    },
+  );
+
   test("缺少 promotion capability 时在任何状态写入前 fail-closed", async () => {
     const setStatus = vi.fn(async () => undefined);
     const service = new CandidateReviewService({

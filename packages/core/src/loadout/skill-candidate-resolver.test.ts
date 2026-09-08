@@ -44,6 +44,18 @@ function score() {
 }
 
 describe("resolveSkillLoadoutCandidate", () => {
+  test("never relabels a Skill artifact with the caller scope or routes an unreviewed draft", () => {
+    const breakdown = score();
+    const candidate = resolveSkillLoadoutCandidate({ read: read(), scope: { ...scope, appId: "other" },
+      score: breakdown.score, scoreBreakdown: breakdown, tokenEstimate: 30 });
+    expect(candidate.scope).toEqual(scope);
+    expect(candidate.lifecycleEligible).toBe(false);
+    for (const status of ["draft", "review", "revoked"] as const) {
+      expect(resolveSkillLoadoutCandidate({ read: { ...read(), artifact: { ...read().artifact, status } },
+        scope, score: breakdown.score, scoreBreakdown: breakdown, tokenEstimate: 30 }).lifecycleEligible).toBe(false);
+    }
+  });
+
   test("published suggest-only Skill can bind only to experience/resource with governed score", async () => {
     const breakdown = score();
     const candidate = resolveSkillLoadoutCandidate({

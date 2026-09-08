@@ -39,11 +39,19 @@ export type PostgresMemoryWriteKernelMutation = (
   memory: WriteMemoryRecord,
 ) => Promise<{ memoryId: string; stored: boolean }>;
 
+/** Only provider composition supplies these hooks; both run on the kernel's dedicated transaction client. */
+export interface PostgresMemoryWriteKernelTransactionHooks {
+  afterBegin?(client: PostgresMemoryWriteKernelClient): Promise<void>;
+  beforeMutation?(client: PostgresMemoryWriteKernelClient, memory: WriteMemoryRecord): Promise<void>;
+  afterReceipt?(client: PostgresMemoryWriteKernelClient, receipt: NormalizedMemoryWriteReceipt, memory: WriteMemoryRecord): Promise<void>;
+}
+
 export interface ProviderOwnedMemoryWriteKernelTransactionPort {
   transaction<T>(work: (context: MemoryWriteTransactionContext) => Promise<T>): Promise<T>;
 }
 
 const providerOwnedPorts = new WeakSet<object>();
+const providerHooks = new WeakMap<object, PostgresMemoryWriteKernelTransactionHooks>();
 const SHA256 = /^[a-f0-9]{64}$/;
 const CANDIDATE_ROUTES = new Set<WriteAdmissionRoute>([
   "candidate_low_priority",
@@ -68,6 +76,31 @@ type TransactionStage =
 
 const SQLSTATE = /^[0-9A-Z]{5}$/;
 
+export interface PostgresMemoryWriteKernelFailureDiagnostic {
+  readonly phase: TransactionStage | "connect" | "rollback" | "cleanup";
+  readonly code: "TRANSACTION_FAILED" | "TRANSACTION_CONTRACT" | "CONNECTION_FAILED" | "ROLLBACK_FAILED" | "CLEANUP_FAILED";
+  readonly sqlState?: string;
+}
+
+// Diagnostics stay off thrown/public error objects and never retain the provider cause.
+const transactionDiagnostics = new WeakMap<object, Readonly<PostgresMemoryWriteKernelFailureDiagnostic>>();
+
+export function getPostgresMemoryWriteKernelFailureDiagnostic(error: unknown): Readonly<PostgresMemoryWriteKernelFailureDiagnostic> | undefined {
+  return error !== null && typeof error === "object" ? transactionDiagnostics.get(error) : undefined;
+}
+
+function sqlStateOf(error: unknown): string | undefined {
+  try {
+    const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+    return typeof code === "string" && SQLSTATE.test(code) ? code : undefined;
+  } catch { return undefined; }
+}
+
+function diagnose<T extends Error>(error: T, phase: PostgresMemoryWriteKernelFailureDiagnostic["phase"], code: PostgresMemoryWriteKernelFailureDiagnostic["code"], sqlState?: string): T {
+  transactionDiagnostics.set(error, Object.freeze({ phase, code, ...(sqlState ? { sqlState } : {}) }));
+  return error;
+}
+
 export class PostgresMemoryWriteKernelTransactionError extends Error {
   override readonly name = "PostgresMemoryWriteKernelTransactionError";
 
@@ -80,22 +113,24 @@ export class PostgresMemoryWriteKernelTransactionError extends Error {
 }
 
 function transactionFailure(stage: TransactionStage, cause: unknown) {
-  const rawCode = cause && typeof cause === "object"
-    ? (cause as { code?: unknown }).code
-    : undefined;
-  const sqlState = typeof rawCode === "string" && SQLSTATE.test(rawCode)
-    ? `_${rawCode}`
-    : "";
-  return new PostgresMemoryWriteKernelTransactionError(
-    `MEMORY_WRITE_TX_${stage.toUpperCase()}_FAILED${sqlState}`,
+  const sqlState = sqlStateOf(cause);
+  return diagnose(new PostgresMemoryWriteKernelTransactionError(
+    `MEMORY_WRITE_TX_${stage.toUpperCase()}_FAILED${sqlState ? `_${sqlState}` : ""}`,
     `Postgres memory write kernel transaction failed at ${stage.replaceAll("_", " ")}`,
-  );
+  ), stage, "TRANSACTION_FAILED", sqlState);
 }
 
 export function isProviderOwnedMemoryWriteKernelTransactionPort(
   value: unknown,
 ): value is ProviderOwnedMemoryWriteKernelTransactionPort {
   return typeof value === "object" && value !== null && providerOwnedPorts.has(value);
+}
+
+export function isProviderOwnedMemoryWriteKernelTransactionWithHooks(
+  value: unknown,
+  hooks: PostgresMemoryWriteKernelTransactionHooks,
+): value is ProviderOwnedMemoryWriteKernelTransactionPort {
+  return isProviderOwnedMemoryWriteKernelTransactionPort(value) && providerHooks.get(value) === hooks;
 }
 
 class TransactionContractError extends Error {}
@@ -280,11 +315,13 @@ implements ProviderOwnedMemoryWriteKernelTransactionPort {
   constructor(
     private readonly pool: PostgresMemoryWriteKernelPool,
     private readonly mutate: PostgresMemoryWriteKernelMutation,
+    private readonly hooks: PostgresMemoryWriteKernelTransactionHooks = {},
   ) {
     if (!pool || typeof pool.connect !== "function" || typeof mutate !== "function") {
       throw new Error("Postgres memory write kernel transaction dependencies are required");
     }
     providerOwnedPorts.add(this);
+    providerHooks.set(this, hooks);
   }
 
   async transaction<T>(
@@ -296,8 +333,8 @@ implements ProviderOwnedMemoryWriteKernelTransactionPort {
     let client: PostgresMemoryWriteKernelClient;
     try {
       client = await this.pool.connect();
-    } catch {
-      throw new Error("Postgres memory write kernel connection failed");
+    } catch (error) {
+      throw diagnose(new Error("Postgres memory write kernel connection failed"), "connect", "CONNECTION_FAILED", sqlStateOf(error));
     }
     let begun = false;
     let committed = false;
@@ -368,6 +405,7 @@ WHERE storage_key = $1`,
         }
         assertScopeOwner(memory.scope, identity);
         const recordType = recordTypeOf(memory);
+        await this.hooks.beforeMutation?.(client, memory);
         const result = await this.mutate(client, memory);
         if (!result || typeof result.memoryId !== "string" || result.memoryId.length === 0 ||
             typeof result.stored !== "boolean") {
@@ -528,6 +566,7 @@ WHERE storage_key = $1`,
               validated.requestFingerprint, JSON.stringify(validated.result)],
           );
         }
+        await this.hooks.afterReceipt?.(client, validated, mutation.memory);
         state.receiptWritten = true;
         stage = "callback";
       },
@@ -536,6 +575,7 @@ WHERE storage_key = $1`,
     try {
       await client.query("BEGIN");
       begun = true;
+      await this.hooks.afterBegin?.(client);
       stage = "callback";
       const result = await work(context);
       if (state.mutation && !state.receiptWritten) {
@@ -550,25 +590,28 @@ WHERE storage_key = $1`,
       if (begun && !committed) {
         try {
           await client.query("ROLLBACK");
-        } catch {
-          failure = new PostgresMemoryWriteKernelTransactionError(
+        } catch (error) {
+          failure = diagnose(new PostgresMemoryWriteKernelTransactionError(
             "MEMORY_WRITE_TX_ROLLBACK_FAILED",
             "Postgres memory write kernel transaction and rollback failed",
-          );
+          ), "rollback", "ROLLBACK_FAILED", sqlStateOf(error));
         }
       }
-      if (failure instanceof TransactionContractError) throw failure;
-      if (failure instanceof PostgresMemoryWriteKernelTransactionError) throw failure;
+      if (failure instanceof TransactionContractError) throw diagnose(failure, stage, "TRANSACTION_CONTRACT");
+      if (failure instanceof PostgresMemoryWriteKernelTransactionError) {
+        if (!transactionDiagnostics.has(failure)) diagnose(failure, stage, "TRANSACTION_FAILED");
+        throw failure;
+      }
       throw transactionFailure(stage, failure);
     } finally {
       try {
         client.release();
-      } catch {
+      } catch (error) {
         if (!failure && committed) {
-          throw new PostgresMemoryWriteKernelTransactionError(
+          throw diagnose(new PostgresMemoryWriteKernelTransactionError(
             "MEMORY_WRITE_TX_CLEANUP_FAILED",
             "Postgres memory write kernel transaction committed but connection cleanup failed",
-          );
+          ), "cleanup", "CLEANUP_FAILED", sqlStateOf(error));
         }
       }
     }

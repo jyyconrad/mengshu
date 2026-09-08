@@ -22,6 +22,12 @@ import type {
   RecordProvenance,
 } from "../domain/types.js";
 import { matchesContentHash } from "../scoring/hash-utils.js";
+import { hasEvolutionReadHold } from "./governed-retrieval-engine.js";
+import {
+  authorizeReuseRecord,
+  requiresExplicitReuseGrant,
+  type ExplicitReuseReadOptions,
+} from "../evolution/reuse/reuse-read-access.js";
 import type {
   GovernedRetrievalCandidate,
   GovernedRetrievalHydration,
@@ -103,10 +109,15 @@ const CURRENT_MEMORY_VERSION_SQL = `(lineage_id IS NULL OR id = (
     AND (current_version.valid_to IS NULL OR current_version.valid_to > CURRENT_TIMESTAMP)
     AND current_version.temporal_invalidated IS NOT TRUE
     AND current_version.temporal_purge_pending IS NOT TRUE
+    AND current_version.evolution_alias_of IS NULL
     AND ((current_version.lifecycle_status = 'active'
         AND current_version.temporal_activation_state = 'active')
       OR (current_version.lifecycle_status = 'archived'
-        AND current_version.temporal_activation_state = 'staged'))
+        AND current_version.temporal_activation_state = 'staged')
+      OR (current_version.lifecycle_status = 'archived'
+        AND current_version.temporal_activation_state = 'active'
+        AND current_version.metadata->>'admissionRoute' = 'lookup_only'
+        AND current_version.metadata->>'contextEligible' = 'false'))
   ORDER BY current_version.valid_from DESC, current_version.revision DESC
   LIMIT 1
 ))`;
@@ -131,6 +142,7 @@ const READ_MEMORY_SQL = `SELECT
   ${MEMORY_SESSION_SQL} AS session_id,
   ${EFFECTIVE_MEMORY_LIFECYCLE_SQL} AS lifecycle_status,
   legacy_quarantine_reason,
+  evolution_disputed,
   metadata
 FROM memories
 WHERE tenant_id = $1
@@ -149,10 +161,13 @@ WHERE tenant_id = $1
   AND legacy_quarantine_reason IS NULL
   AND temporal_invalidated IS NOT TRUE
   AND temporal_purge_pending IS NOT TRUE
-  AND (lineage_id IS NULL OR (
-    valid_from <= CURRENT_TIMESTAMP
-    AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
-  ))
+  AND evolution_disputed IS NOT TRUE
+  AND COALESCE(jsonb_typeof(metadata #> '{governance,evolution}'), 'object') = 'object'
+  AND COALESCE(metadata #> '{governance,evolution,disputed}', 'false'::jsonb) = 'false'::jsonb
+  AND COALESCE(metadata #> '{governance,evolution,needsReview}', 'false'::jsonb) = 'false'::jsonb
+  AND (valid_to IS NULL OR valid_to > CURRENT_TIMESTAMP)
+  AND evolution_alias_of IS NULL
+  AND (lineage_id IS NULL OR valid_from <= CURRENT_TIMESTAMP)
   AND ${CURRENT_MEMORY_VERSION_SQL}
   AND (
     metadata->>'sessionId' IS NULL
@@ -393,8 +408,10 @@ function decodeMemory(
   scope: CanonicalAuthorityScope,
   authoritativeRecordId: string,
 ): DecodedMemory | undefined {
-  const row = exactRow(value, MEMORY_ROW_KEYS);
+  const row = exactRow(value, [...MEMORY_ROW_KEYS, "evolution_disputed"] as const) ??
+    exactRow(value, MEMORY_ROW_KEYS);
   if (!row || row.id !== authoritativeRecordId || !sameScopeRow(row, scope) ||
+      ("evolution_disputed" in row && row.evolution_disputed !== false && row.evolution_disputed !== null) ||
       typeof row.text !== "string" || row.text.trim().length === 0 ||
       typeof row.content_hash !== "string" || !matchesContentHash(row.text, row.content_hash) ||
       !score(row.importance) || typeof row.category !== "string" ||
@@ -406,7 +423,7 @@ function decodeMemory(
   if (createdAt === undefined || updatedAt === undefined || updatedAt < createdAt) return invalid();
 
   const metadata = dataRecord(row.metadata);
-  if (!metadata) return invalid();
+  if (!metadata || hasEvolutionReadHold(metadata)) return invalid();
   const governance = dataRecord(metadata.governance);
   const candidate = governance && dataRecord(governance.candidate);
   const candidateEvidence = candidate && dataRecord(candidate.evidence);
@@ -598,7 +615,10 @@ function scopeParams(
 }
 
 export class PostgresGovernedRetrievalHydrator implements GovernedRetrievalHydrator {
-  constructor(private readonly client: PostgresGovernedRetrievalHydrationClient) {
+  constructor(
+    private readonly client: PostgresGovernedRetrievalHydrationClient,
+    private readonly options: ExplicitReuseReadOptions = {},
+  ) {
     if (!client || typeof client.query !== "function") {
       throw new TypeError("Postgres governed retrieval hydration client is required");
     }
@@ -610,6 +630,14 @@ export class PostgresGovernedRetrievalHydrator implements GovernedRetrievalHydra
     const scope = canonicalCandidateScope(input);
     if (!scope) return invalid();
     throwIfAborted(input.signal);
+    const source = input.candidates[0]!.scope;
+    if (!input.scope || source.tenantId !== input.scope.tenantId || source.userId !== input.scope.userId) {
+      return invalid();
+    }
+    const before = requiresExplicitReuseGrant(source, input.scope)
+      ? await this.options.reuseAuthorizer?.authorize(source, input.scope)
+      : undefined;
+    if (requiresExplicitReuseGrant(source, input.scope) && !before) return invalid();
     const memoryResult = await this.client.query(
       READ_MEMORY_SQL,
       scopeParams(scope, input.authoritativeRecordId),
@@ -618,6 +646,8 @@ export class PostgresGovernedRetrievalHydrator implements GovernedRetrievalHydra
     if (!validResult(memoryResult) || memoryResult.rows.length !== 1) return invalid();
     const memory = decodeMemory(memoryResult.rows[0], scope, input.authoritativeRecordId);
     if (!memory) return invalid();
+    const access = await authorizeReuseRecord(memory.record, input.scope, this.options);
+    if (!access) return invalid();
 
     const evidenceResult = await this.client.query(READ_EVIDENCE_SQL, [
       ...scopeParams(scope, input.authoritativeRecordId),
@@ -632,6 +662,10 @@ export class PostgresGovernedRetrievalHydrator implements GovernedRetrievalHydra
       memory.directEvidenceIds,
     );
     if (!evidenceIds) return invalid();
+    if (before && !await this.options.reuseAuthorizer?.revalidate(before)) return invalid();
+    if (access.permit && !await this.options.reuseAuthorizer?.revalidate(access.permit, memory.record.kind)) {
+      return invalid();
+    }
     return Object.freeze({
       record: Object.freeze({ ...memory.record, sourceNodeIds: [...evidenceIds] }),
       evidenceIds,

@@ -37,7 +37,23 @@ import {
   PostgresMemoryWriteKernelTransactionPort,
   type PostgresMemoryWriteKernelClient,
   type ProviderOwnedMemoryWriteKernelTransactionPort,
+  type PostgresMemoryWriteKernelTransactionHooks,
 } from "../../service/write-kernel-postgres-transaction.js";
+import type { MemoryWriteKernelDependencies } from "../../service/write-kernel.js";
+import { PostgresEvolutionRepository } from "../../evolution/postgres-repository.js";
+import { authorityScopeFingerprint } from "../../domain/authority-scope-fingerprint.js";
+import { PostgresEvolutionInventoryReadPort } from "../../evolution/postgres-inventory.js";
+import { PostgresEvolutionRelatedTargets } from "../../evolution/postgres-related-targets.js";
+import { PostgresEvolutionSourceReconciliationPort, type PostgresEvolutionAdministrativeReviewGuard } from "../../evolution/postgres-source-reconciliation.js";
+import { PostgresEvolutionGovernanceUndoPort, type PostgresEvolutionGovernanceUndoRequest } from "../../evolution/postgres-governance-undo.js";
+import type { SourceReconciliationPort } from "../../evolution/sources/reconciliation-types.js";
+import { budgetEvolutionControlPool } from "../../storage/repositories/evolution-control-budget.js";
+import type { ExplicitReuseReadOptions } from "../../evolution/reuse/reuse-read-access.js";
+import {
+  PostgresEvolutionGovernedWriter, type PostgresEvolutionGovernedWriterOptions,
+  type PostgresEvolutionVerifiedInput,
+} from "../../evolution/governed-writer.js";
+import { POSTGRES_EVOLUTION_GOVERNANCE_SCHEMA_VERSION, type PostgresEvolutionPool } from "../../evolution/postgres-common.js";
 import {
   PostgresSessionWorkingSetRepository,
   type PostgresWorkingSetClient,
@@ -103,8 +119,13 @@ import {
 } from "../../storage/repositories/postgres-job-v2.js";
 import {
   DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
+  DURABLE_JOB_V2_EVOLUTION_TYPES,
+  type DurableJobV2AuthoritativeTypes,
+  type DurableJobV2,
   createDurableJobHandlerRegistry,
 } from "../../storage/repositories/job-v2.js";
+import { fenceEvolutionPool } from "../../storage/repositories/job-v2-evolution-fence.js";
+import { boundEvolutionPool } from "../../storage/repositories/evolution-query-pool.js";
 import {
   PostgresDurableJobV2EffectRepository,
   PostgresDurableJobV2EffectError,
@@ -329,7 +350,10 @@ export interface PostgresDurableJobV2RuntimeReadiness {
 export interface PostgresDurableJobV2RuntimeBundle {
   readonly contract: "mengshu.postgres-durable-job-v2/v1";
   readonly repository: PostgresDurableJobV2Repository;
-  readonly handlerTypes: typeof DURABLE_JOB_V2_AUTHORITATIVE_TYPES;
+  readonly handlerTypes: DurableJobV2AuthoritativeTypes;
+  readonly createEvolutionPersistence?: (
+    scope: MemoryScope, options: PostgresEvolutionPersistenceOptions,
+  ) => PostgresEvolutionPersistence;
   readonly executeCandidateEffect: (
     request: PostgresCandidateEffectRequest,
   ) => Promise<PostgresDurableJobV2EffectResult<PostgresCandidateEffectSummary>>;
@@ -361,14 +385,42 @@ export interface PostgresDurableJobV2RuntimeBundle {
   readonly close: () => Promise<void>;
 }
 
+export interface PostgresEvolutionPersistenceOptions {
+  readonly job?: DurableJobV2;
+  readonly signal?: AbortSignal;
+  readonly kernelDependencies?: (verified: PostgresEvolutionVerifiedInput) => Omit<MemoryWriteKernelDependencies, "transaction">;
+  readonly writer?: Omit<PostgresEvolutionGovernedWriterOptions, "repository" | "createKernel">;
+}
+export interface PostgresEvolutionPersistence {
+  readonly repository: PostgresEvolutionRepository;
+  readonly inventory: PostgresEvolutionInventoryReadPort;
+  readonly relatedTargets: PostgresEvolutionRelatedTargets;
+  readonly writer: PostgresEvolutionGovernedWriter;
+  readonly assertReady: () => Promise<void>;
+  readonly evidenceTransactionPort: ProviderOwnedMemoryWriteKernelTransactionPort;
+  readonly createControlPorts: (input: {
+    limits: { maxRecords: number; maxBytes: number }; signal?: AbortSignal;
+    authorizeAdministrativeReview?: PostgresEvolutionAdministrativeReviewGuard;
+  }) => PostgresEvolutionControlPorts;
+}
+export interface PostgresEvolutionControlPorts {
+  readonly previewUndo: (input: { operationReceiptId: string }) => ReturnType<PostgresEvolutionGovernanceUndoPort["previewUndo"]>;
+  readonly undo: (input: Omit<PostgresEvolutionGovernanceUndoRequest, "scope">) => ReturnType<PostgresEvolutionGovernanceUndoPort["undo"]>;
+  readonly source: (sourceId: string, configFingerprint: string) => SourceReconciliationPort;
+}
+
 export interface PostgresDurableJobV2RuntimeBundleDependencies {
   readonly clock: () => number;
   readonly tokenFactory: () => string;
   readonly backoffMs: (attempts: number) => number;
   readonly effectClock?: () => number;
+  readonly enableMemoryEvolution?: boolean;
 }
 
 const POSTGRES_DURABLE_RUNTIME_BUNDLE_OWNERS = new WeakMap<object, PostgresProvider>();
+const POSTGRES_EVOLUTION_PERSISTENCE_OWNERS = new WeakMap<object, {
+  provider: PostgresProvider; scopeFingerprint: string; jobFence?: string;
+}>();
 const POSTGRES_ENTITY_GRAPH_QUERY_HITS_OWNERS = new WeakMap<object, PostgresProvider>();
 const POSTGRES_GOVERNED_RETRIEVAL_HYDRATOR_OWNERS = new WeakMap<object, PostgresProvider>();
 const POSTGRES_GOVERNED_RETRIEVAL_CANDIDATE_SOURCE_OWNERS =
@@ -419,6 +471,26 @@ export function assertPostgresProviderOwnsDurableJobV2RuntimeBundle(
     bundleError("DURABLE_RUNTIME_BUNDLE_INVALID");
   }
   return bundle;
+}
+
+export function assertPostgresBundleOwnsEvolutionPersistence(
+  runtimeBundle: PostgresDurableJobV2RuntimeBundle,
+  value: unknown,
+  scope: MemoryScope,
+  job?: DurableJobV2,
+): PostgresEvolutionPersistence {
+  const bundle = assertProviderOwnedPostgresDurableJobV2RuntimeBundle(runtimeBundle);
+  const owner = value && typeof value === "object" ? POSTGRES_EVOLUTION_PERSISTENCE_OWNERS.get(value) : undefined;
+  if (!owner || owner.provider !== POSTGRES_DURABLE_RUNTIME_BUNDLE_OWNERS.get(bundle) ||
+      owner.scopeFingerprint !== authorityScopeFingerprint(scope) ||
+      owner.jobFence !== evolutionJobFenceIdentity(job)) {
+    bundleError("DURABLE_RUNTIME_BUNDLE_INVALID");
+  }
+  return value as PostgresEvolutionPersistence;
+}
+
+function evolutionJobFenceIdentity(job?: DurableJobV2): string | undefined {
+  return job && JSON.stringify([job.id, job.leaseOwner, job.leaseToken, job.leaseGeneration]);
 }
 
 export function assertProviderOwnedPostgresEffectRepository(
@@ -729,7 +801,7 @@ function snapshotDurableRuntimeBundleDependencies(
     bundleError("DURABLE_RUNTIME_BUNDLE_INVALID");
   }
   const required = ["clock", "tokenFactory", "backoffMs"] as const;
-  const allowed = new Set<string>([...required, "effectClock"]);
+  const allowed = new Set<string>([...required, "effectClock", "enableMemoryEvolution"]);
   const keys = Reflect.ownKeys(value);
   if (keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
       required.some((key) => !keys.includes(key))) {
@@ -748,7 +820,11 @@ function snapshotDurableRuntimeBundleDependencies(
       (Object.hasOwn(snapshot, "effectClock") && typeof snapshot.effectClock !== "function")) {
     bundleError("DURABLE_RUNTIME_BUNDLE_INVALID");
   }
+  if (Object.hasOwn(snapshot, "enableMemoryEvolution") && typeof snapshot.enableMemoryEvolution !== "boolean") {
+    bundleError("DURABLE_RUNTIME_BUNDLE_INVALID");
+  }
   return Object.freeze({
+    ...(snapshot.enableMemoryEvolution === true ? { enableMemoryEvolution: true } : {}),
     clock: snapshot.clock as () => number,
     tokenFactory: snapshot.tokenFactory as () => string,
     backoffMs: snapshot.backoffMs as (attempts: number) => number,
@@ -1898,8 +1974,17 @@ FROM "${table}"`);
    * route -> 主库/候选区的纯映射由 write-kernel-mapping 负责；两条写入路径
    * 都使用 transaction port 传入的同一个 dedicated client。
    */
-  createMemoryWriteKernelTransactionPort(): ProviderOwnedMemoryWriteKernelTransactionPort {
-    return new PostgresMemoryWriteKernelTransactionPort({
+  createMemoryWriteKernelTransactionPort(
+    hooks: PostgresMemoryWriteKernelTransactionHooks = {},
+  ): ProviderOwnedMemoryWriteKernelTransactionPort {
+    return this.#createMemoryWriteKernelTransactionPort(hooks);
+  }
+
+  #createMemoryWriteKernelTransactionPort(
+    hooks: PostgresMemoryWriteKernelTransactionHooks,
+    poolOverride?: PostgresEvolutionPool,
+  ): ProviderOwnedMemoryWriteKernelTransactionPort {
+    return new PostgresMemoryWriteKernelTransactionPort(poolOverride ?? {
       connect: async (): Promise<PostgresMemoryWriteKernelClient> => {
         await this.initialize();
         this.assertSchemaVersion(14, "memory write kernel transaction");
@@ -1983,7 +2068,101 @@ FROM "${table}"`);
         throw new Error("Postgres memory write kernel returned an invalid memory result");
       }
       return { memoryId: result.persistedId, stored: result.stored };
+    }, hooks);
+  }
+
+  async assertEvolutionReady(): Promise<void> {
+    const result = await boundEvolutionPool(this.#evolutionQuerySource()).query(`SELECT
+      to_regclass('mengshu_evolution_batches') IS NOT NULL AS batches,
+      to_regclass('mengshu_evolution_apply_receipts') IS NOT NULL AS receipts,
+      to_regclass('mengshu_evolution_processed_inputs') IS NOT NULL AS processed,
+      to_regclass('mengshu_evolution_reviews') IS NOT NULL AS reviews,
+      to_regclass('mengshu_evolution_source_dispositions') IS NOT NULL AS sources,
+      to_regclass('mengshu_evolution_operation_receipts') IS NOT NULL AS operations,
+      to_regclass('mengshu_evolution_budget_reservations') IS NOT NULL AS budgets,
+      to_regclass('mengshu_evolution_host_state') IS NOT NULL AS host_state,
+      to_regclass('mengshu_evolution_host_receipts') IS NOT NULL AS host_receipts`);
+    if (["batches", "receipts", "processed", "reviews", "sources", "operations", "budgets", "host_state", "host_receipts"]
+      .some(table => result.rows[0]?.[table] !== true)) {
+      throw new Error("EVOLUTION_SCHEMA_CAPABILITY_UNAVAILABLE");
+    }
+  }
+
+  #evolutionQuerySource(): PostgresEvolutionPool {
+    const ready = async () => {
+      await this.initialize();
+      this.assertSchemaVersion(POSTGRES_EVOLUTION_GOVERNANCE_SCHEMA_VERSION, "continuous memory evolution");
+    };
+    return {
+      query: async <Row extends Record<string, unknown> = Record<string, unknown>>(sql: string, params: readonly unknown[] = []) => {
+        await ready();
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Row[], rowCount: result.rowCount };
+      },
+      connect: async () => {
+        await ready();
+        const client = await this.pool!.connect();
+        return {
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(sql: string, params: readonly unknown[] = []) => {
+            const result = await client.query(sql, [...params]);
+            return { rows: result.rows as Row[], rowCount: result.rowCount };
+          },
+          release: (error?: Error) => client.release(error),
+        };
+      },
+    };
+  }
+
+  createEvolutionPersistence(scope: MemoryScope, options: PostgresEvolutionPersistenceOptions = {}): PostgresEvolutionPersistence {
+    const scopeFingerprint = authorityScopeFingerprint(scope);
+    scope = structuredClone(scope);
+    const kernelDependencies = options.kernelDependencies;
+    const controlJob = options.job && structuredClone(options.job);
+    const sourcePool = this.#evolutionQuerySource();
+    if (options.job && Object.entries(options.job.scope).some(([key, value]) => scope[key as keyof MemoryScope] !== value)) {
+      throw new Error("EVOLUTION_JOB_SCOPE_MISMATCH");
+    }
+    const unfencedPool = boundEvolutionPool(sourcePool, options.signal);
+    const pool = options.job ? fenceEvolutionPool(sourcePool, options.job, options.signal) : unfencedPool;
+    const repository = new PostgresEvolutionRepository({ pool, scope });
+    // Source verification may run while the writer holds the job row. These reads
+    // must not start a second fenced transaction; the writer locks targets/raw evidence itself.
+    const inventory = new PostgresEvolutionInventoryReadPort({ client: { query: unfencedPool.query }, scope, repository });
+    const relatedTargets = new PostgresEvolutionRelatedTargets({ client: { query: unfencedPool.query }, scope });
+    const writer = new PostgresEvolutionGovernedWriter({
+      ...options.writer, repository,
+      ...(kernelDependencies ? { createKernel: (hooks, verified) => ({
+        dependencies: kernelDependencies(verified),
+        transactionPort: this.#createMemoryWriteKernelTransactionPort(hooks, pool),
+      }) } : {}),
     });
+    const createControlPorts: PostgresEvolutionPersistence["createControlPorts"] = control => {
+      const signals = [options.signal, control.signal].filter((value): value is AbortSignal => value !== undefined);
+      const signal = signals.length ? AbortSignal.any(signals) : undefined;
+      const budgetPool = budgetEvolutionControlPool(sourcePool, control.limits);
+      const readPool = boundEvolutionPool(budgetPool, signal);
+      const mutationPool = controlJob ? fenceEvolutionPool(budgetPool, controlJob, signal) : readPool;
+      const controlRepository = new PostgresEvolutionRepository({ scope, pool: mutationPool });
+      const undo = new PostgresEvolutionGovernanceUndoPort({ repository: controlRepository, readClient: readPool,
+        authorizeAdministrativeReview: control.authorizeAdministrativeReview });
+      const requireJob = () => { if (!controlJob) throw new Error("CONTROL_JOB_REQUIRED"); };
+      return Object.freeze({
+        previewUndo: request => undo.previewUndo({ ...request, scope }),
+        undo: async request => { requireJob(); return undo.undo({ ...request, scope }); },
+        source: (sourceId, configFingerprint) => {
+          requireJob();
+          return new PostgresEvolutionSourceReconciliationPort({ repository: controlRepository, sourceId, configFingerprint,
+            authorizeAdministrativeReview: control.authorizeAdministrativeReview });
+        },
+      } satisfies PostgresEvolutionControlPorts);
+    };
+    const persistence = Object.freeze({ repository, inventory, relatedTargets, writer, createControlPorts, assertReady: () => this.assertEvolutionReady(),
+      evidenceTransactionPort: this.#createMemoryWriteKernelTransactionPort({}, pool),
+    });
+    POSTGRES_EVOLUTION_PERSISTENCE_OWNERS.set(persistence, {
+      provider: this, scopeFingerprint, jobFence: evolutionJobFenceIdentity(options.job),
+    });
+    return persistence;
   }
 
   /** M1 exact-scope temporal version chain; future staging requires schema v34. */
@@ -2391,7 +2570,7 @@ FROM "${table}"`);
   }
 
   /** v15 governed retrieval hydration；只暴露权威回读，不暴露 provider client/lifecycle。 */
-  createGovernedRetrievalHydrator(): ProviderOwnedPostgresGovernedRetrievalHydrator {
+  createGovernedRetrievalHydrator(options: ExplicitReuseReadOptions = {}): ProviderOwnedPostgresGovernedRetrievalHydrator {
     const delegate = new PostgresGovernedRetrievalHydrator({
       query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
         sql: string,
@@ -2402,7 +2581,7 @@ FROM "${table}"`);
         const result = await this.pool!.query(sql, [...params]);
         return { rows: result.rows as Row[], rowCount: result.rowCount };
       },
-    });
+    }, options);
     const port = Object.freeze({
       contract: "mengshu.postgres-governed-retrieval-hydrator/v1" as const,
       hydrate: (input: PostgresGovernedRetrievalHydrationRequest) => delegate.hydrate(input),
@@ -2412,7 +2591,7 @@ FROM "${table}"`);
   }
 
   /** v15 multi-route candidate producer; final policy and scoring stay in GovernedRetrievalEngine. */
-  createGovernedRetrievalCandidateSource(): ProviderOwnedPostgresGovernedRetrievalCandidateSource {
+  createGovernedRetrievalCandidateSource(options: ExplicitReuseReadOptions = {}): ProviderOwnedPostgresGovernedRetrievalCandidateSource {
     const delegate = new PostgresGovernedRetrievalCandidateSource({
       query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
         sql: string,
@@ -2421,7 +2600,7 @@ FROM "${table}"`);
         const result = await this.pool!.query(sql, [...params]);
         return { rows: result.rows as Row[], rowCount: result.rowCount };
       },
-    });
+    }, options);
     const port = Object.freeze({
       contract: "mengshu.postgres-governed-retrieval-candidate-source/v1" as const,
       search: async (input: PostgresGovernedRetrievalCandidateSearchInput) => {
@@ -2464,8 +2643,10 @@ FROM "${table}"`);
     rawDependencies: PostgresDurableJobV2RuntimeBundleDependencies,
   ): PostgresDurableJobV2RuntimeBundle {
     const dependencies = snapshotDurableRuntimeBundleDependencies(rawDependencies);
+    const handlerTypes = dependencies.enableMemoryEvolution === true
+      ? DURABLE_JOB_V2_EVOLUTION_TYPES : DURABLE_JOB_V2_AUTHORITATIVE_TYPES;
     const repository = this.#createDurableJobV2Repository({
-      registry: createDurableJobHandlerRegistry(DURABLE_JOB_V2_AUTHORITATIVE_TYPES),
+      registry: createDurableJobHandlerRegistry(handlerTypes),
       clock: dependencies.clock,
       tokenFactory: dependencies.tokenFactory,
       backoffMs: dependencies.backoffMs,
@@ -2493,7 +2674,11 @@ FROM "${table}"`);
     const bundle = Object.freeze({
       contract: "mengshu.postgres-durable-job-v2/v1" as const,
       repository,
-      handlerTypes: DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
+      handlerTypes,
+      ...(dependencies.enableMemoryEvolution === true ? {
+        createEvolutionPersistence: (scope: MemoryScope, options: PostgresEvolutionPersistenceOptions) =>
+          this.createEvolutionPersistence(scope, options),
+      } : {}),
       executeCandidateEffect: (request: PostgresCandidateEffectRequest) =>
         this.#executeCandidateEffect(request, effectDependencies),
       executeGraphEffect: (request: PostgresExtractGraphEffectRequest) =>
@@ -2512,8 +2697,16 @@ FROM "${table}"`);
         canonicalEntityCentrality.refresh(input),
       readCanonicalEntityTopicFacts: (input: CanonicalEntityTopicReadInput) =>
         canonicalEntityTopicRead.read(input),
-      assertEnqueueReady: () => this.#assertDurableJobV2EnqueueReady(),
-      assertReady: () => this.#assertDurableJobV2RuntimeReady(),
+      assertEnqueueReady: async () => {
+        const result = await this.#assertDurableJobV2EnqueueReady();
+        if (dependencies.enableMemoryEvolution === true) await this.assertEvolutionReady();
+        return result;
+      },
+      assertReady: async () => {
+        const result = await this.#assertDurableJobV2RuntimeReady();
+        if (dependencies.enableMemoryEvolution === true) await this.assertEvolutionReady();
+        return result;
+      },
       close: () => this.#closeProviderPool(),
     }) satisfies PostgresDurableJobV2RuntimeBundle;
     POSTGRES_DURABLE_RUNTIME_BUNDLE_OWNERS.set(bundle, this);

@@ -240,6 +240,8 @@ export interface MemoryWriteTransactionContext {
 export interface MemoryWriteKernelDependencies {
   /** When enabled, every newly active canonical row is born inside a temporal lineage. */
   readonly temporalMemoryEnabled?: boolean;
+  /** Enable only after provider lookup readers accept archived current lineage heads. */
+  readonly temporalLookupOnlyEnabled?: boolean;
   resolveAuthority(input: {
     serverAuthority: unknown;
     clientScope: unknown;
@@ -421,6 +423,7 @@ function temporalMutation(
   occurredAt: number,
   route: WriteAdmissionRoute,
   bootstrapEnabled: boolean,
+  lookupOnlyEnabled: boolean,
 ): TemporalMemoryWriteMutation | undefined {
   const scopeFingerprint = authorityScopeFingerprint({
     ...scope,
@@ -428,7 +431,7 @@ function temporalMutation(
   });
   if (command.type !== "correctMemory" || command.correctionKind !== "replaceText" ||
       command.temporal === undefined) {
-    if (!bootstrapEnabled || route !== "active") return undefined;
+    if (!bootstrapEnabled || (route !== "active" && !(lookupOnlyEnabled && route === "lookup_only"))) return undefined;
     const receipt: MemoryVersionTransitionReceipt = {
       id: createHash("sha256").update(JSON.stringify([
         "mengshu.memory-version-transition-receipt/v1",
@@ -734,6 +737,7 @@ export class MemoryWriteKernel {
       createdAt,
       route,
       this.dependencies.temporalMemoryEnabled === true,
+      this.dependencies.temporalLookupOnlyEnabled === true,
     );
     const memory: WriteMemoryRecord = {
         id: memoryId,

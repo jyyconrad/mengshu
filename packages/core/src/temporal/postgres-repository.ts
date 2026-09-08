@@ -169,7 +169,7 @@ function decodeVersion(row: Record<string, unknown> | undefined): MemoryTemporal
     throw new MemoryEvolutionError("MEMORY_VERSION_CONFLICT");
   }
   const record = structuredClone(snapshotRecord) as unknown as MemoryRecord;
-  record.lifecycleStatus = activationState === "staged"
+  record.lifecycleStatus = activationState === "staged" && record.metadata.admissionRoute !== "lookup_only"
     ? "active"
     : row.lifecycle_status as MemoryRecord["lifecycleStatus"];
   return {
@@ -310,7 +310,10 @@ WHERE scope_fingerprint = $1 AND lineage_id = $2`,
   }
 
   async getVersion(scope: MemoryScope, lineageId: string, versionId: string) {
-    const result = await this.pool.query(
+    return this.getVersionWithClient(this.pool, scope, lineageId, versionId);
+  }
+  async getVersionWithClient(client: PostgresTemporalMemoryQueryClient, scope: MemoryScope, lineageId: string, versionId: string) {
+    const result = await client.query(
       `/* temporal-repository:get-version */
 SELECT id::text AS id, text, content_hash, lifecycle_status, lineage_id, revision,
        floor(extract(epoch FROM valid_from) * 1000)::text AS valid_from_ms,
@@ -470,7 +473,8 @@ RETURNING id::text AS id`,
           input.version.previousVersionId ?? null, input.version.restoredFromVersionId ?? null,
           input.version.validFrom, input.version.recordedAt, input.version.transitionType,
           input.version.transitionReason ?? null, input.version.activationState,
-          staged ? "archived" : "active", JSON.stringify(input.version),
+          staged || (input.version.record.metadata.admissionRoute === "lookup_only" &&
+            input.version.record.metadata.contextEligible === false) ? "archived" : "active", JSON.stringify(input.version),
           input.version.record.id, input.scope.tenantId, input.scope.userId],
       );
       if (stamped.rowCount !== 1 || stamped.rows[0]?.id !== input.version.record.id) {
@@ -564,7 +568,9 @@ RETURNING event_id`,
   }
 
   async closeHead(input: CloseTemporalMemoryHeadInput): Promise<MemoryVersionTransitionResult> {
-    const result = await transaction(this.pool, async (client) => {
+    return transaction(this.pool, client => this.closeHeadWithClient(client, input));
+  }
+  async closeHeadWithClient(client: PostgresTemporalMemoryClient, input: CloseTemporalMemoryHeadInput): Promise<MemoryVersionTransitionResult> {
       const replay = await this.#lockedReceipt(client, input.scope, input.receipt);
       if (replay) return replay;
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
@@ -593,7 +599,7 @@ UPDATE memories
 SET valid_to = to_timestamp($1::double precision / 1000),
     transition_reason = $2
 WHERE id = $3 AND scope_fingerprint = $4 AND lineage_id = $5 AND revision = $6
-  AND valid_to IS NULL AND lifecycle_status = 'active'
+  AND valid_to IS NULL AND (lifecycle_status = 'active' OR lifecycle_status = 'archived' AND metadata->>'admissionRoute' = 'lookup_only')
   AND temporal_activation_state = 'active' AND temporal_purge_pending IS NOT TRUE
 RETURNING id::text AS id`,
             [input.validTo, input.reason ?? null, head.currentVersionId,
@@ -657,12 +663,9 @@ RETURNING event_id`,
             input.receipt.occurredAt],
         );
       }
-      return { versionId: head.currentVersionId, receipt: input.receipt };
-    });
-    if ("version" in result) return result;
-    const version = await this.getVersion(input.scope, input.lineageId, result.versionId);
+    const version = await this.getVersionWithClient(client, input.scope, input.lineageId, head.currentVersionId);
     if (!version) throw new MemoryEvolutionError("MEMORY_VERSION_CONFLICT");
-    return { version, receipt: result.receipt, replayed: false };
+    return { version, receipt: input.receipt, replayed: false };
   }
 
   async current(scope: MemoryScope, lineageId: string, at: number) {
@@ -679,7 +682,8 @@ SELECT id::text AS id, text, content_hash, lifecycle_status, lineage_id, revisio
 FROM memories
 WHERE scope_fingerprint = $1 AND lineage_id = $2
   AND ((lifecycle_status = 'active' AND temporal_activation_state = 'active') OR
-    (lifecycle_status = 'archived' AND temporal_activation_state = 'staged'))
+    (lifecycle_status = 'archived' AND (temporal_activation_state = 'staged'
+      OR temporal_activation_state = 'active' AND metadata->>'admissionRoute' = 'lookup_only' AND metadata->>'contextEligible' = 'false')))
   AND valid_from <= to_timestamp($3::double precision / 1000)
   AND (valid_to IS NULL OR valid_to > to_timestamp($3::double precision / 1000))
   AND temporal_invalidated IS NOT TRUE AND temporal_purge_pending IS NOT TRUE
@@ -795,7 +799,7 @@ SET valid_to = to_timestamp($1::double precision / 1000),
     closed_at = to_timestamp($2::double precision / 1000),
     lifecycle_status = 'superseded'
 WHERE scope_fingerprint = $3 AND lineage_id = $4 AND id = $5
-  AND revision = $6 AND lifecycle_status = 'active'
+  AND revision = $6 AND (lifecycle_status = 'active' OR lifecycle_status = 'archived' AND metadata->>'admissionRoute' = 'lookup_only')
   AND temporal_activation_state = 'active' AND valid_to IS NULL
   AND temporal_purge_pending IS NOT TRUE
 RETURNING id::text AS id`,
@@ -809,7 +813,7 @@ RETURNING id::text AS id`,
         const version = await client.query(
           `/* temporal-repository:activate-version */
 UPDATE memories
-SET temporal_activation_state = 'active', lifecycle_status = 'active'
+SET temporal_activation_state = 'active', lifecycle_status = CASE WHEN metadata->>'admissionRoute' = 'lookup_only' AND metadata->>'contextEligible' = 'false' THEN 'archived' ELSE 'active' END
 WHERE scope_fingerprint = $1 AND lineage_id = $2 AND id = $3 AND revision = $4
   AND temporal_activation_state = 'staged' AND lifecycle_status = 'archived'
   AND temporal_purge_pending IS NOT TRUE
@@ -872,7 +876,7 @@ JOIN mengshu_memory_lineage_heads heads
  AND heads.lineage_id = versions.lineage_id
  AND heads.current_version_id = versions.id
  AND heads.current_version_revision = versions.revision
-WHERE versions.lifecycle_status = 'active'
+WHERE (versions.lifecycle_status = 'active' OR versions.lifecycle_status = 'archived' AND versions.metadata->>'admissionRoute' = 'lookup_only')
   AND versions.temporal_activation_state = 'active'
   AND versions.valid_to <= to_timestamp($1::double precision / 1000)
   AND versions.temporal_invalidated IS NOT TRUE
@@ -895,7 +899,7 @@ UPDATE memories
 SET lifecycle_status = 'archived',
     closed_at = to_timestamp($1::double precision / 1000)
 WHERE scope_fingerprint = $2 AND lineage_id = $3 AND id = $4 AND revision = $5
-  AND lifecycle_status = 'active' AND temporal_activation_state = 'active'
+  AND (lifecycle_status = 'active' OR lifecycle_status = 'archived' AND metadata->>'admissionRoute' = 'lookup_only') AND temporal_activation_state = 'active'
   AND valid_to <= to_timestamp($1::double precision / 1000)
   AND temporal_purge_pending IS NOT TRUE
 RETURNING id::text AS id`,

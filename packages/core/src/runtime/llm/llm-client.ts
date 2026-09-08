@@ -26,6 +26,7 @@ import OpenAI from "openai";
 import pLimit from "p-limit";
 import retry from "p-retry";
 import type { MemoryConfig } from "../../../../../config.js";
+import { getModelNetworkOptions } from "./model-network.js";
 import {
   UNSCOPED_RUNTIME_COST_FINGERPRINT,
   UNPRICED_RUNTIME_PRICING_SNAPSHOT,
@@ -70,7 +71,7 @@ export interface LlmCompletionOptions {
   maxTokens?: number;
   /** 调用方提供的 abort signal，用于取消请求。 */
   signal?: AbortSignal;
-  /** 请求超时时间（毫秒），超时后自动取消。未设置则无超时限制。 */
+  /** Total deadline including queueing/retry backoff; defaults to 30 seconds. */
   timeout?: number;
   /**
    * 模型用途类型，用于选择分层模型。
@@ -123,7 +124,10 @@ export interface ChatCompletionClient {
         max_tokens?: number;
         temperature?: number;
         response_format?: { type: "json_object" };
+      }, options?: {
         signal?: AbortSignal;
+        timeout?: number;
+        maxRetries?: number;
       }): Promise<{
         choices: Array<{ message: { content: string | null } }>;
         usage?: { prompt_tokens?: number; completion_tokens?: number };
@@ -198,6 +202,9 @@ export class OpenAiLlmClient implements LlmClient {
       (new OpenAI({
         apiKey: llmConfig.apiKey,
         baseURL: llmConfig.baseURL,
+        ...getModelNetworkOptions(),
+        maxRetries: 0,
+        timeout: DEFAULT_LLM_TIMEOUT_MS,
       }) as unknown as ChatCompletionClient);
 
     this.defaultModel = llmConfig.model;
@@ -250,52 +257,8 @@ export class OpenAiLlmClient implements LlmClient {
     const model = this.selectModel(options.modelType);
     const costContext = this.resolveCostContext(options.costContext, "llm.complete");
 
-    // 合并 abort signal：优先使用调用方的 signal，若未显式给出 timeout 则套用默认上限，
-    // 防止 fetch 永久挂起导致资源耗尽（安全约束）。
-    const effectiveTimeout =
-      typeof options.timeout === "number" && options.timeout > 0
-        ? options.timeout
-        : DEFAULT_LLM_TIMEOUT_MS;
-    const signal = this.mergeAbortSignals(options.signal, effectiveTimeout);
-
-    return this.limit(() =>
-      retry(
-        async (attemptNumber) => {
-          let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
-          try {
-            const response = await this.client.chat.completions.create({
-              model,
-              messages,
-              ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
-              temperature,
-              ...(signal ? { signal } : {}),
-            });
-            usage = response.usage;
-            const content = response.choices?.[0]?.message?.content;
-            if (typeof content !== "string" || content.length === 0) {
-              throw new Error("LLM completion returned empty content");
-            }
-            await this.recordCostAttempt(model, costContext, "succeeded", attemptNumber, usage);
-            return content;
-          } catch (error) {
-            await this.recordCostAttempt(model, costContext, "failed", attemptNumber, usage);
-            throw error;
-          }
-        },
-        {
-          retries: this.maxRetries,
-          minTimeout: this.minTimeout,
-          maxTimeout: this.maxTimeout,
-          factor: 2,
-          onFailedAttempt: (error) => {
-            // 如果是 abort 错误，不重试
-            if (error.name === "AbortError" || signal?.aborted) {
-              throw error;
-            }
-          },
-        },
-      ),
-    );
+    return this.executeRequest({ model, messages, ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}), temperature },
+      options, costContext, content => content);
   }
 
   async summarize(text: string, instruction: string, options?: LlmCompletionOptions): Promise<string> {
@@ -350,47 +313,69 @@ export class OpenAiLlmClient implements LlmClient {
     );
   }
 
-  /**
-   * 合并 abort signals：如果提供了 timeout，创建一个超时 signal 并与原 signal 合并。
-   * 返回合并后的 signal，如果两者都未提供则返回 undefined。
-   */
-  private mergeAbortSignals(signal?: AbortSignal, timeout?: number): AbortSignal | undefined {
-    if (!signal && !timeout) {
-      return undefined;
-    }
+  private async abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      const cleanup = () => signal.removeEventListener("abort", onAbort);
+      signal.addEventListener("abort", onAbort, { once: true });
+      work.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+      if (signal.aborted) { cleanup(); onAbort(); }
+    });
+  }
 
-    if (timeout && !signal) {
-      // 只有 timeout，创建超时 AbortController
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
-      // 清理 timeout（虽然 abort 后也无害，但避免内存泄漏）
-      controller.signal.addEventListener("abort", () => clearTimeout(timeoutId), { once: true });
-      return controller.signal;
-    }
-
-    if (signal && !timeout) {
-      // 只有 signal，直接返回
-      return signal;
-    }
-
-    // 两者都有，需要合并：创建新的 AbortController，任一 signal abort 时都 abort
+  private async executeRequest<T>(
+    body: Parameters<ChatCompletionClient["chat"]["completions"]["create"]>[0],
+    options: LlmCompletionOptions,
+    context: RuntimeCostContext,
+    parse: (content: string) => T,
+  ): Promise<T> {
+    const timeout = Number.isSafeInteger(options.timeout) && options.timeout! > 0 && options.timeout! <= 2_147_483_647
+      ? options.timeout! : DEFAULT_LLM_TIMEOUT_MS;
     const controller = new AbortController();
-
-    if (signal!.aborted) {
-      controller.abort();
-      return controller.signal;
+    const signal = controller.signal;
+    const onAbort = () => controller.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+    const timer = setTimeout(() => controller.abort(new DOMException("Request aborted: LLM deadline exceeded", "AbortError")), timeout);
+    timer.unref?.();
+    let activeAttempt: Promise<T> | undefined;
+    try {
+      // A cancelled waiter never starts a network attempt after a concurrency slot becomes free.
+      signal.throwIfAborted();
+      return await this.abortable(this.limit(() => {
+        signal.throwIfAborted();
+        return retry(attempt => {
+          signal.throwIfAborted();
+          activeAttempt = (async () => {
+            let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+            try {
+              const response = await this.abortable(this.client.chat.completions.create(body, {
+                signal, timeout, maxRetries: 0,
+              }), signal);
+              usage = response.usage;
+              signal.throwIfAborted();
+              const content = response.choices?.[0]?.message?.content;
+              if (typeof content !== "string" || content.length === 0) throw new Error("LLM completion returned empty content");
+              const result = parse(content);
+              await this.recordCostAttempt(body.model, context, "succeeded", attempt, usage);
+              return result;
+            } catch (error) {
+              await this.recordCostAttempt(body.model, context, "failed", attempt, usage);
+              throw error;
+            }
+          })();
+          return activeAttempt;
+        }, {
+          retries: this.maxRetries, minTimeout: this.minTimeout, maxTimeout: this.maxTimeout, factor: 2, signal,
+          onFailedAttempt: error => { if (error.name === "AbortError" || signal.aborted) throw error; },
+        });
+      }), signal);
+    } finally {
+      // p-retry may reject on abort first; finish the actual attempt's single ledger event before returning.
+      await activeAttempt?.catch(() => undefined);
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
     }
-
-    const onAbort = () => controller.abort();
-    signal!.addEventListener("abort", onAbort, { once: true });
-
-    const timeoutId = setTimeout(() => controller.abort(), timeout!);
-    controller.signal.addEventListener("abort", () => {
-      clearTimeout(timeoutId);
-      signal!.removeEventListener("abort", onAbort);
-    }, { once: true });
-
-    return controller.signal;
   }
 
   /**
@@ -600,59 +585,14 @@ export class OpenAiLlmClient implements LlmClient {
     const model = this.selectModel(options.modelType);
     const costContext = this.resolveCostContext(options.costContext, "llm.extract_structured");
 
-    // 合并 abort signal：未显式给出 timeout 时套用默认上限（安全约束）。
-    const effectiveTimeout =
-      typeof options.timeout === "number" && options.timeout > 0
-        ? options.timeout
-        : DEFAULT_LLM_TIMEOUT_MS;
-    const signal = this.mergeAbortSignals(options.signal, effectiveTimeout);
-
-    return retry(
-      async (attemptNumber) => {
-        let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
-        try {
-          const response = await this.limit(() =>
-            this.client.chat.completions.create({
-              model,
-              messages: augmented,
-              ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
-              temperature, // 显式传递 0.0
-              response_format: { type: "json_object" },
-              ...(signal ? { signal } : {}),
-            }),
-          );
-          usage = response.usage;
-
-          const content = response.choices?.[0]?.message?.content;
-          if (typeof content !== "string" || content.length === 0) {
-            throw new Error("LLM returned empty content");
-          }
-
-          const parsed = JSON.parse(content) as T;
-
-          // D-08 (§2.2): schema 运行时校验 - 递归检查 required 字段
-          this.validateSchema(parsed, schema, "root");
-          await this.recordCostAttempt(model, costContext, "succeeded", attemptNumber, usage);
-          return parsed;
-        } catch (error) {
-          await this.recordCostAttempt(model, costContext, "failed", attemptNumber, usage);
-          throw error;
-        }
-      },
-      {
-        // §10.4: 最多 3 次重试，指数退避
-        retries: this.maxRetries,
-        minTimeout: this.minTimeout,
-        maxTimeout: this.maxTimeout,
-        factor: 2,
-        onFailedAttempt: (error) => {
-          // 如果是 abort 错误，不重试
-          if (error.name === "AbortError" || signal?.aborted) {
-            throw error;
-          }
-        },
-      },
-    );
+    return this.executeRequest({ model, messages: augmented,
+      ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}), temperature,
+      response_format: { type: "json_object" },
+    }, options, costContext, content => {
+      const parsed = JSON.parse(content) as T;
+      this.validateSchema(parsed, schema, "root");
+      return parsed;
+    });
   }
 }
 

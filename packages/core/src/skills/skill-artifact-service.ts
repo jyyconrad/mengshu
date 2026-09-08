@@ -69,6 +69,10 @@ export interface SkillArtifactServiceDependencies {
   readonly maxResourceBytes?: number;
   readonly embeddingSearch?: SkillArtifactEmbeddingSearch;
   readonly policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
+  /** Host-owned target binding reader. Incompatibility stops retrieval, never widens scope. */
+  readonly targetCompatibility?: {
+    allowsSkill(artifact: SkillArtifactVersion, targetScope: MemoryScope): Promise<boolean>;
+  };
 }
 
 export interface SkillArtifactEmbeddingSearch {
@@ -200,6 +204,11 @@ function artifactContent(artifact: Pick<SkillArtifactVersion,
   };
 }
 
+/** Same canonical bytes as persisted versions; consumers must recompute, not trust contentHash. */
+export function computeSkillArtifactContentHash(artifact: Parameters<typeof artifactContent>[0]): string {
+  return hash("skill-artifact-content-v1", artifactContent(artifact));
+}
+
 function tokens(value: string): string[] {
   return value.toLocaleLowerCase("en-US").match(/[\p{L}\p{N}_-]+/gu) ?? [];
 }
@@ -212,6 +221,7 @@ export class SkillArtifactService {
   readonly #maxResourceBytes: number;
   readonly #embeddingSearch?: SkillArtifactEmbeddingSearch;
   readonly #policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
+  readonly #targetCompatibility?: SkillArtifactServiceDependencies["targetCompatibility"];
 
   constructor(deps: SkillArtifactServiceDependencies) {
     this.#repository = deps.repository;
@@ -221,6 +231,7 @@ export class SkillArtifactService {
     this.#maxResourceBytes = deps.maxResourceBytes ?? 5_242_880;
     this.#embeddingSearch = deps.embeddingSearch;
     this.#policyResolver = deps.policyResolver;
+    this.#targetCompatibility = deps.targetCompatibility;
   }
 
   async #replay(
@@ -638,12 +649,16 @@ export class SkillArtifactService {
         memoryIds: artifact.evidenceMemoryIds,
         chunkIds: artifact.evidenceChunkIds,
       });
+    const compatible = await this.#targetCompatible(artifact, input.scope);
     const validity = artifact.status === "revoked" ? "revoked" as const :
-      evidence.readable ? "valid" as const : "stale" as const;
+      evidence.readable && compatible ? "valid" as const : "stale" as const;
+    const warnings = validity === "stale"
+      ? [...(evidence.readable ? [] : ["evidence_unavailable"]), ...(compatible ? [] : ["target_incompatible"])]
+      : [];
     return Object.freeze({
       artifact,
       validity,
-      warnings: Object.freeze(validity === "stale" ? ["evidence_unavailable"] : []),
+      warnings: Object.freeze(warnings),
       receipts: Object.freeze(receipts.map((receipt) => Object.freeze({ ...receipt }))),
       evidenceMemoryIds: Object.freeze([...artifact.evidenceMemoryIds]),
       evidenceChunkIds: Object.freeze([...artifact.evidenceChunkIds]),
@@ -664,9 +679,12 @@ export class SkillArtifactService {
       memoryIds: artifact.evidenceMemoryIds,
       chunkIds: artifact.evidenceChunkIds,
     });
-    return evidence.readable
+    const compatible = await this.#targetCompatible(artifact, input.scope);
+    return evidence.readable && compatible
       ? { artifact, validity: "valid", warnings: [] }
-      : { artifact, validity: "stale", warnings: ["evidence_unavailable"] };
+      : { artifact, validity: "stale", warnings: [
+        ...(evidence.readable ? [] : ["evidence_unavailable"]), ...(compatible ? [] : ["target_incompatible"]),
+      ] };
   }
 
   async search(input: SearchSkillInput): Promise<SkillSearchResult> {
@@ -704,6 +722,7 @@ export class SkillArtifactService {
         (await this.#repository.getLatest(scopeFingerprint, skillId));
       if (artifact?.status !== "published") return undefined;
       const read = await this.read({ scope: input.scope, skillId });
+      if (this.#targetCompatibility && read.validity !== "valid") return undefined;
       return { ...read, score };
     }));
     const ranked = hits.filter((hit): hit is NonNullable<typeof hit> => hit !== undefined);
@@ -726,5 +745,18 @@ export class SkillArtifactService {
       }
     }
     throw error;
+  }
+
+  async #targetCompatible(artifact: SkillArtifactVersion, scope: MemoryScope): Promise<boolean> {
+    // Owners may inspect draft/review artifacts; those statuses remain ineligible for search and loadout.
+    if (artifact.status !== "published") return true;
+    if (artifact.executionMode !== "suggest_only") return false;
+    if (!this.#targetCompatibility) return true;
+    try {
+      if (!await this.#targetCompatibility.allowsSkill(artifact, scope)) return false;
+      const head = await this.#repository.getLatest(exactPrivateScope(scope), artifact.skillId);
+      return head !== undefined && head.status !== "revoked" && head.status !== "deprecated";
+    }
+    catch { return false; }
   }
 }

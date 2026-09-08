@@ -648,6 +648,24 @@ describe("MemoryWriteKernel", () => {
     });
   });
 
+  test("temporal bootstrap includes kind-only lookup records without adding semanticType", async () => {
+    const { kernel, writtenRecords } = harness({ temporalMemoryEnabled: true, temporalLookupOnlyEnabled: true,
+      scoreAdmission: () => ({ route: "lookup_only", valueScore: 0.9 }) });
+    await expect(kernel.execute(saveCommand({ kind: "fact", idempotencyKey: "kind-only-lineage" })))
+      .resolves.toMatchObject({ status: "persisted", route: "lookup_only" });
+    expect(writtenRecords[0]).toMatchObject({ kind: "fact", route: "lookup_only", temporal: { expectedHeadRevision: 0, transitionType: "created" } });
+    expect(writtenRecords[0]).not.toHaveProperty("semanticType");
+  });
+
+  test("lookup-only lineage bootstrap stays disabled without a matching reader capability", async () => {
+    const { kernel, writtenRecords } = harness({ temporalMemoryEnabled: true,
+      scoreAdmission: () => ({ route: "lookup_only", valueScore: 0.9 }) });
+    await expect(kernel.execute(saveCommand({ kind: "fact", idempotencyKey: "kind-only-no-lineage" })))
+      .resolves.toMatchObject({ status: "persisted", route: "lookup_only" });
+    expect(writtenRecords[0]).not.toHaveProperty("temporal");
+    expect(writtenRecords[0]).not.toHaveProperty("semanticType");
+  });
+
   test("lifecycle transaction failure never acknowledges", async () => {
     const ack = vi.fn();
     const { kernel } = harness({

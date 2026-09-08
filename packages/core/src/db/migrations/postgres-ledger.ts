@@ -481,6 +481,78 @@ const WRITE_JOURNAL_COLUMN_TYPES = Object.freeze({
   }),
 } as const);
 
+interface CatalogColumnContract {
+  readonly type: string;
+  readonly nullable: boolean;
+  readonly default: string | null;
+}
+interface EvolutionCatalogOptions { readonly evolutionGovernance?: boolean }
+const EVOLUTION_OUTBOX_COLUMN_CONTRACT: Readonly<Record<string, CatalogColumnContract>> = {
+  evolution_consumed_at: { type: "bigint", nullable: true, default: null },
+  evolution_origin: { type: "boolean", nullable: false, default: "false" },
+};
+const EVOLUTION_MEMORY_COLUMN_CONTRACT: Readonly<Record<string, CatalogColumnContract>> = {
+  evolution_review_due_at: { type: "bigint", nullable: false, default: "0" },
+  evolution_disputed: { type: "boolean", nullable: false, default: "false" },
+  evolution_alias_of: { type: "uuid", nullable: true, default: null },
+};
+const EVOLUTION_EVIDENCE_COLUMN_CONTRACT: Readonly<Record<string, CatalogColumnContract>> = {
+  relation_state: { type: "text", nullable: false, default: "'effective'::text" },
+  retired_at: { type: "bigint", nullable: true, default: null },
+  ...Object.fromEntries([
+    "root_evidence_id", "source_id", "source_revision", "source_current_revision", "source_hash",
+    "source_kind", "source_record_id", "source_path_id", "source_span_id", "source_logical_file_id",
+    "continuity_key", "independence_group_id",
+  ].map(name => [name, { type: "text", nullable: true, default: null }])),
+};
+const TEMPORAL_OUTBOX_COLUMN_CONTRACT: Readonly<Record<string, CatalogColumnContract>> = Object.fromEntries(
+  Object.entries({ event_id: "text", scope_fingerprint: "text", lineage_id: "text", revision: "integer",
+    event_type: "text", payload: "jsonb", occurred_at: "bigint", published_at: "bigint" })
+    .map(([name, type]) => [name, { type, nullable: name === "published_at", default: null }]),
+);
+
+/** Remove only the validated, ledger-selected expansion; base checks still reject unknown columns. */
+function verifyCatalogColumnExtension(
+  tableName: string,
+  rows: readonly Record<string, unknown>[],
+  contract: Readonly<Record<string, CatalogColumnContract>>,
+): Record<string, unknown>[] {
+  for (const [name, expected] of Object.entries(contract)) {
+    const matches = rows.filter(row => row.object_name === name);
+    const row = matches[0];
+    if (matches.length !== 1 || !row || row.definition !== expected.type ||
+        row.is_nullable !== (expected.nullable ? "YES" : "NO") || row.default_definition !== expected.default) {
+      throw new PostgresSchemaContractError("SCHEMA_CONTRACT_INVALID",
+        `Postgres versioned column is invalid: ${tableName}.${name}`);
+    }
+  }
+  return rows.filter(row => !Object.hasOwn(contract, String(row.object_name)));
+}
+
+export async function verifyTemporalOutboxSchemaCatalog(
+  client: PostgresMigrationClient,
+  options: EvolutionCatalogOptions = {},
+): Promise<void> {
+  const tableName = "mengshu_memory_version_outbox";
+  const result = await client.query(DURABLE_DOMAIN_SCHEMA_CATALOG_SQL, [[tableName]]);
+  const columns = result.rows.filter(row => row.kind === "column" && row.table_name === tableName);
+  const remaining = verifyCatalogColumnExtension(tableName, columns, {
+    ...TEMPORAL_OUTBOX_COLUMN_CONTRACT,
+    ...(options.evolutionGovernance ? EVOLUTION_OUTBOX_COLUMN_CONTRACT : {}),
+  });
+  if (remaining.length) throw new PostgresSchemaContractError("SCHEMA_CONTRACT_INVALID",
+    "Postgres temporal outbox contains undeclared columns");
+}
+
+async function verifyEvolutionMemoryColumnsCatalog(client: PostgresMigrationClient): Promise<void> {
+  const result = await client.query(DURABLE_DOMAIN_SCHEMA_CATALOG_SQL, [["memories"]]);
+  const columns = result.rows.filter(row => row.kind === "column" && row.table_name === "memories");
+  const remaining = verifyCatalogColumnExtension("memories", columns, EVOLUTION_MEMORY_COLUMN_CONTRACT);
+  if (remaining.some(row => String(row.object_name).startsWith("evolution_"))) {
+    throw new PostgresSchemaContractError("SCHEMA_CONTRACT_INVALID", "Postgres memories contains undeclared evolution columns");
+  }
+}
+
 const EMBEDDING_REEMBED_NULLABLE_COLUMNS = Object.freeze({
   mengshu_embedding_spaces: Object.freeze(["queryability_state"]),
   mengshu_embedding_reembed_shadow: Object.freeze([
@@ -1261,6 +1333,7 @@ export async function verifyDurableJobStateSchemaCatalog(
 /** v11 ledger/readiness requires the complete atomic memory write journal. */
 export async function verifyWriteJournalSchemaCatalog(
   client: PostgresMigrationClient,
+  options: EvolutionCatalogOptions = {},
 ): Promise<void> {
   const tableNames = Object.keys(WRITE_JOURNAL_REQUIRED_COLUMNS);
   const result = await client.query(DURABLE_DOMAIN_SCHEMA_CATALOG_SQL, [tableNames]);
@@ -1268,8 +1341,9 @@ export async function verifyWriteJournalSchemaCatalog(
     const expectedColumns = WRITE_JOURNAL_REQUIRED_COLUMNS[
       tableName as keyof typeof WRITE_JOURNAL_REQUIRED_COLUMNS
     ];
-    const columnRows = result.rows.filter((row) =>
-      row.kind === "column" && row.table_name === tableName);
+    const columnRows = verifyCatalogColumnExtension(tableName, result.rows.filter((row) =>
+      row.kind === "column" && row.table_name === tableName),
+    options.evolutionGovernance && tableName === "mengshu_write_outbox" ? EVOLUTION_OUTBOX_COLUMN_CONTRACT : {});
     const actualColumns = columnRows.map((row) => row.object_name).sort();
     const expectedTypes = WRITE_JOURNAL_COLUMN_TYPES[
       tableName as keyof typeof WRITE_JOURNAL_COLUMN_TYPES
@@ -1503,14 +1577,16 @@ export async function verifyCandidateWriteJournalSchemaCatalog(
 /** v15 ledger/readiness requires evidence provenance independent from Work Graph storage. */
 export async function verifyEvidenceLinkLedgerSchemaCatalog(
   client: PostgresMigrationClient,
+  options: EvolutionCatalogOptions = {},
 ): Promise<void> {
   const tableNames = Object.keys(EVIDENCE_LINK_LEDGER_REQUIRED_COLUMNS);
   const result = await client.query(DURABLE_DOMAIN_SCHEMA_CATALOG_SQL, [tableNames]);
   for (const tableName of tableNames) {
     const typedTableName = tableName as keyof typeof EVIDENCE_LINK_LEDGER_REQUIRED_COLUMNS;
     const expectedColumns = EVIDENCE_LINK_LEDGER_REQUIRED_COLUMNS[typedTableName];
-    const columnRows = result.rows.filter((row) =>
-      row.kind === "column" && row.table_name === tableName);
+    const columnRows = verifyCatalogColumnExtension(tableName, result.rows.filter((row) =>
+      row.kind === "column" && row.table_name === tableName),
+    options.evolutionGovernance && tableName === "mengshu_memory_evidence_links" ? EVOLUTION_EVIDENCE_COLUMN_CONTRACT : {});
     const actualColumns = columnRows.map((row) => row.object_name).sort();
     if (!sameColumns(actualColumns, [...expectedColumns].sort()) || columnRows.some((row) =>
       row.definition !== (row.object_name === "created_at" ? "bigint" : "text") ||
@@ -2013,6 +2089,15 @@ export async function executePostgresMigrations(
       if (migration.version === 24) {
         await verifyHistoryRebuildModelAttemptSchemaCatalog(client);
       }
+      if (migration.version === 28) {
+        await verifyTemporalOutboxSchemaCatalog(client);
+      }
+      if (migration.version === 37) {
+        await verifyWriteJournalSchemaCatalog(client, { evolutionGovernance: true });
+        await verifyEvidenceLinkLedgerSchemaCatalog(client, { evolutionGovernance: true });
+        await verifyTemporalOutboxSchemaCatalog(client, { evolutionGovernance: true });
+        await verifyEvolutionMemoryColumnsCatalog(client);
+      }
       await client.query(INSERT_MIGRATION_SQL, [
         migration.version,
         migration.name,
@@ -2043,7 +2128,7 @@ export async function executePostgresMigrations(
       await verifyDurableJobStateSchemaCatalog(client);
     }
     if (effectiveApplied.has(11) && !appliedVersions.includes(11)) {
-      await verifyWriteJournalSchemaCatalog(client);
+      await verifyWriteJournalSchemaCatalog(client, { evolutionGovernance: effectiveApplied.has(37) });
     }
     if (effectiveApplied.has(12) && !appliedVersions.includes(12)) {
       await verifyEmbeddingReembedSchemaCatalog(client);
@@ -2055,7 +2140,7 @@ export async function executePostgresMigrations(
       await verifyCandidateWriteJournalSchemaCatalog(client);
     }
     if (effectiveApplied.has(15) && !appliedVersions.includes(15)) {
-      await verifyEvidenceLinkLedgerSchemaCatalog(client);
+      await verifyEvidenceLinkLedgerSchemaCatalog(client, { evolutionGovernance: effectiveApplied.has(37) });
     }
     if (effectiveApplied.has(16) && !appliedVersions.includes(16)) {
       await verifyTopicTreeAliasSchemaCatalog(client);
@@ -2079,6 +2164,12 @@ export async function executePostgresMigrations(
     }
     if (effectiveApplied.has(24) && !appliedVersions.includes(24)) {
       await verifyHistoryRebuildModelAttemptSchemaCatalog(client);
+    }
+    if (effectiveApplied.has(28) && !appliedVersions.includes(28) && !appliedVersions.includes(37)) {
+      await verifyTemporalOutboxSchemaCatalog(client, { evolutionGovernance: effectiveApplied.has(37) });
+    }
+    if (effectiveApplied.has(37) && !appliedVersions.includes(37)) {
+      await verifyEvolutionMemoryColumnsCatalog(client);
     }
 
     await client.query("COMMIT");

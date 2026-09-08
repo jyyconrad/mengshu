@@ -140,6 +140,21 @@ function harness(options: HarnessOptions = {}) {
 }
 
 describe("PostgresCandidatePromotionPort", () => {
+  test.each([{ version: 1, operation: "evolve" }, { operation: "create" }, null, false])(
+    "evolution metadata cannot enter ordinary provider promotion: %j",
+    async (evolution) => {
+      const h = harness({ candidate: candidateRow({ metadata: { evolution } }) });
+      const insert = vi.fn();
+      const port = new PostgresCandidatePromotionPort(h.pool, insert, scope);
+      await expect(port.promote({ candidateId: "candidate-1", material: material() }))
+        .rejects.toMatchObject({ code: "EVOLUTION_REVIEW_REQUIRED", retryable: false });
+      expect(insert).not.toHaveBeenCalled();
+      expect(h.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true);
+      expect(h.calls.some(({ sql }) => sql === "COMMIT")).toBe(false);
+      expect(h.calls.some(({ sql }) => /SELECT.*metadata/.test(sql))).toBe(true);
+    },
+  );
+
   test("Postgres provider factory 只返回带 provider-owned 品牌的 scope-bound port", () => {
     const provider = new PostgresProvider({
       host: "127.0.0.1",

@@ -83,6 +83,28 @@ function result(rows: Record<string, unknown>[] = [], rowCount = rows.length) {
 }
 
 describe("PostgresTemporalMemoryRepository", () => {
+  test("kind-only lookup versions retain archived visibility while temporal history advances", async () => {
+    const next = version(1, "A verified kind-only fact");
+    delete next.record.semanticType;
+    next.record.kind = "fact";
+    next.record.lifecycleStatus = "archived";
+    next.record.metadata = { admissionRoute: "lookup_only", contextEligible: false };
+    const calls: { sql: string; params: readonly unknown[] }[] = [];
+    const query = vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+      calls.push({ sql, params });
+      if (sql.includes("stamp-version")) return result([{ id: next.record.id }]);
+      if (sql.includes("advance-head")) return result([{ latest_revision: 1 }]);
+      if (sql.includes("insert-receipt")) return result([{ receipt_id: receipt(next).id }]);
+      if (sql.includes("insert-outbox")) return result([{ event_id: params[0] }]);
+      return result();
+    });
+    const client = { query: query as PostgresTemporalMemoryClient["query"], release: vi.fn() };
+    const repository = new PostgresTemporalMemoryRepository({ query: client.query, connect: async () => client }, {
+      persistVersion: async () => ({ memoryId: next.record.id, stored: true }),
+    });
+    await repository.appendVersion({ scope: SCOPE, expectedHeadRevision: 0, version: next, receipt: receipt(next) });
+    expect(calls.find(({ sql }) => sql.includes("stamp-version"))?.params[10]).toBe("archived");
+  });
   test("future expiration schedules validTo without clearing the current head", async () => {
     const current = version(1, "temporary context");
     const expirationReceipt: MemoryVersionTransitionReceipt = {

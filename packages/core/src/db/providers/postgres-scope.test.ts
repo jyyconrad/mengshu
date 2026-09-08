@@ -37,6 +37,32 @@ let migrationRows: Array<{ version: number; name: string; checksum: string }> = 
 let transactionMigrationRows: Array<{ version: number; name: string; checksum: string }> | undefined;
 let catalogRows: Record<string, unknown>[] | undefined;
 
+function createEvolutionCatalogColumns(tableName: string): Record<string, unknown>[] {
+  if (!(transactionMigrationRows ?? migrationRows).some(row => row.version === 37) && !queryCalls.some(({ sql }) =>
+    sql === "ALTER TABLE memories ADD COLUMN IF NOT EXISTS evolution_disputed BOOLEAN NOT NULL DEFAULT FALSE")) return [];
+  const outbox = { evolution_consumed_at: ["bigint", "YES", null], evolution_origin: ["boolean", "NO", "false"] };
+  const types: Record<string, Record<string, unknown[]>> = {
+    mengshu_write_outbox: outbox,
+    mengshu_memory_version_outbox: outbox,
+    memories: { evolution_review_due_at: ["bigint", "NO", "0"], evolution_disputed: ["boolean", "NO", "false"], evolution_alias_of: ["uuid", "YES", null] },
+    mengshu_memory_evidence_links: {
+      relation_state: ["text", "NO", "'effective'::text"], retired_at: ["bigint", "YES", null],
+      ...Object.fromEntries(["root_evidence_id", "source_id", "source_revision", "source_current_revision", "source_hash", "source_kind", "source_record_id", "source_path_id", "source_span_id", "source_logical_file_id", "continuity_key", "independence_group_id"].map(name => [name, ["text", "YES", null]])),
+    },
+  };
+  return Object.entries(types[tableName] ?? {}).map(([object_name, [definition, is_nullable, default_definition]]) => ({
+    kind: "column", table_name: tableName, object_name, definition, is_nullable, default_definition, is_valid: true, is_ready: true,
+  }));
+}
+
+function createTemporalOutboxCatalogRows(): Record<string, unknown>[] {
+  return [...Object.entries({ event_id: "text", scope_fingerprint: "text", lineage_id: "text", revision: "integer",
+    event_type: "text", payload: "jsonb", occurred_at: "bigint", published_at: "bigint" })
+    .map(([object_name, definition]) => ({ kind: "column", table_name: "mengshu_memory_version_outbox", object_name, definition,
+      is_nullable: object_name === "published_at" ? "YES" : "NO", default_definition: null, is_valid: true, is_ready: true })),
+    ...createEvolutionCatalogColumns("mengshu_memory_version_outbox")];
+}
+
 function createDurableDomainCatalogRows(): Record<string, unknown>[] {
   const nullable = new Map<string, readonly string[]>([
     ["mengshu_tree_leaves", []],
@@ -177,7 +203,7 @@ function createWriteJournalCatalogRows(): Record<string, unknown>[] {
       is_ready: true,
     });
   }
-  return rows;
+  return [...rows, ...createEvolutionCatalogColumns("mengshu_write_outbox")];
 }
 
 function createEmbeddingReembedCatalogRows(): Record<string, unknown>[] {
@@ -425,7 +451,7 @@ function createEvidenceLinkCatalogRows(): Record<string, unknown>[] {
     "mengshu_graph_relation_evidence_scope_evidence_idx",
     "mengshu_graph_entity_aliases_scope_alias_idx",
   ]);
-  return rows;
+  return [...rows, ...createEvolutionCatalogColumns("mengshu_memory_evidence_links")];
 }
 
 function createTopicTreeAliasCatalogRows(): Record<string, unknown>[] {
@@ -580,6 +606,8 @@ function createAssetLoadoutCatalogRows(
     })),
   );
   const loadoutEventLedger = Object.hasOwn(columnsByTable, "mengshu_loadout_audit");
+  const governedDocumentKinds = (transactionMigrationRows ?? migrationRows).some(row => row.version === 26) ||
+    queryCalls.some(({ sql }) => sql.includes("ALTER TABLE mengshu_asset_versions") && sql.includes("'memory_document'"));
   appendCatalogConstraints(rows, loadoutEventLedger
     ? {
         mengshu_loadout_audit: [
@@ -598,8 +626,12 @@ function createAssetLoadoutCatalogRows(
     : {
         mengshu_asset_versions: [
           "PRIMARY KEY (scope_fingerprint, asset_id, version)",
-          "CHECK (kind = 'memory_view')",
-          "CHECK (status = ANY (ARRAY['draft', 'review', 'published', 'deprecated', 'revoked']))",
+          governedDocumentKinds
+            ? "CHECK (kind = ANY (ARRAY['memory_view'::text, 'memory_document'::text, 'tree_document'::text, 'index_document'::text]))"
+            : "CHECK (kind = 'memory_view')",
+          governedDocumentKinds
+            ? "CHECK (status = ANY (ARRAY['draft'::text, 'review'::text, 'published'::text, 'active'::text, 'deprecated'::text, 'revoked'::text]))"
+            : "CHECK (status = ANY (ARRAY['draft', 'review', 'published', 'deprecated', 'revoked']))",
           "CHECK (visibility = 'private')",
           "CHECK (jsonb_typeof(descriptor) = 'object')",
         ],
@@ -854,6 +886,11 @@ const mockQuery = vi.fn(async (sql: string, params?: unknown[]) => {
   }
   if (/FROM information_schema\.columns/.test(sql)) {
     const requestedTables = Array.isArray(params?.[0]) ? params[0] as string[] : [];
+    if (requestedTables.includes("mengshu_memory_version_outbox") || requestedTables.includes("memories")) {
+      const rows = requestedTables.flatMap(table => table === "mengshu_memory_version_outbox"
+        ? createTemporalOutboxCatalogRows() : createEvolutionCatalogColumns(table));
+      return { rows, rowCount: rows.length };
+    }
     const rows = requestedTables.includes("mengshu_history_rebuild_model_attempts")
       ? createHistoryRebuildModelAttemptCatalogRows()
       : requestedTables.includes("mengshu_history_rebuild_runs")
@@ -1089,6 +1126,21 @@ describe("PostgresProvider scope 维度列（D-25）", () => {
       expect(queryCalls.some(({ sql }) => /CREATE UNIQUE INDEX memories_authority_content_hash_uidx/.test(sql)))
         .toBe(true);
       expect(queryCalls.some(({ sql }) => /FROM pg_class AS table_rel/.test(sql))).toBe(true);
+    });
+
+    it("v37 catalog survives close and initialization of a new provider without rewriting the ledger", async () => {
+      const provider = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
+      await provider.initialize();
+      await provider.applyScopeContentHashDedupeContract({ maintenance: true, quiescenceConfirmed: true });
+      const ledger = structuredClone(migrationRows);
+      const insertCount = queryCalls.filter(call => /INSERT INTO mengshu_schema_migrations/.test(call.sql)).length;
+      await provider.close();
+      const restarted = new PostgresProvider(PG_CONFIG, "text-embedding-3-small");
+      await restarted.initialize();
+      expect(await restarted.getSchemaContractStatus()).toMatchObject({ currentVersion: 37, scopeContentHashDedupe: "ready" });
+      expect(migrationRows).toEqual(ledger);
+      expect(queryCalls.filter(call => /INSERT INTO mengshu_schema_migrations/.test(call.sql))).toHaveLength(insertCount);
+      await restarted.close();
     });
 
     it("CREATE TABLE 包含 5 个 scope 列", async () => {

@@ -23,6 +23,7 @@ import type { LlmClient } from "../runtime/llm/llm-client.js";
 import type { MemoryPolicyResolver } from "../policy/memory-policy-overlay.js";
 import type { ResolvedMemoryPolicy } from "../policy/types.js";
 import { memoryPolicyCostContext } from "../policy/cost-attribution.js";
+import type { GovernedSkillAggregationService } from "../evolution/maintenance/skill-aggregation.js";
 
 /**
  * SkillCandidate 聚合器
@@ -34,6 +35,8 @@ export class SkillCandidateAggregator {
   private trigger: GeneralizationTrigger;
   private now: () => number;
   private policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
+  private governedAggregation?: Pick<GovernedSkillAggregationService, "run">;
+  private requireGovernedAggregation: boolean;
 
   constructor(deps: {
     candidateRepository: CandidateRepository;
@@ -42,6 +45,8 @@ export class SkillCandidateAggregator {
     trigger?: Partial<GeneralizationTrigger>;
     now?: () => number;
     policyResolver?: Pick<MemoryPolicyResolver, "resolve">;
+    governedAggregation?: Pick<GovernedSkillAggregationService, "run">;
+    requireGovernedAggregation?: boolean;
   }) {
     this.candidateRepo = deps.candidateRepository;
     this.skillRepo = deps.skillCandidateRepository;
@@ -49,6 +54,8 @@ export class SkillCandidateAggregator {
     this.trigger = { ...DEFAULT_GENERALIZATION_TRIGGER, ...deps.trigger };
     this.now = deps.now ?? Date.now;
     this.policyResolver = deps.policyResolver;
+    this.governedAggregation = deps.governedAggregation;
+    this.requireGovernedAggregation = deps.requireGovernedAggregation ?? false;
   }
 
   /**
@@ -57,6 +64,7 @@ export class SkillCandidateAggregator {
   async analyzeExperienceClusters(
     scope?: MemoryScope
   ): Promise<GeneralizationAnalysis[]> {
+    if (this.requireGovernedAggregation || this.governedAggregation) return [];
     // 获取所有 pending 的 experience 候选
     const experiences = await this.candidateRepo.list({
       scope,
@@ -267,6 +275,7 @@ export class SkillCandidateAggregator {
   async generateSkillCandidate(
     analysis: GeneralizationAnalysis
   ): Promise<SkillCandidate | null> {
+    if (this.requireGovernedAggregation || this.governedAggregation) return null;
     if (!analysis.meetsThreshold) {
       return null;
     }
@@ -559,6 +568,11 @@ ${experienceTexts}
     analyses: GeneralizationAnalysis[];
     errors: string[];
   }> {
+    if (this.governedAggregation) {
+      if (!scope) return { skillCandidates: [], analyses: [], errors: ["governed_skill_scope_required"] };
+      return this.governedAggregation.run(scope);
+    }
+    if (this.requireGovernedAggregation) return { skillCandidates: [], analyses: [], errors: ["governed_skill_aggregation_unavailable"] };
     const skillCandidates: SkillCandidate[] = [];
     const errors: string[] = [];
 

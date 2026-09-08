@@ -8,7 +8,16 @@ import {
   filterContextEligibleRecords,
   filterRecallEligibleRecords,
 } from "../domain/recall-filter.js";
-import { applyScopeReusePolicy } from "../domain/scope-policy.js";
+import { applyScopeReusePolicy, scopeToSessionKey } from "../domain/scope-policy.js";
+import {
+  authorizeReuseRecord,
+  requiresExplicitReuseGrant,
+  type ExplicitReuseReadOptions,
+} from "../evolution/reuse/reuse-read-access.js";
+import {
+  sameExactReuseScope,
+  type ExplicitReusePermit,
+} from "../evolution/reuse/explicit-reuse-authorizer.js";
 import type {
   MemoryKind,
   MemoryRecord,
@@ -45,6 +54,8 @@ export interface GovernedRetrievalCandidate {
   /** Provider-issued identity for route arbitration; hydration verifies it before use. */
   governedSemanticIdentity?: string;
   admissionRoute?: "active" | "lookup_only" | "evidence_only";
+  /** Optional producer projection. Hydration remains authoritative for the claim kind. */
+  claimKind?: MemoryKind;
   navigation?: GovernedRetrievalNavigation;
 }
 
@@ -182,6 +193,20 @@ function hasUnresolvedConflict(record: MemoryRecord): boolean {
     (typeof conflictStatus === "string" && conflictStatus !== "resolved" && conflictStatus !== "none");
 }
 
+/** Evolution holds apply to ordinary lookup too; owner audit reads use separate repositories. */
+export function hasEvolutionReadHold(metadata: Readonly<Record<string, unknown>>): boolean {
+  const governance = metadata.governance;
+  if (governance === undefined) return false;
+  if (!governance || typeof governance !== "object" || Array.isArray(governance)) return true;
+  const evolution = (governance as Record<string, unknown>).evolution;
+  if (evolution === undefined) return false;
+  if (!evolution || typeof evolution !== "object" || Array.isArray(evolution)) return true;
+  return ["disputed", "needsReview"].some((key) => {
+    const value = (evolution as Record<string, unknown>)[key];
+    return value !== undefined && value !== false;
+  });
+}
+
 function retrievalEligible(
   record: MemoryRecord,
   scope: MemoryScope,
@@ -280,7 +305,7 @@ function validateRequest(request: GovernedRetrievalRequest): { minScore: number;
 export class GovernedRetrievalEngine {
   private readonly hydrator: GovernedRetrievalHydrator;
 
-  constructor(hydrator: GovernedRetrievalHydrator) {
+  constructor(hydrator: GovernedRetrievalHydrator, private readonly options: ExplicitReuseReadOptions = {}) {
     this.hydrator = hydrator;
   }
 
@@ -294,6 +319,11 @@ export class GovernedRetrievalEngine {
         denied.push(filtered(candidate, "authority_mismatch"));
         continue;
       }
+      if (requiresExplicitReuseGrant(candidate.scope, request.scope) &&
+          !await this.options.reuseAuthorizer?.authorize(candidate.scope, request.scope)) {
+        denied.push(filtered(candidate, "scope_mismatch"));
+        continue;
+      }
       const group = candidatesByRecord.get(candidate.authoritativeRecordId) ?? [];
       group.push(candidate);
       candidatesByRecord.set(candidate.authoritativeRecordId, group);
@@ -304,6 +334,7 @@ export class GovernedRetrievalEngine {
       hydration: GovernedRetrievalHydration;
       candidates: GovernedRetrievalCandidate[];
       route: "active" | "lookup_only";
+      permit?: ExplicitReusePermit;
     }>>();
     for (const [authoritativeRecordId, candidates] of candidatesByRecord) {
       const hydration = await this.hydrator.hydrate({
@@ -321,11 +352,18 @@ export class GovernedRetrievalEngine {
         denied.push(...candidates.map((item) => filtered(item, "authority_mismatch")));
         continue;
       }
-      if (applyScopeReusePolicy([record], request.scope).reusable.length === 0) {
+      const access = await authorizeReuseRecord(record, request.scope, this.options);
+      if (!access) {
         denied.push(...candidates.map((item) => filtered(item, "scope_mismatch")));
         continue;
       }
       const scopedCandidates = candidates.filter((item) => {
+        if (access.permit) {
+          if (sameExactReuseScope(item.scope, record.scope) &&
+              (item.claimKind === undefined || item.claimKind === record.kind)) return true;
+          denied.push(filtered(item, "scope_mismatch"));
+          return false;
+        }
         const candidateScopedRecord = { ...record, scope: item.scope };
         if (applyScopeReusePolicy([candidateScopedRecord], request.scope).reusable.length === 1) {
           return true;
@@ -338,11 +376,13 @@ export class GovernedRetrievalEngine {
         denied.push(...scopedCandidates.map((item) => filtered(item, "risk_blocked")));
         continue;
       }
-      if (hasUnresolvedConflict(record) && record.metadata.admissionRoute !== "lookup_only") {
+      if (hasEvolutionReadHold(record.metadata) ||
+          (hasUnresolvedConflict(record) && record.metadata.admissionRoute !== "lookup_only")) {
         denied.push(...scopedCandidates.map((item) => filtered(item, "conflict_unresolved")));
         continue;
       }
-      if (!retrievalEligible(record, request.scope, request.intent)) {
+      // Scope authorization is complete above; lifecycle/risk checks retain the source coordinates.
+      if (!retrievalEligible(record, record.scope, request.intent)) {
         denied.push(...scopedCandidates.map((item) => filtered(item, "lifecycle_ineligible")));
         continue;
       }
@@ -365,12 +405,18 @@ export class GovernedRetrievalEngine {
         return true;
       });
       if (governanceMatched.length === 0) continue;
-      const group = governed.get(identity) ?? [];
-      group.push({ record, hydration, candidates: governanceMatched, route });
-      governed.set(identity, group);
+      // Equal wording in independently authorized scopes is not proof of the same canonical claim.
+      const scopedIdentity = JSON.stringify([scopeToSessionKey(record.scope), record.scope.visibility ?? "private", identity]);
+      const group = governed.get(scopedIdentity) ?? [];
+      group.push({ record, hydration, candidates: governanceMatched, route, permit: access.permit });
+      governed.set(scopedIdentity, group);
     }
 
-    const scored: Array<{ hit: GovernedRetrievalHit; representative: GovernedRetrievalCandidate }> = [];
+    const scored: Array<{
+      hit: GovernedRetrievalHit;
+      representative: GovernedRetrievalCandidate;
+      permit?: ExplicitReusePermit;
+    }> = [];
     for (const records of governed.values()) {
       const winningRank = Math.min(...records.map((item) => routeRank(item.route)));
       const winner = records.find((item) => routeRank(item.route) === winningRank)!;
@@ -412,6 +458,7 @@ export class GovernedRetrievalEngine {
       );
       scored.push({
         representative,
+        permit: winner.permit,
         hit: {
           record,
           score: scoreBreakdown.score,
@@ -425,7 +472,15 @@ export class GovernedRetrievalEngine {
       });
     }
 
-    const aboveThreshold = scored.filter(({ hit, representative }) => {
+    const current: typeof scored = [];
+    for (const item of scored) {
+      if (item.permit && !await this.options.reuseAuthorizer?.revalidate(item.permit, item.hit.record.kind)) {
+        denied.push(filtered(item.representative, "scope_mismatch"));
+      } else {
+        current.push(item);
+      }
+    }
+    const aboveThreshold = current.filter(({ hit, representative }) => {
       if (hit.score >= minScore) return true;
       denied.push(filtered(representative, "score_below_threshold"));
       return false;

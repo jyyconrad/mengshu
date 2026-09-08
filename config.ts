@@ -1,10 +1,16 @@
 import fs from "node:fs";
+import { createPublicKey } from "node:crypto";
+import { isAbsolute } from "node:path";
+import type { SourceParser, SourceSemantics } from "./packages/core/src/evolution/sources/types.js";
+import type { ClientAuthorityScopeRequest } from "./packages/core/src/domain/authority-scope.js";
 import { resolveDefaultLanceDbPath, resolveLegacyLanceDbPath } from "./core/paths.js";
 import {
   resolveAuthorityScope,
   type AuthorityScope,
 } from "./packages/core/src/domain/authority-scope.js";
 import type { MemoryVisibility } from "./packages/core/src/domain/types.js";
+import { parseRuntimeBackgroundWork, type RuntimeBackgroundWorkConfig } from "./packages/core/src/runtime/background-work.js";
+import { fingerprintTargetProfile, type TargetExecutionProfile } from "./packages/core/src/evolution/reuse/target-compatibility.js";
 
 /**
  * 路由规则配置
@@ -52,6 +58,26 @@ export interface CostPricingConfig {
   currency: string;
   minorUnitsPerMajor?: number;
   models: Record<string, CostModelPricingConfig>;
+}
+
+export interface EvolutionSourceConfig {
+  sourceId: string;
+  root: string;
+  parser: SourceParser;
+  semantics?: SourceSemantics;
+  scope?: Partial<ClientAuthorityScopeRequest>;
+  include?: string[];
+  exclude?: string[];
+}
+
+export interface EvolutionMaintenanceConfig {
+  enabled: boolean;
+  intervalMs: number;
+  quietPeriodMs: number;
+  dailyTokens: number;
+  dailyMinorUnits: number;
+  maxStorageBytes: number;
+  minFreeBytes: number;
 }
 
 export type MemoryConfig = {
@@ -105,6 +131,8 @@ export type MemoryConfig = {
     port?: number;
     secret?: string;
     requireHttps?: boolean;
+    backgroundWork?: RuntimeBackgroundWorkConfig;
+    workerOwnership?: "runtime-host" | "external-runtime-host";
   };
   features?: {
     bm25?: boolean;
@@ -114,6 +142,7 @@ export type MemoryConfig = {
     /** 显式启用 private Asset/Loadout 对原生 5 槽位的增强注入。 */
     assetInjection?: boolean;
     temporalMemory?: boolean;
+    continuousMemoryEvolution?: boolean;
     sessionWorkingSet?: boolean;
     skillArtifacts?: boolean;
     memoryPolicyOverlay?: boolean;
@@ -125,6 +154,16 @@ export type MemoryConfig = {
     allowHistoricalRecall?: boolean;
     allowRestore?: boolean;
     historicalIndex?: "bm25";
+  };
+  evolution?: {
+    sources: EvolutionSourceConfig[];
+    maintenance?: EvolutionMaintenanceConfig;
+    attestation?: { trustedIssuers: Array<{ id: string; publicKeyPem: string }> };
+    reuse?: { targetProfile: TargetExecutionProfile; evaluations?: Array<{
+      id: string; planFile: string; planFileHash: string; holdoutFile: string; holdoutFileHash: string;
+    }> };
+    /** Separate operator credential; never included in ordinary MCP/LLM arguments. */
+    control?: { ownerSecret: string };
   };
   sessionWorkingSet?: {
     mildRatio?: number;
@@ -336,6 +375,144 @@ function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], la
     return;
   }
   throw new Error(`${label} has unknown keys: ${unknown.join(", ")}`);
+}
+
+function parseEvolutionConfig(value: unknown): MemoryConfig["evolution"] {
+  if (value === undefined) return undefined;
+  const object = (raw: unknown, label: string): Record<string, unknown> => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${label} must be an object`);
+    return raw as Record<string, unknown>;
+  };
+  const config = object(value, "evolution");
+  assertAllowedKeys(config, ["sources", "maintenance", "control", "attestation", "reuse"], "evolution");
+  let reuse: NonNullable<MemoryConfig["evolution"]>["reuse"];
+  if (config.reuse !== undefined) {
+    const raw = object(config.reuse, "evolution reuse");
+    assertAllowedKeys(raw, ["targetProfile", "evaluations"], "evolution reuse");
+    const target = object(raw.targetProfile, "evolution reuse target profile");
+    assertAllowedKeys(target, ["model", "tools", "environmentFingerprint", "applicability"], "evolution reuse target profile");
+    assertAllowedKeys(object(target.model, "evolution reuse model"), ["provider", "modelId", "revision"], "evolution reuse model");
+    if (!Array.isArray(target.tools) || target.tools.length > 128) throw new Error("evolution reuse tools are invalid");
+    for (const tool of target.tools) assertAllowedKeys(object(tool, "evolution reuse tool"), ["name", "version", "schemaHash"], "evolution reuse tool");
+    const targetProfile = structuredClone(target) as unknown as TargetExecutionProfile;
+    fingerprintTargetProfile(targetProfile);
+    let evaluations: NonNullable<NonNullable<MemoryConfig["evolution"]>["reuse"]>["evaluations"];
+    if (raw.evaluations !== undefined) {
+      if (!Array.isArray(raw.evaluations) || raw.evaluations.length > 32) throw new Error("evolution reuse evaluations are invalid");
+      const ids = new Set<string>();
+      evaluations = raw.evaluations.map(value => {
+        const entry = object(value, "evolution reuse evaluation");
+        assertAllowedKeys(entry, ["id", "planFile", "planFileHash", "holdoutFile", "holdoutFileHash"], "evolution reuse evaluation");
+        if (typeof entry.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(entry.id) || ids.has(entry.id)) throw new Error("evolution reuse evaluation id is invalid");
+        for (const field of ["planFile", "holdoutFile"] as const) if (typeof entry[field] !== "string" || !isAbsolute(entry[field]) || entry[field].length > 4096 || /[\u0000-\u001f\u007f]/.test(entry[field])) throw new Error("evolution reuse evaluation file is invalid");
+        for (const field of ["planFileHash", "holdoutFileHash"] as const) if (typeof entry[field] !== "string" || !/^[a-f0-9]{64}$/.test(entry[field])) throw new Error("evolution reuse evaluation hash is invalid");
+        ids.add(entry.id);
+        return { id: entry.id, planFile: entry.planFile as string, planFileHash: entry.planFileHash as string,
+          holdoutFile: entry.holdoutFile as string, holdoutFileHash: entry.holdoutFileHash as string };
+      });
+    }
+    reuse = { targetProfile, ...(evaluations ? { evaluations } : {}) };
+  }
+  let attestation: NonNullable<MemoryConfig["evolution"]>["attestation"];
+  if (config.attestation !== undefined) {
+    const raw = object(config.attestation, "evolution attestation");
+    assertAllowedKeys(raw, ["trustedIssuers"], "evolution attestation");
+    if (!Array.isArray(raw.trustedIssuers) || raw.trustedIssuers.length > 32) throw new Error("evolution attestation issuers are invalid");
+    const ids = new Set<string>();
+    attestation = { trustedIssuers: raw.trustedIssuers.map(value => {
+      const issuer = object(value, "evolution attestation issuer");
+      assertAllowedKeys(issuer, ["id", "publicKeyPem"], "evolution attestation issuer");
+      if (typeof issuer.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(issuer.id) || ids.has(issuer.id) ||
+          typeof issuer.publicKeyPem !== "string" || issuer.publicKeyPem.length > 4096 ||
+          !/^-----BEGIN PUBLIC KEY-----\r?\n[\s\S]+\r?\n-----END PUBLIC KEY-----\s*$/.test(issuer.publicKeyPem)) {
+        throw new Error("evolution attestation issuer is invalid");
+      }
+      try { if (createPublicKey(issuer.publicKeyPem).asymmetricKeyType !== "ed25519") throw new Error(); }
+      catch { throw new Error("evolution attestation requires an Ed25519 public key"); }
+      ids.add(issuer.id);
+      return { id: issuer.id, publicKeyPem: issuer.publicKeyPem };
+    }) };
+  }
+  let maintenance: EvolutionMaintenanceConfig | undefined;
+  if (config.maintenance !== undefined) {
+    const raw = object(config.maintenance, "evolution maintenance");
+    assertAllowedKeys(raw, ["enabled", "intervalMs", "quietPeriodMs", "dailyTokens", "dailyMinorUnits", "maxStorageBytes", "minFreeBytes"], "evolution maintenance");
+    if (typeof raw.enabled !== "boolean") throw new Error("evolution maintenance enabled must be boolean");
+    const bounded = (key: string, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number => {
+      const count = raw[key];
+      if (!Number.isSafeInteger(count) || (count as number) < minimum || (count as number) > maximum) {
+        throw new Error(`evolution maintenance ${key} is invalid`);
+      }
+      return count as number;
+    };
+    maintenance = {
+      enabled: raw.enabled, intervalMs: bounded("intervalMs", 60_000, 30 * 86_400_000),
+      quietPeriodMs: bounded("quietPeriodMs", 1_000, 86_400_000),
+      dailyTokens: bounded("dailyTokens", 1), dailyMinorUnits: bounded("dailyMinorUnits", 1),
+      maxStorageBytes: bounded("maxStorageBytes", 1), minFreeBytes: bounded("minFreeBytes", 1),
+    };
+  }
+  let control: { ownerSecret: string } | undefined;
+  if (config.control !== undefined) {
+    const raw = object(config.control, "evolution control");
+    assertAllowedKeys(raw, ["ownerSecret"], "evolution control");
+    if (typeof raw.ownerSecret !== "string") throw new Error("evolution control credential is invalid");
+    const ownerSecret = resolveEnvVars(raw.ownerSecret, "evolution.control.ownerSecret");
+    if (ownerSecret.length < 32 || ownerSecret.length > 4096 || /[\s\p{Cc}]/u.test(ownerSecret)) {
+      throw new Error("evolution control credential is invalid");
+    }
+    control = { ownerSecret };
+  }
+  const rawSources = config.sources ?? [];
+  if (!Array.isArray(rawSources) || rawSources.length > 64) throw new Error("evolution.sources must contain at most 64 bindings");
+  const seen = new Set<string>();
+  const sources = rawSources.map((raw): EvolutionSourceConfig => {
+    const source = object(raw, "evolution source");
+    assertAllowedKeys(source, ["sourceId", "root", "parser", "semantics", "scope", "include", "exclude"], "evolution source");
+    if (typeof source.sourceId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(source.sourceId) || seen.has(source.sourceId)) {
+      throw new Error("evolution sourceId must be unique and bounded");
+    }
+    seen.add(source.sourceId);
+    if (typeof source.root !== "string" || !isAbsolute(source.root) || source.root.length > 4096 || /[\u0000-\u001f\u007f]/.test(source.root)) {
+      throw new Error("evolution root must be an absolute host path");
+    }
+    const parser = source.parser ?? "auto";
+    if (!["auto", "markdown", "codex-jsonl", "claude-code-jsonl", "openclaw-jsonl"].includes(parser as string)) {
+      throw new Error("evolution parser is invalid");
+    }
+    if (source.semantics !== undefined && !["current_document", "append_history", "reference_snapshot"].includes(source.semantics as string)) {
+      throw new Error("evolution semantics is invalid");
+    }
+    let scope: Partial<ClientAuthorityScopeRequest> | undefined;
+    if (source.scope !== undefined) {
+      const rawScope = object(source.scope, "evolution source scope");
+      assertAllowedKeys(rawScope, ["appId", "projectId", "agentId", "namespace", "visibility"], "evolution source scope");
+      for (const [key, item] of Object.entries(rawScope)) {
+        if (typeof item !== "string" || !/^[^\s\p{Cc}]{1,256}$/u.test(item) ||
+            key === "visibility" && !["private", "workspace", "team", "public"].includes(item)) {
+          throw new Error("evolution source scope is invalid");
+        }
+      }
+      scope = { ...rawScope } as Partial<ClientAuthorityScopeRequest>;
+    }
+    const patterns = (key: "include" | "exclude"): string[] | undefined => {
+      const items = source[key];
+      if (items === undefined) return undefined;
+      if (!Array.isArray(items) || items.length > 64 || items.some(item =>
+        typeof item !== "string" || item.length < 1 || item.length > 256 || item.startsWith("!") || /[\u0000-\u001f\u007f]/.test(item))) {
+        throw new Error(`evolution ${key} is invalid`);
+      }
+      return [...items] as string[];
+    };
+    const include = patterns("include"), exclude = patterns("exclude");
+    return {
+      sourceId: source.sourceId, root: source.root, parser: parser as SourceParser,
+      ...(source.semantics === undefined ? {} : { semantics: source.semantics as SourceSemantics }),
+      ...(scope === undefined ? {} : { scope }),
+      ...(include === undefined ? {} : { include }), ...(exclude === undefined ? {} : { exclude }),
+    };
+  });
+  return { sources, ...(maintenance ? { maintenance } : {}), ...(control ? { control } : {}), ...(attestation ? { attestation } : {}), ...(reuse ? { reuse } : {}) };
 }
 
 function parseHostAuthority(value: unknown): AuthorityScope | undefined {
@@ -550,11 +727,12 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "authority", "defaultAgentId", "llm", "mode", "server", "features", "temporalMemory", "sessionWorkingSet", "skillArtifacts", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
+      ["embedding", "authority", "defaultAgentId", "llm", "mode", "server", "features", "temporalMemory", "evolution", "sessionWorkingSet", "skillArtifacts", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
       "memory config",
     );
 
     const authority = parseHostAuthority(cfg.authority);
+    const evolution = parseEvolutionConfig(cfg.evolution);
     if (cfg.defaultAgentId !== undefined &&
         (typeof cfg.defaultAgentId !== "string" || cfg.defaultAgentId.trim().length === 0)) {
       throw new Error("defaultAgentId must be a non-empty string");
@@ -633,7 +811,10 @@ export const memoryConfigSchema = {
 
     const server = cfg.server as Record<string, unknown> | undefined;
     if (server) {
-      assertAllowedKeys(server, ["enabled", "host", "port", "secret", "requireHttps"], "server config");
+      assertAllowedKeys(server, ["enabled", "host", "port", "secret", "requireHttps", "backgroundWork", "workerOwnership"], "server config");
+      if (server.workerOwnership !== undefined && !["runtime-host", "external-runtime-host"].includes(server.workerOwnership as string)) {
+        throw new Error("server.workerOwnership must be runtime-host or external-runtime-host");
+      }
       if (server.enabled !== undefined && typeof server.enabled !== "boolean") {
         throw new Error("server.enabled must be a boolean");
       }
@@ -658,10 +839,10 @@ export const memoryConfigSchema = {
     if (features) {
       assertAllowedKeys(
         features,
-        ["bm25", "graph", "summaryTree", "webConsole", "assetInjection", "temporalMemory", "sessionWorkingSet", "skillArtifacts", "memoryPolicyOverlay", "teamAssets", "proxy"],
+        ["bm25", "graph", "summaryTree", "webConsole", "assetInjection", "temporalMemory", "continuousMemoryEvolution", "sessionWorkingSet", "skillArtifacts", "memoryPolicyOverlay", "teamAssets", "proxy"],
         "features config",
       );
-      for (const key of ["bm25", "graph", "summaryTree", "webConsole", "assetInjection", "temporalMemory", "sessionWorkingSet", "skillArtifacts", "memoryPolicyOverlay", "teamAssets", "proxy"]) {
+      for (const key of ["bm25", "graph", "summaryTree", "webConsole", "assetInjection", "temporalMemory", "continuousMemoryEvolution", "sessionWorkingSet", "skillArtifacts", "memoryPolicyOverlay", "teamAssets", "proxy"]) {
         if (features[key] !== undefined && typeof features[key] !== "boolean") {
           throw new Error(`features.${key} must be a boolean`);
         }
@@ -942,6 +1123,7 @@ export const memoryConfigSchema = {
 
     return {
       authority,
+      ...(evolution === undefined ? {} : { evolution }),
       defaultAgentId,
       embedding: {
         provider: "openai",
@@ -967,6 +1149,8 @@ export const memoryConfigSchema = {
         port: typeof server?.port === "number" ? server.port : DEFAULT_SERVER_PORT,
         secret: typeof server?.secret === "string" ? resolveEnvVars(server.secret, "server.secret") : undefined,
         requireHttps: server?.requireHttps === true,
+        ...(server?.backgroundWork === undefined ? {} : { backgroundWork: parseRuntimeBackgroundWork(server.backgroundWork) }),
+        ...(server?.workerOwnership === undefined ? {} : { workerOwnership: server.workerOwnership as "runtime-host" | "external-runtime-host" }),
       },
       features: {
         bm25: features?.bm25 === true,
@@ -975,6 +1159,7 @@ export const memoryConfigSchema = {
         webConsole: features?.webConsole === true,
         assetInjection: features?.assetInjection === true,
         temporalMemory: features?.temporalMemory === true,
+        continuousMemoryEvolution: features?.continuousMemoryEvolution === true,
         sessionWorkingSet: features?.sessionWorkingSet === true,
         skillArtifacts: features?.skillArtifacts === true,
         memoryPolicyOverlay: features?.memoryPolicyOverlay === true,

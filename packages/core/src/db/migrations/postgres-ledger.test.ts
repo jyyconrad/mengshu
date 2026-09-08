@@ -50,6 +50,26 @@ class FakePostgresClient implements PostgresMigrationClient {
   historyRebuildLedgerCatalogRows?: Record<string, unknown>[];
   candidateWriteRouteValues?: readonly string[];
   jobStateCatalogRows?: Record<string, unknown>[];
+  evolutionCatalogMutation?: (rows: Record<string, unknown>[]) => Record<string, unknown>[];
+
+  private evolutionColumns(tableName: string): Record<string, unknown>[] {
+    const applied = this.transactionApplied ?? this.applied;
+    if (!applied.some(({ version }) => version === 37) && !this.calls.some(({ sql }) =>
+      sql === "ALTER TABLE memories ADD COLUMN IF NOT EXISTS evolution_disputed BOOLEAN NOT NULL DEFAULT FALSE")) return [];
+    const outbox = { evolution_consumed_at: ["bigint", "YES", null], evolution_origin: ["boolean", "NO", "false"] };
+    const specs: Record<string, Record<string, unknown[]>> = {
+      mengshu_write_outbox: outbox,
+      mengshu_memory_version_outbox: outbox,
+      memories: { evolution_review_due_at: ["bigint", "NO", "0"], evolution_disputed: ["boolean", "NO", "false"], evolution_alias_of: ["uuid", "YES", null] },
+      mengshu_memory_evidence_links: {
+        relation_state: ["text", "NO", "'effective'::text"], retired_at: ["bigint", "YES", null],
+        ...Object.fromEntries(["root_evidence_id", "source_id", "source_revision", "source_current_revision", "source_hash", "source_kind", "source_record_id", "source_path_id", "source_span_id", "source_logical_file_id", "continuity_key", "independence_group_id"].map(name => [name, ["text", "YES", null]])),
+      },
+    };
+    return Object.entries(specs[tableName] ?? {}).map(([object_name, [definition, is_nullable, default_definition]]) => ({
+      kind: "column", table_name: tableName, object_name, definition, is_nullable, default_definition, is_valid: true, is_ready: true,
+    }));
+  }
 
   async query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
@@ -106,6 +126,18 @@ class FakePostgresClient implements PostgresMigrationClient {
     }
     if (sql === DURABLE_DOMAIN_SCHEMA_CATALOG_SQL) {
       const requestedTables = Array.isArray(params[0]) ? params[0] as string[] : [];
+      if (requestedTables.includes("mengshu_memory_version_outbox") || requestedTables.includes("memories")) {
+        const rows = requestedTables.flatMap(tableName => {
+          const base = tableName === "mengshu_memory_version_outbox" ? Object.entries({
+            event_id: "text", scope_fingerprint: "text", lineage_id: "text", revision: "integer",
+            event_type: "text", payload: "jsonb", occurred_at: "bigint", published_at: "bigint",
+          }).map(([object_name, definition]) => ({ kind: "column", table_name: tableName, object_name, definition,
+            is_nullable: object_name === "published_at" ? "YES" : "NO", default_definition: null, is_valid: true, is_ready: true })) : [];
+          return [...base, ...this.evolutionColumns(tableName)];
+        });
+        const catalogRows = this.evolutionCatalogMutation?.(rows) ?? rows;
+        return { rows: catalogRows as Row[], rowCount: catalogRows.length };
+      }
       if (requestedTables.includes("mengshu_history_rebuild_model_attempts")) {
         const nullable = new Set([
           "output", "output_hash", "actual_input_tokens", "actual_output_tokens",
@@ -574,7 +606,8 @@ class FakePostgresClient implements PostgresMigrationClient {
             is_valid: true, is_ready: true,
           });
         }
-        const catalogRows = this.evidenceLinkCatalogRows ?? rows;
+        rows.push(...this.evolutionColumns("mengshu_memory_evidence_links"));
+        const catalogRows = this.evidenceLinkCatalogRows ?? this.evolutionCatalogMutation?.(rows) ?? rows;
         return { rows: catalogRows as Row[], rowCount: catalogRows.length };
       }
       if (requestedTables.includes("mengshu_candidate_write_receipts")) {
@@ -845,7 +878,8 @@ class FakePostgresClient implements PostgresMigrationClient {
             is_ready: true,
           });
         }
-        const writeRows = this.writeCatalogRows ?? rows;
+        rows.push(...this.evolutionColumns("mengshu_write_outbox"));
+        const writeRows = this.writeCatalogRows ?? this.evolutionCatalogMutation?.(rows) ?? rows;
         return { rows: writeRows as Row[], rowCount: writeRows.length };
       }
       const nullable = new Map<string, readonly string[]>([
@@ -1078,6 +1112,90 @@ describe("executePostgresMigrations", () => {
     expect(client.calls.filter((call) => call.sql === INSERT_MIGRATION_SQL)).toHaveLength(ledgerWrites);
     expect(client.calls.filter((call) => call.sql === AUTHORITY_DEDUPE_INDEX_CATALOG_SQL).length)
       .toBeGreaterThanOrEqual(2);
+  });
+
+  test.each([36, 37])("v%s catalog supports repeated startup with exactly its versioned columns", async (version) => {
+    const client = new FakePostgresClient();
+    const options = { migrations: SCHEMA_MIGRATIONS.slice(0, version), currentSchemaVersion: version };
+    await executePostgresMigrations(client, options);
+    await executePostgresMigrations(client, { ...options,
+      contractMigration: { mode: "apply", maintenance: true, quiescenceConfirmed: true } });
+    const before = structuredClone(client.applied);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(executePostgresMigrations(client, options)).resolves.toMatchObject({ toVersion: version, appliedVersions: [] });
+      expect(client.applied).toEqual(before);
+    }
+  });
+
+  test("v36 upgrades to v37 and restarts without rewriting any previous ledger entry", async () => {
+    const client = new FakePostgresClient();
+    await executePostgresMigrations(client, { migrations: SCHEMA_MIGRATIONS.slice(0, 36), currentSchemaVersion: 36,
+      contractMigration: { mode: "apply", maintenance: true, quiescenceConfirmed: true } });
+    const original = structuredClone(client.applied);
+    await expect(executePostgresMigrations(client)).resolves.toMatchObject({ fromVersion: 36, toVersion: 37, appliedVersions: [37] });
+    await expect(executePostgresMigrations(client)).resolves.toMatchObject({ toVersion: 37, appliedVersions: [] });
+    expect(client.applied.slice(0, 36)).toEqual(original);
+    const calls = client.calls.length;
+    await expect(executePostgresMigrations(client, { migrations: SCHEMA_MIGRATIONS.slice(0, 36), currentSchemaVersion: 36 })).rejects.toThrow(/newer or unknown/i);
+    expect(client.calls.slice(calls).some(call => call.sql === DURABLE_DOMAIN_SCHEMA_CATALOG_SQL)).toBe(false);
+    expect(client.applied.slice(0, 36)).toEqual(original);
+  });
+
+  test.each([
+    ["mengshu_write_outbox", "evolution_consumed_at"], ["mengshu_write_outbox", "evolution_origin"],
+    ["mengshu_memory_version_outbox", "evolution_consumed_at"], ["mengshu_memory_version_outbox", "evolution_origin"],
+    ["mengshu_memory_evidence_links", "relation_state"], ["mengshu_memory_evidence_links", "source_id"],
+    ["mengshu_memory_evidence_links", "source_current_revision"], ["mengshu_memory_evidence_links", "retired_at"],
+    ["memories", "evolution_review_due_at"], ["memories", "evolution_disputed"], ["memories", "evolution_alias_of"],
+  ])("v37 rejects missing/type/default/nullability drift in %s.%s on every restart", async (table, column) => {
+    const client = new FakePostgresClient();
+    await executePostgresMigrations(client, { contractMigration: { mode: "apply", maintenance: true, quiescenceConfirmed: true } });
+    const original = structuredClone(client.applied);
+    for (const drift of ["missing", "definition", "default_definition", "is_nullable"]) {
+      client.evolutionCatalogMutation = rows => rows.flatMap(row => {
+        if (row.kind !== "column" || row.table_name !== table || row.object_name !== column) return [row];
+        if (drift === "missing") return [];
+        return [{ ...row, [drift]: drift === "is_nullable" ? (row.is_nullable === "YES" ? "NO" : "YES") : "unsafe_drift" }];
+      });
+      await expect(executePostgresMigrations(client)).rejects.toMatchObject({ code: "SCHEMA_CONTRACT_INVALID" });
+      expect(client.calls.at(-1)?.sql).toBe("ROLLBACK");
+      expect(client.applied).toEqual(original);
+    }
+  });
+
+  test.each([36, 37])("v%s rejects undeclared journal/evidence/temporal columns instead of allowing unknown extensions", async (version) => {
+    const client = new FakePostgresClient();
+    const options = { migrations: SCHEMA_MIGRATIONS.slice(0, version), currentSchemaVersion: version };
+    await executePostgresMigrations(client, { ...options, contractMigration: { mode: "apply", maintenance: true, quiescenceConfirmed: true } });
+    for (const table of ["mengshu_write_outbox", "mengshu_memory_evidence_links", "mengshu_memory_version_outbox"]) {
+      client.evolutionCatalogMutation = rows => rows.some(row => row.table_name === table) ? [...rows, {
+        kind: "column", table_name: table, object_name: "evolution_unknown", definition: "text", default_definition: null, is_nullable: "YES",
+      }] : rows;
+      await expect(executePostgresMigrations(client, options)).rejects.toMatchObject({ code: "SCHEMA_CONTRACT_INVALID" });
+    }
+  });
+
+  test("v37 validates expansion before recording its ledger and rolls back invalid defaults", async () => {
+    const client = new FakePostgresClient();
+    await executePostgresMigrations(client, { migrations: SCHEMA_MIGRATIONS.slice(0, 36), currentSchemaVersion: 36,
+      contractMigration: { mode: "apply", maintenance: true, quiescenceConfirmed: true } });
+    client.evolutionCatalogMutation = rows => rows.map(row => row.object_name === "evolution_origin"
+      ? { ...row, default_definition: "true" } : row);
+    const start = client.calls.length;
+    await expect(executePostgresMigrations(client)).rejects.toMatchObject({ code: "SCHEMA_CONTRACT_INVALID" });
+    expect(client.applied.at(-1)?.version).toBe(36);
+    expect(client.calls.slice(start).some(call => call.sql === INSERT_MIGRATION_SQL && call.params[0] === 37)).toBe(false);
+  });
+
+  test("v36 does not accept v37 columns without the v37 migration", async () => {
+    const client = new FakePostgresClient();
+    const options = { migrations: SCHEMA_MIGRATIONS.slice(0, 36), currentSchemaVersion: 36 };
+    await executePostgresMigrations(client, { ...options, contractMigration: { mode: "apply", maintenance: true, quiescenceConfirmed: true } });
+    client.evolutionCatalogMutation = rows => rows.some(row => row.table_name === "mengshu_write_outbox") ? [...rows, {
+      kind: "column", table_name: "mengshu_write_outbox", object_name: "evolution_origin", definition: "boolean", default_definition: "false", is_nullable: "NO",
+    }] : rows;
+    await expect(executePostgresMigrations(client, options)).rejects.toMatchObject({ code: "SCHEMA_CONTRACT_INVALID" });
+    expect(client.applied.at(-1)?.version).toBe(36);
   });
 
   test("v18 catalog predicate 漂移时 fail-closed，且不写 v18 ledger", async () => {

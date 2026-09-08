@@ -1,5 +1,6 @@
 import type { CompleteRecallScoreBreakdown } from "../domain/recall-scoring.js";
 import type { MemoryScope } from "../domain/types.js";
+import { sameExactReuseScope } from "../evolution/reuse/explicit-reuse-authorizer.js";
 import type { SkillReadResult } from "../skills/types.js";
 import type { LoadoutAssetCandidate } from "./types.js";
 
@@ -34,12 +35,13 @@ export function resolveSkillLoadoutCandidate(input: {
     assetKind: "skill" as const,
     status: artifact.status,
     contentValidity: input.read.validity === "valid" ? "current" as const : "stale" as const,
-    scope: input.scope,
+    scope: artifact.scope,
     semanticTypes: ["experience", "resource"] as const,
     recordId: artifact.skillId,
     content,
     evidenceRefs: [...artifact.evidenceChunkIds],
-    lifecycleEligible: artifact.status === "published" && input.read.validity === "valid",
+    lifecycleEligible: artifact.status === "published" && input.read.validity === "valid" &&
+      artifact.executionMode === "suggest_only" && sameExactReuseScope(artifact.scope, input.scope),
     riskBlocked: artifact.riskBoundaries.some((boundary) =>
       /(?:不可逆|付费|删除|credential|secret|payment|delete)/i.test(boundary)),
     conflictUnresolved: false,

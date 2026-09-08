@@ -42,6 +42,9 @@ export function candidateToMemoryRecord(
   candidate: CandidateRecord,
   now: number = Date.now(),
 ): MemoryRecord {
+  if (Object.prototype.hasOwnProperty.call(candidate.metadata, "evolution")) {
+    throw new Error("evolution_review_required");
+  }
   return {
     id: deterministicUuid(`mengshu:candidate-memory\0${candidate.id}`),
     scope: candidate.scope,

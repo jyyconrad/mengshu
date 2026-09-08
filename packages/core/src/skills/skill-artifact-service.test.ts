@@ -5,7 +5,7 @@ import { describe, expect, test } from "vitest";
 import type { MemoryScope } from "../domain/types.js";
 import { InMemorySkillCandidateRepository } from "../lifecycle/skill-candidate-repository.js";
 import { InMemorySkillArtifactRepository } from "./in-memory-repository.js";
-import { SkillArtifactService } from "./skill-artifact-service.js";
+import { SkillArtifactService, type SkillArtifactServiceDependencies } from "./skill-artifact-service.js";
 
 const scope: MemoryScope = {
   tenantId: "tenant-1", userId: "user-1", appId: "codex", projectId: "project-1",
@@ -23,6 +23,7 @@ const resource = {
 async function fixture(options: {
   highRisk?: boolean;
   evidenceReadable?: boolean;
+  targetCompatibility?: SkillArtifactServiceDependencies["targetCompatibility"];
   policyReceipt?: {
     scopeFingerprint: string;
     layer: "skill_review";
@@ -63,6 +64,7 @@ async function fixture(options: {
       }),
     },
     now: () => 1_000,
+    targetCompatibility: options.targetCompatibility,
     ...(options.policyReceipt === undefined ? {} : {
       policyResolver: {
         resolve: async () => ({
@@ -79,6 +81,45 @@ async function fixture(options: {
 }
 
 describe("SkillArtifactService", () => {
+  test("a revoked head invalidates a pinned published version even while the target binding remains valid", async () => {
+    const { service } = await fixture({ targetCompatibility: { allowsSkill: async () => true } });
+    await service.proposeFromCandidate({ scope, ownerUserId: scope.userId, candidateId: "candidate-1",
+      skillId: "skill-pinned", expectedLatestVersion: 0, manifest: [resource],
+      expectedOutcomePolicyVersion: "v1", idempotencyKey: "pinned-propose" });
+    const reviewed = await service.review({ scope, skillId: "skill-pinned", expectedLatestVersion: 1,
+      reviewerUserId: scope.userId, decision: "approve", reason: "reviewed", idempotencyKey: "pinned-review" });
+    await service.publish({ scope, skillId: "skill-pinned", expectedLatestVersion: 2,
+      reviewerUserId: scope.userId, reviewReceiptId: reviewed.receipt.id, idempotencyKey: "pinned-publish" });
+    expect(await service.read({ scope, skillId: "skill-pinned", version: 3 })).toMatchObject({ validity: "valid" });
+    await service.revoke({ scope, skillId: "skill-pinned", expectedLatestVersion: 3, actorUserId: scope.userId,
+      reason: "withdrawn procedure", idempotencyKey: "pinned-revoke" });
+    expect(await service.read({ scope, skillId: "skill-pinned", version: 3 })).toMatchObject({
+      validity: "stale", warnings: ["target_incompatible"], artifact: { status: "published", executionMode: "suggest_only" },
+    });
+    expect(await service.explain({ scope, skillId: "skill-pinned", version: 3 })).toMatchObject({ validity: "stale" });
+  });
+
+  test("host target incompatibility invalidates published read, explain and search on the next call", async () => {
+    let compatible = true;
+    const { service } = await fixture({ targetCompatibility: { allowsSkill: async () => compatible } });
+    await service.proposeFromCandidate({ scope, ownerUserId: scope.userId, candidateId: "candidate-1",
+      skillId: "skill-target", expectedLatestVersion: 0, manifest: [resource],
+      expectedOutcomePolicyVersion: "v1", idempotencyKey: "target-propose" });
+    const reviewed = await service.review({ scope, skillId: "skill-target", expectedLatestVersion: 1,
+      reviewerUserId: scope.userId, decision: "approve", reason: "reviewed", idempotencyKey: "target-review" });
+    await service.publish({ scope, skillId: "skill-target", expectedLatestVersion: 2,
+      reviewerUserId: scope.userId, reviewReceiptId: reviewed.receipt.id, idempotencyKey: "target-publish" });
+    expect(await service.read({ scope, skillId: "skill-target" })).toMatchObject({ validity: "valid" });
+    compatible = false;
+    expect(await service.read({ scope, skillId: "skill-target" })).toMatchObject({
+      validity: "stale", warnings: ["target_incompatible"], artifact: { executionMode: "suggest_only" },
+    });
+    expect(await service.explain({ scope, skillId: "skill-target" })).toMatchObject({
+      validity: "stale", warnings: ["target_incompatible"],
+    });
+    expect((await service.search({ scope, query: "Release" })).hits).toEqual([]);
+  });
+
   test("curated import validates license/provenance and still stops at review-required draft", async () => {
     const { service, candidates } = await fixture();
     const input = {

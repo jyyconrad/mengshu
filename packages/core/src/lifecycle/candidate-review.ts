@@ -98,6 +98,10 @@ export class CandidateReviewService {
         errors.push(`not_found:${id}`);
         continue;
       }
+      if (Object.prototype.hasOwnProperty.call(record.metadata, "evolution")) {
+        errors.push(`evolution_review_required:${id}`);
+        continue;
+      }
       const approvedReplay = record.status === "approved" &&
         this.deps.replayApprovedPromotion === true &&
         typeof record.promotedToMemoryId === "string" &&
@@ -245,6 +249,9 @@ export function candidateToMemoryRecord(
     idFactory?: () => string;
   }
 ): MemoryRecord {
+  if (Object.prototype.hasOwnProperty.call(candidate.metadata, "evolution")) {
+    throw new Error("evolution_review_required");
+  }
   const id = options.idFactory
     ? options.idFactory()
     : durableUuid("candidate-memory", candidate.id);

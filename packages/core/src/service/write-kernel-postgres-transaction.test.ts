@@ -7,6 +7,7 @@ import {
   PostgresMemoryWriteKernelTransactionError,
   PostgresMemoryWriteKernelTransactionPort,
   isProviderOwnedMemoryWriteKernelTransactionPort,
+  getPostgresMemoryWriteKernelFailureDiagnostic,
   type PostgresMemoryWriteKernelClient,
 } from "./write-kernel-postgres-transaction.js";
 import type {
@@ -111,6 +112,63 @@ function harness(client = new Client()) {
   return { client, mutate, port };
 }
 
+describe("host-only transaction diagnostics", () => {
+  test.each(["42P18", "secret-provider-code", "23505 body", "abcde"])("bounds mutation SQLSTATE %s without error payloads", async code => {
+    const client = new Client();
+    const port = new PostgresMemoryWriteKernelTransactionPort({ connect: async () => client }, async () => {
+      throw Object.assign(new Error("secret body and connection config"), { code, detail: "secret detail" });
+    });
+    const error = await port.transaction(commitContent).catch((failure: unknown) => failure);
+    const diagnostic = getPostgresMemoryWriteKernelFailureDiagnostic(error);
+    expect(diagnostic).toEqual({ phase: "mutation", code: "TRANSACTION_FAILED", ...(code === "42P18" ? { sqlState: code } : {}) });
+    expect(Object.isFrozen(diagnostic)).toBe(true);
+    expect(JSON.stringify(diagnostic)).not.toContain("secret");
+  });
+
+  test("retains the exact stage for an unmodified private contract error", async () => {
+    const { port } = harness();
+    const error = await port.transaction(tx => tx.writeMemory(content)).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(Error);
+    expect(getPostgresMemoryWriteKernelFailureDiagnostic(error)).toEqual({ phase: "mutation", code: "TRANSACTION_CONTRACT" });
+    expect(getPostgresMemoryWriteKernelFailureDiagnostic(new Error("forged error"))).toBeUndefined();
+  });
+
+  test("connect failure keeps only the SQLSTATE in the host diagnostic", async () => {
+    const port = new PostgresMemoryWriteKernelTransactionPort({ connect: async () => {
+      throw Object.assign(new Error("secret connect config"), { code: "53300" });
+    } }, async () => ({ memoryId: "memory", stored: true }));
+    const error = await port.transaction(commitContent).catch((failure: unknown) => failure);
+    expect(getPostgresMemoryWriteKernelFailureDiagnostic(error)).toEqual({ phase: "connect", code: "CONNECTION_FAILED", sqlState: "53300" });
+    expect(String(error)).toBe("Error: Postgres memory write kernel connection failed");
+  });
+
+  test.each([
+    ["begin", /^BEGIN$/], ["receipt_read", /FROM mengshu_write_receipts/],
+    ["audit", /INSERT INTO mengshu_write_audit/], ["outbox", /INSERT INTO mengshu_write_outbox/],
+    ["receipt_write", /INSERT INTO mengshu_write_receipts/], ["commit", /^COMMIT$/],
+  ] as const)("retains bounded SQLSTATE and phase at %s", async (phase, failSql) => {
+    const client = new Client(), query = client.query.bind(client);
+    client.query = async (sql, params) => {
+      if (failSql.test(sql)) throw Object.assign(new Error("private query/body/config"), { code: "57014" });
+      return query(sql, params);
+    };
+    const { port } = harness(client);
+    const error = await port.transaction(commitContent).catch((failure: unknown) => failure);
+    expect(getPostgresMemoryWriteKernelFailureDiagnostic(error)).toEqual({ phase, code: "TRANSACTION_FAILED", sqlState: "57014" });
+    expect(client.releaseCount).toBe(1);
+  });
+
+  test("an error code accessor cannot replace the transaction failure", async () => {
+    const client = new Client();
+    const port = new PostgresMemoryWriteKernelTransactionPort({ connect: async () => client }, async () => {
+      throw Object.defineProperty(new Error("private body"), "code", { get: () => { throw new Error("private getter"); } });
+    });
+    const error = await port.transaction(commitContent).catch((failure: unknown) => failure);
+    expect(getPostgresMemoryWriteKernelFailureDiagnostic(error)).toEqual({ phase: "mutation", code: "TRANSACTION_FAILED" });
+    expect(String(error)).not.toContain("private");
+  });
+});
+
 async function commitContent(
   context: MemoryWriteTransactionContext,
   durableReceipt = receipt(),
@@ -139,6 +197,40 @@ async function commitContent(
 }
 
 describe("PostgresMemoryWriteKernelTransactionPort", () => {
+  test("provider hooks share the canonical client and complete before COMMIT", async () => {
+    const client = new Client();
+    const afterBegin = vi.fn(async (c: PostgresMemoryWriteKernelClient) => {
+      expect(c).toBe(client);
+      await c.query("/* evolution transaction limits */ SELECT 1");
+    });
+    const beforeMutation = vi.fn(async (c: PostgresMemoryWriteKernelClient) => {
+      expect(c).toBe(client);
+      await c.query("/* evolution guard */ SELECT 1");
+    });
+    const afterReceipt = vi.fn(async (c: PostgresMemoryWriteKernelClient) => {
+      expect(c).toBe(client);
+      await c.query("/* evolution receipt */ SELECT 1");
+    });
+    const port = new PostgresMemoryWriteKernelTransactionPort({ connect: async () => client },
+      async () => ({ memoryId: content.id, stored: true }), { afterBegin, beforeMutation, afterReceipt });
+    await port.transaction(commitContent);
+    expect(beforeMutation).toHaveBeenCalledTimes(1);
+    expect(afterBegin).toHaveBeenCalledTimes(1);
+    expect(client.calls[1]?.sql).toContain("evolution transaction limits");
+    expect(afterReceipt).toHaveBeenCalledTimes(1);
+    expect(client.calls.at(-2)?.sql).toContain("evolution receipt");
+    expect(client.calls.at(-1)?.sql).toBe("COMMIT");
+  });
+  test("failed evolution receipt hook rolls back canonical, audit and kernel receipt", async () => {
+    const client = new Client();
+    const port = new PostgresMemoryWriteKernelTransactionPort({ connect: async () => client },
+      async () => ({ memoryId: content.id, stored: true }), {
+        afterReceipt: async () => { throw new Error("fencing lost"); },
+      });
+    await expect(port.transaction(commitContent)).rejects.toThrow();
+    expect(client.calls.at(-1)?.sql).toBe("ROLLBACK");
+    expect(client.calls.some(({ sql }) => sql === "COMMIT")).toBe(false);
+  });
   test("brands only provider-owned transaction ports", () => {
     const { port } = harness();
     expect(isProviderOwnedMemoryWriteKernelTransactionPort(port)).toBe(true);
@@ -443,15 +535,17 @@ describe("PostgresMemoryWriteKernelTransactionPort", () => {
       message: "Postgres memory write kernel transaction and rollback failed",
     });
     expect(String(failure)).not.toContain("secret payload");
+    expect(getPostgresMemoryWriteKernelFailureDiagnostic(failure)).toEqual({ phase: "rollback", code: "ROLLBACK_FAILED" });
   });
 
   test("surfaces post-commit release failure so replay can recover from the receipt", async () => {
     const { client, port } = harness();
     client.failRelease = true;
 
-    await expect(port.transaction(commitContent)).rejects.toThrow(
-      "committed but connection cleanup failed",
-    );
+    const failure = await port.transaction(commitContent).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(String(failure)).toContain("committed but connection cleanup failed");
+    expect(getPostgresMemoryWriteKernelFailureDiagnostic(failure)).toEqual({ phase: "cleanup", code: "CLEANUP_FAILED" });
     expect(client.calls.at(-1)?.sql).toBe("COMMIT");
     expect(client.releaseCount).toBe(1);
   });

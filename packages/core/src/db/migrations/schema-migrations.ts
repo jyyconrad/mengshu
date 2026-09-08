@@ -2488,6 +2488,176 @@ WHERE temporal_activation_state = 'staged' AND temporal_purge_pending IS NOT TRU
 ON mengshu_memory_purge_retry_requests (next_attempt_at, scope_fingerprint, lineage_id)`,
     ],
   },
+  {
+    version: 36,
+    name: "add-memory-evolution-batches",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_batches (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  id TEXT NOT NULL CHECK (char_length(id) BETWEEN 1 AND 256),
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  body JSONB NOT NULL CHECK (jsonb_typeof(body) = 'object' AND octet_length(body::text) <= 262144),
+  version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+  lease_owner TEXT,
+  fencing_token BIGINT NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+  lease_expires_at BIGINT NOT NULL DEFAULT 0 CHECK (lease_expires_at >= 0),
+  PRIMARY KEY (scope_fingerprint, id),
+  UNIQUE (scope_fingerprint, idempotency_key)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_apply_receipts (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  proposal_id TEXT NOT NULL CHECK (char_length(proposal_id) BETWEEN 1 AND 256),
+  batch_id TEXT NOT NULL,
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object' AND octet_length(receipt::text) <= 16384),
+  PRIMARY KEY (scope_fingerprint, proposal_id),
+  FOREIGN KEY (scope_fingerprint, batch_id) REFERENCES mengshu_evolution_batches (scope_fingerprint, id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_processed_inputs (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  input_fingerprint TEXT NOT NULL CHECK (input_fingerprint ~ '^[0-9a-f]{64}$'),
+  action TEXT NOT NULL CHECK (action IN ('propose', 'apply_allowed')),
+  proposal_id TEXT NOT NULL CHECK (char_length(proposal_id) BETWEEN 1 AND 256),
+  processed_at BIGINT NOT NULL CHECK (processed_at >= 0),
+  PRIMARY KEY (scope_fingerprint, input_fingerprint, action)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_evolution_candidates_batch_idx
+ON mengshu_candidates ((metadata->'evolution'->'proposal'->>'batchId'), created_at, id)
+WHERE metadata ? 'evolution'`,
+      `CREATE INDEX IF NOT EXISTS memories_evolution_inventory_keyset_idx
+ON memories (tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, created_at, id)`,
+    ],
+  },
+  {
+    version: 37,
+    name: "add-evolution-governance-and-maintenance",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_reviews (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  review_id TEXT NOT NULL CHECK (char_length(review_id) BETWEEN 1 AND 256),
+  proposal_id TEXT NOT NULL CHECK (char_length(proposal_id) BETWEEN 1 AND 256),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  binding_hash TEXT NOT NULL CHECK (binding_hash ~ '^[0-9a-f]{64}$'),
+  review JSONB NOT NULL CHECK (jsonb_typeof(review) = 'object' AND octet_length(review::text) <= 196608),
+  reviewer_id TEXT CHECK (reviewer_id IS NULL OR char_length(reviewer_id) BETWEEN 1 AND 256),
+  decision TEXT CHECK (decision IS NULL OR decision IN ('approve', 'reject')),
+  receipt_id TEXT,
+  receipt JSONB CHECK (receipt IS NULL OR jsonb_typeof(receipt) = 'object' AND octet_length(receipt::text) <= 32768),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  expires_at BIGINT NOT NULL CHECK (expires_at > created_at),
+  revoked_at BIGINT,
+  consumed_at BIGINT,
+  consumed_by_proposal_id TEXT,
+  PRIMARY KEY (scope_fingerprint, review_id),
+  UNIQUE (scope_fingerprint, receipt_id),
+  CHECK ((decision IS NULL AND receipt IS NULL AND receipt_id IS NULL AND reviewer_id IS NULL)
+    OR (decision IS NOT NULL AND receipt IS NOT NULL AND receipt_id IS NOT NULL AND reviewer_id IS NOT NULL))
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_evolution_reviews_proposal_idx
+ON mengshu_evolution_reviews (scope_fingerprint, proposal_id, created_at DESC, review_id)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS mengshu_evolution_reviews_one_decision_idx
+ON mengshu_evolution_reviews (scope_fingerprint, proposal_id) WHERE receipt IS NOT NULL AND revoked_at IS NULL`,
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS evolution_review_due_at BIGINT NOT NULL DEFAULT 0 CHECK (evolution_review_due_at >= 0)",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS evolution_disputed BOOLEAN NOT NULL DEFAULT FALSE",
+      "ALTER TABLE memories ADD COLUMN IF NOT EXISTS evolution_alias_of UUID REFERENCES memories(id)",
+      `CREATE INDEX IF NOT EXISTS memories_evolution_due_idx
+ON memories (tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, evolution_review_due_at, id)
+WHERE evolution_alias_of IS NULL AND temporal_purge_pending IS NOT TRUE`,
+      "ALTER TABLE mengshu_write_outbox ADD COLUMN IF NOT EXISTS evolution_consumed_at BIGINT",
+      "ALTER TABLE mengshu_write_outbox ADD COLUMN IF NOT EXISTS evolution_origin BOOLEAN NOT NULL DEFAULT FALSE",
+      `CREATE INDEX IF NOT EXISTS mengshu_write_outbox_evolution_pending_idx
+ON mengshu_write_outbox (tenant_id, user_id, canonical_project_id, product_id, producer_id, namespace, occurred_at, event_id)
+WHERE evolution_consumed_at IS NULL AND evolution_origin IS FALSE`,
+      "ALTER TABLE mengshu_memory_version_outbox ADD COLUMN IF NOT EXISTS evolution_consumed_at BIGINT",
+      "ALTER TABLE mengshu_memory_version_outbox ADD COLUMN IF NOT EXISTS evolution_origin BOOLEAN NOT NULL DEFAULT FALSE",
+      `CREATE INDEX IF NOT EXISTS mengshu_memory_version_outbox_evolution_pending_idx
+ON mengshu_memory_version_outbox (scope_fingerprint, occurred_at, event_id)
+WHERE evolution_consumed_at IS NULL AND evolution_origin IS FALSE`,
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS relation_state TEXT NOT NULL DEFAULT 'effective' CHECK (relation_state IN ('staged', 'effective', 'reviewed_reference', 'contradicting', 'superseded', 'revoked'))",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS root_evidence_id TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_id TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_revision TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_current_revision TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_hash TEXT CHECK (source_hash IS NULL OR source_hash ~ '^[0-9a-f]{64}$')",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_kind TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_record_id TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_path_id TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_span_id TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS source_logical_file_id TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS continuity_key TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS independence_group_id TEXT",
+      "ALTER TABLE mengshu_memory_evidence_links ADD COLUMN IF NOT EXISTS retired_at BIGINT",
+      `CREATE INDEX IF NOT EXISTS mengshu_memory_evidence_links_source_state_idx
+ON mengshu_memory_evidence_links (scope_fingerprint, source_id, source_revision, relation_state, target_memory_id)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_source_dispositions (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  source_id TEXT NOT NULL CHECK (char_length(source_id) BETWEEN 1 AND 256),
+  logical_file_id TEXT NOT NULL DEFAULT '' CHECK (char_length(logical_file_id) <= 256),
+  revision TEXT NOT NULL CHECK (char_length(revision) BETWEEN 1 AND 256),
+  source_hash TEXT NOT NULL CHECK (source_hash ~ '^[0-9a-f]{64}$'),
+  disposition TEXT NOT NULL CHECK (disposition IN ('current', 'unavailable', 'superseded', 'revoked')),
+  receipt_id TEXT NOT NULL,
+  changed_at BIGINT NOT NULL CHECK (changed_at >= 0),
+  PRIMARY KEY (scope_fingerprint, source_id, logical_file_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_operation_receipts (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 256),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  operation TEXT NOT NULL CHECK (char_length(operation) BETWEEN 1 AND 64),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object' AND octet_length(receipt::text) <= 32768),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  PRIMARY KEY (scope_fingerprint, idempotency_key)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_budget_reservations (
+  owner_key TEXT NOT NULL CHECK (owner_key ~ '^[0-9a-f]{64}$'),
+  day_key TEXT NOT NULL CHECK (day_key ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
+  reservation_id TEXT NOT NULL CHECK (char_length(reservation_id) BETWEEN 1 AND 256),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  reserved_tokens BIGINT NOT NULL CHECK (reserved_tokens >= 0),
+  reserved_cost_micros BIGINT NOT NULL CHECK (reserved_cost_micros >= 0),
+  actual_tokens BIGINT CHECK (actual_tokens IS NULL OR actual_tokens >= 0),
+  actual_cost_micros BIGINT CHECK (actual_cost_micros IS NULL OR actual_cost_micros >= 0),
+  status TEXT NOT NULL CHECK (status IN ('reserved', 'settled', 'released')),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  expires_at BIGINT NOT NULL CHECK (expires_at > created_at),
+  PRIMARY KEY (owner_key, day_key, reservation_id)
+)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS mengshu_evolution_operation_receipt_id_idx
+ON mengshu_evolution_operation_receipts (scope_fingerprint, (receipt->>'id')) WHERE receipt ? 'id'`,
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_host_state (
+  owner_key TEXT NOT NULL CHECK (owner_key ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  kind TEXT NOT NULL CHECK (kind ~ '^[a-z][a-z0-9_]{0,63}$'),
+  entry_id TEXT NOT NULL CHECK (entry_id ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$'),
+  revision BIGINT NOT NULL CHECK (revision >= 1),
+  value JSONB NOT NULL CHECK (octet_length(value::text) <= 32768),
+  value_hash TEXT NOT NULL CHECK (value_hash ~ '^[0-9a-f]{64}$'),
+  updated_at BIGINT NOT NULL CHECK (updated_at >= 0),
+  expires_at BIGINT CHECK (expires_at IS NULL OR expires_at > updated_at),
+  revoked_at BIGINT CHECK (revoked_at IS NULL OR revoked_at >= 0),
+  PRIMARY KEY (owner_key, scope_fingerprint, kind, entry_id)
+)`,
+      `CREATE TABLE IF NOT EXISTS mengshu_evolution_host_receipts (
+  owner_key TEXT NOT NULL CHECK (owner_key ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  kind TEXT NOT NULL CHECK (kind ~ '^[a-z][a-z0-9_]{0,63}$'),
+  idempotency_key TEXT NOT NULL CHECK (idempotency_key ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$'),
+  request_hash TEXT NOT NULL CHECK (request_hash ~ '^[0-9a-f]{64}$'),
+  receipt_id TEXT NOT NULL CHECK (receipt_id ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$'),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object' AND octet_length(receipt::text) <= 32768),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  consumed_by TEXT CHECK (consumed_by IS NULL OR consumed_by ~ '^[0-9a-f]{64}$'),
+  consumed_at BIGINT CHECK (consumed_at IS NULL OR consumed_at >= 0),
+  PRIMARY KEY (owner_key, scope_fingerprint, kind, idempotency_key),
+  UNIQUE (owner_key, scope_fingerprint, receipt_id),
+  CHECK ((consumed_by IS NULL) = (consumed_at IS NULL))
+)`,
+    ],
+  },
 ];
 
 export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = Object.freeze(

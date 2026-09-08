@@ -39,6 +39,11 @@ function candidate(overrides: Partial<CandidateRecord> = {}): CandidateRecord {
 }
 
 describe("candidateToMemoryRecord", () => {
+  test("isolated evolution metadata cannot use the legacy conversion helper", () => {
+    expect(() => candidateToMemoryRecord(candidate({ metadata: { evolution: null } })))
+      .toThrow("evolution_review_required");
+  });
+
   test("映射核心字段并固定 active 状态", () => {
     const record = candidateToMemoryRecord(candidate(), 5000);
     expect(record.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);

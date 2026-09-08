@@ -67,6 +67,7 @@ export interface CandidatePromotionResult {
 
 export type PostgresCandidatePromotionErrorCode =
   | "INVALID_INPUT"
+  | "EVOLUTION_REVIEW_REQUIRED"
   | "CANDIDATE_NOT_PENDING"
   | "PROMOTION_CONFLICT"
   | "PROMOTION_FAILED";
@@ -404,7 +405,7 @@ export class PostgresCandidatePromotionPort implements ProviderOwnedCandidatePro
       await client.query("BEGIN");
       begun = true;
       const selected = await client.query(
-        `SELECT id, text, semantic_type, kind, confidence, content_hash, evidence_ids, status,
+        `SELECT id, text, semantic_type, kind, confidence, content_hash, evidence_ids, status, metadata,
   promoted_to_memory_id
 FROM mengshu_candidates
 WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3 AND project_id = $4
@@ -415,6 +416,12 @@ FOR UPDATE`,
       );
       if ((selected.rowCount ?? selected.rows.length) !== selected.rows.length || selected.rows.length !== 1) {
         throw fail("CANDIDATE_NOT_PENDING");
+      }
+      // Only the evolution writer can hydrate staged evidence and atomically apply a proposal.
+      const metadata = selected.rows[0]?.metadata;
+      if (metadata && typeof metadata === "object" &&
+          Object.prototype.hasOwnProperty.call(metadata, "evolution")) {
+        throw fail("EVOLUTION_REVIEW_REQUIRED");
       }
       const candidate = decodeCandidate(selected.rows[0]);
       if (candidate.id !== candidateId) throw fail("PROMOTION_CONFLICT");

@@ -378,12 +378,17 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
           limit: 500,
         })
       : [];
+    // Governed hydration is defined for canonical memory records. Knowledge/document
+    // records are already authority-filtered provider results and do not have memory
+    // evidence identities, so sending them through the memory hydrator would discard
+    // every valid knowledge hit as evidence_unavailable.
+    const governedMemoryRecords = authorityRecords.filter((record) => record.dataType === "memory");
     const governedResult = this.governedRetrieval
       ? await this.governedRetrieval.retrieve({
           intent,
           scope,
           candidates: [
-            ...authorityRecords.map((record) => ({
+            ...governedMemoryRecords.map((record) => ({
               candidateId: `vector:${record.id}`,
               authoritativeRecordId: record.id,
               scope: record.scope,
@@ -396,11 +401,13 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
             })),
             ...supplementalCandidates,
           ],
-          minScore: input.minScore,
-          limit: input.limit,
+          // Knowledge/document candidates are merged below. Apply the public
+          // threshold and limit once, after both candidate families are scored.
+          minScore: undefined,
+          limit: undefined,
         })
       : undefined;
-    const hits: RecallHit[] = governedResult
+    const governedHits: RecallHit[] = governedResult
       ? governedResult.hits.map((hit) => ({
           record: hit.record,
           score: hit.score,
@@ -408,7 +415,11 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
           scoreBreakdown: hit.scoreBreakdown,
           provenance: hit.record.provenance,
         }))
-      : eligibleRecords.map((record) => {
+      : [];
+    const locallyScoredRecords = governedResult
+      ? eligibleRecords.filter((record) => record.dataType !== "memory")
+      : eligibleRecords;
+    const localHits: RecallHit[] = locallyScoredRecords.map((record) => {
         // authority 已硬隔离；同 tenant/user 内其它 scope 维度继续作为软排序信号。
         // 因此 profile 等既有跨 project 语义不受影响。
         const recordScope = (record as MemoryRecord).scope ?? scope;
@@ -429,7 +440,8 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
           provenance: record.provenance,
         };
         return hit;
-      })
+      });
+    const hits: RecallHit[] = [...governedHits, ...localHits]
       // 综合分降序：同 authority 内，同 scope（高 scopeFit）排前，跨 project 等靠后。
       // 综合分相同时按向量相似度兜底（保持相关性优先的稳定排序）。
       .sort((a, b) => {
@@ -440,7 +452,7 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
       })
       .filter((hit) => input.minScore === undefined || hit.score >= input.minScore)
       // 最终 limit 只能在 hard filter 与六因子门槛之后应用。
-      .slice(0, input.limit ?? eligibleRecords.length);
+      .slice(0, input.limit);
 
     // P2: 追踪 queryHits，递增被命中 entity 的 queryHits30d
     if (this.queryHitsTracker && hits.length > 0) {

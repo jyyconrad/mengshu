@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import pLimit from "p-limit";
 import retry from "p-retry";
 import type { MemoryConfig } from "../../../../../config.js";
+import { getModelNetworkOptions } from "./model-network.js";
 import {
   UNSCOPED_RUNTIME_COST_FINGERPRINT,
   UNPRICED_RUNTIME_PRICING_SNAPSHOT,
@@ -124,6 +125,7 @@ export class Embeddings {
     this.client = options.client ?? (new OpenAI({
         apiKey: embeddingConfig.apiKey,
         baseURL: embeddingConfig.baseURL,
+        ...getModelNetworkOptions(),
         timeout: DEFAULT_REQUEST_TIMEOUT_MS,
         // p-retry below is the single retry owner; SDK retries would multiply attempts.
         maxRetries: 0,

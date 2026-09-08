@@ -21,6 +21,8 @@ import type {
   GovernedRetrievalSource,
 } from "./governed-retrieval-engine.js";
 import { createGovernedSemanticIdentity } from "./governed-retrieval-engine.js";
+import type { ExplicitReuseReadOptions } from "../evolution/reuse/reuse-read-access.js";
+import type { ExplicitReusePermit } from "../evolution/reuse/explicit-reuse-authorizer.js";
 
 export interface PostgresGovernedRetrievalCandidateQueryResult<
   Row extends Record<string, unknown> = Record<string, unknown>,
@@ -92,10 +94,15 @@ const MEMORY_CURRENT_VERSION_SQL = `(memory.lineage_id IS NULL OR memory.id = (
     AND (current_version.valid_to IS NULL OR current_version.valid_to > CURRENT_TIMESTAMP)
     AND current_version.temporal_invalidated IS NOT TRUE
     AND current_version.temporal_purge_pending IS NOT TRUE
+    AND current_version.evolution_alias_of IS NULL
     AND ((current_version.lifecycle_status = 'active'
         AND current_version.temporal_activation_state = 'active')
       OR (current_version.lifecycle_status = 'archived'
-        AND current_version.temporal_activation_state = 'staged'))
+        AND current_version.temporal_activation_state = 'staged')
+      OR (current_version.lifecycle_status = 'archived'
+        AND current_version.temporal_activation_state = 'active'
+        AND current_version.metadata->>'admissionRoute' = 'lookup_only'
+        AND current_version.metadata->>'contextEligible' = 'false'))
   ORDER BY current_version.valid_from DESC, current_version.revision DESC
   LIMIT 1
 ))`;
@@ -166,10 +173,13 @@ const SEARCH_SQL = `WITH query_terms AS MATERIALIZED (
     AND memory.legacy_quarantine_reason IS NULL
     AND memory.temporal_invalidated IS NOT TRUE
     AND memory.temporal_purge_pending IS NOT TRUE
-    AND (memory.lineage_id IS NULL OR (
-      memory.valid_from <= CURRENT_TIMESTAMP
-      AND (memory.valid_to IS NULL OR memory.valid_to > CURRENT_TIMESTAMP)
-    ))
+    AND memory.evolution_disputed IS NOT TRUE
+    AND COALESCE(jsonb_typeof(memory.metadata #> '{governance,evolution}'), 'object') = 'object'
+    AND COALESCE(memory.metadata #> '{governance,evolution,disputed}', 'false'::jsonb) = 'false'::jsonb
+    AND COALESCE(memory.metadata #> '{governance,evolution,needsReview}', 'false'::jsonb) = 'false'::jsonb
+    AND (memory.valid_to IS NULL OR memory.valid_to > CURRENT_TIMESTAMP)
+    AND memory.evolution_alias_of IS NULL
+    AND (memory.lineage_id IS NULL OR memory.valid_from <= CURRENT_TIMESTAMP)
     AND ${MEMORY_CURRENT_VERSION_SQL}
     AND jsonb_typeof(memory.metadata->'sourceNodeIds') = 'array'
     AND jsonb_typeof(memory.metadata #> '{governance,evidenceIds}') = 'array'
@@ -609,6 +619,7 @@ function decodeCandidate(
       () => governedIdentity(row),
     ),
     admissionRoute,
+    claimKind: row.memory_kind as MemoryKind,
     ...(navigation === undefined ? {} : { navigation }),
   });
 }
@@ -652,13 +663,46 @@ function validateResult(
 }
 
 export class PostgresGovernedRetrievalCandidateSource {
-  constructor(private readonly client: PostgresGovernedRetrievalCandidateQueryClient) {
+  constructor(
+    private readonly client: PostgresGovernedRetrievalCandidateQueryClient,
+    private readonly options: ExplicitReuseReadOptions = {},
+  ) {
     if (!client || typeof client.query !== "function") {
       throw new TypeError("Postgres governed retrieval candidate query client is required");
     }
   }
 
   async search(
+    input: PostgresGovernedRetrievalCandidateSearchInput,
+  ): Promise<GovernedRetrievalCandidate[]> {
+    diagnose("INPUT_INVALID", () => validateInput(input));
+    const native = await this.#searchScope(input);
+    const authorizer = this.options.reuseAuthorizer;
+    if (!authorizer) return native;
+    const shared: Array<{ candidate: GovernedRetrievalCandidate; permit: ExplicitReusePermit }> = [];
+    for (const source of await authorizer.sources(input.scope)) {
+      throwIfAborted(input.signal);
+      const before = await authorizer.authorize(source, input.scope);
+      if (!before) continue;
+      // Exact producer/evidence SQL is unchanged. A grant selects a source, not a broader WHERE clause.
+      const candidates = await this.#searchScope({ ...input, scope: source });
+      if (!await authorizer.revalidate(before)) continue;
+      for (const candidate of candidates) {
+        if (!candidate.claimKind) continue;
+        const permit = await authorizer.authorize(source, input.scope, candidate.claimKind);
+        if (permit) shared.push({ candidate, permit });
+      }
+    }
+    const current = [...native];
+    for (const { candidate, permit } of shared) {
+      if (await authorizer.revalidate(permit, candidate.claimKind)) current.push(candidate);
+    }
+    throwIfAborted(input.signal);
+    current.sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0) || a.candidateId.localeCompare(b.candidateId));
+    return Object.freeze(current.slice(0, input.limit)) as unknown as GovernedRetrievalCandidate[];
+  }
+
+  async #searchScope(
     input: PostgresGovernedRetrievalCandidateSearchInput,
   ): Promise<GovernedRetrievalCandidate[]> {
     const validated = diagnose("INPUT_INVALID", () => validateInput(input));
