@@ -1,5 +1,9 @@
 # 集成指南
 
+所有产品共享同一个 Project Memory Workspace，但各自提供可信运行时身份。先在项目根目录
+执行 `ms init`；该命令不依赖 OpenClaw。详细边界见
+[项目身份与运行时 Authority](authority-and-project-scope.md)。
+
 ## OpenClaw 插件集成
 
 mengshu 以 OpenClaw memory slot 插件形态集成。插件包位于 `plugins/openclaw`，canonical id 为 `mengshu-openclaw`，旧 id `memory-autodb` 和 `mengshu` 通过 `legacyPluginIds` 兼容。
@@ -92,11 +96,17 @@ ms migrate-openclaw-plugin-id --execute
 Codex 插件包位于 `plugins/codex`，插件名为 `mengshu-memory`。仓库级 marketplace 位于 `.agents/plugins/marketplace.json`。
 
 ```bash
+ms setup
+ms init /path/to/project
 codex plugin marketplace add .agents/plugins
 codex plugin add mengshu-memory@mengshu-local
 ```
 
-Codex MCP 启动器默认使用当前发布包内的 `dist/bin/ms.js`，不读取 PATH 中的全局 `ms`，并在启动前校验插件/runtime 版本一致。先用当前发布包的 `ms doctor` 验证 `~/.mengshu` 配置；开发或隔离测试只有在显式设置绝对路径 `MENGSHU_CODEX_MS_PATH` 时才会覆盖包内 runtime。
+Codex 不需要安装或认证 OpenClaw。插件默认从 `~/.mengshu/authority.json` 读取
+Codex 自己的 authority/defaultScope；其中 `projectId` 应与当前项目 `.mengshu.json` 一致。
+启动器使用当前发布包内的 `dist/bin/ms.js`，不读取 PATH 中的全局 `ms`，并在启动前校验
+插件/runtime 版本一致。先运行 `ms doctor` 验证 `~/.mengshu` 配置；开发或隔离测试只有在
+显式设置绝对路径 `MENGSHU_CODEX_MS_PATH` 时才覆盖包内 runtime。
 
 ## MCP Server 集成
 
@@ -115,18 +125,38 @@ ms mcp
       "command": "ms",
       "args": ["mcp"],
       "env": {
-        "MENGSHU_HOME": "~/.mengshu"
+        "MENGSHU_HOME": "~/.mengshu",
+        "MENGSHU_AUTHORITY_FILE": "/absolute/path/to/.mengshu/authority.json"
       }
     }
   }
 }
 ```
 
+## 自定义 Agent 产品的项目解析
+
+自定义产品可以使用 `@mengshu/core/api` 导出的 `ProjectIdentityResolver` 决定当前项目
+identity。resolver 只处理 project/workspace；tenant/user/app/agent 仍由产品认证层负责。
+
+```typescript
+import type { ProjectIdentityResolver } from "@mengshu/core/api";
+
+export const resolveMyProductProject: ProjectIdentityResolver = ({ requested, suggested }) => ({
+  workspaceId: requested.workspaceId ?? suggested.workspaceId,
+  projectId: requested.projectId ?? suggested.projectId,
+  defaultVisibility: requested.defaultVisibility ?? "private",
+});
+```
+
+将 resolver 注入 `registerProjectCliCommands` 后，`ms init` 使用产品结果写 manifest；
+`resolveMemoryScope` 是另一个独立依赖，只在 `project context/lookup` 访问记忆库时调用。
+
 ## REST API 集成
 
 ### 启动 HTTP Server
 
 ```bash
+export MENGSHU_AUTHORITY_FILE="$HOME/.mengshu/authority.json"
 ms serve --port 8080
 ```
 
@@ -134,8 +164,9 @@ ms serve --port 8080
 
 ```http
 POST /v1/memories
-GET /v1/memories/recall
-DELETE /v1/memories/:id
+POST /v1/recall
+POST /v1/context
+GET /v1/health
 ```
 
 详见 [Memory API 文档](../api/memory-api.md)。
@@ -153,6 +184,7 @@ npm install @mengshu/core
 先启动本机 REST 服务：
 
 ```bash
+export MENGSHU_AUTHORITY_FILE="$HOME/.mengshu/authority.json"
 ms serve --port 3847
 ```
 

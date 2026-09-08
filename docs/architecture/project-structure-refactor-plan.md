@@ -399,7 +399,7 @@ npx tsc --noEmit
 - `packages/api/src` 已承载 `agent-fast-path`、REST router/auth/types、SDK client/types 实现，`api/agent-fast-path.ts`、`adapters/rest/*`、`adapters/sdk/*` 为兼容 re-export。
 - `bin/ms.ts` 已瘦身为入口壳，实际 CLI 主逻辑位于 `packages/api/src/cli/ms.ts`。
 - `ms mcp` 与独立 `scripts/mengshu-mcp.ts` 已直接调用 `packages/mcp/src/stdio-server.ts`。
-- OpenClaw scope / manifest 和 CLI 命令注册模块已迁到 `plugins/openclaw/src/*`，`adapters/openclaw/*` 为兼容 re-export；下一阶段再把产品无关命令继续拆入 `packages/api/src/cli`，OpenClaw 只保留宿主桥接。
+- 产品无关的 Project Workspace CLI 合同已从 `packages/api/src/cli/project.ts` 导出，`ms init/status` 不再依赖 OpenClaw authority；其他 OpenClaw scope、manifest 兼容实现和宿主命令仍位于 `plugins/openclaw/src/*`。
 
 验收：
 
@@ -418,7 +418,7 @@ npm test -- adapters/mcp adapters/rest adapters/sdk
 3. [x] OpenClaw 插件 id 修正为 `mengshu-openclaw`，并保留 `memory-autodb` / `mengshu` legacy alias。
 4. [x] Codex 插件加入仓库级 marketplace。
 5. [x] `adapters/openclaw/tools.ts`、`hooks.ts`、`context-fast.ts` 继续迁到 `plugins/openclaw/src`。
-6. [x] `adapters/openclaw/cli-*.ts` 迁到 `plugins/openclaw/src/cli/`，旧路径保留 re-export；产品无关 CLI 继续拆入 `packages/api/src/cli` 留到后续阶段。
+6. [x] `adapters/openclaw/cli-*.ts` 迁到 `plugins/openclaw/src/cli/`，旧路径保留 re-export；Project Workspace CLI 已从 `packages/api/src/cli/project.ts` 导出产品无关 resolver contract。
 7. [x] `adapters/openclaw/scope.ts`、`manifest.ts` 迁到 `plugins/openclaw/src/`，旧路径保留 re-export。
 
 当前实现边界：
@@ -427,10 +427,10 @@ npm test -- adapters/mcp adapters/rest adapters/sdk
 - 根 `index.ts` 和 `adapters/openclaw/index.ts` 仅保留兼容 re-export。
 - OpenClaw tools / hooks / `memory_context_fast` handler 已迁到 `plugins/openclaw/src/tools.ts`、`hooks.ts`、`context-fast.ts`；旧 `adapters/openclaw/*` 同名文件仅保留兼容 re-export。
 - OpenClaw scope / manifest 已迁到 `plugins/openclaw/src/scope.ts`、`manifest.ts`；旧 `adapters/openclaw/*` 同名文件仅保留兼容 re-export。
-- OpenClaw CLI 注册实现已迁到 `plugins/openclaw/src/cli/`；旧 `adapters/openclaw/cli-*.ts` 和 `agent-service-helper.ts` 仅保留兼容 re-export。
+- OpenClaw 专属 CLI 注册实现位于 `plugins/openclaw/src/cli/`；Project Workspace init/status 通过 `packages/api/src/cli/project.ts` 暴露产品无关入口，旧 `adapters/openclaw/cli-*.ts` 仅保留兼容 re-export。
 - `plugins/openclaw/openclaw.plugin.json` 和根 `openclaw.plugin.json` 均使用 `mengshu-openclaw`，通过 `legacyPluginIds: ["memory-autodb", "mengshu"]` 兼容旧配置；`ms migrate-openclaw-plugin-id` 可迁移 `~/.openclaw/conf/plugins.json`。
 - `plugins/codex` 已包含 `.codex-plugin/plugin.json`、`.mcp.json`、`mcp/server.mjs`、skill 和 `.agents/plugins/marketplace.json` 本地 marketplace 条目。
-- OpenClaw CLI、scope、manifest 相关模块已迁入 `plugins/openclaw/src/*`；后续再按产品无关能力和宿主桥接职责继续拆分 CLI 与 runtime bridge。
+- Project Workspace 已先拆出产品无关 CLI 出口和 identity/scope resolver 边界；manifest 兼容实现与其余宿主 CLI 仍待继续收敛物理目录。
 
 验收：
 

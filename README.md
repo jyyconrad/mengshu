@@ -29,13 +29,20 @@ npm install -g @mengshu/core
 
 该包会提供 `ms` 和 `mengshu` 两个命令。
 
-### 初始化
+### 全局配置与项目初始化
 
 ```bash
+# 配置 LLM、Embedding 和数据库
+ms setup
+
+# 在当前目录建立产品无关的 Project Memory Workspace
 ms init
 ```
 
-初始化向导会配置 LLM、Embedding 和数据库连接。已有 OpenClaw 环境时，可以通过 `~/.mengshu/config.json` 复用同一套 PostgreSQL 记忆库。
+`ms setup` 写入 `~/.mengshu/config.json`；`ms init` 只创建当前项目的
+`.mengshu.json`、全局 project manifest 和 registry，不要求 OpenClaw authority，也不访问
+记忆库。Codex、OpenClaw 和其他 Agent 产品各自提供可信运行时身份，并复用同一项目
+`workspaceId/projectId`。
 
 ### 健康检查
 
@@ -71,6 +78,7 @@ openclaw plugin add ./plugins/openclaw
 ### MCP Server
 
 ```bash
+export MENGSHU_AUTHORITY_FILE="$HOME/.mengshu/authority.json"
 ms mcp
 ```
 
@@ -79,6 +87,7 @@ MCP Server 暴露 `memory_recall`、`memory_lookup`、`memory_context_fast`、`m
 ### REST API 与 Web Console
 
 ```bash
+export MENGSHU_AUTHORITY_FILE="$HOME/.mengshu/authority.json"
 ms serve --port 3847
 ```
 
@@ -149,6 +158,7 @@ mengshu 按三层加载配置：
 |------|------|
 | [快速开始](docs/guides/getting-started.md) | 安装、初始化和第一次召回 |
 | [配置说明](docs/guides/configuration.md) | 配置文件、模型、数据库和环境变量 |
+| [项目身份与 Authority](docs/guides/authority-and-project-scope.md) | 产品无关项目初始化与各 Agent 的可信运行时边界 |
 | [集成指南](docs/guides/integration.md) | OpenClaw、MCP、REST、SDK 和 Agent 集成 |
 | [最佳实践](docs/guides/best-practices.md) | 记忆治理、scope 设计和使用建议 |
 | [CLI 命令](docs/api/cli-commands.md) | `ms` 命令完整参考 |

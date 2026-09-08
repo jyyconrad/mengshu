@@ -162,7 +162,7 @@ plugins/openclaw/
 | `adapters/openclaw/manifest.ts` | 已迁到 `plugins/openclaw/src/manifest.ts` |
 | `adapters/openclaw/cli-*.ts` | 已迁到 `plugins/openclaw/src/cli/`，旧路径保留兼容 re-export |
 
-迁移时避免一次性删除 `adapters/openclaw`。已完成的模块由旧路径 re-export 新实现；当前 OpenClaw 插件入口、tools、hooks、context-fast、scope、manifest 和 CLI 注册均已收敛到插件包内。
+迁移时避免一次性删除 `adapters/openclaw`。已完成的模块由旧路径 re-export 新实现；OpenClaw 插件入口、tools、hooks、context-fast 和宿主 CLI 已收敛到插件包内。Project Workspace CLI 另从 `packages/api/src/cli/project.ts` 暴露产品无关入口，`ms init` 不要求 OpenClaw authority。
 
 ### OpenClaw 配置目标
 
@@ -473,7 +473,7 @@ npm pack --workspaces
 当前实现边界：
 
 - OpenClaw canonical 入口为 `plugins/openclaw/src/index.ts`，根 `index.ts` 仅作为兼容 re-export。
-- OpenClaw 注册主实现已迁到 `plugins/openclaw/src/register.ts`，tools / hooks / `memory_context_fast` handler、scope、manifest 和 CLI 注册模块已迁到 `plugins/openclaw/src`；`adapters/openclaw/index.ts`、`tools.ts`、`hooks.ts`、`context-fast.ts`、`scope.ts`、`manifest.ts`、`cli-*.ts` 仅作为兼容 re-export。
+- OpenClaw 注册主实现已迁到 `plugins/openclaw/src/register.ts`，tools / hooks / `memory_context_fast` handler 与宿主 CLI 位于 `plugins/openclaw/src`；Project Workspace CLI 通过 `packages/api/src/cli/project.ts` 导出产品无关 resolver contract，`adapters/openclaw/*` 仅作为兼容路径。
 - OpenClaw manifest 的 canonical id 已切换为 `mengshu-openclaw`，并通过 `legacyPluginIds: ["memory-autodb", "mengshu"]` 兼容旧配置。
 - OpenClaw memory runtime bridge 已注册 prompt section / flush plan / runtime health manager；实际记忆召回和写入复用插件包内 tools、hooks、CLI、service。
 - Codex 插件包已包含 `.codex-plugin/plugin.json`、`.mcp.json`、`mcp/server.mjs`、skill 和仓库级 marketplace；launcher 默认使用当前包内 `dist/bin/ms.js`，不回退到 PATH 中任意全局 `ms`。

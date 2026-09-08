@@ -1,95 +1,38 @@
 {
-  "id": "mengshu",
-  "config": {
-    "embedding": {
-      "apiKey": "${OPENAI_API_KEY}",
-      "baseURL": "https://api.openai.com/v1",
-      "model": "text-embedding-3-small"
-    },
-
-    // LLM chat completion 配置 (可选)
-    // 提供后启用摘要 / 抽取等生成式能力；不提供则相关功能自动降级关闭
-    "llm": {
-      "provider": "openai",
-      "model": "gpt-4o-mini",
-      "baseURL": "https://api.openai.com/v1",
-      "apiKey": "${OPENAI_API_KEY}",
-      "maxTokens": 512 // 可选，单次生成最大 token 数；temperature 由运行时固定为 0.0
-    },
-
-    // 数据库类型选择: "postgres" (推荐，共享 OpenClaw PostgreSQL + pgvector), "lancedb" (本地单机) 或 "supabase" (云端)
-    "dbType": "postgres",
-
-    // PostgreSQL 存储配置 (仅 dbType=postgres 时需要)
-    // 需要 pgvector 扩展；连接用户需具备创建扩展、建表和索引权限。
-    "postgres": {
-      "host": "${PG_HOST}",
-      "port": 5432,
-      "database": "${PG_DATABASE}",
-      "user": "${PG_USER}",
-      "password": "${PG_PASSWORD}",
-      "ssl": false
-    },
-
-    // OpenClaw 本机可信边界。多 Agent 时 defaultAgentId 必填且必须属于 agentIds。
-    "authority": {
-      "tenantId": "local",
-      "userId": "owner",
-      "allow": {
-        "appIds": ["openclaw"],
-        "projectIds": ["default"],
-        "agentIds": ["main", "codex"],
-        "namespaces": ["default"],
-        "visibilities": ["private"]
-      }
-    },
-    "defaultAgentId": "main",
-
-    // LanceDB 本地存储配置 (仅 dbType=lancedb 时需要)
-    // "dbPath": "~/.mengshu/memory/lancedb",
-
-    // Supabase 云端存储配置 (可选，提供则开启混合模式或纯云端模式)
-    "supabase": {
-      "url": "${SUPABASE_URL}",
-      "serviceKey": "${SUPABASE_SERVICE_KEY}"
-    },
-
-    // 自动捕获和召回
-    "autoCapture": true,
-    "autoRecall": true,
-    "recallIncludeDocuments": false, // 自动召回是否包含扫描的文档数据
-    "captureMaxChars": 500,
-
-    // Asset/Loadout 是原生 5 槽位之上的可选增强；升级后默认关闭，验证后再显式开启
-    "features": {
-      "assetInjection": false
-    },
-
-    // 批量处理配置 (可选)
-    "batchProcessing": {
-      "maxBatchSize": 20,
-      "concurrency": 3,
-      "retryAttempts": 3
-    },
-
-    // 目录扫描配置 (可选)
-    "scanner": {
-      "defaultIgnorePaths": [
-        "node_modules",
-        ".git",
-        ".github",
-        ".vscode",
-        "dist",
-        "build",
-        "coverage"
-      ],
-      "customIgnoreRules": [
-        "*.log",
-        "*.tmp",
-        "*.temp",
-        "*.test.md",
-        "*draft*"
-      ]
-    }
+  "embedding": {
+    "apiKey": "${OPENAI_API_KEY}",
+    "baseURL": "https://api.openai.com/v1",
+    "model": "text-embedding-3-small"
+  },
+  "llm": {
+    "apiKey": "${OPENAI_API_KEY}",
+    "baseURL": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini"
+  },
+  "dbType": "postgres",
+  "postgres": {
+    "host": "${PG_HOST}",
+    "port": 5432,
+    "database": "${PG_DATABASE}",
+    "user": "${PG_USER}",
+    "password": "${PG_PASSWORD}",
+    "ssl": false
+  },
+  "autoCapture": true,
+  "autoRecall": true,
+  "recallIncludeDocuments": false,
+  "captureMaxChars": 500,
+  "features": {
+    "bm25": true,
+    "graph": true,
+    "summaryTree": true,
+    "webConsole": true,
+    "assetInjection": false,
+    "temporalMemory": false,
+    "sessionWorkingSet": false,
+    "skillArtifacts": false,
+    "memoryPolicyOverlay": false,
+    "teamAssets": false,
+    "proxy": false
   }
 }

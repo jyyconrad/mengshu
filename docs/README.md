@@ -5,16 +5,17 @@
 ## 快速开始
 
 - [安装配置指南](guides/getting-started.md) - 快速安装和配置
+- [项目身份与 Authority](guides/authority-and-project-scope.md) - 区分项目初始化和 Agent 产品权限
 - [CLI 命令参考](api/cli-commands.md) - 命令行工具使用
 
 ## 核心文档
 
 ### 架构设计
-- [系统架构](architecture/system-architecture.md) - 整体架构设计
-- [技术栈](architecture/technology-stack.md) - 技术选型说明
+- [系统架构](architecture/system-architecture.md) - RuntimeHost、治理主链、扩展能力和存储边界
+- [技术栈](architecture/technology-stack.md) - 当前依赖、运行时、传输与 feature gate
 
 ### 核心设计
-- [记忆系统统一设计](design/memory-system-unified-design.md) - 算法层单一事实来源
+- [记忆系统统一设计](design/memory-system-unified-design.md) - D-01~D-23 算法真源与当前运行态映射
 - [记忆树批量推理方案](design/memory-tree-batch-inference-plan.md) - 记忆树摘要、faithfulness judge 和结论生成的异步 Batch LLM 方案
 - [数据库 Schema](design/schema.md) - 数据模型设计
 
@@ -25,6 +26,7 @@
 ## 用户指南
 
 - [配置说明](guides/configuration.md) - 配置文件详解
+- [持续记忆进化](guides/continuous-memory-evolution.md) - 有限批次、owner 来源对账/撤销与受控复用、维护阻断、E3 经验来源及验证边界
 - [集成指南](guides/integration.md) - 如何集成到你的项目
 - [最佳实践](guides/best-practices.md) - 使用建议
 
@@ -32,4 +34,4 @@
 
 - 当前版本：v1.0.7
 - 开源协议：MIT
-- 仓库地址：[GitHub](https://github.com/your-org/mengshu)
+- 仓库地址：[GitHub](https://github.com/jyyconrad/mengshu)

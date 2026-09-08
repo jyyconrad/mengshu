@@ -1,259 +1,209 @@
 # 系统架构
 
-> **状态**: 架构演进记录（2026-07-12 运行态校准）
-> **当前版本**: v1.0.7（算法资产较完整，生产主链升级中；不可按 P0-P4 全量运行态理解）
-> **单一事实来源**: 算法层设计见 [memory-system-unified-design.md](../design/memory-system-unified-design.md) (v2.0)
-> **架构路线**: 本文只描述当前公开边界；未接入生产主链的能力不按已交付计算
+> 当前版本：v1.0.7
+> 代码快照：2026-08-31
+> 算法规格：[记忆系统统一设计](../design/memory-system-unified-design.md)（D-01~D-23）
+> 状态口径：本文只把已接入当前运行组合且有测试覆盖的能力标为“运行态”；仅有类型、模块或迁移脚本的能力不自动视为已启用
 
-本文描述 mengshu 当前代码架构与实施状态。表中的“代码资产”表示模块和测试已经存在，不等于所有入口已经在生产 RuntimeHost 中调用。当前默认 production `ms serve` 只有在注入同一 PostgreSQL provider 的 native fenced job capability 后才允许监听；默认组合缺少该能力时会 fail-closed。
+mengshu 是面向多产品 Agent Runtime 的本地优先记忆中间件。当前代码已从单一 OpenClaw 插件演进为“共享 RuntimeHost + 多协议薄适配器 + PostgreSQL 治理主链”的结构，同时保留 LanceDB、Supabase 和根目录旧导入路径的兼容能力。
 
-## 总体结构
-
-### 1.1 当前实施状态对照
-
-| Phase | 范围 | 当前状态 | 说明 |
-|-------|------|------------|------|
-| Phase 0 | 架构收口与兼容契约 | ✅ 已实施 | `packages/core/src/service/memory-service.ts`、`packages/core/src/domain/scope.ts`、`packages/core/src/storage/legacy-database-adapter.ts` |
-| Phase 1 | Server + REST + MCP | ✅ PostgreSQL 安全组合 | RuntimeHost 使用 provider-owned durable capability；缺失时在监听前 fail-closed |
-| Phase 2 | Scope/Namespace/Pipeline | ✅ 合同与迁移工具 | AuthorityScope 已接主要入口；scope/semantic type 迁移均为 dry-run 优先并支持 quarantine |
-| Phase 3 | 混合检索 | ✅ governed 主链 | vector/BM25/graph/tree 候选统一经过 hard filter 和 6 因子 receipt |
-| Phase 4 | 图谱与生命周期 | ✅ native durable 组合 | Write Kernel、candidate、active derivation、Entity/Work Memory Graph 和 evidence link 已接线 |
-| Phase 5 | Memory Tree 与上下文装配 | ✅ 渐进披露与 private overlay | source/topic/global、SlotSnapshotV2、R0-R4、private Asset/Loadout 和 durable invalidation 已接线 |
-| Phase 6 | 产品化与团队部署 | 📋 规划中 | Python SDK、多租户、Connector sync（未启动） |
-
-LLM 结构化提取、11 闸门 validator、4 套评分、语义去重、L0-L3 树摘要、6 因子召回和 5 槽位注入均有代码资产；其运行态接入程度不同。算法规格见 [memory-system-unified-design.md](../design/memory-system-unified-design.md)（D-01~D-23 决策）。
-
-### 1.2 当前目录结构
+## 1. 总体拓扑
 
 ```text
-OpenClaw Plugin
-  index.ts
-    ├─ plugins/openclaw/         # OpenClaw memory slot 插件
-    ├─ plugins/codex/            # Codex MCP + skill 插件
-    ├─ adapters/openclaw/        # OpenClaw 旧路径兼容层
-    ├─ core/                     # 根层旧路径兼容 facade
-    ├─ packages/core/src/domain/ # types/scope/service contract/recall-scoring/semantic/profile 等领域能力
-    ├─ packages/core/src/service/ # MemoryService
-    ├─ packages/core/src/context/ # slot-context-builder / prompt packer / snapshot
-    ├─ packages/core/src/runtime/ # paths / registry
-    ├─ packages/core/src/scoring/ # value/importance/confidence/scoring weights/hash/text splitter
-    ├─ packages/core/src/runtime/llm/ # LLM client、embeddings、extraction rules
-    ├─ processing/               # 旧路径兼容 facade
-    ├─ packages/core/src/lifecycle/ # 候选区 validator（11 闸门）、语义去重、遗忘、晋升、skill 聚合
-    ├─ lifecycle/                # 旧路径兼容 facade
-    ├─ packages/core/src/graph/  # LLM 图谱抽取、entity 三级匹配、centrality、schema
-    ├─ graph/                    # 旧路径兼容 facade
-    ├─ packages/core/src/tree/   # L0-L3 树摘要、leaf 路由、buffer、faithfulness
-    ├─ tree/                     # 旧路径兼容 facade
-    ├─ packages/core/src/retrieval/ # 召回编排、融合排序（RRF）、prompt 注入防护、上下文打包
-    ├─ retrieval/                # 旧路径兼容 facade
-    ├─ packages/core/src/ingest/ # 摄入管线、chunker、scanner、agent-history 导入（含 redaction）
-    ├─ ingest/ / scanner/        # 旧路径兼容 facade
-    ├─ packages/core/src/storage/ # LegacyDatabaseAdapter、repositories/、indexes/
-    ├─ storage/                  # 旧路径兼容 facade
-    ├─ packages/core/src/db/      # LanceDB、Supabase、Postgres provider
-    ├─ db/                       # 旧路径兼容 facade
-    ├─ packages/core/src/routing/ # 路由规则引擎
-    ├─ packages/core/src/feedback/ # 反馈闭环（collector、in-memory-store）
-    ├─ packages/api/src/ + server/ # REST router、SDK、agent-fast-path、Node HTTP daemon
-    ├─ packages/mcp/src/          # MCP Server（stdio/transport-agnostic facade）
-    ├─ packages/ui/src/console/   # Console 聚合 API（console/* 为兼容 re-export）
-    ├─ packages/ui/src/web/       # Web Console 静态前端
-    └─ tests/eval/                # Golden set 评估框架（runners/goldens/fixtures）
+OpenClaw / Codex / Claude Code / CLI / REST / JS SDK / Web Console
+                           │
+              adapter / RuntimeClient / MCP proxy
+                           │
+              RuntimeHost（单一 owner + generation）
+                           │
+       ┌───────────────────┼────────────────────┐
+       │                   │                    │
+ Memory Write Kernel  Governed Retrieval   Context Engine
+       │                   │                    │
+ authority → validate  multi-route → filter  5 slots + R0-R4
+ → score → dedup       → hydrate → rerank    + Asset/Knowledge
+ → admission           → receipt             + assembly receipt
+       │                   │                    │
+       └───────────────────┼────────────────────┘
+                           │
+ PostgreSQL durable repositories / outbox / worker / audit
+                           │
+ temporal / working set / tree / graph / skill / policy / documents
 ```
 
-## 运行模式
+默认 `ms mcp` 不创建第二套数据库、缓存或 worker，而是通过 loopback HTTP 或 owner-only Unix socket 连接共享 RuntimeHost。Codex 打包插件显式设置 `MENGSHU_MCP_MODE=standalone`，使插件在没有单独托管 `ms serve` 时也能启动 MCP；该模式创建进程内 Runtime，但不取得 RuntimeHost durable worker ownership。旧的 `MENGSHU_MCP_DIRECT_DIAGNOSTIC=1` 继续作为 `standalone` 的兼容别名。
 
-| 模式 | 状态 | 说明 |
-|------|------|------|
-| Embedded OpenClaw plugin | ✅ 代码入口 | `index.ts` 注册工具、钩子和 CLI（`ms` 命令组） |
-| 本机 server | 🚧 fail-closed | RuntimeHost/HTTP daemon 已实现；默认 production 组合缺少 native fenced handlers 时不启动 listener |
-| MCP facade | ✅ 代码入口 | 提供 stdio MCP Server（`packages/mcp/src/stdio-server.ts`） |
-| JS SDK | ✅ baseline | 面向 REST API 的 client（`packages/api/src/sdk/client.ts`，`adapters/sdk/*`、`sdk/js/*` 兼容旧路径） |
-| Remote/backend-proxy | 📋 规划 | 配置类型已保留（Phase 6），完整实现待 v0.5+ |
+### 1.1 Project Identity 与产品 Authority
 
-## 核心链路（代码资产与运行态边界）
+Project Memory Workspace 是跨产品共享的本地上下文容器。`ms init` 只根据目录、显式参数
+或 Agent 产品注入的 project resolver 固化 `workspaceId/projectId`；该过程不创建 Runtime，
+不读取 provider，也不要求 OpenClaw authority。
 
-### 保存记忆（目标链路，接入中）
+Codex、OpenClaw、Claude Code 等产品在访问记忆库时，把这个 project identity 与自己的
+可信 `tenantId/userId/appId/agentId/namespace` 组合成完整 scope。项目 manifest 不能覆盖
+产品身份，客户端 scope 也不能扩大 server authority。这样同一项目可被多个授权产品复用，
+同时保留来源产品与 Agent 的审计信息。
+
+## 2. 包与职责边界
+
+| 边界 | 主要职责 | Canonical 路径 |
+|------|----------|----------------|
+| Core domain | scope、authority、状态、语义类型、服务合同 | `packages/core/src/domain/` |
+| Core service | `MemoryService`、Write Kernel、forget 与事务合同 | `packages/core/src/service/` |
+| Runtime composition | provider、embedding registry、worker、能力装配和生命周期 | `runtime.ts`、`server/runtime-host-factory.ts`、`packages/core/src/runtime/` |
+| Retrieval | governed retrieval、候选源、RRF、6 因子评分、prompt safety | `packages/core/src/retrieval/` |
+| Context | 5 槽位、SlotSnapshotV2、Loadout、装配回执 | `packages/core/src/context/`、`packages/core/src/loadout/` |
+| Lifecycle | validator、准入、候选、去重、晋升、撤回 | `packages/core/src/lifecycle/` |
+| Knowledge structures | Entity/Work Memory Graph、source/topic/global tree | `packages/core/src/graph/`、`packages/core/src/tree/` |
+| Durable extensions | temporal、working set、skill artifact、policy overlay | `packages/core/src/temporal/`、`working-set/`、`skills/`、`policy/` |
+| File-native layer | canonical Markdown、curation artifact、Vault 安全边界 | `packages/core/src/documents/`、`packages/core/src/vault/` |
+| Storage | provider contract、PostgreSQL/LanceDB/Supabase、migration、repository | `packages/core/src/db/`、`packages/core/src/storage/` |
+| Public adapters | REST、SDK、RuntimeClient、MCP、Web Console | `packages/api/src/`、`packages/mcp/src/`、`packages/ui/src/` |
+| Project workspace | 产品无关 init/status、manifest/registry 与产品 resolver contract | `packages/api/src/cli/project.ts`、`packages/core/src/runtime/registry.ts`、`plugins/openclaw/src/manifest.ts`（兼容位置） |
+| Product plugins | OpenClaw、Codex、Claude Code source adapter | `plugins/` |
+
+根目录的 `core/`、`processing/`、`retrieval/`、`db/`、`storage/`、`ingest/`、`scanner/`、`lifecycle/`、`graph/`、`tree/`、`feedback/`、`routing/` 和 `adapters/` 主要是旧路径兼容 facade。新代码应从 `packages/*` 或 `plugins/*` 的 canonical 路径导入。
+
+## 3. 运行模式
+
+| 模式 | 当前行为 | 适用场景 |
+|------|----------|----------|
+| Embedded | 宿主进程创建 Runtime 并直接调用 service | OpenClaw 插件、单进程嵌入 |
+| Server | `ms serve` 持有 RuntimeHost、listener、worker 和 generation | 本机共享服务、REST、Web Console |
+| MCP proxy | `ms mcp` 通过 RuntimeClient 转发工具表与调用 | Codex、Claude Code、MCP 客户端 |
+| MCP standalone | `MENGSHU_MCP_MODE=standalone` 创建进程内 Runtime，不持有 durable worker | 自包含 Codex 插件、隔离诊断 |
+| SDK/client | REST client 或 Unix/HTTP RuntimeClient | 自定义应用集成 |
+
+RuntimeHost 的 readiness 与 listener 绑定：host 未 ready、embedding registry 不可验证或所需 PostgreSQL capability 不完整时，服务保持 fail-closed，而不是用降级状态伪装为可用。
+
+## 4. 核心运行链路
+
+### 4.1 写入与纠错
 
 ```text
-memory_store / REST / MCP
-  -> DefaultMemoryService.storeMemory()
-  -> lifecycle/candidate-validator.ts（11 闸门）
-  -> packages/core/src/scoring/value-score.ts（准入决策）
-  -> lifecycle/semantic-dedup.ts（去重）
-  -> LegacyDatabaseAdapter
-  -> DatabaseProvider
-  -> LanceDB / Supabase / Postgres
+memory_save / memory_observe_light / REST / OpenClaw hook
+  -> server-owned authority resolution
+  -> normalize + prompt/sensitive risk detection
+  -> embedding-space write guard
+  -> deterministic candidate validator
+  -> valueScore + importance
+  -> exact / lexical / semantic dedup
+  -> admission route
+  -> provider-owned transaction
+       record or candidate + audit + outbox + idempotency receipt
+  -> post-commit warm derivation
+       graph / tree / slot invalidation / temporal / skill aggregation
 ```
 
-validator、准入和语义去重已有实现，但历史兼容入口和 provider transaction 尚未全部收敛到一套 Write Kernel。判断某入口是否安全时，应以该入口的真实调用链和测试为准，不能仅以模块存在为准。
+`MemoryWriteKernel` 负责顺序和 fail-closed 分支，具体策略与持久化能力通过显式依赖注入。自动观察即使达到 active 阈值也先进入 candidate；`intent=ignore` 返回非持久化结果。显式保存允许保留只有 `MemoryKind` 的记录，但没有可靠 `semanticType` 的记录不会进入 5 槽位。
 
-### 召回记忆（目标链路，接入中）
+PostgreSQL 运行组合通过 provider-owned transaction 保证 canonical record/candidate、audit、outbox 和幂等 receipt 同一提交。非 PostgreSQL provider 继续提供兼容存取，但不宣称具备相同的 durable job、fencing 和扩展仓库能力。
+
+### 4.2 Governed Recall
 
 ```text
-memory_recall / REST / MCP
-  -> DefaultMemoryService.recall()
-  -> packages/core/src/retrieval/orchestrator.ts
-  -> 并行查询：vector + BM25 + recent + graph
-  -> packages/core/src/retrieval/fusion.ts（RRF 融合）
-  -> packages/core/src/domain/recall-scoring.ts（6 因子重排）
-  -> packages/core/src/retrieval/context-packer.ts（token budget + provenance）
-  -> RecallResult
+query
+  -> embedding registry read guard
+  -> provider vector candidates
+  -> PostgreSQL supplemental candidates（BM25 / graph / tree 等）
+  -> tenant/user authority hard filter
+  -> scope / lifecycle / visibility / risk / embedding-space filter
+  -> authoritative hydration
+  -> 6 因子评分与解释
+  -> minScore
+  -> limit
+  -> RecallResult + filtered reasons
 ```
 
-混合检索模块已实现；真实入口仍需逐一验证是否实例化 orchestrator、是否执行 authority/scope 与 embedding-space guard。
+`minScore` 与 `limit` 只在治理过滤和最终评分后生效。PostgreSQL Runtime 注入 `GovernedRetrievalEngine` 与多路候选源；兼容 provider 使用同一 authority、lifecycle 和 6 因子基础合同，但候选路线较少。召回结果保留 source signal、score breakdown、provenance 和过滤原因，供 `ms why`、`--explain` 与装配回执复用。
 
-### Agent 快路径（5 槽位与渐进披露）
+### 4.3 Agent Context
 
 ```text
 memory_context_fast / POST /v1/agent/context
-  -> packages/api/src/agent-fast-path/index.ts
-  -> packages/core/src/context/slot-context-builder.ts（5 问题语义协议）
-  -> packages/core/src/context/slot-snapshot.ts（SlotSnapshotV2）
-  -> exact-scope AgentLoadout + private memory_view（可选增强）
-  -> 5 slot context（profile/task_context/rules/experience/resource）
-  -> source/topic/global navigation -> L0 evidence
+  -> governed recall（context intent）
+  -> SlotContextBuilder
+  -> profile / task_context / rules / experience / resource
+  -> R0-R4 progressive disclosure
+  -> optional Asset / Knowledge / Loadout augmentation
+  -> prompt-safe packing + token budget
+  -> ContextAssemblyReceipt（capability 可用时）
 ```
 
-5 type 是面向 Agent 上下文的语义视图，不能替代通用 MemoryKind。历史数据只有显式合法或高置信映射才进入 5 槽位；其余记录保留为 kind-only/lookup-only。Asset/Loadout 是可独立关闭的增强层，不能越过 scope、lifecycle、risk/conflict、召回门槛和 token budget。
+5 槽位是 Agent 上下文视图，不替代通用 `MemoryKind`。Asset、Knowledge resource 和 Loadout 只能在原生 scope、lifecycle、risk、conflict、召回门槛和预算之后增强上下文。它们不可用时，原生 5 槽位仍可独立工作。
 
-上下文采用 R0-R4 渐进披露：R0 为 5 槽位必读，R1/R2 为 source/topic/global 与资产导航，R3 为受控资源读取，R4 回到原始 evidence。Asset/Loadout 版本变更通过 durable outbox 按 scope fingerprint 失效缓存，读取时仍再次校验 revoked/stale 状态。
+### 4.4 异步增强
 
-最终装配按槽位累计消费预算：先扣除原生正文，再按 6 因子分数选择 Asset；binding priority 仅用于同分排序，超预算内容降级为导航引用。每个 slot 的历史内容通过统一 prompt safety 转义，并声明为不可信数据，不能构造 developer/assistant/tool 指令。
+RuntimeHost 持有 durable job v2 supervisor。PostgreSQL 参考组合使用 lease、fencing token、retry、DLQ 和 authoritative handler registry；MCP proxy 不取得 worker ownership。已提交的主记录不会因 post-commit 图谱或树增强失败而回滚，但失败会进入可观测的 job/audit 路径。
 
-PostgreSQL v22 将最终 `ContextAssemblyReceipt` 持久化，记录 plan、Loadout/binding、过滤与降级、memory/tree/asset/evidence 引用、warning、稳定/动态 hash 和 expiry。CLI/MCP 只能在 host-owned exact private session 读取；receipt 缺失或写失败不阻断原生 5 槽位，只返回显式 warning。
+## 5. 增量能力层
 
-Tree 到 Asset 的晋升继续执行 D-07：extractive 摘要受 500 token deterministic gate 限制，高风险 abstractive 摘要必须已有 faithfulness 验证，旧节点缺证明时 fail-closed。
+这些能力由 `features.*` 与运行 capability 共同控制，默认不因模块存在而自动启用。
 
-### 目录扫描与 agent-history 预览
+| 能力 | 实现边界 | 当前约束 |
+|------|----------|----------|
+| Temporal Memory | 版本链、evolve/correct/restore、as-of recall、expire/revoke/purge | PostgreSQL durable repository；历史索引为 BM25 |
+| Continuous Memory Evolution | 两入口预览/隔离提案、no-op 与保守治理底座 | 默认关闭；RuntimeHost + PostgreSQL v36 capability；内容应用缺通用授权闭环 |
+| Session Working Set | session ingest、outline、assemble、payload read、close、retention | 受预算和保留期控制，不替代长期记忆 |
+| Skill Artifact | propose/import/review/publish/read/search/explain/revoke | v1 仅 `suggest_only`，不允许可执行资源 |
+| Memory Policy Overlay | scoped version append 与 effective policy resolve | 只能收窄/叠加治理，不得扩大 authority |
+| Memory Asset/Loadout | immutable asset version、binding、deprecate/revoke、slot 注入 | exact private scope；`assetInjection` 默认关闭 |
+| Knowledge Resource | revision-pinned search/read | 只读、exact-scope、预算与 prompt safety 约束 |
+| Canonical Markdown/Vault | 受治理的文档导出、审阅、回灌和 Vault 放置 | PostgreSQL 保留 canonical 治理真源；文件路径经过安全校验 |
+| Runtime Cost | append-only token/金额估算账本 | 价格缺失时明确标为 `unpriced` |
 
-```text
-memory_scan_directory / ms scan
-  -> ingest/adapters/file-system.ts
-  -> ingest/canonicalize.ts
-  -> ingest/chunker.ts（deterministic chunk ID）
-  -> ingest/pipeline.ts
-  -> documents / chunks / jobs / audit baseline
+Team ACL、任意可执行 Skill 和可选 Proxy 不属于 v1.0.7 的公开运行边界。
 
-ms project ingest-history --dry-run
-  -> ingest/agent-history/
-  -> redaction.ts（敏感信息过滤）
-  -> packages/core/src/ingest/sources/jsonl-parser.ts（通用 JSONL 解析）
-  -> plugins/{codex,claude-code,openclaw}/sources（产品来源适配）
-  -> dry-run 报告（不写库）
-```
+### 5.1 持续记忆进化边界
 
-已实现 agent-history source adapter 骨架与 dry-run 预览；正式 apply 写库留给后续 evidence 导入阶段。
+持续进化只接收已有记忆和 host 预先注册的目录来源。CLI、REST、MCP、SDK 使用同一批次协议，客户端不能选择任意服务器路径、模型或 authority；模型由可信全局配置解析，来源必须与批次 scope 精确匹配。它不引入在线会话 hook、文件 watcher 或自动长期调度。
 
-### LLM 图谱抽取（代码资产）
+输入读取与来源指纹复核、模型提案、确定性门禁、provider-owned 治理提交相互分离。模型不持有数据库事务；`preview` 无模型/embedding/canonical 写入，`propose` 只保存隔离候选和必要片段。允许的应用仍复用 Write Kernel、validator、temporal、CAS、lease/fencing 与提交 receipt，不能由普通候选审核取代专用门禁。显式恢复开新有限 segment，累计 usage 不清零；调用/token 预算为保守预留而非实际账单。
 
-```text
-会话事件流 / document
-  -> packages/core/src/runtime/llm/llm-client.ts.extractStructured()
-  -> graph/llm-extractor.ts（entity + relation + attribute 三元组）
-  -> graph/extraction-validator.ts（schema 校验）
-  -> graph/entity-resolver.ts（三级匹配：exact / fuzzy / semantic）
-  -> graph/centrality-calculator.ts（hotness 计算）
-  -> graph/schema.ts（entity types / relation allowlist）
-```
+库存使用 baseline 的冻结上界和 keyset；`changed/due` 的持久增量选择不可用。库存 legacy raw evidence 与目录内容均缺可信作者/目标授权证明，当前统一为 untrusted；MCP/user 通道名、remember intent、role/frontmatter 都不能代替 host 证明。默认 Runtime 可靠范围是 preview/propose/no-op，create/correct/evolve 只有治理底座，需可靠 host 授权端口才可能应用；当前无通用 owner-approve API。
 
-LLM 结构化图谱抽取采用 JSON Schema 约束输出 + 三级实体匹配；默认 production RuntimeHost 尚未注册其 native fenced handler。
+目录入口没有自动 related-target 生产 resolver，不能作为已支持的库存纠错/替代通道。补独立证据、冲突标记、完整来源支持对账与授权/治理闭环仍不提供通用自动化能力。kind-only 保持 lookup-only，高影响项仍需审阅，待审状态不表示存在可直接批准的接口。
 
-## 存储层（当前状态）
+v36 仅保存有界 batch 状态、无全文的 apply receipt/processed 索引；正文片段留候选区，候选到期不代表自动物理清理。配置与使用见[持续进化指南](../guides/continuous-memory-evolution.md)，数据合同见 [Schema](../design/schema.md)。
 
-| 层 | 文件 | 说明 |
-|----|------|------|
-| Provider contract | `packages/core/src/db/types.ts` | `MemoryEntry` 和 `DatabaseProvider` 契约（legacy 兼容） |
-| Provider factory | `packages/core/src/db/factory.ts` | 根据配置创建 LanceDB、Supabase、Postgres 或 hybrid provider |
-| Legacy adapter | `packages/core/src/storage/legacy-database-adapter.ts` | 将 legacy provider 暴露为 core repository（兼容层） |
-| In-memory baseline | `packages/core/src/storage/repositories/in-memory.ts` | 中间件 contract 测试和 baseline |
-| Text index | `packages/core/src/storage/indexes/in-memory-bm25.ts` | BM25/文本检索 baseline（Phase 3） |
-| Candidate store | `packages/core/src/lifecycle/candidate-types.ts` | 候选区状态机（11 闸门 + TTL 30d） |
-| Job queue | `packages/core/src/storage/repositories/job-v2.ts`、`postgres-job-v2.ts`、`server/workers-v2.ts` | durable job v2、lease/fencing/DLQ 已实现；native effect handlers 尚未完成生产组合 |
+## 6. 存储与一致性
 
-存储层保留 legacy provider（LanceDB/Supabase/Postgres）作为向量存储后端，中间件能力（候选区/去重/图谱/树）通过 adapter + baseline 增量落地；PostgreSQL 是 durable jobs/effect fencing 的参考实现。
+| 后端 | 定位 | 能力边界 |
+|------|------|----------|
+| PostgreSQL | 当前完整治理参考实现 | embedding registry、atomic write、durable jobs、graph/tree、asset/loadout、receipt、temporal、working set、skill、policy、documents |
+| Supabase | 兼容云端 provider | 基础记忆/知识向量存取；不自动等同 PostgreSQL native capability |
+| LanceDB | 本地兼容 provider | 单机向量存取与开发场景；registry 不可用时 ANN 读取 fail-closed |
 
-## 对外接口（当前状态）
+Schema migration 采用 additive、checksum 固定和 dry-run 优先策略。历史导入、topic tree、temporal backfill、Markdown curation 等 operator 都要求显式计划、校验与回滚身份，不能由普通在线请求隐式触发。
 
-| 接口 | 文件 | 状态 |
-|------|------|------|
-| OpenClaw tools | `plugins/openclaw/src/tools.ts` | ✅ 可用（memory_store/recall/scan/cleanup/context_fast；`adapters/openclaw/tools.ts` 兼容转发） |
-| OpenClaw hooks | `plugins/openclaw/src/hooks.ts` | ✅ 自动召回和自动捕获（autoRecall/autoCapture；`adapters/openclaw/hooks.ts` 兼容转发） |
-| CLI（`ms` 命令组） | `packages/api/src/cli/ms.ts`、`plugins/openclaw/src/cli/*` | 部分可用；短命令有生命周期清理，production `serve` 受 native capability 门禁保护 |
-| REST API | `packages/api/src/rest/router.ts`、`server/daemon.ts` | router/daemon 已实现；是否可监听取决于 RuntimeHost 安全组合 |
-| MCP Server | `packages/mcp/src/server.ts`、`packages/mcp/src/stdio-server.ts`、`packages/mcp/src/tools.ts` | ✅ stdio 可用，含 5 槽位、tree/evidence 导航和只读 Asset 工具 |
-| JS SDK | `packages/api/src/sdk/client.ts` | ✅ REST client baseline（`adapters/sdk/*`、`sdk/js/*` 兼容旧路径） |
-| Web Console | `packages/ui/src/console/api.ts`、`packages/ui/src/web/` | ✅ baseline（Overview/Lookup/Graph/Jobs 4 个视图） |
-| Eval 框架 | `tests/eval/runners/`、`tests/eval/goldens/` | 11 套 deterministic suite 已登记；离线 release gate 通过不代表 production gate 已验收 |
+## 7. 对外接口
 
-CLI 使用 `ms` 命令组（与 `mengshu` 别名），支持配置向导、诊断、评分追溯、召回解释、agent-history dry-run、历史 5 type 漏斗迁移，以及 private Asset 的 list/explain/deprecate/revoke；具体命令以 `ms --help` 为准。
+| 接口 | 代码入口 | 说明 |
+|------|----------|------|
+| OpenClaw tools/hooks | `plugins/openclaw/src/` | 自动捕获/召回与 CLI 注册 |
+| REST | `packages/api/src/rest/router.ts` | memory、context、temporal、working set、skill、policy、console、runtime control |
+| MCP | `packages/mcp/src/` | 动态按 capability 注册工具；默认由 RuntimeClient proxy 提供 |
+| JS SDK/RuntimeClient | `packages/api/src/sdk/`、`packages/api/src/runtime-client.ts` | REST client 与 loopback/Unix transport |
+| Web Console | `packages/ui/src/` | Overview、Lookup、Graph、Jobs、Candidates 等聚合视图 |
+| CLI | `packages/api/src/cli/ms.ts`、`plugins/openclaw/src/cli/` | `ms` / `mengshu` 命令组 |
 
-## 架构决策（当前确认状态）
+## 8. 评测与发布口径
 
-### 1. OpenClaw 只是 adapter（✅ 已落地）
+评测分为三个互不替代的轨道：
 
-业务逻辑已迁入 `packages/core/src/{domain,service,context,runtime,scoring,retrieval,db,storage,ingest,lifecycle,graph,tree}`。根 `core/`、`processing/`、`retrieval/`、`db/`、`storage/`、`ingest/`、`scanner/`、`lifecycle/`、`graph/`、`tree/` 和 `index.ts` 保留兼容入口，不再包含对应核心业务逻辑。
+- G 轨：公开通用数据，产出 GMS；当前 G0 runner 的 lexical 结果仅为 diagnostic，未运行官方 answer scorer 时不具备正式分数资格。
+- P 轨：本地私有冻结集，产出 PMS；需要 paired comparison 和至少 150 例 P-FRESH。
+- Q 轨：contract、safety、算法与 runtime 工程门禁；`npm run eval:quick` 只运行 Q 轨。
 
-### 2. 保留 legacy provider（✅ 已确认）
+版本发布结论要求 G/P paired gate、Q gate、报告完整性和 private fresh quota 同时满足。Q 轨全绿不能单独表述为记忆效果提升或版本可发布。
 
-LanceDB、Supabase、Postgres provider 继续作为向量存储后端。中间件能力（候选区/去重/图谱/树/4 套评分）通过 `LegacyDatabaseAdapter` 和新模块增量落地，不重写存储层。
+## 9. 设计原则
 
-### 3. Scope 是新 API 的强边界（合同已定义，入口持续收敛）
+1. server-owned authority 是硬边界，客户端 scope 不能覆盖 tenant/user。
+2. LLM 只提供候选和信号，最终准入、过滤、评分、合并与发布由确定性合同裁决。
+3. active embedding space 必须可验证；未知或混合空间不执行 ANN。
+4. 写入先提交 canonical 事实，再异步派生 graph/tree/asset；派生层不是事实源。
+5. 兼容 facade 只服务迁移，新实现进入 canonical package。
+6. 运行态能力以 composition + capability + test 为准，不以文件存在为准。
 
-REST、MCP、SDK、console 和 graph/tree 查询应使用 `MemoryScope` 或可规范化的 scope input（`packages/core/src/domain/scope.ts`，`core/scope.ts` 为旧路径兼容转发）。目标合同要求所有 API 解析 scope，server/remote 模式不得绕过 scope filter；历史入口仍需按真实调用链验收。
-
-### 4. 快路径不等待重语义处理（✅ 已分离）
-
-Agent 启动上下文优先走缓存和轻量构建（`packages/api/src/agent-fast-path/index.ts`）；embedding、抽取、graph/tree、summary 等重处理放到 warm/cold path（后台 job 队列）。
-
-### 5. LLM 可以建议，不可单独裁决（算法层铁律，入口持续收敛）
-
-目标合同要求所有入库动作经过 deterministic validator（`lifecycle/candidate-validator.ts` 11 闸门），记忆具有 evidence，摘要节点不能创造事实（`tree/faithfulness.ts`），并优先检测冲突而非盲目合并。当前仍在把历史入口收敛到这一合同。
-
-### 6. 四套评分分工明确（✅ 已落地 D-01~D-03）
-
-- **valueScore**（`packages/core/src/scoring/value-score.ts`）：准入决策（<0.40 drop / 0.40-0.55 low / 0.55-0.88 pending / ≥0.88 active）
-- **importance**（`packages/core/src/scoring/importance-score.ts`）：召回排序 + score breakdown（4 项：salience_llm 0.45 + sourceAuthority 0.20 + explicitnessBonus 0.20 + typePrior 0.15）
-- **confidence**（`packages/core/src/scoring/confidence-score.ts`）：去重治理 + 证据晋升（多证据贝叶斯累积）
-- **hotness**（`packages/core/src/graph/query-hits-tracker.ts`）：topic tree 路由 + 归档（5 项：mention + source + recency + centrality + queryHits）
-
-权重配置统一在 `packages/core/src/scoring/scoring-weights.ts`（SCORING_WEIGHTS_V1），不分散到各模块。
-
-### 7. Profile 三层分层（✅ 已落地 D-04/D-13）
-
-`project → app → global` 三层分层（`packages/core/src/domain/profile-layer.ts`，`core/profile-layer.ts` 为旧路径兼容转发），召回优先级由近及远。避免项目偏好污染全局画像，`targetScope` 包含 `app` 层（6 档：message/turn/session/project/app/global）。
-
----
-
-## 核心代码资产总结
-
-### 已存在的算法与模块资产
-
-1. **LLM 结构化提取**：`extractStructured` 支持 JSON Schema 约束输出（`packages/core/src/runtime/llm/llm-client.ts`），图谱抽取 entity + relation + attribute 三元组（`packages/core/src/graph/llm-extractor.ts`）
-2. **11 闸门 validator**：`packages/core/src/lifecycle/candidate-validator.ts` 提供 deterministic 校验；各入口仍在收敛到统一 Write Kernel（铁律：LLM 可以建议，不可单独裁决）
-3. **4 套评分体系**：value（准入）/importance（召回）/confidence（去重）/hotness（树路由），权重统一在 `packages/core/src/scoring/scoring-weights.ts`（SCORING_WEIGHTS_V1）
-4. **语义去重**：`packages/core/src/lifecycle/semantic-dedup.ts`，embedding 阈值 0.90/0.82（合并/judge），冲突检测优于盲目合并
-5. **L0-L3 树摘要**：`packages/core/src/tree/build-tree-handler.ts`、`packages/core/src/tree/seal.ts`、`packages/core/src/tree/leaf-routing.ts`，source/topic/global 三类树（baseline，待完整 seal/routing）
-6. **6 因子召回**：`packages/core/src/domain/recall-scoring.ts`，混合检索（vector + BM25 + recent + graph）+ RRF 融合（`packages/core/src/retrieval/fusion.ts`）+ 6 因子重排
-7. **5 槽位注入**：`packages/core/src/context/slot-context-builder.ts`，5 问题语义协议（profile/task_context/rules/experience/resource）快路径注入（`packages/api/src/agent-fast-path/index.ts`）
-8. **Scope 隔离**：`packages/core/src/domain/scope.ts`，6 档 targetScope（message/turn/session/project/app/global），运行时按 scope 策略过滤
-9. **Agent-history 导入**：`packages/core/src/ingest/agent-history/`，含 redaction（`redaction.ts`）和批量去重
-10. **Eval 评估体系**：`tests/eval/runners/`、`tests/eval/goldens/` 登记 11 套 suite；当前离线 quick eval 全绿，production gate 必须显式 live opt-in，未执行时不得标为生产验收
-
-### 未来规划（Phase 5-6）
-
-| Phase | 范围 | 预计版本 |
-|-------|------|---------|
-| Phase 5 完整 | Memory Tree 完整 seal/routing/daily digest | v0.3-v0.5 |
-| Phase 6 | Python SDK、多租户、Connector sync、团队部署 | v0.5+ |
-
-### 相关文档
-
-- **算法层单一事实来源**：[memory-system-unified-design.md](../design/memory-system-unified-design.md)（v2.0，D-01~D-23 决策）
-- **技术栈**：[technology-stack.md](technology-stack.md)（TypeScript + LanceDB + OpenAI embedding）
-
----
-
-**创建日期**：2026-05-30（v4 架构方案）  
-**最后更新**：2026-08-16（v1.0.7 运行态校准）
+**最后更新**：2026-08-31

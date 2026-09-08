@@ -57,6 +57,10 @@ const result = await memory.recall({
 
 ### 按 scope 过滤
 
+`workspaceId/projectId` 来自当前项目 `.mengshu.json`；`tenantId/userId/appId/agentId`
+由 Agent 产品的可信运行时提供。下面的对象用于说明最终服务端 scope，客户端不能用它覆盖
+tenant/user authority。
+
 ```typescript
 const result = await memory.recall({
   query: '架构决策',
@@ -71,6 +75,10 @@ const result = await memory.recall({
   }
 });
 ```
+
+不要为 Codex、OpenClaw 等产品分别初始化不同的 projectId。它们应读取同一个
+Project Memory Workspace，并用各自的 `appId/agentId` 记录来源。详细规则见
+[项目身份与运行时 Authority](authority-and-project-scope.md)。
 
 ### 解释召回结果
 

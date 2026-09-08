@@ -1,0 +1,22 @@
+{
+  "authority": {
+    "tenantId": "local",
+    "userId": "owner",
+    "allow": {
+      "appIds": ["codex"],
+      "projectIds": ["project-api"],
+      "agentIds": ["codex"],
+      "namespaces": ["working-context"],
+      "visibilities": ["private"]
+    }
+  },
+  "defaultScope": {
+    "tenantId": "local",
+    "userId": "owner",
+    "appId": "codex",
+    "projectId": "project-api",
+    "agentId": "codex",
+    "namespace": "working-context",
+    "visibility": "private"
+  }
+}

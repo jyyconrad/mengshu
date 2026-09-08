@@ -1,6 +1,6 @@
 # CLI 命令
 
-`ms` 是 mengshu 的管理命令组。当前全局 CLI 入口是 [bin/ms.ts](../../bin/ms.ts)，主实现位于 [packages/api/src/cli/ms.ts](../../packages/api/src/cli/ms.ts)；OpenClaw 插件内的 CLI 注册实现位于 [plugins/openclaw/src/cli/](../../plugins/openclaw/src/cli)，旧 [adapters/openclaw/cli.ts](../../adapters/openclaw/cli.ts) 仅作为兼容转发。
+`ms` 是 mengshu 的管理命令组。当前全局 CLI 入口是 [bin/ms.ts](../../bin/ms.ts)，主实现位于 [packages/api/src/cli/ms.ts](../../packages/api/src/cli/ms.ts)。产品无关的 Project Workspace 入口从 [packages/api/src/cli/project.ts](../../packages/api/src/cli/project.ts) 导出；OpenClaw 下的历史路径只保留兼容。OpenClaw 专属 server/hook/tool 命令仍位于 [plugins/openclaw/src/cli/](../../plugins/openclaw/src/cli)。
 
 ## 命令总览
 
@@ -13,9 +13,15 @@
 | `ms query` | 用 JSON filter 做高级查询 |
 | `ms export` | 导出 JSON 或 CSV |
 | `ms scan <directory>` | 扫描 Markdown 目录并进入 ingestion pipeline |
+| `ms evolve inventory/scan` | host-bound 批次的预览、隔离提案与受控门禁，默认预览 |
+| `ms evolve status/resume <batch-id>` | 查询批次或显式开启一个有限恢复段 |
+| `ms evolve control/undo-preview/undo-approve` | 独立 owner 的来源对账、支持关系撤销与精确治理撤销 |
 | `ms cleanup` | 按数据类型、时间或分类清理数据 |
 | `ms kb:list` | 列出 `knowledge*` 知识库表 |
-| `ms init` | 初始化项目指针和全局 manifest（v0.1.2+） |
+| `ms setup` | 交互式配置 LLM、Embedding 和数据库 |
+| `ms init [dir]` | 初始化产品无关的项目指针和全局 manifest，不要求 authority |
+| `ms project status [dir]` | 读取本地项目 identity，不访问记忆库 |
+| `ms project context/lookup` | 在 Agent 产品提供的可信 scope 内访问项目记忆 |
 | `ms migrate-home` | 迁移 `~/.openclaw/` 到 `~/.mengshu/`（v0.1.2+） |
 | `ms migrate-openclaw-plugin-id` | 迁移 OpenClaw memory 插件 id 到 `mengshu-openclaw` |
 | `ms serve` | 启动本机 REST server 和 `/console` |
@@ -191,13 +197,15 @@ ms kb:list
 
 ```bash
 ms init [directory]
+ms init --workspace-id workspace-acme --project-id project-api
 ms init --force
 ```
 
-**用途**：初始化项目记忆工作区（v0.1.2+）。
+**用途**：初始化产品无关的 Project Memory Workspace。该命令只写本地项目元数据，
+不读取 runtime 配置、不连接数据库，也不要求 OpenClaw authority。
 
 **行为**：
-1. 生成或复用 `projectId/workspaceId`
+1. 使用 Agent 产品 resolver、显式参数或目录派生结果确定 `projectId/workspaceId`
 2. 写入项目指针 `.mengshu.json`（version: "0.2"）
 3. 创建全局项目目录 `~/.mengshu/projects/<projectId>/`
 4. 写入完整 `manifest.json`
@@ -205,9 +213,26 @@ ms init --force
 
 **选项**：
 - `[directory]`：目标项目目录（默认当前目录）
+- `--workspace-id <id>`：Agent 产品确定的 workspace id
+- `--project-id <id>`：Agent 产品确定的 project id
+- `--visibility <level>`：`private/workspace/team/public`
 - `--force`：强制覆盖已存在的指针文件
 
 **幂等性**：重复 `init` 会更新 registry 的 `lastOpenedAt`，不会修改已存在的 `projectId`。
+
+`tenantId/userId/appId/agentId/namespace` 不属于项目初始化参数，由 Codex、OpenClaw 或其他
+Agent 产品的可信运行时提供。`--user-id` 会被拒绝。标识不能包含路径分隔符。详见
+[项目身份与运行时 Authority](../guides/authority-and-project-scope.md)。
+
+## `ms setup`
+
+```bash
+ms setup
+```
+
+交互式写入 `~/.mengshu/config.json` 和 `~/.mengshu/.env`。它只负责模型与存储配置，
+不创建项目 identity，也不生成产品 authority。首次直接运行 `ms init` 且全局配置不存在时，
+CLI 会先进入同一个 setup 向导，再继续项目初始化。
 
 ## `ms migrate-home`
 
@@ -266,6 +291,7 @@ ms migrate-openclaw-plugin-id --execute
 ## `ms serve`
 
 ```bash
+export MENGSHU_AUTHORITY_FILE="$HOME/.mengshu/authority.json"
 ms serve
 ms serve --host 127.0.0.1 --port 3847
 ```
@@ -279,6 +305,7 @@ http://127.0.0.1:3847/console
 
 安全默认值：
 
+- 必须由 Agent 产品提供 `authority/defaultScope`；`ms init` 不负责生成或扩大它。
 - 未配置 `server.secret` 时，只允许 loopback 请求。
 - 配置 `server.secret` 后，REST 请求需要 `Authorization: Bearer <secret>`。
 - `server.requireHttps` 为真时，非 HTTPS 请求会被拒绝；本机 Node daemon 当前传入协议为 `http`。
@@ -503,6 +530,126 @@ ms session explain session-20260813-001
 
 该命令要求 PostgreSQL schema v22 和 host-owned exact private scope。参数只接受 1-256 个字符、NFKC 规范化且不含空白、控制字符或路径分隔符的 `sessionId`；不能用 CLI 参数覆盖 tenant/user/scope。session 不匹配、receipt 不存在或 capability 未就绪时会明确失败，不回退到跨 scope 查询。
 
+## `ms evolve`
+
+通过 RuntimeClient 调用共享 RuntimeHost，不在 CLI 中创建独立 provider/worker。进化批次要求操作者开启 `features.continuousMemoryEvolution` 且 host 注册对应 native PostgreSQL capability；v36 为批次基础，治理扩展使用 v37。CLI 存在不代表已连接的服务端支持相应控制能力。
+
+```bash
+ms evolve inventory --selection baseline --dry-run \
+  --max-records 20 --idempotency-key inventory-preview-001
+ms evolve scan --source-id project-notes --propose \
+  --max-files 5 --max-llm-calls 2 --idempotency-key notes-propose-001
+ms evolve inventory --selection baseline --propose \
+  --max-records 20 --idempotency-key inventory-cli-propose-001
+ms evolve status <batch-id>
+ms evolve resume <batch-id>
+```
+
+`scan` 只接受 host 预先注册的 `--source-id`，不接受位置目录参数或客户端 path/scope/model/authority。`inventory` 的 `--selection` 默认 `baseline`；native v37 provider 已组装 `changed/due` 选择与逐项确认，其他 host 需提供同一组合。changed 使用外部语义 outbox，due 使用到期复核字段，不以访问热度判断变化；preview 不消费事件。冻结批次完成不等于全库增量已处理。
+
+| 参数 | 说明 |
+|------|------|
+| `--dry-run` | `preview`，也是未指定动作时的默认值；无 LLM/embedding/canonical 写入，可保存批次报告 |
+| `--propose` | 生成隔离提案与必要证据，不改当前 head、confidence 或正常召回 |
+| `--apply-allowed` | 进入专用治理门；无合格 host attestation 的库存/目录证据仍 untrusted，不是直接内容更新或批准候选的命令 |
+| `--idempotency-key <key>` | 1-128 字符安全标识；省略时生成新键，同请求重试应复用原键 |
+| `--max-records <count>` / `--max-files <count>` | 记录/证据与文件读取预算，包括必要复核 |
+| `--max-bytes <count>` | 应用层字节预算；目录计入来源 hash 重读，库存为有界 SQL 结果返回后的保护，不是数据库磁盘/网络硬配额 |
+| `--max-llm-calls <count>` | 模型调用预算 |
+| `--max-input-tokens <count>` / `--max-output-tokens <count>` | 模型 token 预算 |
+| `--max-duration-ms <count>` | 单执行段总时长上限，毫秒 |
+
+inventory/scan 的三个动作互斥，上表预算 flags 只接受正整数，并同时受 CLI 上限与服务端 schema 校验约束；省略值由服务端补齐，默认值见[进化指南](../guides/continuous-memory-evolution.md)。下述治理控制使用独立 JSON 合同，不使用这些动作和预算 flags。`status/resume` 只接受 batch ID，不接受更换动作、limits 或 checkpoint。
+
+库存已计入 lookahead 与原始证据返回行；`usage.records/bytes` 描述应用层预算工作量，不是 provider 的精确线上 I/O。`maxBytes` 超限检查发生在有界结果返回之后，不能用该 flag 限定数据库实际磁盘扫描或网络传输字节。
+
+输出为 JSON 批次报告；关注 `status/reasons/resumable`、累计 `usage` 和 `counts`，不把命令返回视作 canonical 应用成功。显式 resume 新开有限 segment，累计 usage 不清零；幂等请求重试、后台 job retry 不增加新额度。目录来源不因注册获得信任，高影响操作保留审阅，普通候选批准不能绕过进化门禁。默认 related-target 查找仅发现审阅对象，不授予修改权；目录持久定位已接入新 reader 实例的精确重读，复核失败不以 staged quote 替代当前来源，单条重读不确认整页 manifest，也不代表实际系统恢复演练已完成。完整适用边界见[进化指南](../guides/continuous-memory-evolution.md)，传输合同见 [Memory API](memory-api.md)。
+
+库存 legacy raw evidence 与目录不因 MCP/user 通道名或 remember intent 获得作者/目标授权证明。可信 issuer 签名与事务内复核另有 host 合同，`--apply-allowed` 和普通候选审批不是授权补齐方式。专用审阅绑定具体提案与版本，且只有 host 注册真实 review capability 后才提供服务。缺少能力时返回 `EVOLUTION_CONTROL_UNAVAILABLE`，不降级为直接写入。
+
+### 后台控制
+
+```bash
+ms evolve background
+ms evolve maintenance
+ms evolve background --mode paused --expected-revision <revision>
+ms evolve background --mode evolution_only --batch-id <batch-id> --expected-revision <revision>
+```
+
+不带参数时读取状态；修改要求独立 ownerSecret 和读取到的当前 revision。`evolution_only` 的 `--batch-id` 可重复，最多 100 个不重复 ID；`all/paused` 不接批次白名单。响应包含 `mode/revision/state/active/allowedBatchIds`。切换后的 `draining` 需要等待至 `active=0`，不表示当前事务已回滚。读服务继续可用，但显式前台写入不受此后台门禁止。
+
+`maintenance` 仅 GET 查询低频维护快照，不触发任务，也不接受 `--enable` 或预算参数。快照含 `enabled/status/reasons/updatedAt/budgetReserved/localFreeBytes/databaseFreeBytes`，可带 batchId/jobId。默认 driver 已接入原 scheduler，维护缺省关闭且自动仅 `due + propose`；当前数据库剩余空间未知（`databaseFreeBytes=null`）会阻断自动维护。本地磁盘样本不代表 PG 剩余空间，状态也不是清理完成或实际费用结算证明。
+
+退出维护只有在操作者完成回执、预算与后验检查后，以新的 revision 显式选择 `--mode all`；该变更不持久化到启动配置，重启后必须重新读取状态。
+
+### 专用审阅合同
+
+native RuntimeHost 已组装以下 review/cancel 服务；连接其他或旧 host 时仍须检查 capability。操作者凭据来自可信配置 `evolution.control.ownerSecret`，不放在 flag 中，批准不是跳过 writer 门禁的保证。
+
+| 命令形式 | 参数/意义 |
+|----------|-----------|
+| `ms evolve proposals` | 可选 `--batch-id <id>`、`--status <status>`、`--limit <count>`、`--cursor <cursor>`；默认 20、最多 50 项，status 为 staged/rejected/review/applied/noop，cursor 仅使用响应中的 nextCursor |
+| `ms evolve proposal <proposal-id>` | 提案详情、必要证据与可选审阅回执摘要；不是完整原始来源导出 |
+| `ms evolve review <proposal-id>` | 读取精确 diff、来源、目标和 bindingHash；不是批量候选自动批准 |
+| `ms evolve review-status <review-id>` | 读取同 scope 的审阅项状态 |
+| `ms evolve approve <review-id>` / `reject <review-id>` | 必须传 `--binding-hash <hash>`、`--idempotency-key <key>`，可传 `--reason <reason>`；批准并不改写来源作者 |
+| `ms evolve apply <approval-receipt-id>` | 使用批准回执准备受治理应用，仍需重读来源、目标 CAS、有效期与唯一 durable job |
+| `ms evolve cancel <batch-id>` | 请求取消；不当作已提交内容的 rollback |
+
+`reviewId/proposalId/approvalReceiptId` 必须来自相应真实响应，不从本地文件或 ID 猜测构造；`bindingHash` 必须原样使用当前审阅值，不能把旧 diff 批准套到新状态。审阅与应用返回、错误和可用性见 [Memory API](memory-api.md)。
+
+以下参数占位必须替换为本次响应值；批准前读取完整 review。`--binding-hash` 为 64 位小写十六进制，`--reason` 最多 512 字符。
+
+```bash
+ms evolve proposals --batch-id <batch-id> --limit 20
+ms evolve proposal <proposal-id>
+ms evolve review <proposal-id>
+ms evolve approve <review-id> --binding-hash <binding-hash> --idempotency-key owner-decision-001
+ms evolve apply <approval-receipt-id>
+```
+
+`apply` 返回批次报告，后续用 `status` 和提交 receipt 核对；不能用 decision receipt 当作已提交证明。默认 Runtime 已接入输入预算和 writer 同事务 attestation/revocation 复核，未通过来源重读、目标 CAS、有效期或撤销检查时仍会阻断。没有通用 host-state put 或历史 continuation 子命令。
+
+### 来源与复用控制
+
+以下命令已注册为专用 host proxy；`--request` 是单个 JSON 字符串，不是文件路径或任意 state 写入，原始字符串上限 16384 字节。完整请求字段见 [来源证明 API](memory-api.md#来源证明控制)和[复用 API](memory-api.md#受控复用与配对评测)。
+
+| 命令形式 | 合同 |
+|----------|------|
+| `ms evolve source-attest --request <json>` | 提交可信 issuer 已签名的 statement、signature、expectedRevision、idempotencyKey；不在 CLI 中签名 |
+| `ms evolve source-revoke-attestation --request <json>` | sourceId/sourceRevision、expectedRevision、idempotencyKey、operationIdempotencyKey、expiresAt；只撤销来源信任 |
+| `ms evolve reuse-status` | 查询 targetFingerprint（可缺省）、grantsRevision、grantIds；列表不是实时授权成功证明 |
+| `ms evolve reuse-grants --request <json>` | grants、expectedRevision、idempotencyKey；完整替换目标 scope 的同 owner 来源授权，空 grants 明确清空 |
+| `ms evolve reuse-evaluate <plan-id>` | 只执行 host 注册的计划，不接受 path、model、holdout 正文或成功标记 |
+
+CLI 启动入口为这五个专用控制命令转发可信配置 `evolution.control.ownerSecret`，使用独立 `x-mengshu-owner-token`；普通 inventory 请求不携带 owner 凭据。仍须配置有效凭据并由 host 提供对应 capability，普通 bearer 不能代替 owner 认证。
+
+attest/revoke 返回来源信任状态回执，不证明 canonical evidence/links 已撤销或事实已遗忘；grants 返回替换回执，不绕过读取、目标兼容性、期限、撤销及引用缓存门禁。evaluate 可能调用已配置模型，当前仅注册的 `synthetic:fact-selection-v1` 适用；`accepted_for_review` 仍禁止发布/执行，不是正式 G/P 通过，也不补齐缺少独立 outcome 证明的 E3 经验来源。
+
+### 治理控制
+
+以下三条命令使用原 RuntimeHost durable 队列和后台门，要求独立 owner 凭据；CLI 启动入口从可信配置转发 `evolution.control.ownerSecret`，不接受凭据 flag、通用 state、path 或 authority。
+
+| 命令形式 | 合同 |
+|----------|------|
+| `ms evolve control --request <json>` | 上限 16384 字节；closed input.mode=control，action=execute_control，work 仅 source_reconcile/source_revoke/undo_governance |
+| `ms evolve undo-preview <receipt-id>` | 64 位小写十六进制的原操作 receipt ID，返回精确当前状态 hash；不执行撤销 |
+| `ms evolve undo-approve --request <json>` | 上限 4096 字节；operationReceiptId/currentStateHash/expectedRevision/idempotencyKey/operationIdempotencyKey/expiresAt，返回行政批准而非已执行证明 |
+
+`--request` 只能是单个 JSON 字符串，不读取请求文件。以下仅展示结构，sourceId 和幂等键为示意；`control` 会准备治理写入批次，不是 dry-run，也不是生产操作授权：
+
+```bash
+ms evolve control --request '{"input":{"mode":"control","work":{"kind":"source_reconcile","sourceId":"project-notes"}},"action":"execute_control","limits":{"maxRecords":100,"maxFiles":20,"maxBytes":1000000,"maxDurationMs":120000},"idempotencyKey":"source-reconcile-demo-001"}'
+```
+
+control 的 `limits` 仅接受四项 I/O 限额，模型/token 预算固定为零且不接受对应请求字段。source_reconcile 的 maxFiles 必须为正数；source_revoke/undo_governance 归零，允许显式 0。较小限额仍可能不足以完成一次对账或事务，不能据 parser 接受推断能完成。
+
+source_revoke 先由 `source-revoke-attestation` 取得精确 sourceRevision 与 operationIdempotencyKey 绑定的行政批准，再以其 id 作为 reviewReceiptId 执行控制批次；前一步只撤销信任，不撤销 canonical evidence/links。undo 先 preview、approve，再提交 undo_governance，批次 idempotencyKey 必须等于批准绑定的 operationIdempotencyKey。完整 JSON 字段及有效期见[治理控制 API](memory-api.md#治理控制批次)，不能猜测回执或 hash。
+
+控制批次仍用 `ms evolve status/resume <batch-id>`。resume 从可信配置转发可选 owner 凭据；无凭据保留普通批次恢复，但控制批次必须独立 owner 认证。报告公开 work.kind 和有限 work.result，usageAccounting 为 budget_reservation；source_reconcile 的 partial 可能已含数据库提交 receipt，不等于完全未写，manifest 确认与数据库提交须分别核对。
+
+历史 operator 当前只支持 synthetic/loopback 隔离工程验证，不是 `ms evolve` 的生产历史入口。本指南不提供真实历史更新或恢复命令，关闭 feature 也不降级 schema。
+
 ## `ms cost`
 
 ```bash
@@ -521,10 +668,13 @@ ms cost --window 7d --json
 ## `ms mcp`
 
 ```bash
+export MENGSHU_AUTHORITY_FILE="$HOME/.mengshu/authority.json"
 ms mcp
 ```
 
-启动 stdio 传输的 MCP server，让本地 MCP 客户端（Claude Desktop、Cursor 等）通过标准输入输出调用长期记忆工具。
+启动 stdio 传输的 MCP server，让本地 MCP 客户端（Codex、Claude Desktop、Cursor 等）
+通过标准输入输出调用长期记忆工具。启动前必须由 Agent 产品提供
+`MENGSHU_AUTHORITY_FILE` 或 `MENGSHU_AUTHORITY_JSON`，两者只能设置一个。
 
 工具清单：
 
@@ -547,6 +697,11 @@ ms mcp
 | `memory_asset_explain` | 解释资产版本、底层引用和 evidence |
 | `memory_asset_search` | 按 `query` 搜索 exact private scope 的资产，可选 `limit` 和 `semanticType` |
 | `memory_session_explain` | 仅按 `sessionId` 读取 server-owned exact private session 的最新装配 receipt |
+| `memory_evolution_run` | capability 可用时，提交 host-bound 的 inventory/directory 批次请求 |
+| `memory_evolution_status` / `memory_evolution_resume` | capability 可用时，仅按 `batchId` 查询/恢复进化批次 |
+| `memory_evolution_source_attest` / `memory_evolution_source_revoke_attestation` | sourceControl 可用且 proxy 独立 owner 认证后，提交签名声明/撤销来源信任 |
+| `memory_evolution_reuse_status` / `memory_evolution_reuse_grants` / `memory_evolution_reuse_evaluate` | reuse 可用且 proxy 独立 owner 认证后，查询/替换同 owner 授权或评测注册计划 |
+| `memory_evolution_control_run` / `memory_evolution_control_undo_preview` / `memory_evolution_control_undo_approve` | control 可用且 proxy 独立 owner 认证后，提交治理批次或精确撤销预览/批准；直接 stdio 不暴露这三条控制工具 |
 
 Claude Desktop 配置示例（`claude_desktop_config.json`）：
 
@@ -554,8 +709,11 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）：
 {
   "mcpServers": {
     "mengshu": {
-      "command": "npx",
-      "args": ["openclaw", "ms", "mcp"]
+      "command": "ms",
+      "args": ["mcp"],
+      "env": {
+        "MENGSHU_AUTHORITY_FILE": "/absolute/path/to/.mengshu/authority.json"
+      }
     }
   }
 }

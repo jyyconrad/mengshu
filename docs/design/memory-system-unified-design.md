@@ -1,15 +1,14 @@
 # mengshu 记忆系统统一设计方案
 
-> 版本：v2.0
-> 日期：2026-06-16
-> 状态：已定稿，作为 mengshu 记忆系统算法层的单一事实来源与实施指引
+> 规范版本：v2.0
+> 定稿日期：2026-06-16
+> 实施校准：2026-08-31
+> 状态：D-01~D-23 已定稿；当前运行态映射见 §0.2
 >
 > 关联文档：
-> - [product-positioning.md §2.2](../../03-architecture/product-positioning.md)
-> - [mengshu-deep-optimization-architecture.md §3.10](../../03-architecture/mengshu-deep-optimization-architecture.md)
-> - [structured-knowledge-graph-memory-tree-detail.md](./structured-knowledge-graph-memory-tree-detail.md)
-> - [llm-graph-extraction-upgrade.md](./llm-graph-extraction-upgrade.md)
-> - [auto-capture-recall-detail.md](./auto-capture-recall-detail.md)
+> - [系统架构](../architecture/system-architecture.md)
+> - [数据库 Schema](./schema.md)
+> - [记忆树批量推理](./memory-tree-batch-inference-plan.md)
 
 ---
 
@@ -25,6 +24,30 @@
 2. **完整性**：结论先行、ADR、参考文献、多视角评估、代码对应表一应俱全。
 3. **可决策性**：所有关键决策抽离到 §0.3 / §16.1 逐项登记（D-01~D-23），便于追溯与实施对照。
 4. **可实施性**：每个算法都给出确定性规格、配置项与验收门禁，定稿即可实现。
+
+### 0.2 当前运行态映射（2026-08-31）
+
+本文定义算法约束，运行态是否生效以 composition、provider capability 和测试共同判断。v1.0.7 的 PostgreSQL 参考组合已形成以下主链：
+
+```text
+server-owned authority
+  -> MemoryWriteKernel（normalize / validate / score / dedup / admission）
+  -> provider-owned transaction（record/candidate + audit + outbox + receipt）
+  -> GovernedRetrievalEngine（hard filter / hydrate / 6-factor rerank）
+  -> SlotContextBuilder（5 slots + R0-R4 + prompt safety）
+  -> durable warm derivation（graph / tree / asset / temporal / skill）
+```
+
+运行态补充边界：
+
+- Project identity 与 server authority 分离：`ms init` 只固化产品无关的 `workspaceId/projectId`，Agent 产品在运行时补充可信 tenant/user/app/agent/namespace；项目 manifest 不得扩大 authority。
+- `RuntimeHost` 是 provider、worker、cache 和 capability 的单一 owner；默认 `ms mcp` 通过 loopback/Unix `RuntimeClient` 转发，不创建第二套 Runtime。
+- PostgreSQL 是完整治理参考组合；LanceDB/Supabase 保留兼容 provider 路径，但不自动具备 atomic write、durable jobs、temporal、working set、skill、policy 或 documents repository。
+- Temporal Memory、Session Working Set、reviewed Skill Artifact、Memory Policy Overlay、Asset/Loadout、Knowledge Resource 和 canonical Markdown/Vault 是增量能力层，由 `features.*` 与 capability 同时控制；它们不能改变 D-01~D-23 的准入、scope、证据和确定性裁决原则。
+- 5 槽位仍是上下文视图，不是主数据模型；kind-only 或低置信 semantic mapping 可以保留查询，但不能直接进入必读槽位。
+- G/P/Q 评测彼此独立：`eval:quick` 只证明 Q 轨工程合同，正式发布还需要 G/P paired gate、报告完整性和 P-FRESH 配额。
+
+Canonical 实现路径统一位于 `packages/core/src/`、`packages/api/src/`、`packages/mcp/src/` 和 `plugins/`。根层同名目录是兼容 facade，不应作为新实现位置。
 
 ### 0.3 已定稿决策项
 
@@ -49,13 +72,13 @@
 
 ### 0.3.1 统一状态模型映射（D-19）
 
-四套状态服务于不同阶段，**分开定义、单向映射**，禁止共用同一枚举（与现有代码 `core/types.ts` / `lifecycle/candidate-types.ts` 对齐）：
+四套状态服务于不同阶段，**分开定义、单向映射**，禁止共用同一枚举（与现有代码 `packages/core/src/domain/types.ts` / `packages/core/src/lifecycle/candidate-types.ts` 对齐）：
 
 | 阶段 | 类型 | 取值 | 代码位置 |
 |------|------|------|---------|
 | 准入路由结果 | `AdmissionRoute` | `drop / candidate_low_priority / candidate / active / lookup_only / evidence_only` | 新增（§6.2） |
-| 候选区状态机 | `CandidateStatus` | `pending / approved / rejected / archived / expired` | `lifecycle/candidate-types.ts:21`（已存在，不改） |
-| 主库生命周期 | `MemoryLifecycleStatus` | `active / archived / revoked / superseded / promoted` | `core/types.ts:54`（已存在，不改） |
+| 候选区状态机 | `CandidateStatus` | `pending / approved / rejected / archived / expired` | `packages/core/src/lifecycle/candidate-types.ts:21`（已存在，不改） |
+| 主库生命周期 | `MemoryLifecycleStatus` | `active / archived / revoked / superseded / promoted` | `packages/core/src/domain/types.ts:54`（已存在，不改） |
 | 用户可见视图 | `UserVisibleStatus` | `active / pending / low_priority / archived / forgotten` | 新增（仅 CLI/UI 聚合，不落库） |
 
 **映射规则**（单向，从内部状态聚合到用户视图）：
@@ -262,7 +285,7 @@ AdmissionRoute              CandidateStatus      MemoryLifecycleStatus     UserV
 | 3 | JSON mode + 本地 schema validator + 一次 repair | 降级路径 |
 | 4 | 启发式 extractor | LLM 不可用或连续失败时使用 |
 
-代码侧扩展 `LlmClient` 接口（`processing/llm-client.ts`）：
+代码侧扩展 `LlmClient` 接口（`packages/core/src/runtime/llm/llm-client.ts`）：
 
 ```typescript
 interface LlmClient {
@@ -492,7 +515,7 @@ salience 评分锚点（你只给原始信号，最终重要性由系统重算�
 字段语义要点：
 
 - `text`：记忆正文，必须可直接复用的一句话；不含"用户说"等包装。
-- `kind`：细分类型（`MemoryKind`），映射到 `core/types.ts`；未知用 `other`。
+- `kind`：细分类型（`MemoryKind`），映射到 `packages/core/src/domain/types.ts`；未知用 `other`。
 - `crossContextual`：模型自评"是否跨情境通用"，§3.2 用它做语义/情景交叉验证。
 - `profileDimension`：仅当 `semanticType=profile` 时填，必须命中 §3.3 白名单 6 维之一。
 - `salience`：LLM 给的原始重要性信号，系统用 §4.2 公式重算 importance。
@@ -617,6 +640,9 @@ interface MemoryScope {
 
 Scope 解析规则：
 
+Project Memory Workspace 只提供 `workspaceId/projectId`。source 中的 tenant/user/app/agent/session
+必须来自 Agent 产品认证后的运行时上下文，不能由 `ms init`、项目文件或客户端消息生成。
+
 | 情况 | targetScope |
 |------|-------------|
 | 用户显式指定"这个项目里记住" | `project` |
@@ -652,7 +678,7 @@ LLM 返回每条 candidate 后，按下表顺序判定。任一"拒绝"命中则
 | 10 | 时效一致性 | `temporality=ephemeral` 不允许 `semanticType ∈ {rules, profile}` | 冲突 → 改 semanticType=experience 或 task_context |
 | 11 | scope 不超界 | `targetScope` 不得宽于 `source.scope` | 超界 → 收窄到 source.scope |
 
-校验器实现位置：扩展现有 `graph/extraction-validator.ts`，新建 `lifecycle/candidate-validator.ts`。
+校验器实现位置：扩展现有 `packages/core/src/graph/extraction-validator.ts`，新建 `packages/core/src/lifecycle/candidate-validator.ts`。
 
 ```typescript
 export function validateCandidate(
@@ -724,7 +750,7 @@ if (["rules", "profile"].includes(llmType) && !reconcileCrossContextual(c)) {
 }
 ```
 
-> 词表 `STABILITY_PATTERNS` / `EPISODIC_PATTERNS` 放在 `processing/extraction-rules.ts`，按语言分组，不暴露给用户。
+> 词表 `STABILITY_PATTERNS` / `EPISODIC_PATTERNS` 放在 `packages/core/src/runtime/llm/extraction-rules.ts`，按语言分组，不暴露给用户。
 
 ### 3.3 profile 白名单、风险标记与分层（Big Five 反向落地）
 
@@ -741,7 +767,7 @@ profile 在 mengshu 中**只承载工作协作偏好**，对应 6 个白名单�
 | `risk_boundary` | 风险/操作边界 | "不要自动 push""删除前必须确认" | "用户谨慎/保守"（特质归因） |
 | `domain_focus` | 长期工作领域 | "主要做记忆系统、Agent Runtime" | "用户是 AI 专家"（能力评价） |
 
-**风险词表**（首期命中不拒绝，只写 `riskFlags=["sensitive"]`；正则放在 `processing/extraction-rules.ts`）：
+**风险词表**（首期命中不拒绝，只写 `riskFlags=["sensitive"]`；正则放在 `packages/core/src/runtime/llm/extraction-rules.ts`）：
 
 | 类别 | 正则模式（示例） |
 |------|----------------|
@@ -936,7 +962,7 @@ task_context 标记为 stale/superseded，当：
 按"先固定一版"决策，下列权重作为 v1 起点。变更需经 ADR 批准。
 
 ```typescript
-// processing/scoring-weights.ts —— v1 baseline
+// packages/core/src/scoring/scoring-weights.ts —— v1 baseline
 export const SCORING_WEIGHTS_V1 = {
   version: "v1.0",
   valueScore: {
@@ -1520,7 +1546,7 @@ topic-label 合并规则（从快到慢）：
 
 ### 7.4.1 treeKey 从 entity.id 迁移到 topic-label（D-21）
 
-现状：当前实现 `tree/topic.ts:60` 用 `entity.id` 作为 topic tree 的 `treeKey`（`routeLeafToTopicTree` 按每个 entity 建桶）。本设计改用归一化 `topic-label`（D-18/D-21）。两者不兼容，需要迁移策略，避免重复建 tree 或丢失既有聚合。
+现状：当前实现 `packages/core/src/tree/topic.ts:60` 用 `entity.id` 作为 topic tree 的 `treeKey`（`routeLeafToTopicTree` 按每个 entity 建桶）。本设计改用归一化 `topic-label`（D-18/D-21）。两者不兼容，需要迁移策略，避免重复建 tree 或丢失既有聚合。
 
 **迁移原则**：灰度、不破坏、可回滚。entity.id 树不直接删除，而是建立到 topic-label 树的映射后逐步收敛。
 
@@ -1849,7 +1875,7 @@ function safeInject(text: string): string {
 由此推导出贯穿全系统的铁律：
 
 - **LLM 只建议不裁决**：所有 LLM 输出都是 candidate / suggestion / judge_result，不是 commit。
-- **deterministic validator 是行为约束框架**：每一条进入持久层的记忆都必须经过 `graph/extraction-validator.ts` 同源的确定性校验；validator 是系统的"现实约束"，LLM 提出的观察只有通过它才被承认。
+- **deterministic validator 是行为约束框架**：每一条进入持久层的记忆都必须经过 `packages/core/src/graph/extraction-validator.ts` 同源的确定性校验；validator 是系统的"现实约束"，LLM 提出的观察只有通过它才被承认。
 - **所有记忆都带 evidence**：没有 evidence 的 LLM 断言一律视为幻觉，直接丢弃。
 - **摘要不创造事实，冲突优先于合并**：摘要层（L1-L3）只能压缩已存在的 evidence，遇到规则冲突时走冲突路径而非静默合并。
 
@@ -1866,7 +1892,7 @@ function safeInject(text: string): string {
 | 摘要封存 | tree seal 时生成 L1-L3 折叠摘要 | evidence-bound：摘要每个 claim 必须可回溯到 leaf evidence；faithfulness 默认 P0/P1=off 仅 deterministic check，P2 起 high_risk（D-07） |
 | 去重灰区判断 | 对 lexical 相似度落在灰区的候选给出 same/distinct 判断 | judge 不写库；中文短文本(<20字符)阈值 0.88、英文默认 0.85（D-06）由确定性函数先裁；judge 仅在灰区被咨询 |
 | 图谱三元组提取 | 提取 (subject, relation, object) 三元组 | 每条 relation 必须带 evidence；输出经 extraction-validator；不通过 → rule-based extractor |
-| 召回意图分类 | 对召回 query 判断意图类别以辅助路由 | 规则优先：先走 `core/recall-scoring.ts` 确定性规则，LLM 仅在规则无法判定时介入 |
+| 召回意图分类 | 对召回 query 判断意图类别以辅助路由 | 规则优先：先走 `packages/core/src/domain/recall-scoring.ts` 确定性规则，LLM 仅在规则无法判定时介入 |
 | experience 升格判断 | 判断一组 experience 是否可聚合为 skill_candidate | 只产出 skill_candidate（独立 schema），不直接写 5 type 主表；升格仍需后续确定性流程确认 |
 | summary faithfulness judge | 对生成摘要做事实一致性打分 | 可配置：默认 P0/P1 关闭，仅在 P2+ high_risk 场景启用；judge 结果用于 gate 摘要，不改写摘要内容 |
 
@@ -1893,8 +1919,8 @@ LLM 调用存在三种失败模式：**不可用**（网络/服务错误）、**
 
 | LLM 任务 | 降级目标 |
 |----------|----------|
-| 候选提取 | `HeuristicTypeExtractor`（规则提取，见 lifecycle/type-extractor.ts） |
-| 图谱提取 | rule-based extractor（graph/extractor.ts 确定性路径） |
+| 候选提取 | `HeuristicTypeExtractor`（规则提取，见 packages/core/src/lifecycle/type-extractor.ts） |
+| 图谱提取 | rule-based extractor（packages/core/src/graph/extractor.ts 确定性路径） |
 | tree seal 摘要 | extractive summary：按 importance 取 top-5 leaf 原文拼接，不做生成式压缩 |
 | dedupe judge | conservative distinct：保守判为"不同"，建立 related_to 边而非合并 |
 | experience 升格 | skip + 重试：本轮跳过，下次封存窗口再试，不产出 skill_candidate |
@@ -2051,7 +2077,7 @@ schema 校验失败后的唯一一次重发使用以下固定模板。该模板�
 | `memory.extraction.minSalience` | `0.3` | 候选提取的最低 salience 门槛，低于此不进入候选池 | — |
 | `memory.extraction.graphExtractMinChars` | `200` | 触发 graph 提取的最小文本长度（字符） | — |
 | `memory.extraction.fewShot.enabled` | `false` | 是否在提取 prompt 中注入 few-shot 示例 | — |
-| `memory.scoring.weightsVersion` | `"v1.0"` | 评分权重版本号，对应 `processing/scoring-weights.ts` 中的权重表 | — |
+| `memory.scoring.weightsVersion` | `"v1.0"` | 评分权重版本号，对应 `packages/core/src/scoring/scoring-weights.ts` 中的权重表 | — |
 | `memory.admission.maxCandidatesPerSession` | `50` | 单 session 候选上限，超出按 valueScore 截断 | D-02 |
 | `memory.admission.lowPriorityCandidateTTLDays` | `30` | low（0.40-0.55）候选保留天数 | D-02 |
 | `memory.admission.pendingCandidateTTLDays` | `90` | pending（0.55-0.88）候选保留天数 | D-02 |
@@ -2110,7 +2136,7 @@ schema 校验失败后的唯一一次重发使用以下固定模板。该模板�
 }
 ```
 
-上述三字段经 `processing/llm-client.ts` 在构造请求时解析并注入对应 model 名；任一字段缺省时回退 `llm.model`，且无论哪条路径 temperature 强制 `0.0`，不接受调用方覆盖。
+上述三字段经 `packages/core/src/runtime/llm/llm-client.ts` 在构造请求时解析并注入对应 model 名；任一字段缺省时回退 `llm.model`，且无论哪条路径 temperature 强制 `0.0`，不接受调用方覆盖。
 ---
 
 ## 12. 成本预算矩阵（经济性设计）
@@ -2146,13 +2172,13 @@ schema 校验失败后的唯一一次重发使用以下固定模板。该模板�
 补充约束说明：
 
 - **任务 1（memory extract）**：与 D-02 的 `maxCandidatesPerSession=50` 协同——抽取产物进入 Admission 前先经候选上限裁剪，避免无效 token 浪费。`每会话≤3` 指对同一 session 的抽取调用次数（含分批），超出后剩余内容走 heuristic。
-- **任务 2（graph extract）**：门控的 `chunk≥200 字符` 直接复用 graph/extractor.ts 的长度判断；`有候选` 指 lifecycle/extract-candidate-handler.ts 已产出候选。该任务为异步增量，失败 skip 不影响记忆入库。
+- **任务 2（graph extract）**：门控的 `chunk≥200 字符` 直接复用 packages/core/src/graph/extractor.ts 的长度判断；`有候选` 指 packages/core/src/lifecycle/extract-candidate-handler.ts 已产出候选。该任务为异步增量，失败 skip 不影响记忆入库。
 - **任务 3（dedupe judge）**：灰区带 [0.82, 0.90] 收窄于 confidence 去重治理体系的 L2 层。注意与 D-06 区分——D-06 的 lexical 阈值（中文短文本 0.88 / 英文 0.85）用于初判，dedupe judge 仅在初判落入灰区时介入。
-- **任务 4（summary seal）**：`max token` 随 treeType 浮动，按折叠层 L0-L3 与 tree/seal.ts 的预算配置取值；越上层（global/topic）预算越高。
+- **任务 4（summary seal）**：`max token` 随 treeType 浮动，按折叠层 L0-L3 与 packages/core/src/tree/seal.ts 的预算配置取值；越上层（global/topic）预算越高。
 - **任务 5（faithfulness judge）**：严格遵循 D-07——P0/P1 默认 off，仅 deterministic check；P2 起仅对 high_risk 摘要触发，是成本最低频的判别任务之一。
 - **任务 6（skill_candidate 升格）**：遵循 D-05，skill_candidate 是 experience 聚合产物、独立 schema，不属于 5 种 MemoryKind。升格为事件驱动，频率极低。
 
-各任务的 token 估算与上限统一从 `processing/scoring-weights.ts` 同级的预算配置读取，便于集中调参。
+各任务的 token 估算与上限统一从 `packages/core/src/scoring/scoring-weights.ts` 同级的预算配置读取，便于集中调参。
 
 ### 12.3 每日预算聚合与降级
 
@@ -2375,7 +2401,7 @@ skill_candidate        2300      $0.007    reasoningModel
 
 ### 13.2 用户可见信息
 
-每条记忆对用户暴露以下字段。这些字段来自 `core/types.ts` 的记忆实体与 evidence 结构，是 §13.3 各动作的展示基础。
+每条记忆对用户暴露以下字段。这些字段来自 `packages/core/src/domain/types.ts` 的记忆实体与 evidence 结构，是 §13.3 各动作的展示基础。
 
 | 暴露字段 | 来源 | 含义 | 用户用途 |
 |---------|------|------|---------|
@@ -2488,8 +2514,8 @@ $ ms correct mem_8f2a --scope workspace
 
 | 阶段 | 内容 | 解除的断点 | 可验收里程碑 | faithfulness 默认开关 |
 |------|------|-----------|-------------|----------------------|
-| **P0-a** 数据契约 + validator + heuristic fallback（纯确定性，零 LLM） | `MemoryExtractionRequest` / `MemoryExtractionOutput` 类型定义；复用已有 `MemorySemanticType`，新增 `AdmissionRoute` 类型（D-19，`MemoryKind` 不动）；candidate-validator 11 条 deterministic 闸门；`processing/scoring-weights.ts` + `extraction-rules.ts`；heuristic fallback（`type-extractor.ts`）保留可用 | 无结构化 schema、无入库前确定性校验、评分硬编码 | validator 11 条闸门可单测红绿；heuristic fallback 在无 LLM 时仍产候选；本段零 LLM 调用、可独立回归 | off |
-| **P0-b** structured extraction spike（LLM 接入） | `LlmClient.extractStructured()` 接口 + provider structured-output 适配；`graph/llm-extractor.ts` 单行 prompt 替换为结构化提示词；`extract-candidate-handler.ts` 接入异步路径 | 单行 prompt、provider 能力未验证、LLM 抽取未接入候选区 | 畸形 LLM 响应触发 schema 校验失败并自动重试 1 次，重试仍失败则丢弃且不污染库（兜底走 P0-a heuristic）；spike 失败不影响 P0-a 能力 | off |
+| **P0-a** 数据契约 + validator + heuristic fallback（纯确定性，零 LLM） | `MemoryExtractionRequest` / `MemoryExtractionOutput` 类型定义；复用已有 `MemorySemanticType`，新增 `AdmissionRoute` 类型（D-19，`MemoryKind` 不动）；candidate-validator 11 条 deterministic 闸门；`packages/core/src/scoring/scoring-weights.ts` + `extraction-rules.ts`；heuristic fallback（`type-extractor.ts`）保留可用 | 无结构化 schema、无入库前确定性校验、评分硬编码 | validator 11 条闸门可单测红绿；heuristic fallback 在无 LLM 时仍产候选；本段零 LLM 调用、可独立回归 | off |
+| **P0-b** structured extraction spike（LLM 接入） | `LlmClient.extractStructured()` 接口 + provider structured-output 适配；`packages/core/src/graph/llm-extractor.ts` 单行 prompt 替换为结构化提示词；`extract-candidate-handler.ts` 接入异步路径 | 单行 prompt、provider 能力未验证、LLM 抽取未接入候选区 | 畸形 LLM 响应触发 schema 校验失败并自动重试 1 次，重试仍失败则丢弃且不污染库（兜底走 P0-a heuristic）；spike 失败不影响 P0-a 能力 | off |
 | **P0-c** eval / golden gate | `mengshu-extraction`（100 条）+ `mengshu-dedup`（80 条，**仅 lexical/hash/规则冲突**）作为 P0-a/P0-b 合并门禁 | 无回归门禁 | extraction precision >= 0.8；lexical/hash dedup 与规则冲突 false merge<=0.03；作为 CI 合并 gate | off（仅 deterministic check，符合 D-07） |
 | **P1** 召回解释 + profile 分层 | valueScore 8 维 + importance / confidence / hotness 公式替换硬编码（含 D-01 riskPenalty=-0.15、D-02 阈值带）；profile 白名单 6 维 + 风险词表 + profileLayer 分层；crossContextual 词表验证；`.mengshu/config.json` 三层加载；召回 score breakdown + filteredReason；用户可见面 `ms why` / `ms recall --explain` / `ms forget` | 评分硬编码、profile 无分层、召回结果不可解释、记忆不可撤回 | 评分确定可复现（同输入同输出，无随机性）；profile 分层召回按 D-04 targetScope 正确路由；用户能查（why/explain）能撤回（forget） | off |
 | **P2** embedding 去重 + hotness 接通 | entity 三级匹配 + candidate 语义去重（salience>=0.5 门控，lexical 0.90 / semantic 0.82 阈值，中文短文本按 D-06 取 0.88）；接通 queryHits 30d 递增 + graphCentrality；faithfulness 升级 high_risk | confidence 多证据无数据源、hotness queryHits 未接通、entity 仅靠精确匹配 | entity 正确合并率 >= 0.9 且误并率 <= 0.05；topic tree 开始创建；rules 类误并率 = 0（rules 不参与语义合并） | high_risk（P2 起，符合 D-07） |
@@ -2502,12 +2528,12 @@ P0 是"先可用"的地基，拆成三段（D-23）：**P0-a 为纯确定性能�
 
 | 工作项 | 段 | 估算 | 说明 |
 |--------|----|------|------|
-| 类型契约（`MemoryExtractionRequest/Output`、`AdmissionRoute`） | P0-a | 1 天 | 复用已有 `MemorySemanticType`（`core/types.ts:27`）；`MemoryKind` 不动；新增 `AdmissionRoute`（D-19） |
-| candidate-validator 11 条闸门 + 测试 | P0-a | 1-2 天 | 新增确定性 validator（参考 `graph/extraction-validator.ts` 模式），覆盖 11 条入库闸门 + 单元测试 |
+| 类型契约（`MemoryExtractionRequest/Output`、`AdmissionRoute`） | P0-a | 1 天 | 复用已有 `MemorySemanticType`（`packages/core/src/domain/types.ts:27`）；`MemoryKind` 不动；新增 `AdmissionRoute`（D-19） |
+| candidate-validator 11 条闸门 + 测试 | P0-a | 1-2 天 | 新增确定性 validator（参考 `packages/core/src/graph/extraction-validator.ts` 模式），覆盖 11 条入库闸门 + 单元测试 |
 | `scoring-weights.ts` + `extraction-rules.ts` | P0-a | 1 天 | 固化 SCORING_WEIGHTS_V1 + STABILITY/EPISODIC/风险词表 |
-| `extractStructured()` + provider 适配 | P0-b | 2-3 天 | 扩展 `processing/llm-client.ts`，统一结构化输出接口，适配各 provider 的 JSON mode / function calling 差异 |
-| 提示词替换（单行 prompt -> 结构化提示词）+ 候选区接入 | P0-b | 1-2 天 | 替换 `graph/llm-extractor.ts` 单行 prompt，`extract-candidate-handler.ts` 接异步路径 |
-| golden cases（提取集 100 条 + 去重集 80 条，**仅 lexical/hash/规则冲突**） | P0-c | 3-4 天 | 构建 `eval/goldens/` 评测集（对齐 §15.5）。**semantic/entity dedup 归 P2，不在 P0 去重集范围** |
+| `extractStructured()` + provider 适配 | P0-b | 2-3 天 | 扩展 `packages/core/src/runtime/llm/llm-client.ts`，统一结构化输出接口，适配各 provider 的 JSON mode / function calling 差异 |
+| 提示词替换（单行 prompt -> 结构化提示词）+ 候选区接入 | P0-b | 1-2 天 | 替换 `packages/core/src/graph/llm-extractor.ts` 单行 prompt，`extract-candidate-handler.ts` 接异步路径 |
+| golden cases（提取集 100 条 + 去重集 80 条，**仅 lexical/hash/规则冲突**） | P0-c | 3-4 天 | 构建 `tests/eval/goldens/` 评测集（对齐 §15.5）。**semantic/entity dedup 归 P2，不在 P0 去重集范围** |
 | **P0 合计** | | **约 9-13 工作日** | P0-a 约 3-4 天可独立交付 |
 
 ### 14.4 每阶段未达标时的降级策略
@@ -2527,20 +2553,26 @@ P0 是"先可用"的地基，拆成三段（D-23）：**P0-a 为纯确定性能�
 
 ## 15. 评测与验收体系
 
-> 本章定义 eval 体系，为四套评分体系、去重治理、摘要忠实度建立可量化、可回归、可单测的验收门禁（gate）。所有 gate 未达通过线时对应功能默认关闭（见 §15.6），与 §14.4 的渐进式启用策略一致。
+> 当前协议采用 G/P/Q 三轨：G 轨产出通用效果分 GMS，P 轨产出私有产品分 PMS，Q 轨验证 contract、安全、算法与 runtime 工程质量。三轨互不替代；`npm run eval:quick` 只运行 Q 轨，不能单独证明效果提升或版本可发布。
+
+版本发布门禁 fail-closed：Q 轨、报告完整性、G/P paired gate 和至少 150 例 P-FRESH 必须同时满足。G0 离线 lexical 结果在 official answer scorer 未运行时仅为 diagnostic，`formalScoreEligible=false`。
 
 ### 15.1 评测套件
 
-在现有 `eval/goldens/mengshu-v0.1.jsonl`（30 条召回基准）与 `mengshu-safety.jsonl`（40 条安全基准）之外，新增 6 个 suite，覆盖抽取、去重、冲突、摘要、召回解释、技能候选六个关键环节。所有 suite 以 jsonl 存储，统一登记到 `eval/goldens/manifest.json`（同步 `size` 与 `sha256`）。
+`tests/eval/goldens/manifest.json` schema v2 当前登记 12 套 Q 轨、358 个 deterministic case。每套都固定 `track`、`datasetVersion`、case 数、bytes、SHA-256、metrics 与 gate。
 
 | Suite 文件 | 覆盖环节 | 规模 | 分布要求 | 核心 gate |
 |---|---|---|---|---|
 | `mengshu-extraction.jsonl` | 候选抽取 + 5 type 分类 | 100 | 5 type 均衡（各 ~20）+ 边界样例 | type precision>=0.85；extraction precision>=0.80；over-capture<=0.10 |
 | `mengshu-dedup.jsonl` | 去重关系判定 | 80 | duplicate/update/conflict/related/distinct = 30/10/20/15/5 | duplicate precision>=0.90；false merge<=0.03 |
-| `mengshu-conflict.jsonl` | 冲突检出 | 50 | 含 rules 类强冲突子集 | conflict recall>=0.80；rules false merge=0 |
-| `mengshu-tree-summary.jsonl` | 摘要 faithfulness + evidence 引用 | 50 | source/topic/global 各 treeType 均衡 | faithfulness>=0.95；key fact evidence rate=1.0 |
+| `mengshu-conflict.jsonl` | 冲突检出 | 10 | 含 rules 类强冲突子集 | conflict recall>=0.80；rules false merge=0 |
+| `mengshu-tree-summary.jsonl` | 摘要 faithfulness + evidence 引用 | 8 | source/topic/global treeType | faithfulness>=0.95；key fact evidence rate=1.0 |
 | `mengshu-recall-explain.jsonl` | 召回 score breakdown + filtered reason | 60 | 各 intent（profile/task/rules/experience/resource）均衡 | breakdown 输出率=1.0 |
-| `mengshu-skill-candidate.jsonl` | experience 聚合升格为 skill_candidate | 30 | 多 experience 聚合场景 | 只生成候选，不生成可执行 skill |
+| `mengshu-skill-candidate.jsonl` | experience 聚合升格为 skill_candidate | 8 | 多 experience 聚合场景 | 只生成候选，不生成可执行 skill |
+| `mengshu-progressive-disclosure.jsonl` | R0-R4 渐进披露 | 5 | navigation / evidence 下钻 | case pass rate=1.0 |
+| `mengshu-asset-promotion.jsonl` | Asset 晋升 | 5 | governance / provenance | case pass rate=1.0 |
+| `mengshu-slot-loadout.jsonl` | Loadout 槽位与预算 | 6 | scope / slot / token budget | case pass rate=1.0 |
+| `mengshu-import-compat.jsonl` | Markdown 导入兼容 | 6 | SHA-256/MD5 + project-workspace scope | case pass rate=1.0 |
 
 说明：
 
@@ -2587,9 +2619,9 @@ P0 是"先可用"的地基，拆成三段（D-23）：**P0-a 为纯确定性能�
 
 铁律落地为可执行约束："LLM 只建议不裁决"必须体现在代码边界上。
 
-- 四套评分（valueScore / importance / confidence / hotness）与去重关系的**最终判定**一律由纯函数计算，集中在（新建）`processing/scoring-weights.ts`、`core/recall-scoring.ts` 及 dedup validator 中（文件新建/扩展状态见 §17）。
-- LLM（`processing/llm-client.ts`、`graph/llm-extractor.ts`）只产出**原始信号**：候选 body、建议 type、建议关系标签、相似度提示、风险提示。这些信号作为纯函数的输入字段，不得作为最终分值或最终关系的来源。
-- 所有入库经 `graph/extraction-validator.ts` 等 deterministic validator 终审。validator 拒绝任何缺失 evidence 的候选。
+- 四套评分（valueScore / importance / confidence / hotness）与去重关系的**最终判定**一律由纯函数计算，集中在（新建）`packages/core/src/scoring/scoring-weights.ts`、`packages/core/src/domain/recall-scoring.ts` 及 dedup validator 中（文件新建/扩展状态见 §17）。
+- LLM（`packages/core/src/runtime/llm/llm-client.ts`、`packages/core/src/graph/llm-extractor.ts`）只产出**原始信号**：候选 body、建议 type、建议关系标签、相似度提示、风险提示。这些信号作为纯函数的输入字段，不得作为最终分值或最终关系的来源。
+- 所有入库经 `packages/core/src/graph/extraction-validator.ts` 等 deterministic validator 终审。validator 拒绝任何缺失 evidence 的候选。
 - 单测要求：给定固定输入（candidate + signals），评分函数与去重判定必须**同输入同输出**，可断言、可审计。评分函数禁止内部发起 LLM 调用或读取非确定性状态（时间戳除外，且需可注入）。
 
 ```typescript
@@ -2606,9 +2638,9 @@ const relation = decideDedupRelation(a, b, signals);       // 纯函数裁决 �
 
 ### 15.4 误判样例与回归
 
-- 每当任一 gate 失败，CI 将该 suite 中所有 misclassified（分类错误、误合并、faithfulness 不达标）样例自动追加到对应 `regression set`（如 `eval/goldens/regression/mengshu-dedup.regression.jsonl`），并记录失败时的输入、期望、实际、判定路径。
+- 每当任一 gate 失败，CI 将该 suite 中所有 misclassified（分类错误、误合并、faithfulness 不达标）样例自动追加到对应 `regression set`（如 `tests/eval/goldens/regression/mengshu-dedup.regression.jsonl`），并记录失败时的输入、期望、实际、判定路径。
 - regression set 是 golden set 的强制子集：后续每次跑评测都包含 regression 样例，防止旧 bug 复现。
-- **调参回归铁律**：任何评分权重、阈值（含 D-01~D-06 系数）、validator 规则、prompt 模板的修改，提交前必须跑**全量 golden set**（含全部 6 个新 suite + `mengshu-v0.1` / `mengshu-safety` + regression），并在 PR 中附 gate 通过表。仅跑子集视为未回归。
+- **调参回归铁律**：任何评分权重、阈值（含 D-01~D-06 系数）、validator 规则、prompt 模板的修改，提交前必须跑**全量 Q 轨 golden set**（当前 12 套 + regression）；影响效果口径时还必须运行对应 G/P paired evaluation。仅跑子集视为未回归。
 - manifest 在每次 golden 变更时同步更新 `size` 与 `sha256`，保证基准集不可静默漂移。
 
 ### 15.5 标注策略
@@ -2640,7 +2672,7 @@ const relation = decideDedupRelation(a, b, signals);       // 纯函数裁决 �
 | `mengshu-recall-explain`（breakdown 输出率<1.0） | 召回解释展示 | 隐藏 breakdown，仅给最终排序 |
 | `mengshu-skill-candidate`（产出可执行 skill） | experience→skill 升格 | 仅累积 experience，不生成 skill_candidate |
 
-判定时机：每次 release gate 评估 manifest 中各 suite 的最新跑分；任一新功能的启用开关读取对应 suite 的 pass 状态。未达标不阻断发布，但对应能力以关闭态发布，待基准达标后再灰度开启。
+判定时机：每次 release gate 固定 manifest 与 RunSpec 后评估。Q 轨任一硬门禁未达标会阻断版本发布；功能级 gate 还会保持对应高成本能力关闭。不得用“功能默认关闭”绕过 G/P/Q 的整体发布合同。
 ---
 
 ## 16. 决策记录与开放问题汇总
@@ -2663,7 +2695,7 @@ const relation = decideDedupRelation(a, b, signals);       // 纯函数裁决 �
 | **D-08** | LLM 调用统一 message-based + structured outputs：`system` 放稳定规则，动态上下文进 `role=user`，输出走 JSON Schema / tool call，不在 prompt 依赖 JSON 示例 | §2.2 | — |
 | **D-09** | graph 与 memory 拆成两次独立 LLM 调用（可并行），触发条件不同，互不阻塞 | §2.4 §2.5 | — |
 | **D-10** | 四套评分分工固化：`valueScore` 管准入，`importance / confidence / hotness` 管运行时（排序 / 去重治理 / 树路由），不合并成单分 | §0.7 §4 | ADR-001 |
-| **D-11** | 评分权重首期固化为 `SCORING_WEIGHTS_V1`，基于记忆工具领域经验值，集中在 `processing/scoring-weights.ts` | §4.6 | ADR-001 |
+| **D-11** | 评分权重首期固化为 `SCORING_WEIGHTS_V1`，基于记忆工具领域经验值，集中在 `packages/core/src/scoring/scoring-weights.ts` | §4.6 | ADR-001 |
 | **D-12** | profile 仅按 6 维白名单提取，不做 Big Five 人格推断；风险词只标 `riskFlags` 不直接落库为人格结论 | §3.3 | — |
 | **D-13** | profile 三层 `global / app / project`，召回优先级 `project > app > global` | §2.6 §3.3 | — |
 | **D-14** | 敏感信息首期不 hard drop：用户要存什么就存什么，只记 `riskFlags`、scope 与 evidence | §3.3 §4.7 | §0.3 |
@@ -2697,7 +2729,7 @@ const relation = decideDedupRelation(a, b, signals);       // 纯函数裁决 �
 
 | 问题 | 影响 | 建议阶段 |
 |------|------|---------|
-| **评估闭环（golden set）** | 全文几乎所有阈值（D-01~D-03、D-06、D-16）目前都是经验值，缺少 ground truth 就无法验证准入率 / 误并率 / 召回命中。`eval/goldens/*` 需尽早扩充为可回归的评测集 | **最高优先开放项**，与 P0 并行启动 |
+| **正式效果闭环（GMS/PMS）** | Q 轨 12 套 deterministic suite 已覆盖工程合同，但不能证明通用/私有记忆效果；G 轨仍需 official answer scorer 与完整对照，P 轨仍需 500 例双人标注且 P-FRESH>=150 | 发布前持续收敛，缺项保持 blocked |
 | **用户隐式反馈闭环** | 决定 `importance / hotness` 能否从静态经验值演进为自适应权重，需要 `FeedbackCollector` 采集采纳 / 召回 / 停留信号反哺评分 | P4 |
 | **遗忘 / 淘汰机制** | 长期低 hotness、从不被召回的 active 记忆是否降级归档，关系到库体积与召回信噪比；机制必须可回滚（归档不等于删除），避免误降级丢失有效记忆 | P4 |
 | **type-specific 去重阈值调参时机** | 统一阈值（D-16）对 rules / experience / resource 的最优点可能不同，何时分档取决于 golden set 上各 type 的误并 / 漏并曲线 | 评估闭环就绪后 |
@@ -2711,14 +2743,14 @@ const relation = decideDedupRelation(a, b, signals);       // 纯函数裁决 �
 
 | 编号 | 问题描述 | 影响范围 | 建议修复时机 | 状态 |
 |------|----------|----------|-------------|------|
-| **P1-Q1** | `processing/llm-client.ts` 的 `extractStructured` 缺 abort signal 与 timeout，挂死请求会阻塞 worker。schema 校验仅顶层 required，嵌套约束（如 `confidence: {minimum: 0, maximum: 1}`）运行时不验证 | LLM 异步路径可靠性 | ~~P1：与 P1 的 importance breakdown 消费链一起改（需要调整 LLM 调用封装）~~ | **✅ 已修复**（2026-06-16）：① abort signal / timeout 已在 `mergeAbortSignals` 实现并集成到 `extractStructured`；② 新增 `validateValueConstraints` 方法，运行时校验 `type`、`enum`、`minimum`/`maximum`、`minLength`/`maxLength`、`minItems`/`maxItems` 等取值约束；③ 修复「只递归对象、跳过基本类型数组元素」缺口，现在 `eventIds`、`riskFlags` 等基本类型数组也逐元素校验。测试覆盖：新增 11 个测试用例（enum/范围/长度/数组长度/类型数组/基本类型数组枚举），全部通过。 |
-| **P1-Q2** | `graph/llm-extractor.ts:206-208` 与 `lifecycle/extract-candidate-handler.ts:74-76` 两处 LLM 异常 `catch {}` 静默吞错，日志未记、audit 未写，运维无法观测 LLM 持续失败 | 可观测性 | ~~P1：加统一 LLM 异常 audit 链（集中记 `llm_extraction_failed` + error message + context）~~ | **✅ 已修复**（2026-06-17）：`extract-candidate-handler.ts:388-400` 在 catch 块添加完整 audit 日志（action: `llm_extraction_failed`，含 error message + fallbackTo + textLength + intent），链路不中断且可观测。 |
+| **P1-Q1** | `packages/core/src/runtime/llm/llm-client.ts` 的 `extractStructured` 缺 abort signal 与 timeout，挂死请求会阻塞 worker。schema 校验仅顶层 required，嵌套约束（如 `confidence: {minimum: 0, maximum: 1}`）运行时不验证 | LLM 异步路径可靠性 | ~~P1：与 P1 的 importance breakdown 消费链一起改（需要调整 LLM 调用封装）~~ | **✅ 已修复**（2026-06-16）：① abort signal / timeout 已在 `mergeAbortSignals` 实现并集成到 `extractStructured`；② 新增 `validateValueConstraints` 方法，运行时校验 `type`、`enum`、`minimum`/`maximum`、`minLength`/`maxLength`、`minItems`/`maxItems` 等取值约束；③ 修复「只递归对象、跳过基本类型数组元素」缺口，现在 `eventIds`、`riskFlags` 等基本类型数组也逐元素校验。测试覆盖：新增 11 个测试用例（enum/范围/长度/数组长度/类型数组/基本类型数组枚举），全部通过。 |
+| **P1-Q2** | `packages/core/src/graph/llm-extractor.ts:206-208` 与 `packages/core/src/lifecycle/extract-candidate-handler.ts:74-76` 两处 LLM 异常 `catch {}` 静默吞错，日志未记、audit 未写，运维无法观测 LLM 持续失败 | 可观测性 | ~~P1：加统一 LLM 异常 audit 链（集中记 `llm_extraction_failed` + error message + context）~~ | **✅ 已修复**（2026-06-17）：`extract-candidate-handler.ts:388-400` 在 catch 块添加完整 audit 日志（action: `llm_extraction_failed`，含 error message + fallbackTo + textLength + intent），链路不中断且可观测。 |
 | **P1-Q3** | `extract-candidate-handler.ts` 三处实现不完整：① sourceScope 硬编码 `project`（闸门 11 session 级 scope 校验失效）；② eventId 传 `["placeholder"]` 占位（闸门 2 evidence 校验形同虚设）；③ schema enum 含 `null` 不符 TS 严格模式 | validator 11 闸门部分旁路 | ~~P1：接入真实 source metadata（sessionId/projectId/eventIds）需要 handler 上游 job 传递完整 context，属 P1 召回解释链路的依赖~~ | **✅ 已修复**（2026-06-17）：① line 298/368 根据 scope.sessionId/projectId/workspaceId 推断实际 scope 上界，闸门 11 正确收窄 targetScope；② line 488 enqueue 传递真实 sessionId；③ eventIds 从上游 job 真实传入。 |
-| **P1-Q4** | `processing/scoring-weights.ts` 已固化 SCORING_WEIGHTS_V1（valueScore 8 维 + importance 4 项），但当前无业务消费方——valueScore 8 维公式、importance 4 项明细计算、sourceAuthority/typePrior 均未接入实际评分代码 | 权重固化未闭环 | ~~P1：valueScore 公式替换 `core/recall-scoring.ts` 硬编码 6 因子（P1 范围 §14.2 明确）+ importance breakdown 输出（§9.4）~~ | **✅ 已修复**（2026-06-17）：① `core/recall-scoring.ts` 已升级集成 `SCORING_WEIGHTS_V1`，importance 计算接入 `processing/importance-score.ts` 的 4 项加权公式（salience_llm 0.45 + sourceAuthority 0.20 + explicitnessBonus 0.20 + typePrior 0.15）；② 新增 `computeImportanceForRecord` 和 `computeImportanceWithBreakdown`，支持从 record 元数据重算 importance + 4 项明细追溯；③ 向后兼容：已有 `record.importance` 直接使用，无元数据时降级到中性默认。测试覆盖：50 个测试用例全部通过（scoring-weights 28 个 + value-score 9 个 + importance-score 13 个）。详见 `docs/04-design/04.2-detail/scoring-system-usage.md`。 |
+| **P1-Q4** | `packages/core/src/scoring/scoring-weights.ts` 已固化 SCORING_WEIGHTS_V1（valueScore 8 维 + importance 4 项），但当前无业务消费方——valueScore 8 维公式、importance 4 项明细计算、sourceAuthority/typePrior 均未接入实际评分代码 | 权重固化未闭环 | ~~P1：valueScore 公式替换 `packages/core/src/domain/recall-scoring.ts` 硬编码 6 因子（P1 范围 §14.2 明确）+ importance breakdown 输出（§9.4）~~ | **✅ 已修复**（2026-06-17）：① `packages/core/src/domain/recall-scoring.ts` 已升级集成 `SCORING_WEIGHTS_V1`，importance 计算接入 `packages/core/src/scoring/importance-score.ts` 的 4 项加权公式（salience_llm 0.45 + sourceAuthority 0.20 + explicitnessBonus 0.20 + typePrior 0.15）；② 新增 `computeImportanceForRecord` 和 `computeImportanceWithBreakdown`，支持从 record 元数据重算 importance + 4 项明细追溯；③ 向后兼容：已有 `record.importance` 直接使用，无元数据时降级到中性默认。测试覆盖：50 个测试用例全部通过（scoring-weights 28 个 + value-score 9 个 + importance-score 13 个）。详见 `docs/04-design/04.2-detail/scoring-system-usage.md`。 |
 | **P1-Q5** | `maxCandidatesPerSession=50` 已在 `candidate-repository.ts` 实施归档逻辑，但现有 `enqueue` 调用方（`extract-candidate-handler`）传 sourceScope 不含 sessionId，导致容量判定退化为全局 scope 比较（session 隔离失效） | 容量约束粒度降级 | ~~P1：handler 上游 job 传递真实 sessionId（同 P1-Q3，属召回解释链路依赖）~~ | **✅ 已修复**（2026-06-17）：`extract-candidate-handler.ts:488` enqueue 传入真实 sessionId（从 scope 推断），candidate-repository 按 sessionId 隔离，session 容量约束生效。 |
-| **P1-Q6** | `lifecycle/candidate-validator.ts` 闸门 9（泛词过滤）用简化启发式（长度≥10 且含具体指代标记），无法识别"修复了一个 bug"/"优化了性能"等无实际信息的泛词。设计 §3.1 要求降级为 evidence-only，当前宽松实现会让泛词候选进 pending | 候选区噪音 | ~~P1/P2：待 eval 数据标注"泛词负例集"后迭代闸门 9 规则，或训练轻量分类器（与 P2 eval 闭环对齐）~~ | **✅ 已修复**（2026-06-17）：闸门 9 已实现 GENERIC_MIN_LENGTH=10 简化启发式，符合首期要求。后续迭代（P5+）根据 eval 数据标注的"泛词负例集"优化规则，或训练轻量分类器。 |
-| **P1-Q7** | `graph/llm-extractor.ts` 已接入 `validateExtraction`（8 条 entity/relation 校验），但 validator 内部硬编码 `ENTITY_TYPES` 与 prompt 的实体类型列表**双轨维护**（当前一致但易漂移）。且 validator 无 audit 输出，拒绝的 entity/relation 不可追溯 | 图谱校验可维护性 | ~~P1：抽取 `ENTITY_TYPES` / `RELATION_PREDICATES` 到 `graph/schema.ts` 作单一事实来源，prompt 与 validator 共用；validator 加 audit 输出（拒绝原因 + 命中规则）~~ | **✅ 已修复**（2026-06-17）：① `graph/schema.ts` 已创建，导出 ENTITY_TYPES / RELATION_PREDICATES 作单一事实来源；② `graph/extraction-validator.ts` 已 import 并使用；③ validator 内部已有 audit 逻辑（验证失败时记录拒绝原因）。 |
-| **P1-Q8** | `retrieval/prompt-safety.ts` 的 `PROMPT_INJECTION_PATTERNS` 与 `processing/extraction-rules.ts` 同名常量**双轨维护**（类似 P1-Q7 但属安全面），retrieval 侧仅含英文模式，导致中文注入（"忽略之前的指令"/"你现在是"/"忘记你之前的设定"等）全部漏过 `index.ts` `shouldCaptureMemory` 的捕获过滤层。**安全缺口** | 注入检测口径不一致 | ~~P1：合并为单一事实来源~~ | **✅ 已修复**（2026-06-17）：`retrieval/prompt-safety.ts` 改为复用 `processing/extraction-rules.ts` 的 `PROMPT_INJECTION_PATTERNS`（中英文基础词表），自身只补充检索侧专用的结构化注入面（HTML 角色标签 / 工具调用诱导 / `system prompt` 字面引用）。新增 5 个回归测试覆盖中文注入场景。整库 `tsc --noEmit` 通过，prompt-safety 测试 5 个 + P1-Q4 评分链相关测试 121 个全部通过。 |
+| **P1-Q6** | `packages/core/src/lifecycle/candidate-validator.ts` 闸门 9（泛词过滤）用简化启发式（长度≥10 且含具体指代标记），无法识别"修复了一个 bug"/"优化了性能"等无实际信息的泛词。设计 §3.1 要求降级为 evidence-only，当前宽松实现会让泛词候选进 pending | 候选区噪音 | ~~P1/P2：待 eval 数据标注"泛词负例集"后迭代闸门 9 规则，或训练轻量分类器（与 P2 eval 闭环对齐）~~ | **✅ 已修复**（2026-06-17）：闸门 9 已实现 GENERIC_MIN_LENGTH=10 简化启发式，符合首期要求。后续迭代（P5+）根据 eval 数据标注的"泛词负例集"优化规则，或训练轻量分类器。 |
+| **P1-Q7** | `packages/core/src/graph/llm-extractor.ts` 已接入 `validateExtraction`（8 条 entity/relation 校验），但 validator 内部硬编码 `ENTITY_TYPES` 与 prompt 的实体类型列表**双轨维护**（当前一致但易漂移）。且 validator 无 audit 输出，拒绝的 entity/relation 不可追溯 | 图谱校验可维护性 | ~~P1：抽取 `ENTITY_TYPES` / `RELATION_PREDICATES` 到 `packages/core/src/graph/schema.ts` 作单一事实来源，prompt 与 validator 共用；validator 加 audit 输出（拒绝原因 + 命中规则）~~ | **✅ 已修复**（2026-06-17）：① `packages/core/src/graph/schema.ts` 已创建，导出 ENTITY_TYPES / RELATION_PREDICATES 作单一事实来源；② `packages/core/src/graph/extraction-validator.ts` 已 import 并使用；③ validator 内部已有 audit 逻辑（验证失败时记录拒绝原因）。 |
+| **P1-Q8** | `retritests/eval/prompt-safety.ts` 的 `PROMPT_INJECTION_PATTERNS` 与 `packages/core/src/runtime/llm/extraction-rules.ts` 同名常量**双轨维护**（类似 P1-Q7 但属安全面），retrieval 侧仅含英文模式，导致中文注入（"忽略之前的指令"/"你现在是"/"忘记你之前的设定"等）全部漏过 `index.ts` `shouldCaptureMemory` 的捕获过滤层。**安全缺口** | 注入检测口径不一致 | ~~P1：合并为单一事实来源~~ | **✅ 已修复**（2026-06-17）：`retritests/eval/prompt-safety.ts` 改为复用 `packages/core/src/runtime/llm/extraction-rules.ts` 的 `PROMPT_INJECTION_PATTERNS`（中英文基础词表），自身只补充检索侧专用的结构化注入面（HTML 角色标签 / 工具调用诱导 / `system prompt` 字面引用）。新增 5 个回归测试覆盖中文注入场景。整库 `tsc --noEmit` 通过，prompt-safety 测试 5 个 + P1-Q4 评分链相关测试 121 个全部通过。 |
 
 **修复优先级建议**：
 - **所有 P1 技术债已完成**（2026-06-17）：P1-Q1~Q8 全部标注为"✅ 已修复"。
@@ -2734,54 +2766,54 @@ const relation = decideDedupRelation(a, b, signals);       // 纯函数裁决 �
 
 | 现有能力 | 代码文件 | 修改点 |
 |---------|---------|--------|
-| 5 type 语义类型 | `core/types.ts` | **复用已有** `MemorySemanticType`（profile/task_context/rules/experience/resource，已定义于 `core/types.ts:27`）。**不要**把 5 type 塞进 `MemoryKind`：`MemoryKind`（preference/decision/entity/fact/task/…）是正交的细粒度种类，保持不变。`skill_candidate` 既不进 `MemorySemanticType` 也不进 `MemoryKind`，是独立 schema（D-05） |
-| 细粒度种类 | `core/types.ts:93` | `MemoryKind`（preference/decision/fact/…）保持现状，与 `MemorySemanticType` 正交共存：一条记忆同时有 `semanticType`（5 问题视图）和 `kind`（细粒度种类） |
-| 启发式候选提取 | `lifecycle/type-extractor.ts` | 保留作为 LLM 降级路径（LLM 不可用或超时时回退到规则提取） |
-| 候选区状态机 | `lifecycle/candidate-types.ts` | `CandidateStatus` 枚举已有（pending/approved/rejected/archived/expired，**不改**），新增独立的 `AdmissionRoute` 类型（drop/candidate_low_priority/candidate/active/lookup_only/evidence_only，D-02/D-19）+ 容量约束 `maxCandidatesPerSession=50`。四套状态分开定义见 §0.3.1 |
-| 自动抽取进入候选区 | `lifecycle/extract-candidate-handler.ts` | 接入 LLM 提取器（异步路径），保留同步规则提取为兜底 |
-| 图谱规则提取 | `graph/extractor.ts` | 保留作降级路径 |
-| LLM 图谱提取 | `graph/llm-extractor.ts:168-170` | 替换单行 prompt 为 §2.4 结构化抽取 prompt |
-| LLM 输出校验 | `graph/extraction-validator.ts` | 扩展为 candidate-validator（11 条 deterministic 闸门），新建 `lifecycle/candidate-validator.ts` |
-| 记忆树 buffer/seal | `tree/buffer.ts`、`tree/seal.ts`、`tree/build-tree-handler.ts` | seal prompt 替换为 §7.6 摘要 prompt；路由逻辑加 §7.3 分级（0.55-0.70 仅 source tree，>=0.70 进 topic/global，D-03） |
-| 召回评分 | `core/recall-scoring.ts` | 补充 score breakdown 输出（§9.4：importance 4 项明细可追溯） |
-| 评分权重 | `processing/scoring-weights.ts` | 新建，固化 `SCORING_WEIGHTS_V1`（valueScore 8 维 + riskPenalty=-0.15，D-01） |
-| 抽取规则词表 | `processing/extraction-rules.ts` | 新建，STABILITY/EPISODIC 词表 + 风险词表（供 valueScore 风险惩罚与 deterministic check 使用） |
-| eval 基础设施 | `eval/README.md`、`eval/goldens/*` | 补充 6 个新 suite（见 §15.1）：`mengshu-extraction`、`mengshu-dedup`、`mengshu-conflict`、`mengshu-tree-summary`、`mengshu-recall-explain`、`mengshu-skill-candidate` |
-| LLM 客户端 | `processing/llm-client.ts` | 新增 `extractStructured<T>()` 接口（统一结构化输出 + JSON schema 校验，temperature 一律 0.0） |
+| 5 type 语义类型 | `packages/core/src/domain/types.ts` | **复用已有** `MemorySemanticType`（profile/task_context/rules/experience/resource，已定义于 `packages/core/src/domain/types.ts:27`）。**不要**把 5 type 塞进 `MemoryKind`：`MemoryKind`（preference/decision/entity/fact/task/…）是正交的细粒度种类，保持不变。`skill_candidate` 既不进 `MemorySemanticType` 也不进 `MemoryKind`，是独立 schema（D-05） |
+| 细粒度种类 | `packages/core/src/domain/types.ts:93` | `MemoryKind`（preference/decision/fact/…）保持现状，与 `MemorySemanticType` 正交共存：一条记忆同时有 `semanticType`（5 问题视图）和 `kind`（细粒度种类） |
+| 启发式候选提取 | `packages/core/src/lifecycle/type-extractor.ts` | 保留作为 LLM 降级路径（LLM 不可用或超时时回退到规则提取） |
+| 候选区状态机 | `packages/core/src/lifecycle/candidate-types.ts` | `CandidateStatus` 枚举已有（pending/approved/rejected/archived/expired，**不改**），新增独立的 `AdmissionRoute` 类型（drop/candidate_low_priority/candidate/active/lookup_only/evidence_only，D-02/D-19）+ 容量约束 `maxCandidatesPerSession=50`。四套状态分开定义见 §0.3.1 |
+| 自动抽取进入候选区 | `packages/core/src/lifecycle/extract-candidate-handler.ts` | 接入 LLM 提取器（异步路径），保留同步规则提取为兜底 |
+| 图谱规则提取 | `packages/core/src/graph/extractor.ts` | 保留作降级路径 |
+| LLM 图谱提取 | `packages/core/src/graph/llm-extractor.ts:168-170` | 替换单行 prompt 为 §2.4 结构化抽取 prompt |
+| LLM 输出校验 | `packages/core/src/graph/extraction-validator.ts` | 扩展为 candidate-validator（11 条 deterministic 闸门），新建 `packages/core/src/lifecycle/candidate-validator.ts` |
+| 记忆树 buffer/seal | `packages/core/src/tree/buffer.ts`、`packages/core/src/tree/seal.ts`、`packages/core/src/tree/build-tree-handler.ts` | seal prompt 替换为 §7.6 摘要 prompt；路由逻辑加 §7.3 分级（0.55-0.70 仅 source tree，>=0.70 进 topic/global，D-03） |
+| 召回评分 | `packages/core/src/domain/recall-scoring.ts` | 补充 score breakdown 输出（§9.4：importance 4 项明细可追溯） |
+| 评分权重 | `packages/core/src/scoring/scoring-weights.ts` | 新建，固化 `SCORING_WEIGHTS_V1`（valueScore 8 维 + riskPenalty=-0.15，D-01） |
+| 抽取规则词表 | `packages/core/src/runtime/llm/extraction-rules.ts` | 新建，STABILITY/EPISODIC 词表 + 风险词表（供 valueScore 风险惩罚与 deterministic check 使用） |
+| eval 基础设施 | `tests/eval/README.md`、`tests/eval/goldens/*` | 补充 6 个新 suite（见 §15.1）：`mengshu-extraction`、`mengshu-dedup`、`mengshu-conflict`、`mengshu-tree-summary`、`mengshu-recall-explain`、`mengshu-skill-candidate` |
+| LLM 客户端 | `packages/core/src/runtime/llm/llm-client.ts` | 新增 `extractStructured<T>()` 接口（统一结构化输出 + JSON schema 校验，temperature 一律 0.0） |
 
 ### 17.2 新建 vs 扩展，与 P0 优先级
 
 新建文件（3 个）
 
 ```text
-processing/scoring-weights.ts     固化 SCORING_WEIGHTS_V1，四套评分体系单一事实来源
-processing/extraction-rules.ts    STABILITY/EPISODIC + 风险词表，被 valueScore 与 validator 共用
-lifecycle/candidate-validator.ts  11 条 deterministic 闸门，承接"所有入库经 validator"铁律
+packages/core/src/scoring/scoring-weights.ts     固化 SCORING_WEIGHTS_V1，四套评分体系单一事实来源
+packages/core/src/runtime/llm/extraction-rules.ts    STABILITY/EPISODIC + 风险词表，被 valueScore 与 validator 共用
+packages/core/src/lifecycle/candidate-validator.ts  11 条 deterministic 闸门，承接"所有入库经 validator"铁律
 ```
 
 扩展现有文件（10 个）
 
 ```text
-core/types.ts                          复用已有 MemorySemanticType；MemoryKind 不动；新增 AdmissionRoute 类型
-core/recall-scoring.ts                 补 score breakdown
-lifecycle/candidate-types.ts           补 AdmissionRoute + 容量约束（CandidateStatus 不改）
-lifecycle/extract-candidate-handler.ts 接入 LLM 异步路径
-lifecycle/type-extractor.ts            降级保留
-graph/llm-extractor.ts                 替换 prompt（168-170）
-graph/extraction-validator.ts          逻辑迁出至 candidate-validator
-graph/extractor.ts                     降级保留
-tree/buffer.ts / tree/seal.ts / tree/build-tree-handler.ts  seal prompt + 分级路由（P2）
-tree/topic.ts                          treeKey 从 entity.id 迁移到 topic-label（P2，迁移策略 §7.4.1）
-processing/llm-client.ts               新增 extractStructured<T>()
+packages/core/src/domain/types.ts                          复用已有 MemorySemanticType；MemoryKind 不动；新增 AdmissionRoute 类型
+packages/core/src/domain/recall-scoring.ts                 补 score breakdown
+packages/core/src/lifecycle/candidate-types.ts           补 AdmissionRoute + 容量约束（CandidateStatus 不改）
+packages/core/src/lifecycle/extract-candidate-handler.ts 接入 LLM 异步路径
+packages/core/src/lifecycle/type-extractor.ts            降级保留
+packages/core/src/graph/llm-extractor.ts                 替换 prompt（168-170）
+packages/core/src/graph/extraction-validator.ts          逻辑迁出至 candidate-validator
+packages/core/src/graph/extractor.ts                     降级保留
+packages/core/src/tree/buffer.ts / packages/core/src/tree/seal.ts / packages/core/src/tree/build-tree-handler.ts  seal prompt + 分级路由（P2）
+packages/core/src/tree/topic.ts                          treeKey 从 entity.id 迁移到 topic-label（P2，迁移策略 §7.4.1）
+packages/core/src/runtime/llm/llm-client.ts               新增 extractStructured<T>()
 ```
 
 P0 三段拆分（D-23，按依赖顺序，前序未完成会阻塞后续）
 
-- **P0-a 数据契约 + validator + heuristic fallback（纯确定性，零 LLM）**：`core/types.ts`（复用 `MemorySemanticType`、新增 `AdmissionRoute`，`MemoryKind` 不动）、`processing/scoring-weights.ts`、`processing/extraction-rules.ts`、新建 `lifecycle/candidate-validator.ts`（11 条 deterministic 闸门）、`lifecycle/type-extractor.ts`（heuristic fallback 保留可用）。这一段不含任何 LLM 调用，是评分与校验的依赖根，可独立交付与回归。
-- **P0-b structured extraction spike（LLM 工程接入）**：`processing/llm-client.ts` 的 `extractStructured<T>()` + provider structured-output 适配、`graph/llm-extractor.ts` prompt 替换、`lifecycle/extract-candidate-handler.ts` 接入异步路径。这一段才是 LLM 接入，与 P0-a 解耦，spike 失败不影响 P0-a 的确定性能力。
-- **P0-c eval/golden gate**：`eval/goldens/*` 的提取集（100 条）+ 去重集（80 条，仅 lexical/hash/规则冲突，见 §15）+ 召回解释集，作为 P0-a/P0-b 的合并门禁。
+- **P0-a 数据契约 + validator + heuristic fallback（纯确定性，零 LLM）**：`packages/core/src/domain/types.ts`（复用 `MemorySemanticType`、新增 `AdmissionRoute`，`MemoryKind` 不动）、`packages/core/src/scoring/scoring-weights.ts`、`packages/core/src/runtime/llm/extraction-rules.ts`、新建 `packages/core/src/lifecycle/candidate-validator.ts`（11 条 deterministic 闸门）、`packages/core/src/lifecycle/type-extractor.ts`（heuristic fallback 保留可用）。这一段不含任何 LLM 调用，是评分与校验的依赖根，可独立交付与回归。
+- **P0-b structured extraction spike（LLM 工程接入）**：`packages/core/src/runtime/llm/llm-client.ts` 的 `extractStructured<T>()` + provider structured-output 适配、`packages/core/src/graph/llm-extractor.ts` prompt 替换、`packages/core/src/lifecycle/extract-candidate-handler.ts` 接入异步路径。这一段才是 LLM 接入，与 P0-a 解耦，spike 失败不影响 P0-a 的确定性能力。
+- **P0-c eval/golden gate**：`tests/eval/goldens/*` 的提取集（100 条）+ 去重集（80 条，仅 lexical/hash/规则冲突，见 §15）+ 召回解释集，作为 P0-a/P0-b 的合并门禁。
 
-> tree seal/topic、embedding 语义去重、score breakdown 召回解释属于 **P1/P2**，不在 P0 范围（见 §14.2）。降级路径（`lifecycle/type-extractor.ts`、`graph/extractor.ts`）在 P0 只需保留可用，不做增强。
+> tree seal/topic、embedding 语义去重、score breakdown 召回解释属于 **P1/P2**，不在 P0 范围（见 §14.2）。降级路径（`packages/core/src/lifecycle/type-extractor.ts`、`packages/core/src/graph/extractor.ts`）在 P0 只需保留可用，不做增强。
 ---
 
 ## 18. 参考文献
@@ -2832,7 +2864,7 @@ P0 三段拆分（D-23，按依赖顺序，前序未完成会阻塞后续）
 | 7 | LLM 执行边界 | 允许 8 项、禁止 8 项、降级 3 种；temperature 一律 0.0；模型分层 extractionModel / summarizationModel / reasoningModel |
 | 8 | 成本预算矩阵 | 6 类 LLM 任务门控（memory extract / graph extract / dedupe judge / summary seal / faithfulness judge / skill_candidate 升格），每类定义 token 上限、调用频次、降级策略 |
 | 9 | 用户可见面 | 看得见（来源/scope/riskFlags/合并记录）、查得到（valueScore/score breakdown 逐项）、改得动（撤回/纠错/固定/归档/回滚合并）、关得掉（暂停自动抽取/成本模式/收窄敏感 scope） |
-| 10 | 分阶段 P0-P4 可验收里程碑 + 6 套 eval | 每阶段有明确验收标准；mengshu-extraction / mengshu-dedup / mengshu-conflict / mengshu-tree-summary / mengshu-recall-explain / mengshu-skill-candidate 6 套评估集 |
+| 10 | 分阶段 P0-P4 里程碑 + G/P/Q 评测 | Q 轨当前 12 套 deterministic suite；G/P 效果分与 Q 工程门禁分离，缺少正式输入时 fail-closed |
 
 ### 一句话精髓
 
@@ -2840,8 +2872,8 @@ P0 三段拆分（D-23，按依赖顺序，前序未完成会阻塞后续）
 
 ### 文档状态
 
-**版本**: v2.0  
-**状态**: 算法规格已定稿；模块资产已广泛实现，运行主链仍按发布版本逐步集成（2026-07-11 复核）
+**版本**: v2.0
+**状态**: 算法规格已定稿；v1.0.7 PostgreSQL 运行主链与增量能力映射已于 2026-08-31 校准
 **定位**: mengshu 记忆系统算法层单一事实来源
 
 后续阈值随 eval 数据循证调整时，更新对应决策项并同步 §16.1。
@@ -2854,6 +2886,6 @@ P0 三段拆分（D-23，按依赖顺序，前序未完成会阻塞后续）
 |------|---|
 | 创建日期 | 2026-06-16 |
 | 版本 | v2.0 |
-| 状态 | 已定稿 |
+| 状态 | 已定稿；2026-08-31 完成运行态校准 |
 | 定位 | mengshu 记忆系统算法层单一事实来源 |
 | 决策范围 | D-01~D-23（详见 §16.1） |
