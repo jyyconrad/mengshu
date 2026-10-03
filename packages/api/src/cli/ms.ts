@@ -42,7 +42,7 @@ import {
   createUnixSocketRuntimeClientTransport,
 } from "../runtime-client.js";
 import { fingerprintRuntimeHome } from "../../../core/src/runtime/host-contract.js";
-import { resolveHomeDir } from "../../../core/src/runtime/paths.js";
+import { resolveHomeDir, resolveMemoryRoot } from "../../../core/src/runtime/paths.js";
 import { JsonlRuntimeCostLedger } from "../../../core/src/cost/runtime-cost-ledger.js";
 import { describeOpenClawEmbeddingStatus } from "../../../../plugins/openclaw/src/embedding-status.js";
 import {
@@ -965,6 +965,7 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
   const runtime = createMengshuRuntime({
     config: cfg,
     resolvedDbPath,
+    rawArchiveRoot: resolveMemoryRoot(),
     appId: "mengshu",
     defaultScope,
     ...(serverAuthority ? { continuousMemoryEvolutionHost: { authority: serverAuthority.authority, config: cfg } } : {}),

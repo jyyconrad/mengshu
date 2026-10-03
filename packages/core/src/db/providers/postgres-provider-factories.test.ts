@@ -140,6 +140,22 @@ describe("PostgresProvider F0 factories", () => {
     expect(stalePool.connect).not.toHaveBeenCalled();
   });
 
+  test("source capture store requires schema v38 before connect", async () => {
+    const client = { query: vi.fn(async () => result()), release: vi.fn() };
+    const pool = { query: vi.fn(), connect: vi.fn(async () => client), end: vi.fn() };
+    const store = providerWithPool(pool, 38).createSourceCaptureStore();
+    await expect(store.findByIdempotency("a".repeat(64), "b".repeat(64))).resolves.toBeUndefined();
+    expect(pool.connect).toHaveBeenCalledOnce();
+    expect(pool.query).not.toHaveBeenCalled();
+    expect(client.release).toHaveBeenCalledOnce();
+
+    const stalePool = { query: vi.fn(), connect: vi.fn(), end: vi.fn() };
+    await expect(providerWithPool(stalePool, 37).createSourceCaptureStore()
+      .findByIdempotency("a".repeat(64), "b".repeat(64)))
+      .rejects.toThrow(/Source capture schema v38/);
+    expect(stalePool.connect).not.toHaveBeenCalled();
+  });
+
   test("F2/F3 asset/loadout repositories reuse provider pool and require schema v20", async () => {
     const pool = {
       query: vi.fn(async () => result()),

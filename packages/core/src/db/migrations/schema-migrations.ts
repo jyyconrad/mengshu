@@ -2658,6 +2658,33 @@ ON mengshu_evolution_operation_receipts (scope_fingerprint, (receipt->>'id')) WH
 )`,
     ],
   },
+  {
+    version: 38,
+    name: "add-source-capture-outbox",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_source_captures (
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  capture_id TEXT NOT NULL CHECK (capture_id ~ '^[0-9a-f]{64}$'),
+  idempotency_key TEXT NOT NULL CHECK (idempotency_key ~ '^[0-9a-f]{64}$'),
+  source_id TEXT NOT NULL CHECK (char_length(source_id) BETWEEN 1 AND 256),
+  revision TEXT NOT NULL CHECK (char_length(revision) BETWEEN 1 AND 256),
+  payload_hash TEXT NOT NULL CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
+  manifest JSONB NOT NULL CHECK (jsonb_typeof(manifest) = 'object' AND octet_length(manifest::text) <= 8192),
+  status TEXT NOT NULL CHECK (status IN ('captured', 'damaged')),
+  outbox_status TEXT NOT NULL CHECK (outbox_status IN ('pending', 'published')),
+  trace_id TEXT NOT NULL CHECK (char_length(trace_id) BETWEEN 1 AND 256),
+  job_id TEXT,
+  occurred_at BIGINT NOT NULL CHECK (occurred_at >= 0),
+  PRIMARY KEY (scope_fingerprint, capture_id),
+  UNIQUE (scope_fingerprint, idempotency_key),
+  UNIQUE (scope_fingerprint, source_id, revision)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_source_captures_pending_idx
+ON mengshu_source_captures (occurred_at, capture_id)
+WHERE status = 'captured' AND outbox_status = 'pending'`,
+    ],
+  },
 ];
 
 export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = Object.freeze(

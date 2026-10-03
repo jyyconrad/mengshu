@@ -119,6 +119,7 @@ export * from "./ingest/scanner/markdown-processor.js";
 export * from "./ingest/scanner/scanner-coordinator.js";
 export * from "./ingest/sources/jsonl-parser.js";
 export * from "./ingest/types.js";
+export * from "./ingest/capture-contract.js";
 export * from "./lifecycle/admission-decision.js";
 export * from "./lifecycle/audit.js";
 export {
@@ -197,6 +198,7 @@ export * from "./tree/tree-fan-out.js";
 export * from "./tree/types.js";
 export * from "./temporal/activation-loop.js";
 export * from "./temporal/time-resolution.js";
+export * from "./temporal/selector.js";
 export * from "./working-set/retention-loop.js";
 export * from "./evolution/types.js";
 export * from "./evolution/schema.js";

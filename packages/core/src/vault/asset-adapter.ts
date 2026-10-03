@@ -21,6 +21,7 @@ import {
   type CommitGovernedDocumentMarkdownInput,
   type GovernedDocumentMarkdownAdapterPort,
   type GovernedDocumentMarkdownCommitResult,
+  type GovernedDocumentSuccessorBase,
 } from "../documents/repository.js";
 import type {
   GovernedDocumentAssetVersion,
@@ -70,6 +71,8 @@ export interface GovernedMarkdownAdapterPhaseEvent {
 export interface MaterializeGovernedMarkdownInput {
   readonly asset: GovernedDocumentAssetVersion;
   readonly relativePath: string;
+  /** Replace only when the current file is still this complete head. */
+  readonly expectedBase?: GovernedDocumentSuccessorBase;
 }
 
 export interface VaultExternalChangeProposal {
@@ -305,7 +308,11 @@ export class GovernedMarkdownVaultAdapter implements GovernedDocumentMarkdownAda
       throw new GovernedDocumentMarkdownCommitError("before_staging");
     }
 
-    const result = await this.materializeComplete({ asset, relativePath });
+    const result = await this.materializeComplete({
+      asset,
+      relativePath,
+      ...(input.expectedBase === undefined ? {} : { expectedBase: input.expectedBase }),
+    });
     if (result.status === "external_modified" || result.status === "conflict") {
       throw new GovernedDocumentMarkdownCommitError("before_staging");
     }
@@ -391,6 +398,24 @@ export class GovernedMarkdownVaultAdapter implements GovernedDocumentMarkdownAda
     });
   }
 
+  #matchesGovernedSuccessor(
+    asset: GovernedDocumentAssetVersion,
+    observed: ObservedMarkdownFile | undefined,
+    expectedBase: GovernedDocumentSuccessorBase | undefined,
+  ): boolean {
+    if (!expectedBase || !observed?.parsed) return false;
+    if (!Number.isSafeInteger(expectedBase.assetVersion) || expectedBase.assetVersion < 1 ||
+        expectedBase.assetVersion !== asset.assetVersion - 1 ||
+        !/^[0-9a-f]{64}$/.test(expectedBase.publicContentHash)) {
+      return false;
+    }
+    const identity = observed.parsed.identity;
+    return identity.assetId === asset.assetId &&
+      identity.assetVersion === expectedBase.assetVersion &&
+      identity.publicContentHash === expectedBase.publicContentHash &&
+      identity.scopeFingerprint === asset.scopeFingerprint;
+  }
+
   #classifyExisting(
     asset: GovernedDocumentAssetVersion,
     canonicalRelativePath: string,
@@ -432,7 +457,8 @@ export class GovernedMarkdownVaultAdapter implements GovernedDocumentMarkdownAda
     const relativePath = normalizeVaultRelativePath(input.relativePath);
     const targetPath = resolveContainedVaultPath(this.#descriptor.rootPath, relativePath);
     const existing = await this.#observeFile(relativePath);
-    if (existing) return this.#classifyExisting(asset, relativePath, existing);
+    const replacing = this.#matchesGovernedSuccessor(asset, existing, input.expectedBase);
+    if (existing && !replacing) return this.#classifyExisting(asset, relativePath, existing);
 
     const parentRelativePath = posix.dirname(relativePath);
     if (parentRelativePath !== ".") {
@@ -472,7 +498,17 @@ export class GovernedMarkdownVaultAdapter implements GovernedDocumentMarkdownAda
 
       // Re-check after fsync so an observed concurrent edit is never overwritten knowingly.
       const raced = await this.#observeFile(relativePath);
-      if (raced) return this.#classifyExisting(asset, relativePath, raced);
+      if (replacing) {
+        if (!raced || !this.#matchesGovernedSuccessor(asset, raced, input.expectedBase)) {
+          if (raced) return this.#classifyExisting(asset, relativePath, raced);
+          throw new GovernedMarkdownAdapterError(
+            "MARKDOWN_IDENTITY_MISMATCH",
+            "governed base disappeared before replace",
+          );
+        }
+      } else if (raced) {
+        return this.#classifyExisting(asset, relativePath, raced);
+      }
       await assertNoVaultSymlink(this.#descriptor.rootPath, stagingRelativePath);
       if (!sameOwnedFile(stagingIdentity, await readOwnedFileIdentity(stagingPath))) {
         throw new GovernedMarkdownAdapterError("MARKDOWN_STAGING_REPLACED");

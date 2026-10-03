@@ -219,4 +219,37 @@ describe("GovernedDocumentReadService", () => {
     await expect(service(revoked).read(scope, "doc_rules"))
       .resolves.toMatchObject({ kind: "filtered", reason: "revoked", fallback: "native_recall" });
   });
+
+  test("current selector 不改变 live head，asOf/knownAt 在资产无时间钉时不返回正文", async () => {
+    const reader = service(fixture("simple"));
+    const current = await reader.read(scope, "doc_rules");
+    const declared = await reader.read(scope, "doc_rules", { temporal: { mode: "current" } });
+    expect(declared).toEqual(current);
+
+    await expect(reader.read(scope, "doc_rules", {
+      temporal: { mode: "as_of", asOf: 1_700_000_000_000, knownAt: 1_700_000_100_000 },
+    })).resolves.toEqual({
+      kind: "temporal_unavailable",
+      assetId: "doc_rules",
+      assetVersion: 2,
+      selector: { mode: "as_of", asOf: 1_700_000_000_000, knownAt: 1_700_000_100_000 },
+      reason: "asset_has_no_temporal_pin",
+    });
+
+    const revoked = fixture("simple");
+    revoked.asset = {
+      ...revoked.asset,
+      lifecycleState: "revoked",
+      governanceDescription: {
+        ...revoked.asset.governanceDescription,
+        lifecycleState: "revoked",
+      },
+    };
+    await expect(service(revoked).read(scope, "doc_rules", {
+      temporal: { asOf: 1_700_000_000_000 },
+    })).resolves.toMatchObject({ kind: "filtered", reason: "revoked" });
+    await expect(reader.read(scope, "doc_rules", {
+      temporal: { mode: "current", asOf: 1 },
+    })).rejects.toMatchObject({ code: "INVALID_READ_REQUEST" });
+  });
 });

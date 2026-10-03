@@ -1,4 +1,4 @@
-import type { MemoryScope } from "../domain/types.js";
+import type { MemoryForm, MemoryScope } from "../domain/types.js";
 import type { MemorySemanticType } from "../domain/types.js";
 
 export type WorkingSetEntryKind =
@@ -211,6 +211,20 @@ export interface PromoteWorkingSetClaimInput {
   readonly idempotencyKey: string;
   /** user_explicit 的独立确认；自动来源不得设置。 */
   readonly confirmation?: "REMEMBER";
+  /** Additive form. Absent promotions keep the previous metadata shape. */
+  readonly memoryForm?: MemoryForm;
+  /** Operator or policy that authorized the promotion. */
+  readonly operatorOrPolicy?: string;
+}
+
+export interface WorkingSetPromotionReceipt {
+  readonly schema: "mengshu.working-set-promotion/v1";
+  readonly entryIds: readonly string[];
+  readonly evidenceRefs: readonly string[];
+  readonly memoryForm: MemoryForm;
+  readonly scopeFingerprint: string;
+  readonly idempotencyKey: string;
+  readonly operatorOrPolicy: string;
 }
 
 export interface WorkingSetRewritePolicy {

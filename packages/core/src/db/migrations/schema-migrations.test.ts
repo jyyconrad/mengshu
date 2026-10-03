@@ -31,6 +31,18 @@ describe("schema migration registry", () => {
     expect(sql).not.toContain("source_text");
     expect(SCHEMA_MIGRATIONS.find((item) => item.version === 36)?.name).toBe("add-memory-evolution-batches");
   });
+
+  test("v38 adds the source capture outbox without rewriting captured bytes", () => {
+    const change = SCHEMA_MIGRATIONS.find((item) => item.version === 38);
+    expect(change?.name).toBe("add-source-capture-outbox");
+    expect(change?.kind).toBe("expand");
+    const sql = change?.statements.join("\n") ?? "";
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_source_captures");
+    expect(sql).toContain("UNIQUE (scope_fingerprint, idempotency_key)");
+    expect(sql).toContain("UNIQUE (scope_fingerprint, source_id, revision)");
+    expect(sql).toContain("outbox_status");
+    expect(sql).not.toMatch(/\b(?:DELETE|TRUNCATE|UPDATE|DROP|RENAME)\b/i);
+  });
   test("v36 isolates evolution state, receipts and processed fingerprints without canonical evidence writes", () => {
     const migration = SCHEMA_MIGRATIONS.find((item) => item.version === 36);
     expect(migration?.name).toBe("add-memory-evolution-batches");

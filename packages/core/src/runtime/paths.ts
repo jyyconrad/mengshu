@@ -139,6 +139,11 @@ export function resolveDefaultLanceDbPath(options: HomePathOptions = {}): string
   return join(resolveHomeDir(options), MEMORY_DIRNAME, LANCEDB_DIRNAME);
 }
 
+/** Raw archive root：`~/.mengshu/memory/`. Scope files live under `<root>/<fingerprint>/raw/`. */
+export function resolveMemoryRoot(options: HomePathOptions = {}): string {
+  return join(resolveHomeDir(options), MEMORY_DIRNAME);
+}
+
 /** 全局 imports/ 目录：`~/.mengshu/imports/`。 */
 export function resolveImportsDir(options: HomePathOptions = {}): string {
   return join(resolveHomeDir(options), IMPORTS_DIRNAME);

@@ -19,6 +19,10 @@ import {
 } from "../packages/core/src/db/providers/postgres.js";
 import { createProviderOwnedNativeBuildTreeHandler } from "./native-build-tree-handler.js";
 import {
+  createNativeCompileDocumentHandler,
+  type CompileDocumentJobRunner,
+} from "./native-compile-document-handler.js";
+import {
   createNativeExtractCandidateHandler,
   type NativeCommittedActiveDerivation,
 } from "./native-extract-candidate-handler.js";
@@ -48,6 +52,7 @@ export interface NativeDurableJobV2CompositionInput {
   readonly onCommittedActiveDerivationWarning?: () => void | Promise<void>;
   readonly llmClient: LlmClient;
   readonly evolution?: EvolutionRuntime;
+  readonly documentCompiler?: CompileDocumentJobRunner;
 }
 export interface NativeDurableJobV2Composition {
   readonly runtimeBundle: PostgresDurableJobV2RuntimeBundle;
@@ -55,7 +60,7 @@ export interface NativeDurableJobV2Composition {
   readonly serveCapability: DurableJobV2ServeCapability;
 }
 
-/** The complete native registry is three jobs, or four with the host evolution capability. */
+/** Exact-three by default, plus evolution and/or compile_document when the provider opts in. */
 export function createNativeDurableJobV2Composition(
   input: NativeDurableJobV2CompositionInput,
 ): NativeDurableJobV2Composition {
@@ -89,8 +94,20 @@ export function createNativeDurableJobV2Composition(
   const evolutionEnabled = (runtimeBundle.handlerTypes as readonly string[]).includes("evolve_memory_batch");
   const evolution = evolutionEnabled ? assertEvolutionRuntimeOwner(input.evolution, runtimeBundle, input.scope) : undefined;
   if (!evolutionEnabled && input.evolution) throw new Error("EVOLUTION_PROVIDER_CAPABILITY_UNAVAILABLE");
+  const compileEnabled = (runtimeBundle.handlerTypes as readonly string[]).includes("compile_document");
+  if (compileEnabled && typeof input.documentCompiler?.publish !== "function") {
+    throw new Error("Native document compiler dependency is required");
+  }
+  if (!compileEnabled && input.documentCompiler) {
+    throw new Error("DOCUMENT_COMPILE_PROVIDER_CAPABILITY_UNAVAILABLE");
+  }
   const registry = createAuthoritativeDurableJobV2WorkerHandlerRegistry({
     ...(evolution ? { evolve_memory_batch: evolution.handler } : {}),
+    ...(compileEnabled ? {
+      compile_document: createNativeCompileDocumentHandler({
+        compiler: input.documentCompiler as CompileDocumentJobRunner,
+      }),
+    } : {}),
     build_tree: createProviderOwnedNativeBuildTreeHandler({ runtimeBundle }),
     extract_candidate: createNativeExtractCandidateHandler({
       runtimeBundle,

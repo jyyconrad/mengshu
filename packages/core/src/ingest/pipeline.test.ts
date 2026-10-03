@@ -1,5 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { InMemoryMemoryStore } from "../storage/repositories/in-memory.js";
+import type { CaptureReceipt } from "./capture-contract.js";
+import { CaptureContractError } from "./capture-contract.js";
 import { IngestionPipeline } from "./pipeline.js";
 
 const scope = {
@@ -71,5 +73,60 @@ describe("IngestionPipeline", () => {
     expect(result.chunksAdmitted).toBe(1);
     expect(result.chunksDropped).toBeGreaterThan(0);
     expect(result.jobsQueued).toBe(1);
+  });
+
+  test("local pending capture does not write chunks or claim a document publish", async () => {
+    const store = new InMemoryMemoryStore({ now: () => 1710000000000 });
+    const receipt: CaptureReceipt = {
+      captureId: "d".repeat(64),
+      status: "captured_local_pending",
+      source: { sourceId: "/docs/guide.md", revision: "e".repeat(64), payloadHash: "e".repeat(64) },
+      idempotencyKey: "d".repeat(64),
+    };
+    const pipeline = new IngestionPipeline({
+      documents: store.documents,
+      chunks: store.chunks,
+      jobs: store.jobs,
+      audit: store.audit,
+      sourceCapture: { capture: async () => receipt },
+    });
+    const result = await pipeline.ingest({
+      scope,
+      sourceId: "/docs/guide.md",
+      content: "# Guide\n\nalpha",
+    });
+    expect(result).toEqual({
+      documentId: receipt.captureId,
+      chunksAdmitted: 0,
+      chunksDropped: 0,
+      jobsQueued: 0,
+      capture: receipt,
+    });
+    await expect(store.documents.list({ scope })).resolves.toEqual([]);
+    await expect(store.chunks.list({ scope })).resolves.toEqual([]);
+  });
+
+  test("damaged capture does not become a chunk document", async () => {
+    const store = new InMemoryMemoryStore({ now: () => 1710000000000 });
+    const pipeline = new IngestionPipeline({
+      documents: store.documents,
+      chunks: store.chunks,
+      jobs: store.jobs,
+      audit: store.audit,
+      sourceCapture: {
+        capture: async () => ({
+          captureId: "f".repeat(64),
+          status: "damaged",
+          source: { sourceId: "/docs/guide.md", revision: "e".repeat(64), payloadHash: "e".repeat(64) },
+          idempotencyKey: "f".repeat(64),
+        }),
+      },
+    });
+    await expect(pipeline.ingest({
+      scope,
+      sourceId: "/docs/guide.md",
+      content: "# Guide",
+    })).rejects.toBeInstanceOf(CaptureContractError);
+    await expect(store.documents.list({ scope })).resolves.toEqual([]);
   });
 });

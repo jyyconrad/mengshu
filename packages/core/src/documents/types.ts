@@ -1,4 +1,5 @@
-import type { MemoryScope, MemorySemanticType } from "../domain/types.js";
+import type { MemoryForm, MemoryScope, MemorySemanticType, SourceWatermark } from "../domain/types.js";
+import type { TemporalRecallSelector } from "../temporal/types.js";
 
 export type GovernedDocumentKind =
   | "memory_document"
@@ -120,6 +121,42 @@ export interface DocumentAssetCommitReceipt {
   readonly createdAt: string;
 }
 
+export type DocumentChangeKind =
+  | "no_op"
+  | "append"
+  | "replace"
+  | "supersede"
+  | "conflict";
+
+export type DocumentCoverageState = "selected" | "read" | "used" | "deferred";
+
+export interface DocumentReadSetEntry {
+  readonly kind: "source" | "span" | "section";
+  readonly ref: string;
+  readonly contentHash: string;
+}
+
+export interface DocumentCoverageEntry {
+  readonly ref: string;
+  readonly state: DocumentCoverageState;
+  readonly cursor?: string;
+}
+
+export interface DocumentSectionDiffEntry {
+  readonly sectionId: string;
+  readonly claimIds: readonly string[];
+  readonly changeKind: DocumentChangeKind;
+  readonly preserved: boolean;
+}
+
+/** Unchanged section/claim bytes, id, and evidence held fixed across a compile. */
+export interface DocumentPreserveEntry {
+  readonly sectionId: string;
+  readonly claimId?: string;
+  readonly contentHash: string;
+  readonly evidenceRefs: readonly string[];
+}
+
 export type GovernanceDisposition =
   | "attached_to_typed_document"
   | "attached_and_routed"
@@ -170,6 +207,7 @@ export interface DocumentGovernanceProposal {
     readonly heading: string;
     readonly brief: string;
     readonly claims: readonly {
+      readonly id?: string;
       readonly text: string;
       readonly inputRefs: readonly string[];
       readonly evidenceRefs: readonly string[];
@@ -182,6 +220,17 @@ export interface DocumentGovernanceProposal {
   readonly changeSummary: string;
   readonly modelFingerprint: string;
   readonly promptVersion: string;
+  /** Ordered digest of source revisions, heads, and policy versions. Optional. */
+  readonly inputSnapshotHash?: string;
+  readonly readSet?: readonly DocumentReadSetEntry[];
+  readonly coverage?: readonly DocumentCoverageEntry[];
+  readonly sectionDiff?: readonly DocumentSectionDiffEntry[];
+  readonly preserveSet?: readonly DocumentPreserveEntry[];
+  readonly sourceWatermarks?: readonly SourceWatermark[];
+  readonly changeKind?: DocumentChangeKind;
+  readonly memoryForm?: MemoryForm;
+  /** Existing TemporalRecallSelector. asOf is valid time; knownAt is knowledge time. */
+  readonly validTimeSelector?: TemporalRecallSelector;
 }
 
 export interface DocumentGovernanceDescriptor {

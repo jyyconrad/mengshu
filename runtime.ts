@@ -56,6 +56,8 @@ import {
   EmbeddingWriteGuard,
 } from "./packages/core/src/storage/embedding-space-policy.js";
 import { IngestionPipeline } from "./ingest/pipeline.js";
+import { FileRawArchive } from "./packages/core/src/ingest/raw-archive.js";
+import { SourceCaptureService } from "./packages/core/src/ingest/source-capture.js";
 import { AgentFastPathService } from "./api/agent-fast-path.js";
 import { createConsoleApi } from "./console/api.js";
 import type { ConsoleApi } from "./console/types.js";
@@ -150,6 +152,7 @@ import {
   createRuntimeDurableJobV2Enqueuer,
   type RuntimeDurableJobV2Enqueuer,
 } from "./runtime-durable-job-v2.js";
+import { strictFastPathJobPayload } from "./runtime-fast-path-job-payload.js";
 import {
   assertNativeDurableJobV2ServeCapability,
   type DurableJobV2ServeCapability,
@@ -246,6 +249,11 @@ export interface RuntimeOptions {
   /** Host-owned canonical-evidence guard; failures retain payloads conservatively. */
   workingSetEvidenceRetentionGuard?: import("./packages/core/src/working-set/session-working-set-service.js")
     .WorkingSetEvidenceRetentionGuard;
+  /**
+   * Raw archive root. Capture is enabled only for an explicit root on PostgreSQL.
+   * Files land under `<root>/<scope-fingerprint>/raw/`.
+   */
+  rawArchiveRoot?: string;
 }
 
 const COMMITTED_ACTIVE_DERIVATION_WARNING =
@@ -316,6 +324,8 @@ export interface MengshuRuntime {
   skillArtifacts?: SkillArtifactService;
   /** M4 structured overlay mutation and resolution facades. */
   memoryPolicyOverlays?: MemoryPolicyOverlayService;
+  /** Raw source archive. Absent unless `rawArchiveRoot` is set on PostgreSQL. */
+  sourceCapture?: SourceCaptureService;
   memoryPolicyResolver?: MemoryPolicyResolver;
   routingEngine: RoutingEngine | null;
   handlers: Record<"extract_candidate" | "build_tree" | "extract_graph", JobHandler>;
@@ -435,56 +445,6 @@ function defaultScope(appId: string): MemoryScope {
     namespace: appId === "mengshu" || appId === "cli" ? "working-context" : "default",
     visibility: "private",
   };
-}
-
-function strictFastPathJobPayload(
-  type: string,
-  payload: Record<string, unknown>,
-): Record<string, unknown> {
-  const rawScope = payload.scope as MemoryScope | undefined;
-  if (!rawScope) return payload;
-  const scope: Record<string, unknown> = {
-    tenantId: rawScope.tenantId,
-    userId: rawScope.userId,
-    appId: rawScope.appId,
-    projectId: rawScope.projectId,
-    agentId: rawScope.agentId,
-    namespace: rawScope.namespace,
-    visibility: rawScope.visibility,
-    ...(rawScope.workspaceId === undefined ? {} : { workspaceId: rawScope.workspaceId }),
-    ...(rawScope.sessionId === undefined ? {} : { sessionId: rawScope.sessionId }),
-  };
-  if (type === "extract_candidate") {
-    return {
-      scope,
-      ...(payload.text === undefined ? {} : { text: payload.text }),
-      ...(payload.traceId === undefined ? {} : { traceId: payload.traceId }),
-      ...(payload.intent === undefined ? {} : { intent: payload.intent }),
-    };
-  }
-  if (type === "build_tree") {
-    return {
-      scope,
-      ...(payload.traceId === undefined ? {} : { traceId: payload.traceId }),
-      ...(payload.treeType === undefined ? {} : { treeType: payload.treeType }),
-      ...(payload.treeKey === undefined ? {} : { treeKey: payload.treeKey }),
-      ...(payload.leaf === undefined ? {} : { leaf: payload.leaf }),
-      ...(payload.routing === undefined ? {} : { routing: payload.routing }),
-      ...(payload.targetIdempotencyKey === undefined
-        ? {}
-        : { targetIdempotencyKey: payload.targetIdempotencyKey }),
-    };
-  }
-  if (type === "extract_graph") {
-    return {
-      scope,
-      ...(payload.chunkId === undefined ? {} : { chunkId: payload.chunkId }),
-      ...(payload.text === undefined ? {} : { text: payload.text }),
-      ...(payload.sourceId === undefined ? {} : { sourceId: payload.sourceId }),
-      ...(payload.context === undefined ? {} : { context: payload.context }),
-    };
-  }
-  return payload;
 }
 
 function postgresForgetTransactionPort(
@@ -1429,11 +1389,19 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
       ? new PostgresTreeRepository(options.config.postgres)
       : new InMemoryTreeRepository()
   );
+  const sourceCapture = options.rawArchiveRoot !== undefined && options.rawArchiveRoot.trim() !== "" &&
+      db instanceof PostgresProvider
+    ? new SourceCaptureService({
+        archive: new FileRawArchive({ root: options.rawArchiveRoot }),
+        store: db.createSourceCaptureStore(),
+      })
+    : undefined;
   const ingestionPipeline = new IngestionPipeline({
     documents: persistentRepos.documents,
     chunks: persistentRepos.chunks,
     jobs: persistentRepos.jobs,
     audit: persistentRepos.audit,
+    ...(sourceCapture ? { sourceCapture } : {}),
   });
 
   const candidateRepository = new InMemoryCandidateRepository();
@@ -1749,6 +1717,20 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         consumer: new ActiveDerivationOutboxConsumer({
           repository: activeDerivationOutboxRepository,
           deriveCommittedActive,
+          ...(sourceCapture && durableJobV2Enqueuer
+            ? {
+                afterDrain: async () => {
+                  try {
+                    await sourceCapture.compensate(async (job) => durableJobV2Enqueuer.enqueue({
+                      type: job.type,
+                      payload: strictFastPathJobPayload(job.type, job.payload),
+                    }));
+                  } catch {
+                    options.logger?.warn?.("source_capture_compensate_failed");
+                  }
+                },
+              }
+            : {}),
         }),
         onError: () => warnCommittedActiveDerivation(options.logger),
       })
@@ -2010,6 +1992,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
       return treeRepository.listSummaries({ scope: resolvedScope });
     },
     logger: options.logger,
+    ...(sourceCapture ? { sourceCapture } : {}),
   });
   const slotInvalidationOutboxLoop = options.config.dbType === "postgres" &&
       db instanceof PostgresProvider
@@ -2243,6 +2226,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     ...(skillArtifacts ? { skillArtifacts } : {}),
     ...(memoryPolicyOverlays ? { memoryPolicyOverlays } : {}),
     ...(memoryPolicyResolver ? { memoryPolicyResolver } : {}),
+    ...(sourceCapture ? { sourceCapture } : {}),
     routingEngine,
     handlers,
     lifecycle,

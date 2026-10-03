@@ -5,8 +5,17 @@
  * 覆盖 context_fast / observe_light / lookup / session_commit 四个时点。
  */
 
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { AgentFastPathService } from "./index.js";
+import { FileRawArchive } from "../../../core/src/ingest/raw-archive.js";
+import {
+  InMemorySourceCaptureStore,
+  SourceCaptureService,
+} from "../../../core/src/ingest/source-capture.js";
 import { DATABASE_STORE_CLEANUP_WARNING } from "../../../core/src/db/types.js";
 import type {
   MemoryRecord,
@@ -1574,13 +1583,15 @@ describe("AgentFastPathService", () => {
   });
 
   describe("sessionCommit()", () => {
-    it("同步失效 slot cache，并且只入队有 consumer 的 extract job", async () => {
+    it("没有可读证据时失效缓存且不入队", async () => {
       const invalidateCache = vi.fn();
       const enqueueJob = vi.fn().mockResolvedValue("job-extract");
+      const warnings: string[] = [];
       const testService = new AgentFastPathService({
         defaultScope: baseScope,
         recall: async () => ({ scope: baseScope, query: "", hits: [] }),
         enqueueJob,
+        logger: { warn: (message) => warnings.push(message) },
         builder: {
           buildSlotContext: vi.fn(),
           buildSlotContextFromRecallHits: vi.fn(),
@@ -1593,16 +1604,62 @@ describe("AgentFastPathService", () => {
       });
 
       expect(response.ack).toBe(true);
-      expect(response.jobs).toEqual(["job-1"]);
+      expect(response.jobs).toEqual([]);
+      expect(response.warnings).toEqual(["session_commit_evidence_unavailable"]);
+      expect(response).not.toHaveProperty("capture");
 
       const explicit = await testService.sessionCommit({
         scope: baseScope,
         summary: "today we upgraded the schema",
+        transcriptRef: "transcript-1",
       });
-      expect(explicit.jobs).toEqual(["job-extract"]);
+      expect(explicit.jobs).toEqual([]);
+      expect(explicit.warnings).toEqual(["session_commit_evidence_unavailable"]);
       expect(invalidateCache).toHaveBeenCalledWith(baseScope);
-      expect(enqueueJob).toHaveBeenCalledOnce();
-      expect(enqueueJob.mock.calls[0]?.[0]).toMatchObject({ type: "extract_candidate" });
+      expect(enqueueJob).not.toHaveBeenCalled();
+      expect(warnings).toEqual(["session_commit_evidence_unavailable"]);
+    });
+
+    it("先归档摘要，再按 capture id 入队，且不写 active claim", async () => {
+      const root = await mkdtemp(join(tmpdir(), "mengshu-session-commit-"));
+      try {
+        const storeObservation = vi.fn();
+        const enqueueJob = vi.fn().mockResolvedValue("job-extract");
+        const captureScope = { ...baseScope, visibility: "private" as const, sessionId: "session-1" };
+        const sourceCapture = new SourceCaptureService({
+          archive: new FileRawArchive({ root }),
+          store: new InMemorySourceCaptureStore(),
+          now: () => 20,
+        });
+        const testService = new AgentFastPathService({
+          defaultScope: captureScope,
+          recall: async () => ({ scope: captureScope, query: "", hits: [] }),
+          enqueueJob,
+          storeObservation,
+          sourceCapture,
+        });
+        const summary = "today we upgraded the schema";
+        const explicit = await testService.sessionCommit({ scope: captureScope, summary });
+        expect(explicit.ack).toBe(true);
+        expect(explicit.jobs).toEqual(["job-extract"]);
+        expect(explicit.capture?.status).toBe("captured");
+        expect(explicit.traceId).toBe(explicit.capture?.captureId);
+        expect(storeObservation).not.toHaveBeenCalled();
+        expect(enqueueJob).toHaveBeenCalledOnce();
+        expect(enqueueJob.mock.calls[0]?.[0]).toMatchObject({
+          type: "extract_candidate",
+          payload: { text: summary, traceId: explicit.traceId, intent: "auto" },
+        });
+        await expect(sourceCapture.read(captureScope, explicit.traceId)).resolves.toEqual(
+          new Uint8Array(Buffer.from(summary)),
+        );
+        const replay = await testService.sessionCommit({ scope: captureScope, summary });
+        expect(replay.capture?.replayed).toBe(true);
+        expect(replay.capture?.captureId).toBe(explicit.traceId);
+        expect(replay.jobs).toEqual(["job-extract"]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     });
   });
 });

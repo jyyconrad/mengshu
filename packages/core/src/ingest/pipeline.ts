@@ -5,7 +5,7 @@
  * 热路径不依赖 embeddings 或 LLM。
  */
 
-import type { ChunkRecord, DocumentRecord } from "../domain/types.js";
+import type { ChunkRecord, DocumentRecord, MemoryScope } from "../domain/types.js";
 import { scopeToKey } from "../domain/scope.js";
 import { computeContentHash, deterministicUuid } from "../scoring/hash-utils.js";
 import type {
@@ -15,6 +15,7 @@ import type {
   JobRepository,
 } from "../storage/repositories/types.js";
 import { canonicalize } from "./canonicalize.js";
+import { CaptureContractError, type CaptureReceipt } from "./capture-contract.js";
 import { chunkMarkdown } from "./chunker.js";
 import { enqueueUniqueJob } from "./jobs.js";
 import type { IngestInput, IngestResult } from "./types.js";
@@ -27,6 +28,16 @@ export interface IngestionPipelineOptions {
   audit: AuditRepository;
   now?: () => number;
   graphJobs?: JobRepository;
+  /** Optional raw archive. Absent pipelines keep the chunk path unchanged. */
+  sourceCapture?: {
+    capture(input: {
+      readonly scope: MemoryScope;
+      readonly sourceId: string;
+      readonly bytes: Uint8Array;
+      readonly mediaType: "text/plain";
+      readonly kind: "sources";
+    }): Promise<CaptureReceipt>;
+  };
 }
 
 export class IngestionPipeline {
@@ -39,6 +50,26 @@ export class IngestionPipeline {
   async ingest(input: IngestInput): Promise<IngestResult> {
     const createdAt = this.now();
     const canonical = canonicalize(input);
+    let capture: CaptureReceipt | undefined;
+    if (this.options.sourceCapture) {
+      capture = await this.options.sourceCapture.capture({
+        scope: input.scope,
+        sourceId: canonical.sourceId,
+        bytes: Buffer.from(canonical.markdown, "utf8"),
+        mediaType: "text/plain",
+        kind: "sources",
+      });
+      if (capture.status === "damaged") throw new CaptureContractError("CAPTURE_CONTRACT_INVALID");
+      if (capture.status === "captured_local_pending") {
+        return {
+          documentId: capture.captureId,
+          chunksAdmitted: 0,
+          chunksDropped: 0,
+          jobsQueued: 0,
+          capture,
+        };
+      }
+    }
     const scopeKey = scopeToKey(input.scope);
     const documentLogicalId = `doc:${computeContentHash(`${scopeKey}:${canonical.sourceId}:${canonical.markdown}`)}`;
     const documentId = deterministicUuid(`mengshu:document\0${documentLogicalId}`);
@@ -125,6 +156,7 @@ export class IngestionPipeline {
       chunksAdmitted: chunks.length,
       chunksDropped,
       jobsQueued,
+      ...(capture === undefined ? {} : { capture }),
     };
   }
 }

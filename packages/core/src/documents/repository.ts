@@ -173,6 +173,12 @@ export interface GovernedDocumentWriteRepositoryPort {
   recordIncomplete(input: RecordIncompleteDocumentInput): Promise<DocumentAssetCommitReceipt>;
 }
 
+/** Previous complete head the caller still holds. A mismatched file is not overwritten. */
+export interface GovernedDocumentSuccessorBase {
+  readonly assetVersion: number;
+  readonly publicContentHash: string;
+}
+
 export interface CommitGovernedDocumentMarkdownInput {
   readonly asset: GovernedDocumentAssetVersion;
   readonly vaultId: string;
@@ -182,6 +188,7 @@ export interface CommitGovernedDocumentMarkdownInput {
   readonly requestHash: string;
   readonly renderHash: string;
   readonly markdown: string;
+  readonly expectedBase?: GovernedDocumentSuccessorBase;
 }
 
 export interface GovernedDocumentMarkdownCommitResult {

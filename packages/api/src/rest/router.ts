@@ -17,6 +17,7 @@ import {
   AuthorityScopeError,
   type AuthorityScope,
 } from "../../../core/src/domain/authority-scope.js";
+import { resolveMemoryRoot } from "../../../core/src/runtime/paths.js";
 import { createMengshuRuntime } from "../../../../runtime.js";
 import type { MengshuRuntime } from "../../../../runtime.js";
 import { authorizeRestRequest } from "./auth.js";
@@ -104,6 +105,7 @@ export function createRestApi(
   const runtime = createMengshuRuntime({
     config,
     resolvedDbPath,
+    rawArchiveRoot: resolveMemoryRoot(),
     appId: defaultScope.appId,
     defaultScope,
     continuousMemoryEvolutionHost: { authority, config },

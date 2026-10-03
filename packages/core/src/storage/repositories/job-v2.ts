@@ -27,11 +27,30 @@ export const DURABLE_JOB_V2_AUTHORITATIVE_TYPES = Object.freeze([
 export const DURABLE_JOB_V2_EVOLUTION_TYPES = Object.freeze([
   "build_tree", "evolve_memory_batch", "extract_candidate", "extract_graph",
 ] as const);
+/**
+ * Opt-in complete registry for the typed-page compiler.
+ * publish_document is a stage inside compile_document, not a queue entry.
+ */
+export const DURABLE_JOB_V2_DOCUMENT_COMPILE_TYPES = Object.freeze([
+  "build_tree", "compile_document", "extract_candidate", "extract_graph",
+] as const);
+/** Evolution plus typed-page compile. Still one complete registry, not a second pool. */
+export const DURABLE_JOB_V2_EVOLUTION_COMPILE_TYPES = Object.freeze([
+  "build_tree", "compile_document", "evolve_memory_batch", "extract_candidate", "extract_graph",
+] as const);
 export type DurableJobV2AuthoritativeTypes =
-  typeof DURABLE_JOB_V2_AUTHORITATIVE_TYPES | typeof DURABLE_JOB_V2_EVOLUTION_TYPES;
+  typeof DURABLE_JOB_V2_AUTHORITATIVE_TYPES |
+  typeof DURABLE_JOB_V2_EVOLUTION_TYPES |
+  typeof DURABLE_JOB_V2_DOCUMENT_COMPILE_TYPES |
+  typeof DURABLE_JOB_V2_EVOLUTION_COMPILE_TYPES;
 
 export function isDurableJobV2AuthoritativeTypes(types: readonly string[]): boolean {
-  return [DURABLE_JOB_V2_AUTHORITATIVE_TYPES, DURABLE_JOB_V2_EVOLUTION_TYPES].some(expected =>
+  return [
+    DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
+    DURABLE_JOB_V2_EVOLUTION_TYPES,
+    DURABLE_JOB_V2_DOCUMENT_COMPILE_TYPES,
+    DURABLE_JOB_V2_EVOLUTION_COMPILE_TYPES,
+  ].some(expected =>
     types.length === expected.length && expected.every((type, index) => types[index] === type));
 }
 

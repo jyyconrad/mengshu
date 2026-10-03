@@ -2428,7 +2428,7 @@ describe("createMengshuRuntime", () => {
     ]);
     expect(session.jobs).toEqual([]);
     expect(warnings).toEqual([
-      expect.stringMatching(/^session_commit job extract_candidate failed:/),
+      "session_commit_evidence_unavailable",
     ]);
     expect(trusted.repository.enqueueInputs).toEqual([]);
     expect(trusted.kernel.writes).toEqual([]);

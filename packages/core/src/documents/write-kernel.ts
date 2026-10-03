@@ -14,6 +14,7 @@ import {
   validateDocumentAssetCommitReceipt,
   type DocumentAssetCommitReceiptExpectation,
   type GovernedDocumentMarkdownAdapterPort,
+  type GovernedDocumentSuccessorBase,
   type GovernedDocumentWriteFailureReason,
   type GovernedDocumentWriteRepositoryPort,
   type PreparedGovernedDocumentVersion,
@@ -26,6 +27,7 @@ import type {
 } from "./types.js";
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,255}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
 
 export type GovernedDocumentWriteErrorCode =
   | "INVALID_INPUT"
@@ -48,6 +50,8 @@ export interface CommitGovernedDocumentAssetInput {
   readonly canonicalPath: string;
   readonly idempotencyKey: string;
   readonly expectedCompleteVersion: number;
+  /** When set, markdown replace is allowed only if the file is still this head. */
+  readonly expectedBase?: GovernedDocumentSuccessorBase;
 }
 
 export interface CommitGovernedDocumentAssetResult {
@@ -137,6 +141,23 @@ function contractError(): never {
   throw new GovernedDocumentWriteError("REPOSITORY_CONTRACT_INVALID");
 }
 
+function expectedSuccessorBase(
+  value: GovernedDocumentSuccessorBase | undefined,
+  expectedCompleteVersion: number,
+): GovernedDocumentSuccessorBase | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" ||
+      value.assetVersion !== expectedCompleteVersion ||
+      !Number.isSafeInteger(value.assetVersion) || value.assetVersion < 0 ||
+      typeof value.publicContentHash !== "string" || !SHA256.test(value.publicContentHash)) {
+    throw new GovernedDocumentWriteError("INVALID_INPUT");
+  }
+  return Object.freeze({
+    assetVersion: value.assetVersion,
+    publicContentHash: value.publicContentHash,
+  });
+}
+
 function validatePrepared(
   prepared: PreparedGovernedDocumentVersion,
   expected: Omit<PreparedGovernedDocumentVersion, "prepareToken">,
@@ -216,6 +237,7 @@ export class GovernedDocumentAssetWriteKernel {
         asset.assetVersion !== input.expectedCompleteVersion + 1) {
       throw new GovernedDocumentWriteError("INVALID_INPUT");
     }
+    const expectedBase = expectedSuccessorBase(input.expectedBase, input.expectedCompleteVersion);
 
     const completionContractHash = computeCompletionContractHash(completionContract(asset));
     const requestHash = computeGovernedDocumentWriteRequestHash({
@@ -271,6 +293,7 @@ export class GovernedDocumentAssetWriteKernel {
         requestHash,
         renderHash,
         markdown: rendered,
+        ...(expectedBase === undefined ? {} : { expectedBase }),
       });
       if (!committed || typeof committed.markdown !== "string") {
         throw new GovernedDocumentMarkdownCommitError("after_write");

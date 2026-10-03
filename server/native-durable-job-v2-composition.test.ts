@@ -6,6 +6,7 @@ import {
   createDurableJobHandlerRegistry,
   createDurableJobV2,
   deriveDurableJobV2DomainDedupeKey,
+  DURABLE_JOB_V2_DOCUMENT_COMPILE_TYPES,
   leaseDurableJobV2,
 } from "../packages/core/src/storage/repositories/job-v2.js";
 import { DurableJobV2HandlerFailure } from "./workers-v2.js";
@@ -23,7 +24,7 @@ const scope = Object.freeze({
   visibility: "private" as const,
 });
 
-function bundle() {
+function bundle(enableDocumentCompile = false) {
   const provider = new PostgresProvider({
     host: "unused",
     port: 5432,
@@ -35,8 +36,13 @@ function bundle() {
     clock: () => 100,
     tokenFactory: () => "t".repeat(32),
     backoffMs: () => 100,
+    ...(enableDocumentCompile ? { enableDocumentCompile: true } : {}),
   });
 }
+
+const documentCompiler = {
+  publish: async () => ({ status: "not_published" as const, code: "INVALID_INPUT" as const }),
+};
 
 const llmClient = {
   available: false,
@@ -127,6 +133,48 @@ describe("createNativeDurableJobV2Composition", () => {
       expect(composition.serveCapability.registry.get(type)).toEqual(expect.any(Function));
     }
     expect(Object.isFrozen(composition)).toBe(true);
+  });
+
+  test("enableDocumentCompile 登记 compile_document，且 publish_document 不是队列", () => {
+    const runtimeBundle = bundle(true);
+    const composition = createNativeDurableJobV2Composition({
+      runtimeBundle,
+      scope,
+      candidateComputation,
+      candidateMaterialization,
+      candidateEvidenceRead,
+      authoritativeEntityGraphRead,
+      prepareEntityEmbeddings,
+      deriveCommittedActive,
+      llmClient,
+      documentCompiler,
+    });
+    expect(composition.registry.types).toEqual(DURABLE_JOB_V2_DOCUMENT_COMPILE_TYPES);
+    expect(composition.registry.types).not.toContain("publish_document");
+    expect(composition.registry.get("compile_document")).toEqual(expect.any(Function));
+    expect(() => createNativeDurableJobV2Composition({
+      runtimeBundle,
+      scope,
+      candidateComputation,
+      candidateMaterialization,
+      candidateEvidenceRead,
+      authoritativeEntityGraphRead,
+      prepareEntityEmbeddings,
+      deriveCommittedActive,
+      llmClient,
+    })).toThrow(/document compiler/i);
+    expect(() => createNativeDurableJobV2Composition({
+      runtimeBundle: bundle(false),
+      scope,
+      candidateComputation,
+      candidateMaterialization,
+      candidateEvidenceRead,
+      authoritativeEntityGraphRead,
+      prepareEntityEmbeddings,
+      deriveCommittedActive,
+      llmClient,
+      documentCompiler,
+    })).toThrow("DOCUMENT_COMPILE_PROVIDER_CAPABILITY_UNAVAILABLE");
   });
 
   test("复制/结构伪造 bundle 在 handler 构造前 fail-closed", () => {

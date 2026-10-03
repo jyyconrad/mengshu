@@ -429,6 +429,7 @@ export class SessionWorkingSetService {
     });
   }
 
+  /** Context rewrite stays in the working set. It does not create an active wiki claim. */
   async assemble(input: SessionAssembleInput): Promise<SessionAssembleResult> {
     const scopeFingerprint = exactSessionFingerprint(input.scope, input.sessionId);
     if (!Number.isSafeInteger(input.contextWindow) || input.contextWindow < 1 ||
@@ -573,6 +574,7 @@ export class SessionWorkingSetService {
     return receipt;
   }
 
+  /** Session close expires working-set rows only. It does not create an active wiki claim. */
   async closeSession(scope: MemoryScope, sessionId: string): Promise<WorkingSetCleanupReceipt> {
     const fingerprint = exactSessionFingerprint(scope, sessionId);
     const closedAt = new Date(this.#now()).toISOString();
@@ -637,6 +639,7 @@ export class SessionWorkingSetService {
     });
   }
 
+  /** Retention cleanup does not promote working-set entries into an active wiki claim. */
   async runRetentionCleanup(input: { readonly limit?: number } = {}): Promise<WorkingSetRetentionBatchResult> {
     const limit = input.limit ?? 25;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {

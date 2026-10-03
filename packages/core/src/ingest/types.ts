@@ -6,6 +6,7 @@
  */
 
 import type { MemoryScope } from "../domain/types.js";
+import type { CaptureReceipt } from "./capture-contract.js";
 
 export interface CanonicalizeInput {
   sourceId: string;
@@ -37,4 +38,6 @@ export interface IngestResult {
   chunksAdmitted: number;
   chunksDropped: number;
   jobsQueued: number;
+  /** Present only when a raw archive captured the source bytes. Not a wiki publish receipt. */
+  capture?: CaptureReceipt;
 }

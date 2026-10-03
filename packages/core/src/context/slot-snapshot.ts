@@ -12,6 +12,8 @@ import type {
   RecallHit,
 } from "../domain/types.js";
 import { authorityScopeFingerprint } from "../domain/authority-scope-fingerprint.js";
+import { assertTemporalRecallSelector } from "../temporal/selector.js";
+import type { TemporalRecallSelector } from "../temporal/types.js";
 
 export interface SlotSnapshot {
   scope: MemoryScope;
@@ -34,6 +36,10 @@ export interface SlotSnapshotVersionInput {
   retrievalVersion: string;
   scoringVersion: string;
   promptPolicyVersion: string;
+  /** One slot assembly. A changed dependency head uses a new epoch. */
+  readEpoch?: string;
+  /** Existing memory temporal clock. Omit for an unscoped legacy snapshot. */
+  temporal?: TemporalRecallSelector;
 }
 
 export interface SlotSnapshotVersion {
@@ -44,7 +50,27 @@ export interface SlotSnapshotVersion {
   retrievalVersion: string;
   scoringVersion: string;
   promptPolicyVersion: string;
+  readEpoch?: string;
+  temporalMode?: TemporalRecallSelector["mode"];
+  asOf?: number;
+  knownAt?: number;
   snapshotHash: string;
+}
+
+const READ_EPOCH = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
+
+function assertReadEpoch(value: string): string {
+  if (!READ_EPOCH.test(value)) throw new Error("Slot snapshot readEpoch is invalid");
+  return value;
+}
+
+export type SlotSnapshotReadStatus = "fresh" | "stale";
+
+export function slotSnapshotReadStatus(
+  cached: SlotSnapshotVersion | undefined,
+  requested: SlotSnapshotVersion,
+): SlotSnapshotReadStatus {
+  return cached !== undefined && sameVersion(cached, requested) ? "fresh" : "stale";
 }
 
 function hash(value: unknown): string {
@@ -59,6 +85,9 @@ export function createSlotSnapshotVersion(
   const assetVersionSetHash = assetVersions.length === 0
     ? undefined
     : hash(assetVersions);
+  const temporal = input.temporal === undefined
+    ? undefined
+    : assertTemporalRecallSelector(input.temporal);
   const identity = {
     slotSnapshot: 2 as const,
     inputFingerprint: input.inputFingerprint,
@@ -67,6 +96,12 @@ export function createSlotSnapshotVersion(
     retrievalVersion: input.retrievalVersion,
     scoringVersion: input.scoringVersion,
     promptPolicyVersion: input.promptPolicyVersion,
+    ...(input.readEpoch === undefined ? {} : { readEpoch: assertReadEpoch(input.readEpoch) }),
+    ...(temporal === undefined ? {} : {
+      temporalMode: temporal.mode,
+      ...(temporal.asOf === undefined ? {} : { asOf: temporal.asOf }),
+      ...(temporal.knownAt === undefined ? {} : { knownAt: temporal.knownAt }),
+    }),
   };
   return Object.freeze({ ...identity, snapshotHash: hash(identity) });
 }
@@ -79,6 +114,10 @@ function sameVersion(left: SlotSnapshotVersion, right: SlotSnapshotVersion): boo
     left.retrievalVersion === right.retrievalVersion &&
     left.scoringVersion === right.scoringVersion &&
     left.promptPolicyVersion === right.promptPolicyVersion &&
+    left.readEpoch === right.readEpoch &&
+    left.temporalMode === right.temporalMode &&
+    left.asOf === right.asOf &&
+    left.knownAt === right.knownAt &&
     left.snapshotHash === right.snapshotHash;
 }
 

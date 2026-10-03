@@ -60,6 +60,10 @@ import {
   type PostgresWorkingSetPool,
 } from "../../working-set/postgres-repository.js";
 import {
+  PostgresSourceCaptureStore,
+  SOURCE_CAPTURE_SCHEMA_VERSION,
+} from "../../ingest/source-capture.js";
+import {
   PostgresSkillArtifactRepository,
   type PostgresSkillArtifactClient,
   type PostgresSkillArtifactPool,
@@ -119,6 +123,8 @@ import {
 } from "../../storage/repositories/postgres-job-v2.js";
 import {
   DURABLE_JOB_V2_AUTHORITATIVE_TYPES,
+  DURABLE_JOB_V2_DOCUMENT_COMPILE_TYPES,
+  DURABLE_JOB_V2_EVOLUTION_COMPILE_TYPES,
   DURABLE_JOB_V2_EVOLUTION_TYPES,
   type DurableJobV2AuthoritativeTypes,
   type DurableJobV2,
@@ -415,6 +421,8 @@ export interface PostgresDurableJobV2RuntimeBundleDependencies {
   readonly backoffMs: (attempts: number) => number;
   readonly effectClock?: () => number;
   readonly enableMemoryEvolution?: boolean;
+  /** Opt-in typed-page compile_document handler. Default runtime leaves this off. */
+  readonly enableDocumentCompile?: boolean;
 }
 
 const POSTGRES_DURABLE_RUNTIME_BUNDLE_OWNERS = new WeakMap<object, PostgresProvider>();
@@ -789,6 +797,17 @@ function snapshotGenericEffectRepositoryDependencies(
   });
 }
 
+function selectDurableHandlerTypes(
+  dependencies: Readonly<PostgresDurableJobV2RuntimeBundleDependencies>,
+): DurableJobV2AuthoritativeTypes {
+  const evolution = dependencies.enableMemoryEvolution === true;
+  const compile = dependencies.enableDocumentCompile === true;
+  if (evolution && compile) return DURABLE_JOB_V2_EVOLUTION_COMPILE_TYPES;
+  if (evolution) return DURABLE_JOB_V2_EVOLUTION_TYPES;
+  if (compile) return DURABLE_JOB_V2_DOCUMENT_COMPILE_TYPES;
+  return DURABLE_JOB_V2_AUTHORITATIVE_TYPES;
+}
+
 function snapshotDurableRuntimeBundleDependencies(
   value: unknown,
 ): Readonly<PostgresDurableJobV2RuntimeBundleDependencies> {
@@ -801,7 +820,9 @@ function snapshotDurableRuntimeBundleDependencies(
     bundleError("DURABLE_RUNTIME_BUNDLE_INVALID");
   }
   const required = ["clock", "tokenFactory", "backoffMs"] as const;
-  const allowed = new Set<string>([...required, "effectClock", "enableMemoryEvolution"]);
+  const allowed = new Set<string>([
+    ...required, "effectClock", "enableMemoryEvolution", "enableDocumentCompile",
+  ]);
   const keys = Reflect.ownKeys(value);
   if (keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
       required.some((key) => !keys.includes(key))) {
@@ -823,8 +844,12 @@ function snapshotDurableRuntimeBundleDependencies(
   if (Object.hasOwn(snapshot, "enableMemoryEvolution") && typeof snapshot.enableMemoryEvolution !== "boolean") {
     bundleError("DURABLE_RUNTIME_BUNDLE_INVALID");
   }
+  if (Object.hasOwn(snapshot, "enableDocumentCompile") && typeof snapshot.enableDocumentCompile !== "boolean") {
+    bundleError("DURABLE_RUNTIME_BUNDLE_INVALID");
+  }
   return Object.freeze({
     ...(snapshot.enableMemoryEvolution === true ? { enableMemoryEvolution: true } : {}),
+    ...(snapshot.enableDocumentCompile === true ? { enableDocumentCompile: true } : {}),
     clock: snapshot.clock as () => number,
     tokenFactory: snapshot.tokenFactory as () => string,
     backoffMs: snapshot.backoffMs as (attempts: number) => number,
@@ -1909,6 +1934,27 @@ FROM "${table}"`);
     };
   }
 
+  /** v38 source revision and capture outbox. Callers receive no raw provider pool. */
+  createSourceCaptureStore(): PostgresSourceCaptureStore {
+    return new PostgresSourceCaptureStore({
+      connect: async () => {
+        await this.initialize();
+        this.assertSchemaVersion(SOURCE_CAPTURE_SCHEMA_VERSION, "Source capture");
+        const client = await this.pool!.connect();
+        return {
+          query: async (sql: string, params: readonly unknown[] = []) => {
+            const result = await client.query(sql, [...params]);
+            return {
+              rows: result.rows as Record<string, unknown>[],
+              rowCount: result.rowCount,
+            };
+          },
+          release: () => client.release(),
+        };
+      },
+    });
+  }
+
   /** v22 append-only receipt boundary for reproducible context assembly. */
   createContextAssemblyReceiptRepository(): PostgresContextAssemblyReceiptRepository {
     const client: PostgresContextAssemblyReceiptQueryClient = {
@@ -2643,8 +2689,7 @@ FROM "${table}"`);
     rawDependencies: PostgresDurableJobV2RuntimeBundleDependencies,
   ): PostgresDurableJobV2RuntimeBundle {
     const dependencies = snapshotDurableRuntimeBundleDependencies(rawDependencies);
-    const handlerTypes = dependencies.enableMemoryEvolution === true
-      ? DURABLE_JOB_V2_EVOLUTION_TYPES : DURABLE_JOB_V2_AUTHORITATIVE_TYPES;
+    const handlerTypes = selectDurableHandlerTypes(dependencies);
     const repository = this.#createDurableJobV2Repository({
       registry: createDurableJobHandlerRegistry(handlerTypes),
       clock: dependencies.clock,

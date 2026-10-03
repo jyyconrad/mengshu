@@ -13,7 +13,7 @@
  * - 默认单机 SLO：context_fast P95 < 80ms
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { types as nodeUtilTypes } from "node:util";
 import { normalizeScope } from "../../../../core/scope.js";
 import { globalSlotContextBuilder, type SlotContextBuilder } from "../../../../core/slot-context-builder.js";
@@ -55,6 +55,7 @@ import type { KnowledgeResourceCapability } from
   "../../../core/src/resources/knowledge-resource-capability.js";
 import { applyKnowledgeResourceIndexToContext } from
   "../../../core/src/resources/knowledge-resource-context.js";
+import type { CaptureReceipt } from "../../../core/src/ingest/capture-contract.js";
 
 export type { AgentTaskContextRequest };
 
@@ -86,6 +87,8 @@ export interface AgentObserveLightResponse {
   duplicate?: boolean;
   queuedJobs: string[];
   warnings?: string[];
+  /** Raw archive receipt. Absent when capture is not configured. */
+  capture?: CaptureReceipt;
 }
 
 export interface AgentLookupRequest {
@@ -168,6 +171,9 @@ export interface AgentSessionCommitResponse {
   ack: true;
   traceId: string;
   jobs: string[];
+  /** Readable source receipt. Session commit does not create an active wiki claim. */
+  capture?: CaptureReceipt;
+  warnings?: string[];
 }
 
 export interface AgentFastPathReadBoundary {
@@ -214,6 +220,20 @@ export interface AgentFastPathDeps {
   enqueueJob?(input: { type: string; payload: Record<string, unknown> }): Promise<string>;
   /** Durable-idempotent ensure capability; duplicate observations may use it to repair missing jobs. */
   ensureJob?(input: { type: string; payload: Record<string, unknown> }): Promise<string>;
+  /**
+   * Raw archive. When present, accepted bytes are durable before observation
+   * storage or candidate enqueue. This is not a wiki publisher.
+   */
+  sourceCapture?: {
+    capture(input: {
+      readonly scope: MemoryScope;
+      readonly sourceId: string;
+      readonly bytes: Uint8Array;
+      readonly mediaType: "text/plain";
+      readonly kind: "sessions" | "events";
+    }): Promise<CaptureReceipt>;
+    acknowledge?(scope: MemoryScope, captureId: string, jobId: string): Promise<unknown>;
+  };
   /** lookup_deep 时加载记忆树摘要（source/topic/global），未注入则 deep 退化为 fast。 */
   loadTreeSummaries?(scope: MemoryScope, query: string): Promise<TreeSummaryNode[]>;
   /** F1 authority-scoped progressive disclosure ports. */
@@ -525,6 +545,22 @@ export class AgentFastPathService {
 
     const jobs: string[] = [];
     const warnings: string[] = [];
+    let captureReceipt: CaptureReceipt | undefined;
+    if (this.deps.sourceCapture) {
+      try {
+        const bytes = Buffer.from(request.text, "utf8");
+        const identity = request.idempotencyKey ?? createHash("sha256").update(bytes).digest("hex");
+        captureReceipt = await this.deps.sourceCapture.capture({
+          scope,
+          sourceId: `observe:${identity}`,
+          bytes,
+          mediaType: "text/plain",
+          kind: "events",
+        });
+      } catch (err) {
+        warnings.push(`source_capture_failed: ${(err as Error).message}`);
+      }
+    }
     let storeOutcome: {
       id: string;
       stored: boolean;
@@ -573,6 +609,7 @@ export class AgentFastPathService {
         duplicate: undefined,
         queuedJobs: [],
         warnings: warnings.length > 0 ? warnings : undefined,
+        ...(captureReceipt === undefined ? {} : { capture: captureReceipt }),
       };
     }
 
@@ -583,7 +620,20 @@ export class AgentFastPathService {
     if (jobWriter) {
       // Candidate route 已经完成提取与准入，只保留候选治理链；不得把候选 ID
       // 当作 active memory 再次触发树/图增强。
+      const capturedId = captureReceipt?.status === "captured" ? captureReceipt.captureId : undefined;
+      if (captureReceipt && capturedId === undefined) {
+        warnings.push(captureReceipt.status === "damaged"
+          ? "source_capture_damaged"
+          : "source_capture_pending");
+      }
       if (storeOutcome.recordType === "candidate") {
+        if (capturedId !== undefined) {
+          await this.deps.sourceCapture?.acknowledge?.(
+            scope,
+            capturedId,
+            `candidate:${storeOutcome.id}`,
+          ).catch(() => warnings.push("source_capture_ack_failed"));
+        }
         return {
           ack: true,
           traceId,
@@ -594,24 +644,40 @@ export class AgentFastPathService {
           duplicate: !storeOutcome.stored,
           queuedJobs: [],
           warnings: warnings.length > 0 ? warnings : undefined,
+          ...(captureReceipt === undefined ? {} : { capture: captureReceipt }),
         };
       }
 
       // Raw evidence must be audited durably before candidate extraction.
       // Graph/tree jobs are derived only from the committed-active receipt, where
       // authoritative evidence and routing facts are available.
-      const shouldExtractCandidate = storeOutcome.admissionRoute === "evidence_only" ||
+      const extractEvidence = storeOutcome.admissionRoute === "evidence_only" ||
         storeOutcome.admissionRoute === undefined;
-      if (shouldExtractCandidate) {
+      if (extractEvidence && (capturedId !== undefined || captureReceipt === undefined)) {
         try {
           const jobId = await jobWriter({
             type: "extract_candidate",
-            payload: { scope, text: request.text, traceId: storeOutcome.id, intent: request.intent },
+            payload: {
+              scope,
+              text: request.text,
+              traceId: capturedId ?? storeOutcome.id,
+              intent: request.intent,
+            },
           });
           jobs.push(jobId);
+          if (capturedId !== undefined) {
+            await this.deps.sourceCapture?.acknowledge?.(scope, capturedId, jobId)
+              .catch(() => warnings.push("source_capture_ack_failed"));
+          }
         } catch (err) {
           warnings.push(`enqueue_failed: ${(err as Error).message}`);
         }
+      } else if (capturedId !== undefined) {
+        await this.deps.sourceCapture?.acknowledge?.(
+          scope,
+          capturedId,
+          `admitted:${storeOutcome.id}`,
+        ).catch(() => warnings.push("source_capture_ack_failed"));
       }
 
     }
@@ -626,6 +692,7 @@ export class AgentFastPathService {
       duplicate: !storeOutcome.stored,
       queuedJobs: jobs,
       warnings: warnings.length > 0 ? warnings : undefined,
+      ...(captureReceipt === undefined ? {} : { capture: captureReceipt }),
     };
   }
 
@@ -749,35 +816,57 @@ export class AgentFastPathService {
     request: AgentSessionCommitRequest
   ): Promise<AgentSessionCommitResponse> {
     const scope = this.resolveScope(request.scope);
-    const traceId = randomUUID();
-    const jobs: string[] = [];
+    const warnings: string[] = [];
     this.builder.invalidateCache(scope);
-
+    const summary = request.summary;
+    if (!this.deps.sourceCapture || summary === undefined || summary.trim() === "") {
+      this.deps.logger?.warn?.("session_commit_evidence_unavailable");
+      warnings.push("session_commit_evidence_unavailable");
+      return { ack: true, traceId: randomUUID(), jobs: [], warnings };
+    }
+    let capture: CaptureReceipt;
+    try {
+      const sessionId = scope.sessionId ?? "current";
+      capture = await this.deps.sourceCapture.capture({
+        scope,
+        sourceId: `session:${sessionId}`,
+        bytes: Buffer.from(summary, "utf8"),
+        mediaType: "text/plain",
+        kind: "sessions",
+      });
+    } catch (err) {
+      this.deps.logger?.warn?.("session_commit_capture_failed");
+      warnings.push(`session_commit_capture_failed: ${(err as Error).message}`);
+      return { ack: true, traceId: randomUUID(), jobs: [], warnings };
+    }
+    if (capture.status !== "captured") {
+      const warning = capture.status === "damaged"
+        ? "session_commit_capture_damaged"
+        : "session_commit_capture_pending";
+      warnings.push(warning);
+      return { ack: true, traceId: capture.captureId, jobs: [], capture, warnings };
+    }
+    const jobs: string[] = [];
     if (this.deps.enqueueJob) {
-      const jobTypes: string[] = [];
-      if (request.summary || request.transcriptRef) {
-        jobTypes.push("extract_candidate");
-      }
-      for (const type of jobTypes) {
-        try {
-          const id = await this.deps.enqueueJob({
-            type,
-            payload: {
-              scope,
-              summary: request.summary,
-              transcriptRef: request.transcriptRef,
-              metadata: request.metadata,
-              traceId,
-            },
-          });
-          jobs.push(id);
-        } catch (err) {
-          this.deps.logger?.warn?.(`session_commit job ${type} failed: ${(err as Error).message}`);
-        }
+      try {
+        const id = await this.deps.enqueueJob({
+          type: "extract_candidate",
+          payload: { scope, text: summary, traceId: capture.captureId, intent: "auto" },
+        });
+        jobs.push(id);
+        await this.deps.sourceCapture.acknowledge?.(scope, capture.captureId, id);
+      } catch (err) {
+        this.deps.logger?.warn?.(`session_commit job extract_candidate failed: ${(err as Error).message}`);
+        warnings.push(`enqueue_failed: ${(err as Error).message}`);
       }
     }
-
-    return { ack: true, traceId, jobs };
+    return {
+      ack: true,
+      traceId: capture.captureId,
+      jobs,
+      capture,
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
   }
 
   /**

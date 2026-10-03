@@ -242,6 +242,8 @@ export class ActiveDerivationOutboxConsumer {
     readonly deriveCommittedActive: NativeCommittedActiveDerivation;
     readonly now?: () => number;
     readonly batchSize?: number;
+    /** Runs after a drain. Failures stay on the caller and do not change derivation results. */
+    readonly afterDrain?: () => Promise<void>;
   }) {
     this.batchSize = options.batchSize ?? 100;
     if (!Number.isSafeInteger(this.batchSize) || this.batchSize < 1 || this.batchSize > 1_000) {
@@ -281,6 +283,11 @@ export class ActiveDerivationOutboxConsumer {
       } catch {
         failures.push({ eventId: event.eventId, reason: "ack_failed" });
       }
+    }
+    try {
+      await this.options.afterDrain?.();
+    } catch {
+      // Source-capture compensation must not be reported as an active-derivation failure.
     }
     return Object.freeze({
       read: events.length,

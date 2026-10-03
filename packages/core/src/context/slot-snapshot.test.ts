@@ -7,6 +7,7 @@ import {
   SlotSnapshotCache,
   RECOMMENDED_TTL,
   createSlotSnapshotVersion,
+  slotSnapshotReadStatus,
 } from "./slot-snapshot.js";
 import type { MemoryScope } from "../domain/semantic-types.js";
 import type { MemoryRecord } from "../domain/types.js";
@@ -229,5 +230,45 @@ describe("SlotSnapshotV2", () => {
       ...version,
       loadoutVersion: 2,
     })).toBeNull();
+  });
+
+  it("readEpoch 或 asOf/knownAt 变化时快照为 stale，未标注的旧输入保持原指纹", () => {
+    const baseInput = {
+      inputFingerprint: "native-revision-1",
+      retrievalVersion: "retrieval-v1",
+      scoringVersion: "scoring-v1",
+      promptPolicyVersion: "prompt-v1",
+    };
+    const plain = createSlotSnapshotVersion(baseInput);
+    const again = createSlotSnapshotVersion(baseInput);
+    const epochA = createSlotSnapshotVersion({ ...baseInput, readEpoch: "epoch-a" });
+    const epochB = createSlotSnapshotVersion({ ...baseInput, readEpoch: "epoch-b" });
+    const historical = createSlotSnapshotVersion({
+      ...baseInput,
+      readEpoch: "epoch-a",
+      temporal: { mode: "as_of", asOf: 10, knownAt: 20 },
+    });
+    const versionedCache = new SlotSnapshotCache();
+    versionedCache.create(mockScope, "task_context", [mockRecord as MemoryRecord], undefined, epochA);
+
+    expect(plain.snapshotHash).toBe(again.snapshotHash);
+    expect(plain.readEpoch).toBeUndefined();
+    expect(plain.asOf).toBeUndefined();
+    expect(plain.knownAt).toBeUndefined();
+    expect(epochA.snapshotHash).not.toBe(plain.snapshotHash);
+    expect(epochA.snapshotHash).not.toBe(epochB.snapshotHash);
+    expect(historical.asOf).toBe(10);
+    expect(historical.knownAt).toBe(20);
+    expect(historical.temporalMode).toBe("as_of");
+    expect(slotSnapshotReadStatus(epochA, epochA)).toBe("fresh");
+    expect(slotSnapshotReadStatus(epochA, epochB)).toBe("stale");
+    expect(slotSnapshotReadStatus(epochA, historical)).toBe("stale");
+    expect(slotSnapshotReadStatus(undefined, epochA)).toBe("stale");
+    expect(versionedCache.get(mockScope, "task_context", undefined, epochB)).toBeNull();
+    expect(() => createSlotSnapshotVersion({ ...baseInput, readEpoch: "" })).toThrow(/readEpoch/);
+    expect(() => createSlotSnapshotVersion({
+      ...baseInput,
+      temporal: { mode: "current", asOf: 1 },
+    })).toThrow(/TEMPORAL_SELECTOR_INVALID/);
   });
 });

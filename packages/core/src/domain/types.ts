@@ -148,6 +148,56 @@ export type MemoryKind =
   | "observation"
   | "other";
 
+/**
+ * MemoryForm：知识形态，正交于 MemoryKind、MemorySemanticType 与 MemoryContainer。
+ * semanticType=experience 只表示槽位用途，不是 event，也不是 procedural。
+ * 不参与四套评分。
+ */
+export const MEMORY_FORMS = Object.freeze([
+  "event/episodic",
+  "fact/claim",
+  "semantic",
+  "procedural",
+] as const);
+
+export type MemoryForm = (typeof MEMORY_FORMS)[number];
+
+export function isMemoryForm(value: unknown): value is MemoryForm {
+  return typeof value === "string" &&
+    (MEMORY_FORMS as readonly string[]).includes(value);
+}
+
+/**
+ * EvidenceGrade：证据等级，不是 confidence / sourceAuthority。
+ * primary 是可回读原文；governed 是已治理事实的重述；inferred 不能当独立证据；
+ * snapshot 只有 native/legacy 快照，没有原始字节。
+ */
+export const EVIDENCE_GRADES = Object.freeze([
+  "primary",
+  "governed",
+  "inferred",
+  "snapshot",
+] as const);
+
+export type EvidenceGrade = (typeof EVIDENCE_GRADES)[number];
+
+export function isEvidenceGrade(value: unknown): value is EvidenceGrade {
+  return typeof value === "string" &&
+    (EVIDENCE_GRADES as readonly string[]).includes(value);
+}
+
+/** 来源 revision 身份。payloadHash 是原始字节的 sha256，不是页面 hash。 */
+export interface SourceRevisionRef {
+  readonly sourceId: string;
+  readonly revision: string;
+  readonly payloadHash: string;
+}
+
+/** 编译规划看到的来源水位。observedAt 是 epoch milliseconds，沿用既有时间钟。 */
+export interface SourceWatermark extends SourceRevisionRef {
+  readonly observedAt?: number;
+}
+
 export interface RecordProvenance {
   source?: "user" | "agent" | "system" | "scan" | string;
   sourceId?: string;
@@ -164,6 +214,10 @@ export interface MemoryRecord {
   kind: MemoryKind;
   /** v3.0 新增（可选）：5 问题语义视图 */
   semanticType?: MemorySemanticType;
+  /** 可选知识形态。缺省表示尚未标注，不能从 kind 或 semanticType 推断。 */
+  memoryForm?: MemoryForm;
+  /** 可选证据等级。缺省不改变准入或召回分。 */
+  evidenceGrade?: EvidenceGrade;
   /** v3.0 新增（可选）：记忆容器，默认 project */
   container?: MemoryContainer;
   /** v3.0 新增（可选）：生命周期状态，默认 active */

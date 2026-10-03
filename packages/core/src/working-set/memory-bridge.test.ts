@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 import { describe, expect, test, vi } from "vitest";
 
+import { authorityScopeFingerprint } from "../domain/authority-scope-fingerprint.js";
 import { InMemorySessionWorkingSetRepository } from "./in-memory-repository.js";
-import { SessionWorkingSetMemoryBridge } from "./memory-bridge.js";
+import {
+  createWorkingSetPromotionReceipt,
+  SessionWorkingSetMemoryBridge,
+} from "./memory-bridge.js";
 import { SessionWorkingSetService } from "./session-working-set-service.js";
 
 const scope = {
@@ -69,5 +73,88 @@ describe("SessionWorkingSetMemoryBridge", () => {
       evidenceEntryIds: [entry.id], evidenceRefs: ["evidence-1"], idempotencyKey: "promote-3",
     })).rejects.toMatchObject({ code: "WORKING_SET_EVIDENCE_UNAVAILABLE" });
     expect(executeMemoryWrite).not.toHaveBeenCalled();
+  });
+
+  test("memoryForm 写入元数据并返回可重放的晋升回执", async () => {
+    const { bridge, entry, executeMemoryWrite } = await fixture();
+    const input = {
+      scope, sessionId: "session-1", source: "verified_outcome" as const,
+      text: "因为完整测试已通过，所以发布前统一运行 npm test，结果稳定。",
+      semanticType: "experience" as const, evidenceEntryIds: [entry.id], evidenceRefs: ["evidence-1"],
+      idempotencyKey: "promote-form", memoryForm: "event/episodic" as const,
+      operatorOrPolicy: "policy:working-set-promote",
+    };
+    const result = await bridge.promoteClaim(input);
+    expect(result).toMatchObject({
+      status: "persisted",
+      candidateId: "candidate-1",
+      replayed: false,
+      promotionReceipt: {
+        schema: "mengshu.working-set-promotion/v1",
+        entryIds: [entry.id],
+        evidenceRefs: ["evidence-1"],
+        memoryForm: "event/episodic",
+        scopeFingerprint: authorityScopeFingerprint(scope),
+        idempotencyKey: "promote-form",
+        operatorOrPolicy: "policy:working-set-promote",
+      },
+    });
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: {
+        source: "session-working-set",
+        promotionSource: "verified_outcome",
+        evidenceEntryIds: [entry.id],
+        memoryForm: "event/episodic",
+        operatorOrPolicy: "policy:working-set-promote",
+      },
+    }));
+    const receipt = createWorkingSetPromotionReceipt({
+      entryIds: [entry.id],
+      evidenceRefs: ["evidence-1"],
+      memoryForm: "fact/claim",
+      scopeFingerprint: authorityScopeFingerprint(scope),
+      idempotencyKey: "promote-form",
+      operatorOrPolicy: "policy:working-set-promote",
+    });
+    expect(receipt).toMatchObject({
+      schema: "mengshu.working-set-promotion/v1",
+      memoryForm: "fact/claim",
+      idempotencyKey: "promote-form",
+      operatorOrPolicy: "policy:working-set-promote",
+    });
+    expect(receipt.entryIds).toEqual([entry.id]);
+    const replay = await bridge.promoteClaim(input);
+    expect(replay.replayed).toBe(true);
+    expect(replay.promotionReceipt).toEqual(result.promotionReceipt);
+    expect(executeMemoryWrite).toHaveBeenCalledOnce();
+    await expect(bridge.promoteClaim({
+      ...input,
+      text: "同一幂等键不能改写成另一条晋升。",
+    })).rejects.toMatchObject({ code: "WORKING_SET_PROMOTION_INVALID" });
+    expect(executeMemoryWrite).toHaveBeenCalledOnce();
+  });
+
+  test("未标注 memoryForm 时元数据保持原字段", async () => {
+    const { bridge, entry, executeMemoryWrite } = await fixture();
+    const input = {
+      scope, sessionId: "session-1", source: "verified_outcome" as const,
+      text: "因为完整测试已通过，所以发布前统一运行 npm test，结果稳定。",
+      semanticType: "experience" as const, evidenceEntryIds: [entry.id], evidenceRefs: ["evidence-1"],
+      idempotencyKey: "promote-plain",
+    };
+    const first = await bridge.promoteClaim(input);
+    expect(first).not.toHaveProperty("promotionReceipt");
+    expect(first.replayed).toBe(false);
+    expect(executeMemoryWrite).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: {
+        source: "session-working-set",
+        promotionSource: "verified_outcome",
+        evidenceEntryIds: [entry.id],
+      },
+    }));
+    const replay = await bridge.promoteClaim(input);
+    expect(replay.replayed).toBe(true);
+    expect(replay).not.toHaveProperty("promotionReceipt");
+    expect(executeMemoryWrite).toHaveBeenCalledOnce();
   });
 });

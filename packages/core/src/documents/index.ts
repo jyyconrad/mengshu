@@ -1,4 +1,5 @@
 export * from "./types.js";
+export * from "./compile-contract.js";
 export * from "./canonical.js";
 export * from "./markdown-codec.js";
 export * from "./read-service.js";
@@ -7,4 +8,5 @@ export * from "./curation-artifacts.js";
 export * from "./private-evidence-bindings.js";
 export * from "./repository.js";
 export * from "./write-kernel.js";
+export * from "./compiler/index.js";
 export * from "../vault/index.js";

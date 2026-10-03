@@ -1,6 +1,11 @@
 import { authorityScopeFingerprint } from "../domain/authority-scope-fingerprint.js";
 import type { MemoryScope } from "../domain/types.js";
 import {
+  assertTemporalRecallSelector,
+  TemporalSelectorError,
+} from "../temporal/selector.js";
+import type { TemporalRecallSelector } from "../temporal/types.js";
+import {
   validateGovernedDocumentAssetVersion,
   validateGovernedDocumentIndex,
 } from "./canonical.js";
@@ -30,6 +35,12 @@ export interface GovernedDocumentReadRepository {
   getComplete(
     scope: MemoryScope,
     assetId: string,
+  ): Promise<GovernedDocumentAssetVersion | undefined>;
+  /** Optional historical complete snapshot. Absence means only the live head is readable. */
+  getVersion?(
+    scope: MemoryScope,
+    assetId: string,
+    assetVersion: number,
   ): Promise<GovernedDocumentAssetVersion | undefined>;
   getIndex(
     scope: MemoryScope,
@@ -73,7 +84,40 @@ export type GovernedDocumentReadResult =
         | "evidence_incomplete";
       readonly fallback: "native_recall";
       readonly navigationRefs: readonly string[];
+    }
+  | {
+      readonly kind: "temporal_unavailable";
+      readonly assetId: string;
+      readonly assetVersion: number;
+      readonly selector: TemporalRecallSelector;
+      readonly reason: "asset_has_no_temporal_pin";
     };
+
+export interface GovernedDocumentReadOptions {
+  readonly sectionId?: string;
+  readonly full?: boolean;
+  /** Existing memory temporal clock. Omit or mode current to read the live head. */
+  readonly temporal?: TemporalRecallSelector;
+  /** Read one retained complete snapshot. Does not invent a second clock. */
+  readonly assetVersion?: number;
+}
+
+function normalizeReadTemporal(
+  temporal: TemporalRecallSelector | undefined,
+): TemporalRecallSelector | undefined {
+  if (temporal === undefined) return undefined;
+  try {
+    return assertTemporalRecallSelector(temporal);
+  } catch (error) {
+    if (error instanceof TemporalSelectorError) {
+      throw new GovernedDocumentReadError(
+        "INVALID_READ_REQUEST",
+        "asOf/knownAt selector is invalid",
+      );
+    }
+    throw error;
+  }
+}
 
 function filtered(
   asset: GovernedDocumentAssetVersion,
@@ -113,7 +157,7 @@ export class GovernedDocumentReadService {
   async read(
     scope: MemoryScope,
     assetId: string,
-    options: { readonly sectionId?: string; readonly full?: boolean } = {},
+    options: GovernedDocumentReadOptions = {},
   ): Promise<GovernedDocumentReadResult> {
     if (options.sectionId !== undefined && options.full === true) {
       throw new GovernedDocumentReadError(
@@ -121,12 +165,22 @@ export class GovernedDocumentReadService {
         "sectionId and full are mutually exclusive",
       );
     }
-    const asset = await this.load(scope, assetId);
+    const temporal = normalizeReadTemporal(options.temporal);
+    const asset = await this.load(scope, assetId, options.assetVersion);
     if (asset.lifecycleState !== "active") return filtered(asset, asset.lifecycleState);
     if (asset.governanceState !== "current") return filtered(asset, asset.governanceState);
     if (asset.governanceDescription.claimEvidenceCoverage !== 1 ||
         asset.governanceDescription.sourceDispositionCoverage !== 1) {
       return filtered(asset, "evidence_incomplete");
+    }
+    if (options.assetVersion === undefined && temporal !== undefined && temporal.mode !== "current") {
+      return Object.freeze({
+        kind: "temporal_unavailable",
+        assetId: asset.assetId,
+        assetVersion: asset.assetVersion,
+        selector: temporal,
+        reason: "asset_has_no_temporal_pin",
+      });
     }
 
     const complex = asset.governanceDescription.complexityClass === "complex";
@@ -162,8 +216,23 @@ export class GovernedDocumentReadService {
     });
   }
 
-  private async load(scope: MemoryScope, assetId: string): Promise<GovernedDocumentAssetVersion> {
-    const asset = await this.input.repository.getComplete(scope, assetId);
+  private async load(
+    scope: MemoryScope,
+    assetId: string,
+    assetVersion?: number,
+  ): Promise<GovernedDocumentAssetVersion> {
+    if (assetVersion !== undefined && (!Number.isSafeInteger(assetVersion) || assetVersion < 1)) {
+      throw new GovernedDocumentReadError("INVALID_READ_REQUEST", "assetVersion is invalid");
+    }
+    const asset = assetVersion === undefined
+      ? await this.input.repository.getComplete(scope, assetId)
+      : await this.input.repository.getVersion?.(scope, assetId, assetVersion);
+    if (assetVersion !== undefined && !this.input.repository.getVersion) {
+      throw new GovernedDocumentReadError(
+        "INVALID_READ_REQUEST",
+        "historical head is unavailable",
+      );
+    }
     if (!asset) throw new GovernedDocumentReadError("DOCUMENT_NOT_FOUND");
     validateGovernedDocumentAssetVersion(asset);
     if (asset.scopeFingerprint !== authorityScopeFingerprint(scope)) {
