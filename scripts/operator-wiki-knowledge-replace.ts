@@ -2074,13 +2074,15 @@ async function main(): Promise<void> {
   const command = process.argv[2];
   if (command === "verify") await verify(process.argv);
   else if (command === "regroup") await regroup();
-  else if (command === "apply") await apply();
+  // ingest-wiki 是统一的"已有 wiki md → mengshu 入库"入口,与 apply 同一受保护合同:
+  // preflight-ready 前置、固定 before-ids、token 确认、事务内替换。
+  else if (command === "apply" || command === "ingest-wiki") await apply();
   else if (command === "freeze") await freezeCli();
   else if (command === "baseline") await baselineCli();
   else if (command === "audit") await auditCli();
   else if (command === "merge") await mergeCli();
   else if (command === "preflight") await preflightCli();
-  else fail("command must be verify, regroup, apply, freeze, baseline, audit, merge, or preflight");
+  else fail("command must be verify, regroup, apply/ingest-wiki, freeze, baseline, audit, merge, or preflight");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
