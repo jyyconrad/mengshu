@@ -94,7 +94,9 @@ export function extractWorksetBody(markdown: string): string {
 export function excerptMatches(body: string, excerpt: string): boolean {
   const sample = excerpt.trim();
   const source = body.trim();
-  if (sample.length < 8 || source.length === 0) return false;
+  // 空/超短正文(<12 字符)没有可截取的片段:唯一真实摘录是全文本身,必须逐字相等。
+  if (source.length < 12) return sample === source;
+  if (sample.length < 12) return false;
   return source.includes(sample);
 }
 
@@ -259,7 +261,8 @@ export function auditRecordReason(
   // 读取阶段允许 "none"；最终页面由 parseWikiPage 用 TREE_TYPES（无 none）拒绝。
   if (typeof record.treeType !== "string" || !TREE_TYPES_READ.has(record.treeType)) return "tree-type";
   if (typeof record.excerpt !== "string") return "invalid-excerpt";
-  if (!checkExcerptQuality(record.excerpt)) return "short-excerpt";
+  // 摘录长度不再在此纯校验:空/超短正文(<12)的合法摘录就是全文本身,
+  // 由正文感知的 excerptMatches(runAudit/runMerge/verify 共用)逐字裁决。
   if (ctx.analysisBatchFile === null) return "unknown-analysis-file";
   if (ctx.analysisBatchFile !== entry.batchFile) return "batch-mismatch";
   return null;
@@ -504,7 +507,7 @@ export function mergeRecordError(
   if (record.path !== entry.path) return "path-drift";
   if (record.sourceSha256 !== entry.sha256) return "source-hash-drift";
   if (record.batchFile !== entry.batchFile) return "batch-drift";
-  if (typeof record.excerpt !== "string" || !checkExcerptQuality(record.excerpt)) return "invalid-excerpt";
+  if (typeof record.excerpt !== "string") return "invalid-excerpt";
   if (typeof record.semanticType !== "string" || !SEMANTIC_TYPES.has(record.semanticType)) return "semantic-type";
   if (typeof record.memoryForm !== "string" || !MEMORY_FORMS.has(record.memoryForm)) return "memory-form";
   // 读取阶段允许 "none"；最终页面由 parseWikiPage 用 TREE_TYPES（无 none）拒绝。

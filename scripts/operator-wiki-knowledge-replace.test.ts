@@ -222,8 +222,17 @@ describe("wiki knowledge replace gates", () => {
       "这是一段知识正文，用来校验摘录。",
     ].join("\n");
     expect(extractWorksetBody(markdown)).toBe("这是一段知识正文，用来校验摘录。");
-    expect(excerptMatches(extractWorksetBody(markdown), "这是一段知识正文")).toBe(true);
+    expect(excerptMatches(extractWorksetBody(markdown), "一段知识正文，用来校验摘录")).toBe(true);
     expect(excerptMatches(extractWorksetBody(markdown), "abcdef")).toBe(false);
+    expect(excerptMatches(extractWorksetBody(markdown), "这是一段知识正文")).toBe(false); // <12 字符的摘录对长正文无效
+  });
+
+  test("空/超短正文的摘录必须与全文逐字相等", () => {
+    expect(excerptMatches("", "")).toBe(true);
+    expect(excerptMatches("", "有内容")).toBe(false);
+    expect(excerptMatches("## ✅ 优化完成", "## ✅ 优化完成")).toBe(true);
+    expect(excerptMatches("## ✅ 优化完成", "优化完成")).toBe(false);
+    expect(excerptMatches("## ✅ 优化完成", "## ✅ 优化完成\n\n凑长度的尾巴")).toBe(false);
   });
 
   test("requires every source id once", () => {
@@ -347,7 +356,8 @@ describe("wiki knowledge replace gates", () => {
     expect(auditRecordReason({ ...base, scopeKey: SCOPE_TYPO }, ctx)).toBe("unknown-scope");
     expect(auditRecordReason({ ...base, scopeKey: SCOPE_B }, ctx)).toBe("scope-mismatch");
     expect(auditRecordReason({ ...base, treeType: "none" }, ctx)).toBeNull(); // 读取阶段允许 none
-    expect(auditRecordReason({ ...base, excerpt: "too short" }, ctx)).toBe("short-excerpt");
+    expect(auditRecordReason({ ...base, excerpt: "too short" }, ctx)).toBeNull(); // 摘录长度由正文感知的 excerptMatches 裁决
+    expect(auditRecordReason({ ...base, excerpt: "" }, ctx)).toBeNull(); // 空正文记录的摘录就是空串
     const entry = manifest.get("11111111-1111-4111-8111-111111111111")!;
     const merged = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({
       ...base, sourceSha256: "0".repeat(64), batchFile: "batch-0000-n60.txt", ...extra,
@@ -359,7 +369,8 @@ describe("wiki knowledge replace gates", () => {
     expect(mergeRecordError(merged({ semanticType: "spam" }), entry)).toBe("semantic-type");
     expect(mergeRecordError(merged({ memoryForm: "vibe" }), entry)).toBe("memory-form");
     expect(mergeRecordError(merged({ treeType: "L3" }), entry)).toBe("tree-type");
-    expect(mergeRecordError(merged({ excerpt: "too short" }), entry)).toBe("invalid-excerpt");
+    expect(mergeRecordError(merged({ excerpt: 42 }), entry)).toBe("invalid-excerpt");
+    expect(mergeRecordError(merged({ excerpt: "too short" }), entry)).toBeNull(); // 长度由 excerptMatches 正文回读裁决
   });
 
   test("detectContentHashConflicts flags only cross-scope duplicates", () => {
@@ -595,7 +606,7 @@ describe("audit", () => {
     const summary = await runAudit(fixture.analysis, join(fixture.run, "source-manifest.jsonl"), join(fixture.base, "before-ids.txt"), join(fixture.base, "scope-templates.json"), fixture.out);
     expect(summary).toMatchObject({ valid: 0, invalid: 3, missingIds: 3 });
     const report = JSON.parse(readFileSync(join(fixture.out, "read", "audit-summary.json"), "utf8")) as { reasons: Record<string, number> };
-    expect(report.reasons["short-excerpt"]).toBe(1);
+    expect(report.reasons["excerpt-miss"]).toBe(1); // 10 字符摘录对长正文不再单独记 short-excerpt
     expect(report.reasons["semantic-type"]).toBe(1);
     expect(report.reasons["source-hash-drift"]).toBe(1);
   });
