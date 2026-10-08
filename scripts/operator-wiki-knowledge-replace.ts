@@ -1804,6 +1804,43 @@ async function regroup(): Promise<void> {
 // apply（已修复 Embeddings 配置类型与 provenance 合同）
 // ---------------------------------------------------------------------------
 
+/**
+ * 分块 + 限流退避的全量向量化:siliconflow bge-m3 对万级一次性请求会 429,
+ * 单飞、小批(16/请求)、每 128 条一块;429 按指数等待重试,进度写 stderr 供长任务观测。
+ */
+export async function embedPagesResilient(
+  embedder: { embedBatch(texts: readonly string[]): Promise<readonly number[][]> },
+  texts: readonly string[],
+  options: { chunkSize?: number; maxAttempts?: number; throttleWaitMs?: number; plainWaitMs?: number } = {},
+): Promise<number[][]> {
+  const chunkSize = options.chunkSize ?? 128;
+  const maxAttempts = options.maxAttempts ?? 12;
+  const throttleWaitMs = options.throttleWaitMs ?? 20_000;
+  const plainWaitMs = options.plainWaitMs ?? 5_000;
+  const out: number[][] = [];
+  for (let offset = 0; offset < texts.length; offset += chunkSize) {
+    const slice = texts.slice(offset, offset + chunkSize);
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const vectors = await embedder.embedBatch(slice);
+        out.push(...vectors.map((vector) => [...vector]));
+        break;
+      } catch (error) {
+        if (attempt >= maxAttempts) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        const throttled = /429|rate|limit|throttl/i.test(message);
+        const waitMs = (throttled ? throttleWaitMs : plainWaitMs) * attempt;
+        process.stderr.write(`embedding retry ${attempt}/${maxAttempts} in ${waitMs}ms: ${message.slice(0, 120)}\n`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+    }
+    if ((offset / chunkSize) % 8 === 0 || offset + chunkSize >= texts.length) {
+      process.stderr.write(`embedding progress: ${Math.min(offset + chunkSize, texts.length)}/${texts.length}\n`);
+    }
+  }
+  return out;
+}
+
 async function apply(): Promise<void> {
   if (arg("--confirmation-token") !== TOKEN) fail("confirmation token was not accepted");
   const configPath = resolve(arg("--config"));
@@ -1905,11 +1942,12 @@ async function applyWithPool(pool: pg.Pool, input: ApplyPoolInput): Promise<void
       model: config.embedding.model,
     },
     undefined,
-    { concurrency: 3, maxBatchSize: 16 },
+    // 429 限流经验值:siliconflow bge-m3 对大批量敏感,单飞、小批,分块退避在 embedPagesResilient。
+    { concurrency: 1, maxBatchSize: 16 },
   );
   // 去重已在 apply() 完成（dedupeWikiPages 合并 sourceIds），此处直接向量化。
   const uniquePages = pages;
-  const vectors = await embedder.embedBatch(uniquePages.map((page) => page.text));
+  const vectors = await embedPagesResilient(embedder, uniquePages.map((page) => page.text));
   if (vectors.length !== uniquePages.length || vectors.some((vector) => vector.length !== dims.dims)) {
     fail(`embedding dimension mismatch: expected ${dims.dims} (source=${dims.source})`);
   }

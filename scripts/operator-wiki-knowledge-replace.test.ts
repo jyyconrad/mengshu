@@ -22,6 +22,7 @@ import {
   dedupeWikiPages,
   detectContentHashConflicts,
   embeddingSpaceQueryFallback,
+  embedPagesResilient,
   evaluateKnownIssues,
   excerptMatches,
   extractWorksetBody,
@@ -1026,5 +1027,41 @@ describe("analysis line compatibility", () => {
     expect(parseAnalysisLine(line)).toEqual({ id, scopeKey: SCOPE_A, excerpt: "知识正文摘录", path: "/k/a.md" });
     expect(() => parseAnalysisLine(JSON.stringify({ id: "not-a-uuid", scopeKey: "s", excerpt: "x", path: "/a" }))).toThrow(/invalid/);
     expect(() => parseAnalysisLine(line + line)).toThrow(); // 拼接 JSON 必须炸
+  });
+});
+
+describe("embedPagesResilient 分块与限流退避", () => {
+  test("429 后按块退避重试,跨块顺序保持", async () => {
+    const calls: number[] = [];
+    let failures = 2;
+    const fake = {
+      async embedBatch(texts: readonly string[]): Promise<number[][]> {
+        calls.push(texts.length);
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error("429 status code (no body)");
+        }
+        return texts.map(() => [0.1, 0.2]);
+      },
+    };
+    const vectors = await embedPagesResilient(fake, ["a", "b", "c"], {
+      chunkSize: 2,
+      throttleWaitMs: 1,
+      plainWaitMs: 1,
+    });
+    expect(vectors).toHaveLength(3);
+    expect(vectors.every((vector) => vector.length === 2)).toBe(true);
+    expect(calls).toEqual([2, 2, 2, 1]); // 第一块两次 429 后成功,第二块一次成功
+  });
+
+  test("超过最大重试次数后抛出原错误", async () => {
+    const fake = {
+      async embedBatch(): Promise<number[][]> {
+        throw new Error("429 rate limited");
+      },
+    };
+    await expect(
+      embedPagesResilient(fake, ["a"], { chunkSize: 1, maxAttempts: 2, throttleWaitMs: 1, plainWaitMs: 1 }),
+    ).rejects.toThrow("429 rate limited");
   });
 });
