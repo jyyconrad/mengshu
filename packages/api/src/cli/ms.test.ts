@@ -1,6 +1,8 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
@@ -19,12 +21,15 @@ import {
   historyTreeWorkerOperatorArgv,
   markdownWorksetOperatorArgv,
   topicTreeMigrationOperatorArgv,
+  isCliMainModule,
   runMengshuCli,
 } from "./ms.js";
 import { Command } from "commander";
 import { CURRENT_SCHEMA_VERSION } from "../../../core/src/db/migrations/schema-migrations.js";
 import { RuntimeClient } from "../runtime-client.js";
 import { DatabaseFactory } from "../../../core/src/db/factory.js";
+
+const root = fileURLToPath(new URL("../../../../", import.meta.url));
 
 let cliHome: string | undefined;
 
@@ -818,4 +823,53 @@ describe("ms serve RuntimeHost composition", () => {
       log.mockRestore();
     }
   });
+});
+
+describe("直接执行 CLI 实现库模块（无顶层调用的回归）", () => {
+  test("isCliMainModule 只有入口恰好是本模块时为真", () => {
+    const moduleUrl = "file:///repo/packages/api/src/cli/ms.ts";
+    const identity = (p: string): string => p;
+    expect(isCliMainModule("/repo/packages/api/src/cli/ms.ts", moduleUrl, identity)).toBe(true);
+    expect(isCliMainModule("/repo/bin/ms.ts", moduleUrl, identity)).toBe(false);
+    expect(isCliMainModule(undefined, moduleUrl, identity)).toBe(false);
+    expect(isCliMainModule("", moduleUrl, identity)).toBe(false);
+  });
+
+  test("isCliMainModule 对符号链接路径按 realpath 归一后再比较", () => {
+    const moduleUrl = "file:///private/tmp/x/ms.ts";
+    const realpath = (p: string) => p.replace(/^\/tmp\//, "/private/tmp/");
+    expect(isCliMainModule("/tmp/x/ms.ts", moduleUrl, realpath)).toBe(true);
+    expect(isCliMainModule("/tmp/x/other.ts", moduleUrl, realpath)).toBe(false);
+  });
+
+  test("isCliMainModule 在路径不可解析时安全返回 false", () => {
+    expect(isCliMainModule("/nonexistent/ms.ts", "file:///repo/ms.ts", () => {
+      throw new Error("ENOENT");
+    })).toBe(false);
+  });
+
+  test("tsx 直接执行本模块时输出与 bin/ms.ts 相同的 CLI 帮助而不是静默退出", () => {
+    const home = mkdtempSync(join(tmpdir(), "mengshu-cli-direct-run-"));
+    const configPath = join(home, "invalid-config-must-not-be-read");
+    writeFileSync(configPath, "invalid config must not be read by help requests");
+    const entry = fileURLToPath(new URL("./ms.ts", import.meta.url));
+    const result = spawnSync(process.execPath, [
+      "--import", import.meta.resolve("tsx"), entry, "--help",
+    ], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 60_000,
+      env: {
+        ...process.env,
+        MENGSHU_HOME: home,
+        MENGSHU_CONFIG: configPath,
+        MENGSHU_AUTHORITY_JSON: "invalid authority must not be parsed",
+      },
+    });
+    rmSync(home, { recursive: true, force: true });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Usage: ms [options] [command]");
+    expect(result.stdout).toContain("recall <query>");
+  }, 60_000);
 });

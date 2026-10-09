@@ -7,6 +7,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { memoryConfigSchema } from "../../../../config.js";
 import { expandHome, resolveConfigPath, resolveEnvPath, resolveLegacyHomeDir } from "../../../../core/paths.js";
@@ -34,6 +35,7 @@ import {
 } from "../../../../server/runtime-host-factory.js";
 import { registerEmbeddingSpaceCliCommands } from "./embedding-space.js";
 import { registerEvalCliCommands } from "./eval.js";
+import { formatCliError } from "./error-output.js";
 import { registerRuntimeCostCliCommands } from "./runtime-cost.js";
 import { registerEvolutionCliCommands } from "./evolve.js";
 import {
@@ -1263,4 +1265,34 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
     }
     throw error;
   }
+}
+
+/**
+ * 判断当前进程是否以本模块为入口直接执行。
+ *
+ * 本模块是 CLI 实现库；规范入口是 bin/ms.ts（以及它暴露的 `ms` bin）。
+ * 直接执行 `tsx packages/api/src/cli/ms.ts <cmd>` 时不应该静默无输出地
+ * 以 exit 0 结束，而是走与 bin/ms.ts 完全相同的装配与错误格式化。
+ *
+ * process.argv[1] 可能带符号链接（macOS /tmp 等），import.meta.url 是
+ * realpath 后的 URL，两侧都 realpath 归一后再比较。
+ */
+export function isCliMainModule(
+  entryPath: string | undefined,
+  moduleUrl: string,
+  realpath: (p: string) => string = (p) => fs.realpathSync(p),
+): boolean {
+  if (typeof entryPath !== "string" || entryPath.length === 0) return false;
+  try {
+    return realpath(fileURLToPath(new URL(moduleUrl))) === realpath(entryPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isCliMainModule(process.argv[1], import.meta.url)) {
+  runMengshuCli().catch((error: unknown) => {
+    console.error(formatCliError(error));
+    process.exitCode = 1;
+  });
 }
