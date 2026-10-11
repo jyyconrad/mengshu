@@ -240,3 +240,18 @@ npx vitest run packages/mcp/src/tools.test.ts
 - **Admission 收据**：`mengshu_admission_decision_receipts`（schema v39）；write-kernel best-effort 记录 accept/reject；`memory_explain({ lastDecision: true | candidateHash })` 可读；LanceDB = in-memory only。
 - **README**：增加「本地治理记忆：升级前后对照（P0 + P1）」并链到 quickstart / plan / Skill。
 - **仍延期**：CI、npm 正式发布、git `v1.0.7` tag、`main` 快进。
+
+---
+
+## 13. 用户硬锁追记（2026-10-11 → P2/P3）
+
+P0+P1 完成后，用户锁定下一阶段边界（详见 [`upgrade-next-20261011.md`](./upgrade-next-20261011.md) **N9–N14**）：
+
+1. **暂不**做 npm 及其它发布渠道  
+2. **不**接入 Graphiti 或其它第三方记忆中间件桥  
+3. **优先**做强 MCP / CLI / Hooks  
+4. **MCP** = Agent 实时调用为主  
+5. **CLI** = 全面分析目录并治理入库为主  
+6. **Hooks** = 被动触发，用 Agent 会话信息更新记忆  
+
+本文件（P0+P1）结论不变；发布与 Graphiti 相关「仍延期」项按上锁 **整段移出** 下一阶段退出标准，改由三入口方案承接。
