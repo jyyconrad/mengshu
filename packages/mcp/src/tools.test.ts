@@ -697,6 +697,8 @@ describe("MCP memory tools", () => {
       "memory_ingest",
       "memory_namespaces",
       "memory_health",
+      "memory_explain",
+      "memory_tools_discover",
     ]);
   });
 
@@ -1335,7 +1337,7 @@ describe("MCP memory tools", () => {
 
   test("keeps 7 safe base tools when no agentFastPath is injected", () => {
     const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
-    expect(tools).toHaveLength(7);
+    expect(tools).toHaveLength(9);
     expect(tools.map((tool) => tool.name)).not.toContain("memory_context_fast");
   });
 
@@ -1372,13 +1374,15 @@ describe("MCP memory tools", () => {
       >[0]["agentFastPath"],
     });
 
-    expect(tools).toHaveLength(12);
+    expect(tools).toHaveLength(14);
     const names = tools.map((tool) => tool.name);
     expect(names).toContain("memory_context_fast");
     expect(names).toContain("memory_observe_light");
     expect(names).toContain("memory_lookup");
     expect(names).toContain("memory_navigate");
     expect(names).toContain("memory_evidence_read");
+    expect(names).toContain("memory_explain");
+    expect(names).toContain("memory_tools_discover");
 
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
     await byName.memory_context_fast.execute({ scope, task: "t" });

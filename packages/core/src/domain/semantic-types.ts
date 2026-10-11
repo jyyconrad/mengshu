@@ -200,6 +200,10 @@ export interface AgentTaskContextRequest {
  */
 export interface ContextFastResponse {
   scope: MemoryScope;
+  /**
+   * 5type consumption view. SlotContextBuilder / ensureFiveSlots guarantee all five
+   * keys at runtime; empty slots use nodeCount=0 + empty_slot warnings (not omitted keys).
+   */
   slots: {
     profile?: SlotContextBlock;
     task_context?: SlotContextBlock;

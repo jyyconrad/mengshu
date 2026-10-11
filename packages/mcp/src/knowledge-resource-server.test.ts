@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { beforeAll, afterAll, describe, expect, test, vi } from "vitest";
 
 import type { AuthorityScope } from "../../core/src/domain/authority-scope.js";
 import { createMcpMemoryServer } from "./server.js";
@@ -24,6 +24,14 @@ const defaultScope = {
   namespace: "memory",
   visibility: "private" as const,
 };
+
+
+const _prevToolMode = process.env.MENGSHU_MCP_TOOL_MODE;
+beforeAll(() => { process.env.MENGSHU_MCP_TOOL_MODE = "full"; });
+afterAll(() => {
+  if (_prevToolMode === undefined) delete process.env.MENGSHU_MCP_TOOL_MODE;
+  else process.env.MENGSHU_MCP_TOOL_MODE = _prevToolMode;
+});
 
 describe("Knowledge resource MCP server composition", () => {
   test("facade and stdio advertise Knowledge tools only when capability is injected", async () => {

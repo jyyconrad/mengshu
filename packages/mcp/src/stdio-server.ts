@@ -44,6 +44,7 @@ import {
 import {
   createMcpMemoryTools,
   freezeMcpToolRegistry,
+  listToolsForMode,
   type McpMemoryTool,
   type MemoryWriteCommandExecutor,
   type MemoryAssetReadCapability,
@@ -116,11 +117,15 @@ interface McpToolResult {
 /**
  * 把工具表转成 MCP ListTools 响应。
  */
-export function buildListToolsResult(tools: readonly McpMemoryTool[]): {
+export function buildListToolsResult(
+  tools: readonly McpMemoryTool[],
+  mode?: import("./tool-mode.js").McpToolMode | string | null,
+): {
   tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
 } {
+  const advertised = listToolsForMode(tools, mode);
   return {
-    tools: tools.map((tool) => ({
+    tools: advertised.map((tool) => ({
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
@@ -214,7 +219,7 @@ export function createRuntimeMcpFacade(options: McpStdioServerOptions): RuntimeM
   }));
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   return Object.freeze({
-    listTools: () => tools.map((tool) => Object.freeze({
+    listTools: () => listToolsForMode(tools).map((tool) => Object.freeze({
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,

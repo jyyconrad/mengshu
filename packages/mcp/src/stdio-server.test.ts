@@ -8,7 +8,7 @@
  * 关键边界：未知工具与 execute 抛错均包成 isError content。
  */
 
-import { describe, expect, test, vi } from "vitest";
+import { beforeAll, afterAll, describe, expect, test, vi } from "vitest";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { MemoryService } from "../../../core/service-types.js";
@@ -220,12 +220,20 @@ class FakeMcpPostgresJobRepository extends PostgresDurableJobV2Repository {
   }
 }
 
+
+const _prevToolMode = process.env.MENGSHU_MCP_TOOL_MODE;
+beforeAll(() => { process.env.MENGSHU_MCP_TOOL_MODE = "full"; });
+afterAll(() => {
+  if (_prevToolMode === undefined) delete process.env.MENGSHU_MCP_TOOL_MODE;
+  else process.env.MENGSHU_MCP_TOOL_MODE = _prevToolMode;
+});
+
 describe("buildListToolsResult", () => {
   test("maps tools to MCP tool descriptors with inputSchema", () => {
     const { tools } = createMcpStdioServer({ authority, defaultScope, service: new FakeMemoryService() });
     const result = buildListToolsResult(tools);
 
-    expect(result.tools).toHaveLength(7);
+    expect(result.tools).toHaveLength(9);
     expect(result.tools.map((tool) => tool.name)).not.toContain("memory_forget");
     const health = result.tools.find((t) => t.name === "memory_health");
     expect(health).toBeDefined();
@@ -410,7 +418,7 @@ describe("createMcpStdioServer", () => {
     // tools/list
     await transport.inject({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const listResponse = transport.responseFor(2) as { result?: { tools?: unknown[] } };
-    expect(listResponse?.result?.tools).toHaveLength(7);
+    expect(listResponse?.result?.tools).toHaveLength(9);
 
     // tools/call
     await transport.inject({

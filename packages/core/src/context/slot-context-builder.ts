@@ -44,6 +44,7 @@ import {
   type RecallWeights,
 } from "../domain/recall-scoring.js";
 import { packSlotsToPrompt } from "./slot-prompt-packer.js";
+import { ensureFiveSlots, MEMORY_SEMANTIC_TYPE_ORDER } from "./five-slot-continuity.js";
 import { mergeProfileByLayer, enrichProfileLayer } from "../domain/profile-layer.js";
 import type { TreeSummaryNode } from "../tree/types.js";
 import { validateDeterministicEvidence } from "../tree/faithfulness.js";
@@ -182,10 +183,16 @@ export class SlotContextBuilder {
       }
     }
 
-    // 5. 拼接 prompt 注入文本
-    const content = packSlotsToPrompt(slots, task);
+    // 5. 5type continuity: always expose all five slot keys
+    const continuousSlots = ensureFiveSlots(slots, {
+      loadoutExcluded: this.loadoutExcludedSet(options.allowedSemanticTypes),
+      filtered,
+    });
 
-    // 6. 检查延迟预算
+    // 6. 拼接 prompt 注入文本（空槽 nodeCount=0 会被 packer 跳过）
+    const content = packSlotsToPrompt(continuousSlots, task);
+
+    // 7. 检查延迟预算
     const latencyMs = Date.now() - startTime;
     if (latencyBudgetMs > 0 && latencyMs > latencyBudgetMs) {
       warnings.push(
@@ -193,8 +200,8 @@ export class SlotContextBuilder {
       );
     }
 
-    // 7. 统计节点数
-    const nodesUsed = Object.values(slots).reduce(
+    // 8. 统计节点数
+    const nodesUsed = Object.values(continuousSlots).reduce(
       (sum, block) => sum + (block?.nodeCount ?? 0),
       0
     );
@@ -203,9 +210,9 @@ export class SlotContextBuilder {
 
     return {
       scope,
-      slots,
+      slots: continuousSlots,
       content,
-      assemblyPlan: this.createAssemblyPlan(scope, slots, filtered, task, options),
+      assemblyPlan: this.createAssemblyPlan(scope, continuousSlots, filtered, task, options),
       warnings: warnings.length > 0 ? warnings : undefined,
       filtered,
       filteredSummary: this.summarizeFiltered(filtered),
@@ -306,21 +313,25 @@ export class SlotContextBuilder {
       }
     }
 
-    const content = packSlotsToPrompt(slots, task);
+    const continuousSlots = ensureFiveSlots(slots, {
+      loadoutExcluded: this.loadoutExcludedSet(options.allowedSemanticTypes),
+      filtered,
+    });
+    const content = packSlotsToPrompt(continuousSlots, task);
     const latencyMs = Date.now() - startTime;
     if (latencyBudgetMs > 0 && latencyMs > latencyBudgetMs) {
       warnings.push(`latency_exceeded: 延迟 ${latencyMs}ms 超过预算 ${latencyBudgetMs}ms`);
     }
-    const nodesUsed = Object.values(slots).reduce(
+    const nodesUsed = Object.values(continuousSlots).reduce(
       (sum, block) => sum + (block?.nodeCount ?? 0),
       0,
     );
 
     return {
       scope,
-      slots,
+      slots: continuousSlots,
       content,
-      assemblyPlan: this.createAssemblyPlan(scope, slots, filtered, task, options),
+      assemblyPlan: this.createAssemblyPlan(scope, continuousSlots, filtered, task, options),
       warnings: warnings.length > 0 ? warnings : undefined,
       filtered,
       filteredSummary: this.summarizeFiltered(filtered),
@@ -472,6 +483,20 @@ export class SlotContextBuilder {
    * - profile 类型按 profileLayer 合并（project > app > global）
    * - 同 profileDimension 保留高层，低层记入 filtered(overridden_by_layer)
    */
+
+  /** Types not in Loadout allowlist are still exposed as empty continuous slots. */
+  private loadoutExcludedSet(
+    allowed: readonly MemorySemanticType[] | undefined,
+  ): Set<MemorySemanticType> | undefined {
+    if (!allowed || allowed.length === 0) return undefined;
+    const allow = new Set(allowed);
+    const excluded = new Set<MemorySemanticType>();
+    for (const type of MEMORY_SEMANTIC_TYPE_ORDER) {
+      if (!allow.has(type)) excluded.add(type);
+    }
+    return excluded.size > 0 ? excluded : undefined;
+  }
+
   private groupBySemanticType(records: MemoryRecord[]): {
     grouped: Partial<Record<MemorySemanticType, MemoryRecord[]>>;
     filtered: FilteredEntry[];

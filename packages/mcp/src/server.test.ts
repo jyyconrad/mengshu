@@ -1,7 +1,7 @@
 import fs, { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, afterAll, describe, expect, test, vi } from "vitest";
 import type { MemoryService } from "../../../core/service-types.js";
 import {
   createMcpMemoryServer,
@@ -45,6 +45,14 @@ const tempDirs: string[] = [];
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+
+const _prevToolMode = process.env.MENGSHU_MCP_TOOL_MODE;
+beforeAll(() => { process.env.MENGSHU_MCP_TOOL_MODE = "full"; });
+afterAll(() => {
+  if (_prevToolMode === undefined) delete process.env.MENGSHU_MCP_TOOL_MODE;
+  else process.env.MENGSHU_MCP_TOOL_MODE = _prevToolMode;
 });
 
 describe("MCP memory server adapter", () => {

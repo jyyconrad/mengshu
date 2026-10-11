@@ -20,6 +20,7 @@ import type { MemoryScope } from "../../core/src/domain/types.js";
 import {
   createMcpMemoryTools,
   freezeMcpToolRegistry,
+  listToolsForMode,
   type McpMemoryTool,
   type MemoryWriteCommandExecutor,
   type MemoryAssetReadCapability,
@@ -58,6 +59,7 @@ export interface McpMemoryServerOptions {
   memoryPolicy?: MemoryPolicyCapability;
   pipeline?: IngestionPipeline;
   llmClient?: LlmClient;
+  toolMode?: import("./tool-mode.js").McpToolMode;
 }
 
 export interface McpServerAuthorityConfig {
@@ -371,7 +373,7 @@ export function createMcpMemoryServer(options: McpMemoryServerOptions): McpMemor
   }));
   return {
     name: "mengshu",
-    listTools: () => tools,
+    listTools: () => listToolsForMode(tools, options.toolMode),
     callTool: async (name, input) => {
       const tool = tools.find((candidate) => candidate.name === name);
       if (!tool) {

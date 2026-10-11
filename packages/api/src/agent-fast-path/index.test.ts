@@ -203,10 +203,15 @@ describe("AgentFastPathService", () => {
       const response = await service.context({ scope, task: "policy" });
 
       expect(response.slots.rules).toBeDefined();
-      expect(response.slots.experience).toBeUndefined();
+      expect(response.slots.experience).toBeDefined();
+      expect(response.slots.experience?.nodeCount).toBe(0);
+      expect(response.slots.experience?.warnings?.[0]).toMatch(/empty_slot: loadout_policy_excluded/);
       expect(response.filtered).toContainEqual(expect.objectContaining({
         recordId: "experience-policy", reason: "loadout_policy_excluded",
       }));
+      for (const key of ["profile", "task_context", "rules", "experience", "resource"] as const) {
+        expect(response.slots[key]).toBeDefined();
+      }
       expect(response.assemblyPlan?.slots.rules?.tokenBudget).toBe(100);
       expect(response.assemblyPlan?.slots.rules?.navigation).toContainEqual(
         expect.objectContaining({ ref: "source-policy", kind: "source_tree", level: "R1" }),

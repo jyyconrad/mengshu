@@ -93,6 +93,16 @@ import type {
 } from "../../core/src/skills/types.js";
 import type { AppendMemoryPolicyOverlayInput, MemoryPolicyLayer } from
   "../../core/src/policy/types.js";
+import { explainAdmissionCandidate } from "../../core/src/lifecycle/admission-explain.js";
+import { extractWhyDetails, formatWhyReport } from "../../../plugins/openclaw/src/cli/why.js";
+import {
+  filterToolsByMode,
+  listHiddenToolDescriptors,
+  resolveMcpToolMode,
+  resolveMcpToolModeFromEnv,
+  type McpToolMode,
+} from "./tool-mode.js";
+
 
 /** JSON Schema 对象（MCP inputSchema 形态，保持宽松类型） */
 export type JsonSchemaObject = Record<string, unknown>;
@@ -209,6 +219,11 @@ export interface McpMemoryToolsOptions {
    * 而不是每次调用时由客户端传递（容易遗漏或不一致）。
    */
   defaultScope?: Partial<MemoryScope>;
+  /**
+   * MCP tool facade mode. Defaults to env MENGSHU_MCP_TOOL_MODE or "default".
+   * full = advertise every registered tool; default/minimal = curated ListTools.
+   */
+  toolMode?: McpToolMode;
 }
 
 /**
@@ -803,6 +818,175 @@ function buildIngestTool(
   };
 }
 
+
+function applyMcpToolFacade(
+  tools: McpMemoryTool[],
+  options: McpMemoryToolsOptions,
+  mergeScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
+  requestScopeSchema: JsonSchemaObject,
+): McpMemoryTool[] {
+  const mode = resolveMcpToolMode(
+    options.toolMode ?? resolveMcpToolModeFromEnv(),
+  );
+  const allTools = [...tools];
+
+  // memory_explain: stored why OR admission dry-run for a 5type candidate draft
+  if (!allTools.some((tool) => tool.name === "memory_explain")) {
+    allTools.push({
+      name: "memory_explain",
+      description:
+        "Explain a stored memory (why/provenance/score) or dry-run admission for a 5type candidate draft. Does not invent memories.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          scope: requestScopeSchema,
+          memoryId: { type: "string", description: "Stored memory id to explain (ms why)." },
+          query: { type: "string", description: "Fallback recall query when memoryId is omitted." },
+          candidate: {
+            type: "object",
+            description: "Dry-run admission for a candidate draft (validator + admission).",
+            properties: {
+              text: { type: "string", minLength: 1 },
+              semanticType: {
+                type: "string",
+                enum: ["profile", "task_context", "rules", "experience", "resource"],
+              },
+              profileDimension: { type: "string" },
+              salience: { type: "number", minimum: 0, maximum: 1 },
+              temporality: { type: "string", enum: ["ephemeral", "persistent"] },
+              intent: { type: "string", enum: ["remember", "auto", "ignore"] },
+              hasConflict: { type: "boolean" },
+            },
+            required: ["text", "semanticType"],
+            additionalProperties: false,
+          },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input) => {
+        const allowed = new Set(["scope", "memoryId", "query", "candidate"]);
+        if (Reflect.ownKeys(input).some((key) => typeof key !== "string" || !allowed.has(key))) {
+          throw new McpInvalidRequestError("memory_explain input is invalid");
+        }
+        const candidate = input.candidate;
+        if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+          const draft = candidate as Record<string, unknown>;
+          if (typeof draft.text !== "string" || typeof draft.semanticType !== "string") {
+            throw new McpInvalidRequestError("memory_explain candidate requires text and semanticType");
+          }
+          if (!MEMORY_SEMANTIC_TYPES.has(draft.semanticType as MemorySemanticType)) {
+            throw new McpInvalidRequestError("memory_explain candidate.semanticType must be a 5type value");
+          }
+          const explained = explainAdmissionCandidate({
+            text: draft.text,
+            semanticType: draft.semanticType as MemorySemanticType,
+            profileDimension: typeof draft.profileDimension === "string" ? draft.profileDimension : undefined,
+            salience: typeof draft.salience === "number" ? draft.salience : undefined,
+            temporality: draft.temporality === "ephemeral" || draft.temporality === "persistent"
+              ? draft.temporality
+              : undefined,
+            intent: typeof draft.intent === "string" ? draft.intent : "auto",
+            hasConflict: draft.hasConflict === true,
+          });
+          return {
+            kind: "admission_dry_run",
+            ...explained,
+            admission: explained.admission
+              ? {
+                  route: explained.admission.route,
+                  valueScore: explained.admission.valueScore,
+                  reason: explained.admission.reason,
+                  breakdown: explained.admission.breakdown,
+                }
+              : undefined,
+          };
+        }
+
+        const target = typeof input.memoryId === "string" && input.memoryId.trim()
+          ? input.memoryId.trim()
+          : typeof input.query === "string" && input.query.trim()
+            ? input.query.trim()
+            : "";
+        if (!target) {
+          throw new McpInvalidRequestError(
+            "memory_explain requires memoryId, query, or candidate",
+          );
+        }
+        const scope = mergeScope(input.scope as Record<string, unknown> | undefined);
+        const result = await options.service.recall({
+          query: target,
+          scope,
+          limit: 5,
+        } as unknown as RecallInput);
+        const hits = requireRecallResultReceipts(result).hits;
+        const record = hits
+          .map((hit) => hit.record)
+          .find((item) => "id" in item && item.id === target)
+          ?? hits[0]?.record;
+        if (!record || !("id" in record)) {
+          return {
+            kind: "stored_why",
+            found: false,
+            reasonCodes: ["memory_not_found"],
+            query: target,
+          };
+        }
+        const hit = hits.find((h) => h.record && "id" in h.record && h.record.id === record.id);
+        return {
+          kind: "stored_why",
+          found: true,
+          details: extractWhyDetails(record as never),
+          report: formatWhyReport(record as never, hit?.scoreBreakdown),
+          semanticType: (record as { semanticType?: string }).semanticType,
+          scoreBreakdown: hit?.scoreBreakdown,
+        };
+      },
+    });
+  }
+
+  // Always register discover against the full registry snapshot
+  const discoverTool: McpMemoryTool = {
+    name: "memory_tools_discover",
+    description:
+      "List MCP memory tools hidden by the current MENGSHU_MCP_TOOL_MODE. Use mode=full to advertise all tools in ListTools.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        includeAdvertised: {
+          type: "boolean",
+          description: "When true, also list tools already advertised in ListTools.",
+        },
+      },
+      additionalProperties: false,
+    },
+    execute: async (input) => {
+      const includeAdvertised = input.includeAdvertised === true;
+      const hidden = listHiddenToolDescriptors(allTools, mode);
+      const advertised = filterToolsByMode(allTools, mode).map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+      }));
+      return {
+        mode,
+        advertisedCount: advertised.length,
+        hiddenCount: hidden.length,
+        hidden,
+        ...(includeAdvertised ? { advertised } : {}),
+        hint: mode === "full"
+          ? "All registered tools are already advertised."
+          : "Set MENGSHU_MCP_TOOL_MODE=full to advertise every tool in ListTools. Hidden tools remain callable by exact name.",
+      };
+    },
+  };
+  const withoutDiscover = allTools.filter((tool) => tool.name !== "memory_tools_discover");
+  withoutDiscover.push(discoverTool);
+
+  // Advertise-only filter happens in ListTools (buildListToolsResult / listToolsForMode).
+  // The registry stays complete so exact-name CallTool still works in default/minimal.
+  void mode;
+  return withoutDiscover;
+}
+
 export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryTool[] {
   if (!options.authority && options.unsafeLegacyScope !== true) {
     throw new Error("MCP authority is required; unsafeLegacyScope is test-only and deprecated");
@@ -1116,7 +1300,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
   }
 
   if (!options.agentFastPath) {
-    return [
+    return applyMcpToolFacade([
       ...baseTools,
       ...(options.memoryAssets
         ? buildMemoryAssetTools(options.memoryAssets, mergeScope, requestScopeSchema)
@@ -1127,7 +1311,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
       ...(options.sessionReceipts
         ? buildMemorySessionTools(options.sessionReceipts, options, mergeScope)
         : []),
-    ];
+    ], options, mergeScope, requestScopeSchema);
   }
 
   const fastPath = options.agentFastPath;
@@ -1268,7 +1452,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     },
   ];
 
-  return [
+  return applyMcpToolFacade([
     ...baseTools,
     ...fastPathTools,
     ...(options.memoryAssets
@@ -1280,7 +1464,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     ...(options.sessionReceipts
       ? buildMemorySessionTools(options.sessionReceipts, options, mergeScope)
       : []),
-  ];
+  ], options, mergeScope, requestScopeSchema);
 }
 
 function exactToolInput(
@@ -2236,4 +2420,23 @@ function buildMemoryAssetTools(
     });
   }
   return tools;
+}
+
+export {
+  resolveMcpToolMode,
+  resolveMcpToolModeFromEnv,
+  filterToolsByMode,
+  type McpToolMode,
+} from "./tool-mode.js";
+
+/** ListTools facade: filter by mode without removing CallTool registry entries. */
+export function listToolsForMode(
+  tools: readonly McpMemoryTool[],
+  mode?: McpToolMode | string | null,
+): McpMemoryTool[] {
+  const resolved = resolveMcpToolMode(
+    typeof mode === "string" || mode == null ? mode : undefined,
+    resolveMcpToolModeFromEnv(),
+  );
+  return filterToolsByMode(tools, resolved);
 }
