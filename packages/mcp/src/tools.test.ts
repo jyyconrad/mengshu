@@ -12,7 +12,8 @@ import type { AuthorityScope } from "../../core/src/domain/authority-scope.js";
 import type { AgentObserveLightRequest } from "../../api/src/agent-fast-path/index.js";
 import { createAuthorityScopedForgetCapability } from "../../core/src/service/authority-forget-capability.js";
 import { PostgresForgetTransactionPort } from "../../core/src/db/providers/postgres-forget-transaction.js";
-import { createMcpMemoryTools } from "./tools.js";
+import { createMcpMemoryTools, listToolsForMode } from "./tools.js";
+import { InMemoryAdmissionDecisionReceiptRepository } from "../../core/src/lifecycle/admission-decision-receipt.js";
 import type { MemoryWriteCommand } from "../../core/src/service/write-kernel.js";
 import { computeRecallScoreBreakdown } from "../../../core/recall-scoring.js";
 
@@ -791,6 +792,7 @@ describe("MCP memory tools", () => {
 
     await expect(byName.memory_recall.execute({ query: "concise", raw: true })).resolves.toEqual({
       query: "concise",
+      recallStatus: "ok",
       hits: [
         {
           text: "User prefers concise replies",
@@ -1789,5 +1791,188 @@ describe("MCP memory tools", () => {
         );
       }
     });
+  });
+
+  test("default List is the realtime sequence and omits scan, ingest, and batch tools", () => {
+    const fastPath = {
+      async context() { return { scope, slots: {}, content: "" }; },
+      async observeLight() { return { ack: true as const, traceId: "t", queuedJobs: [] }; },
+      async lookup() { return { hits: [], telemetry: { latencyMs: 1, mode: "fast" as const } }; },
+      async navigate() { return { ref: "memory-1", items: [] }; },
+      async evidenceRead() { return { evidence: [] }; },
+    };
+    const tools = createMcpMemoryTools({
+      unsafeLegacyScope: true,
+      service: new FakeMemoryService(),
+      agentFastPath: fastPath as never,
+    });
+    expect(listToolsForMode(tools, "default").map((tool) => tool.name)).toEqual([
+      "memory_context_fast",
+      "memory_recall",
+      "memory_lookup",
+      "memory_observe",
+      "memory_save",
+      "memory_observe_light",
+      "memory_explain",
+      "memory_health",
+      "memory_namespaces",
+      "memory_tools_discover",
+    ]);
+    const hidden = listToolsForMode(tools, "full").map((tool) => tool.name);
+    expect(hidden).toEqual(expect.arrayContaining([
+      "memory_ingest",
+      "memory_navigate",
+      "memory_evidence_read",
+      "memory_context",
+    ]));
+  });
+
+  test("memory_recall distinguishes ok-empty, authority-filtered, and not-ready", async () => {
+    const service = new FakeMemoryService();
+    service.recall = (async () => ({
+      scope,
+      query: "missing",
+      hits: [],
+    })) as unknown as typeof service.recall;
+    const recall = () => createMcpMemoryTools({
+      unsafeLegacyScope: true,
+      service,
+    }).find((tool) => tool.name === "memory_recall")!;
+
+    await expect(recall().execute({ query: "missing" })).resolves.toMatchObject({
+      recallStatus: "ok-empty",
+      hits: [],
+      query: "missing",
+    });
+
+    service.recall = (async () => ({
+      scope,
+      query: "blocked",
+      hits: [],
+      filtered: [{
+        candidateId: "tree:hidden",
+        authoritativeRecordId: "memory-hidden",
+        source: "tree" as const,
+        filteredReason: "authority_mismatch" as const,
+      }],
+    })) as unknown as typeof service.recall;
+    const filtered = await recall().execute({ query: "blocked" });
+    expect(filtered).toMatchObject({
+      recallStatus: "authority-filtered",
+      hits: [],
+    });
+    expect(JSON.stringify(filtered)).not.toContain("User prefers concise replies");
+
+    service.health = vi.fn(async () => ({ ok: false, records: 0 }));
+    await expect(recall().execute({ query: "blocked" })).resolves.toMatchObject({
+      recallStatus: "not-ready",
+      hits: [],
+    });
+
+    service.health = vi.fn(async () => { throw new Error("db down"); });
+    service.recall = (async () => {
+      throw Object.assign(new Error("postgres unavailable"), { code: "SERVICE_UNAVAILABLE" });
+    }) as unknown as typeof service.recall;
+    await expect(recall().execute({ query: "down" })).resolves.toMatchObject({
+      recallStatus: "not-ready",
+      hits: [],
+      query: "down",
+    });
+  });
+
+  test("memory_lookup reports ok-empty without treating it as a hit", async () => {
+    const fastPath = {
+      async context() { return { scope, slots: {}, content: "" }; },
+      async observeLight() { return { ack: true as const, traceId: "t", queuedJobs: [] }; },
+      async lookup() { return { hits: [], telemetry: { latencyMs: 1, mode: "fast" as const } }; },
+    };
+    const lookup = createMcpMemoryTools({
+      unsafeLegacyScope: true,
+      service: new FakeMemoryService(),
+      agentFastPath: fastPath as never,
+    }).find((tool) => tool.name === "memory_lookup")!;
+
+    await expect(lookup.execute({ scope, query: "none" })).resolves.toMatchObject({
+      recallStatus: "ok-empty",
+      hits: [],
+    });
+  });
+
+  test("memory_explain reads lastDecision and does not block the next tool call", async () => {
+    const service = new FakeMemoryService();
+    const store = new InMemoryAdmissionDecisionReceiptRepository();
+    const explain = createMcpMemoryTools({
+      service,
+      authority: transportAuthority,
+      defaultScope: {
+        tenantId: "server-tenant",
+        userId: "server-user",
+        appId: "mengshu",
+        projectId: "project-1",
+        agentId: "agent-1",
+        namespace: "memories",
+        visibility: "private",
+      },
+      admissionDecisionReceipts: store,
+    }).find((tool) => tool.name === "memory_explain")!;
+
+    const dryRun = await explain.execute({
+      candidate: { text: "short", semanticType: "rules" },
+    }) as { kind: string; reasonCodes: string[]; candidateHash: string; outcome: string };
+    expect(dryRun.kind).toBe("admission_dry_run");
+    expect(dryRun.outcome).toBe("rejected");
+    expect(dryRun.reasonCodes.some((code) => code.includes("text_too_short"))).toBe(true);
+
+    const latest = await explain.execute({ lastDecision: true }) as {
+      found: boolean;
+      reasonCodes: string[];
+      receipt: { decision: string; reasonCodes: string[] };
+    };
+    expect(latest.found).toBe(true);
+    expect(latest.receipt.decision).toBe("rejected");
+    expect(latest.reasonCodes).toEqual(latest.receipt.reasonCodes);
+
+    const byHash = await explain.execute({ candidateHash: dryRun.candidateHash }) as {
+      found: boolean;
+      receipt: { candidateHash: string };
+    };
+    expect(byHash.found).toBe(true);
+    expect(byHash.receipt.candidateHash).toBe(dryRun.candidateHash);
+
+    const flaky = {
+      async append() { throw new Error("receipt primary down"); },
+      async getLatest() { throw new Error("receipt read down"); },
+      async getByCandidateHash() { throw new Error("receipt read down"); },
+    };
+    const tools = createMcpMemoryTools({
+      service,
+      authority: transportAuthority,
+      defaultScope: {
+        tenantId: "server-tenant",
+        userId: "server-user",
+        appId: "mengshu",
+        projectId: "project-1",
+        agentId: "agent-1",
+        namespace: "memories",
+        visibility: "private",
+      },
+      admissionDecisionReceipts: flaky,
+    });
+    const flakyExplain = tools.find((tool) => tool.name === "memory_explain")!;
+    const continued = await flakyExplain.execute({
+      candidate: {
+        text: "在这个仓库里合并前必须先跑完整 vitest，不要跳过。",
+        semanticType: "rules",
+      },
+    }) as { kind: string; reasonCodes: string[] };
+    expect(continued.kind).toBe("admission_dry_run");
+    expect(continued.reasonCodes.length).toBeGreaterThan(0);
+    await expect(flakyExplain.execute({ lastDecision: true })).resolves.toMatchObject({
+      kind: "admission_decision_receipt",
+      found: false,
+      reasonCodes: ["admission_receipt_read_failed"],
+    });
+    const recall = tools.find((tool) => tool.name === "memory_recall")!;
+    await expect(recall.execute({ query: "concise" })).resolves.toContain("User prefers concise replies");
   });
 });

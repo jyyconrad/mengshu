@@ -27,17 +27,19 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 |------|------|------|
 | 1 | `memory_context_fast` | 任务启动拉 **5 槽位**上下文（优先） |
 | 2 | `memory_recall` / `memory_lookup` | 槽位不够时按查询深挖 |
-| 3 | `memory_explain` | 已存 why / 候选 dry-run / **`lastDecision` 落库收据** |
-| 4 | `memory_save` / `memory_observe` | 确认后的 governed 写入（须带 `semanticType`） |
+| 3 | `memory_save` / `memory_observe` | 确认后的 governed 写入（须带 `semanticType`） |
+| 4 | `memory_explain` | 争议或被拒时：已存 why / 候选 dry-run / **`lastDecision` 落库收据** |
 | 5 | `memory_observe_light` | 运行中轻量观察 / 证据（异步抽候选；非直接当事实） |
 | 6 | `memory_forget` | 用户明确要求撤销/归档/删除时（须 `idempotencyKey`） |
 | — | `memory_health` / `memory_namespaces` | 探活与命名空间 |
 | — | `memory_tools_discover` | 列出当前 mode 未广告的工具 |
 
+目录扫盘、evolve、ingest、working set 不在 default List。目录入库用 CLI `ms scan`。Skill artifact 只在 discover/full 列出，没有可执行 runner。
+
 **推荐启动序列**
 
 1. `memory_context_fast`（`task` = 当前任务一句话）  
-2. 若某槽为空且任务确实需要该类信息 → `memory_recall` / `memory_lookup`  
+2. 若某槽为空且任务确实需要该类信息 → `memory_recall` / `memory_lookup`。空结果看 `recallStatus`：`ok-empty` / `authority-filtered` / `not-ready`，都不要编造记忆。  
 3. 仅当信息已验证或用户明示保存 → `memory_save` / `memory_observe`（带 5type）  
 4. 写入被拒或用户质疑 → `memory_explain`
 

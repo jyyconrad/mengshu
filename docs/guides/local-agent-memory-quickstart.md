@@ -56,8 +56,9 @@ Skill name：`mengshu`。Codex 插件包装：`plugins/codex/skills/mengshu-memo
 ## 5. Agent 最小闭环
 
 1. `memory_context_fast` — 确认五槽 key 都在（空槽 `nodeCount=0` 正常）。  
-2. 需要写入时带 `semanticType`（五选一）。  
-3. 被拒时用 `memory_explain`（候选 dry-run 或已存 why），不要编造。
+2. 槽位不够时 `memory_recall` / `memory_lookup`。空结果看 `recallStatus`：`ok-empty`（确实没有）、`authority-filtered`（被治理滤空）、`not-ready`（服务未就绪）。三种都不要编造记忆。目录扫盘用 CLI `ms scan`。  
+3. 需要写入时 `memory_observe` / `memory_save`，带 `semanticType`（五选一）。  
+4. 被拒或用户质疑时 `memory_explain`（`lastDecision`、`candidateHash` 或候选 dry-run），不要编造。
 
 ## 6. LanceDB-only：哪些治理 fail-closed
 

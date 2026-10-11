@@ -16,19 +16,23 @@ export interface McpToolDescriptor {
   description: string;
 }
 
-/** Curated default surface for coding/work Agents. */
+/**
+ * Realtime default surface, in the Agent usage order:
+ * context_fast → recall/lookup → observe/save → explain.
+ * Scan, evolve, ingest, working-set, and skill mutation tools stay off this list.
+ */
 export const MCP_DEFAULT_TOOL_NAMES: readonly string[] = [
   "memory_context_fast",
   "memory_recall",
-  "memory_save",
-  "memory_observe",
-  "memory_observe_light",
-  "memory_forget",
   "memory_lookup",
+  "memory_observe",
+  "memory_save",
+  "memory_observe_light",
   "memory_explain",
-  "memory_tools_discover",
+  "memory_forget",
   "memory_health",
   "memory_namespaces",
+  "memory_tools_discover",
 ] as const;
 
 export const MCP_MINIMAL_TOOL_NAMES: readonly string[] = [
@@ -63,10 +67,14 @@ export function filterToolsByMode<T extends McpToolDescriptor>(
   if (mode === "full") {
     return [...tools];
   }
-  const allow = new Set(mode === "minimal" ? MCP_MINIMAL_TOOL_NAMES : MCP_DEFAULT_TOOL_NAMES);
+  const ordered = mode === "minimal" ? MCP_MINIMAL_TOOL_NAMES : MCP_DEFAULT_TOOL_NAMES;
+  const allow = new Set<string>(ordered);
   allow.add("memory_tools_discover");
   allow.add("memory_health");
-  return tools.filter((tool) => allow.has(tool.name));
+  const rank = new Map(ordered.map((name, index) => [name, index]));
+  return tools
+    .filter((tool) => allow.has(tool.name))
+    .sort((left, right) => (rank.get(left.name) ?? 1_000) - (rank.get(right.name) ?? 1_000));
 }
 
 export function listHiddenToolDescriptors(

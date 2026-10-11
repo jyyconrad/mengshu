@@ -108,6 +108,12 @@ import {
   resolveMcpToolModeFromEnv,
   type McpToolMode,
 } from "./tool-mode.js";
+import {
+  classifyRecallAvailability,
+  isRecallServiceUnavailable,
+  recallStatusMessage,
+  type RecallAvailabilityStatus,
+} from "./recall-status.js";
 
 
 /** JSON Schema 对象（MCP inputSchema 形态，保持宽松类型） */
@@ -677,6 +683,62 @@ function formatRecallBreakdown(breakdown: CompleteRecallScoreBreakdown): string 
   ].join("\n");
 }
 
+function usableRecallHitCount(result: RecallResult): number {
+  return result.hits.filter((hit) => recallHitText(hit).trim().length > 0).length;
+}
+
+async function probeRecallServiceReady(
+  service: { health(): Promise<{ ok?: boolean }> },
+): Promise<boolean> {
+  try {
+    const health = await service.health();
+    return health?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+function emptyRecallPayload(input: {
+  query: string;
+  recallStatus: Exclude<RecallAvailabilityStatus, "ok">;
+  filtered?: RecallResult["filtered"];
+}): Record<string, unknown> {
+  return {
+    recallStatus: input.recallStatus,
+    query: input.query,
+    hits: [],
+    message: recallStatusMessage(input.recallStatus),
+    ...(input.filtered === undefined ? {} : { filtered: input.filtered }),
+  };
+}
+
+async function presentRecallResult(
+  service: { health(): Promise<{ ok?: boolean }> },
+  result: RecallResult,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const usableHitCount = usableRecallHitCount(result);
+  const serviceReady = usableHitCount > 0
+    ? true
+    : await probeRecallServiceReady(service);
+  const recallStatus = classifyRecallAvailability({
+    usableHitCount,
+    filteredReasons: (result.filtered ?? []).map((item) => item.filteredReason),
+    serviceReady,
+  });
+  if (recallStatus !== "ok") {
+    return emptyRecallPayload({
+      query: result.query,
+      recallStatus,
+      filtered: result.filtered,
+    });
+  }
+  if (isRawRecallRequested(input)) {
+    return { ...formatRecallAsRaw(result, input), recallStatus: "ok" as const };
+  }
+  return formatRecallAsText(result, input);
+}
+
 function formatRecallAsRaw(
   result: RecallResult,
   input: Record<string, unknown>,
@@ -897,17 +959,27 @@ function applyMcpToolFacade(
               note: "LanceDB-only or store not wired; no durable last-decision.",
             };
           }
-          const receipt = typeof input.candidateHash === "string" && input.candidateHash.trim()
-            ? await store.getByCandidateHash(scope as never, input.candidateHash.trim())
-            : await store.getLatest(scope as never);
-          return {
-            kind: "admission_decision_receipt",
-            found: receipt !== undefined,
-            receipt: receipt ?? null,
-            reasonCodes: receipt
-              ? [...receipt.reasonCodes]
-              : ["admission_receipt_not_found"],
-          };
+          try {
+            const receipt = typeof input.candidateHash === "string" && input.candidateHash.trim()
+              ? await store.getByCandidateHash(scope as never, input.candidateHash.trim())
+              : await store.getLatest(scope as never);
+            return {
+              kind: "admission_decision_receipt",
+              found: receipt !== undefined,
+              receipt: receipt ?? null,
+              reasonCodes: receipt
+                ? [...receipt.reasonCodes]
+                : ["admission_receipt_not_found"],
+            };
+          } catch {
+            return {
+              kind: "admission_decision_receipt",
+              found: false,
+              receipt: null,
+              reasonCodes: ["admission_receipt_read_failed"],
+              note: "Receipt read failed; continue the turn without inventing a decision.",
+            };
+          }
         }
         const candidate = input.candidate;
         if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
@@ -1045,8 +1117,8 @@ function applyMcpToolFacade(
         hidden,
         ...(includeAdvertised ? { advertised } : {}),
         hint: mode === "full"
-          ? "All registered tools are already advertised."
-          : "Set MENGSHU_MCP_TOOL_MODE=full to advertise every tool in ListTools. Hidden tools remain callable by exact name.",
+          ? "All registered tools are already advertised. Directory ingest belongs to CLI `ms scan`, not the realtime loop. Skill tools are not an executable runner."
+          : "Default List is realtime only: context_fast → recall/lookup → observe/save → explain. Directory ingest: `ms scan`. Set MENGSHU_MCP_TOOL_MODE=full to advertise batch tools. Hidden tools remain callable by exact name. Skill tools are not an executable runner.",
       };
     },
   };
@@ -1183,14 +1255,18 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     {
       name: "memory_recall",
       description:
-        "Recall relevant memories as concise Markdown, or raw structured hits with the complete six-factor score breakdown.",
+        "Recall relevant memories as concise Markdown, or raw structured hits with the complete six-factor score breakdown. Empty results are JSON with recallStatus ok-empty, authority-filtered, or not-ready; do not invent memories. Directory scan is CLI `ms scan`, not this tool.",
       inputSchema: recallToolInputSchema,
       execute: async (input) => {
         const merged = { ...input, scope: mergeScope(input.scope as Record<string, unknown> | undefined) };
-        const result = await options.service.recall(merged as unknown as RecallInput);
-        return isRawRecallRequested(input)
-          ? formatRecallAsRaw(result, input)
-          : formatRecallAsText(result, input);
+        const query = typeof input.query === "string" ? input.query : "";
+        try {
+          const result = await options.service.recall(merged as unknown as RecallInput);
+          return presentRecallResult(options.service, result, input);
+        } catch (error) {
+          if (!isRecallServiceUnavailable(error)) throw error;
+          return emptyRecallPayload({ query, recallStatus: "not-ready" });
+        }
       },
     },
     {
@@ -1452,7 +1528,8 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     },
     {
       name: "memory_lookup",
-      description: "On-demand fast lookup during a running task.",
+      description:
+        "On-demand fast lookup during a running task. Empty hits include recallStatus ok-empty, authority-filtered, or not-ready; do not invent memories.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1475,9 +1552,34 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
       },
       execute: async (input) => {
         const merged = { ...input, scope: mergeScope(input.scope as Record<string, unknown> | undefined) };
-        return validateAgentLookupResult(
-          await fastPath.lookup(merged as unknown as AgentLookupRequest),
-        );
+        const query = typeof input.query === "string" ? input.query : "";
+        try {
+          const result = validateAgentLookupResult(
+            await fastPath.lookup(merged as unknown as AgentLookupRequest),
+          );
+          const hits = Array.isArray(result.hits) ? result.hits : [];
+          const filtered = "filtered" in result
+            ? (result as { filtered?: RecallResult["filtered"] }).filtered
+            : undefined;
+          const serviceReady = hits.length > 0
+            ? true
+            : await probeRecallServiceReady(options.service);
+          const recallStatus = classifyRecallAvailability({
+            usableHitCount: hits.length,
+            filteredReasons: (filtered ?? []).map((item) => item.filteredReason),
+            serviceReady,
+          });
+          if (recallStatus !== "ok") {
+            return {
+              ...emptyRecallPayload({ query, recallStatus, filtered }),
+              telemetry: result.telemetry,
+            };
+          }
+          return { ...result, recallStatus: "ok" as const };
+        } catch (error) {
+          if (!isRecallServiceUnavailable(error)) throw error;
+          return emptyRecallPayload({ query, recallStatus: "not-ready" });
+        }
       },
     },
     {

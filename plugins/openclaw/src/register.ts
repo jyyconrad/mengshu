@@ -294,7 +294,7 @@ function registerOpenClawTools(
       name: "memory_scan_directory",
       label: "Memory Scan Directory",
       description:
-        "Scan a directory of Markdown files and add them to memory. Automatically handles duplicates and slices large files.",
+        "Batch-scan a Markdown directory into memory. Not a realtime default tool; prefer CLI `ms scan` for directory ingest. Automatically handles duplicates and slices large files.",
       parameters: Type.Object({
         directory: Type.String({ description: "Directory path to scan" }),
         ignorePaths: Type.Optional(Type.Array(Type.String(), { description: "Additional paths to ignore" })),
