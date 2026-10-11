@@ -210,7 +210,7 @@ npx vitest run packages/mcp/src/tools.test.ts
 - [x] P0 代码提交到实现分支（不 push）  
 - [x] `.agents/skills/mengshu/SKILL.md` 达到 §6 合同  
 - [x] 上表聚焦测试通过（authority 竞态旧测 1 条 flaky/无关，见报告）  
-- [ ] 报告：实现 vs 延期、五槽如何强制、残留风险  
+- [x] 报告：实现 vs 延期、五槽如何强制、残留风险（2026-10-11 15:07 经聚焦单测复验后向 parent 交付）  
 
 ---
 
@@ -220,4 +220,12 @@ npx vitest run packages/mcp/src/tools.test.ts
 2. ~~用法 Skill~~（Grok@Mac CLI 可找到但单轮无输出；本地定稿）
 3. ~~P0 代码与单测~~
 4. ~~compose + quickstart~~
-5. 提交 + 向 parent 报告  
+5. 提交 + 向 parent 报告
+
+## 11. P0 验收报告（2026-10-11）
+
+- **实现**：P0-1~P0-5 均已合入 `maintain/upgrade-local-agent-memory-20261011` @ `eaef4dc`（Skill / MCP default 门面 / 五槽连续性 / memory_explain / compose+quickstart）。
+- **延期（P1）**：会话钩子、admission 收据落库、README 拦下 vs 通过对照、CI + npm/`v1.0.7` tag。
+- **五槽如何强制**：`SlotContextBuilder` 返回前调用 `ensureFiveSlots`；空槽 `nodeCount=0` + `empty_slot:<reason>`；`packSlotsToPrompt` 仍跳过空槽。
+- **残留风险**：按 L8 未 push；LanceDB-only 治理 capability 仍 fail-closed；与本轮无关的 authority 竞态旧测可能 flaky。
+- **复验（本 wake）**：聚焦 vitest 6 个文件共 158 tests passed；工作树干净（已丢弃无关 package-lock optional peer 噪声）。
