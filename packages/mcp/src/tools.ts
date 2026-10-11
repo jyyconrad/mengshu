@@ -94,6 +94,12 @@ import type {
 import type { AppendMemoryPolicyOverlayInput, MemoryPolicyLayer } from
   "../../core/src/policy/types.js";
 import { explainAdmissionCandidate } from "../../core/src/lifecycle/admission-explain.js";
+import {
+  computeAdmissionCandidateHash,
+  createAdmissionDecisionReceipt,
+  recordAdmissionDecisionBestEffort,
+  type AdmissionDecisionReceiptRepository,
+} from "../../core/src/lifecycle/admission-decision-receipt.js";
 import { extractWhyDetails, formatWhyReport } from "../../../plugins/openclaw/src/cli/why.js";
 import {
   filterToolsByMode,
@@ -196,6 +202,8 @@ export interface McpMemoryToolsOptions {
   knowledgeResources?: MemoryKnowledgeResourceCapability;
   /** Persisted final assembly receipts. The tool is not advertised when absent. */
   sessionReceipts?: MemorySessionReceiptCapability;
+  /** P1 admission decision receipts (last accept/reject). */
+  admissionDecisionReceipts?: AdmissionDecisionReceiptRepository;
   temporalMemory?: MemoryTemporalCapability;
   sessionWorkingSet?: MemoryWorkingSetCapability;
   sessionWorkingSetBridge?: MemoryWorkingSetBridgeCapability;
@@ -835,16 +843,24 @@ function applyMcpToolFacade(
     allTools.push({
       name: "memory_explain",
       description:
-        "Explain a stored memory (why/provenance/score) or dry-run admission for a 5type candidate draft. Does not invent memories.",
+        "Explain a stored memory (why), dry-run admission for a 5type candidate, or read the last persisted admission decision receipt. Does not invent memories.",
       inputSchema: {
         type: "object",
         properties: {
           scope: requestScopeSchema,
           memoryId: { type: "string", description: "Stored memory id to explain (ms why)." },
           query: { type: "string", description: "Fallback recall query when memoryId is omitted." },
+          lastDecision: {
+            type: "boolean",
+            description: "When true, return the latest persisted admission decision receipt for the scope.",
+          },
+          candidateHash: {
+            type: "string",
+            description: "Lookup a persisted admission decision receipt by candidate hash.",
+          },
           candidate: {
             type: "object",
-            description: "Dry-run admission for a candidate draft (validator + admission).",
+            description: "Dry-run admission for a candidate draft (validator + admission); also records a receipt when the store is available.",
             properties: {
               text: { type: "string", minLength: 1 },
               semanticType: {
@@ -864,9 +880,34 @@ function applyMcpToolFacade(
         additionalProperties: false,
       },
       execute: async (input) => {
-        const allowed = new Set(["scope", "memoryId", "query", "candidate"]);
+        const allowed = new Set([
+          "scope", "memoryId", "query", "candidate", "lastDecision", "candidateHash",
+        ]);
         if (Reflect.ownKeys(input).some((key) => typeof key !== "string" || !allowed.has(key))) {
           throw new McpInvalidRequestError("memory_explain input is invalid");
+        }
+        const scope = mergeScope(input.scope as Record<string, unknown> | undefined);
+        if (input.lastDecision === true || typeof input.candidateHash === "string") {
+          const store = options.admissionDecisionReceipts;
+          if (!store) {
+            return {
+              kind: "admission_decision_receipt",
+              found: false,
+              reasonCodes: ["admission_receipt_store_unavailable"],
+              note: "LanceDB-only or store not wired; no durable last-decision.",
+            };
+          }
+          const receipt = typeof input.candidateHash === "string" && input.candidateHash.trim()
+            ? await store.getByCandidateHash(scope as never, input.candidateHash.trim())
+            : await store.getLatest(scope as never);
+          return {
+            kind: "admission_decision_receipt",
+            found: receipt !== undefined,
+            receipt: receipt ?? null,
+            reasonCodes: receipt
+              ? [...receipt.reasonCodes]
+              : ["admission_receipt_not_found"],
+          };
         }
         const candidate = input.candidate;
         if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
@@ -877,9 +918,10 @@ function applyMcpToolFacade(
           if (!MEMORY_SEMANTIC_TYPES.has(draft.semanticType as MemorySemanticType)) {
             throw new McpInvalidRequestError("memory_explain candidate.semanticType must be a 5type value");
           }
+          const semanticType = draft.semanticType as MemorySemanticType;
           const explained = explainAdmissionCandidate({
             text: draft.text,
-            semanticType: draft.semanticType as MemorySemanticType,
+            semanticType,
             profileDimension: typeof draft.profileDimension === "string" ? draft.profileDimension : undefined,
             salience: typeof draft.salience === "number" ? draft.salience : undefined,
             temporality: draft.temporality === "ephemeral" || draft.temporality === "persistent"
@@ -888,9 +930,40 @@ function applyMcpToolFacade(
             intent: typeof draft.intent === "string" ? draft.intent : "auto",
             hasConflict: draft.hasConflict === true,
           });
+          const decision = explained.outcome === "rejected" ? "rejected" as const : "accepted" as const;
+          const receipt = createAdmissionDecisionReceipt({
+            scope: scope as never,
+            text: draft.text,
+            semanticType,
+            decision,
+            reasonCodes: explained.reasonCodes,
+            source: "explain_dry_run",
+            ...(explained.outcome === "routed" ? { route: explained.admission.route } : {}),
+            ...(explained.outcome === "rejected"
+              ? { rejectedReason: explained.rejectedReason }
+              : {}),
+            profileDimension: typeof draft.profileDimension === "string" ? draft.profileDimension : undefined,
+            temporality: draft.temporality === "ephemeral" || draft.temporality === "persistent"
+              ? draft.temporality
+              : undefined,
+          });
+          await recordAdmissionDecisionBestEffort(
+            options.admissionDecisionReceipts,
+            scope as never,
+            receipt,
+          );
           return {
             kind: "admission_dry_run",
             ...explained,
+            candidateHash: computeAdmissionCandidateHash({
+              text: draft.text,
+              semanticType,
+              temporality: draft.temporality === "ephemeral" || draft.temporality === "persistent"
+                ? draft.temporality
+                : undefined,
+              profileDimension: typeof draft.profileDimension === "string" ? draft.profileDimension : undefined,
+            }),
+            receiptId: receipt.id,
             admission: explained.admission
               ? {
                   route: explained.admission.route,
@@ -909,10 +982,9 @@ function applyMcpToolFacade(
             : "";
         if (!target) {
           throw new McpInvalidRequestError(
-            "memory_explain requires memoryId, query, or candidate",
+            "memory_explain requires memoryId, query, candidate, lastDecision, or candidateHash",
           );
         }
-        const scope = mergeScope(input.scope as Record<string, unknown> | undefined);
         const result = await options.service.recall({
           query: target,
           scope,

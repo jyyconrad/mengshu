@@ -265,6 +265,11 @@ import {
   type PostgresContextAssemblyReceiptQueryClient,
 } from "../../context/postgres-assembly-receipt.js";
 import {
+  PostgresAdmissionDecisionReceiptRepository,
+  type PostgresAdmissionDecisionReceiptQueryClient,
+} from "../../lifecycle/postgres-admission-decision-receipt.js";
+
+import {
   PostgresTemporalMemoryRepository,
   type PostgresTemporalMemoryClient,
   type PostgresTemporalMemoryPool,
@@ -1966,6 +1971,19 @@ FROM "${table}"`);
       },
     };
     return new PostgresContextAssemblyReceiptRepository(client);
+  }
+
+  /** v39 admission decision receipts for explain / last-decision. */
+  createAdmissionDecisionReceiptRepository(): PostgresAdmissionDecisionReceiptRepository {
+    const client: PostgresAdmissionDecisionReceiptQueryClient = {
+      query: async (sql: string, params: readonly unknown[] = []) => {
+        await this.initialize();
+        this.assertSchemaVersion(39, "Admission decision receipt repository");
+        const result = await this.pool!.query(sql, [...params]);
+        return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+      },
+    };
+    return new PostgresAdmissionDecisionReceiptRepository(client);
   }
 
   /**

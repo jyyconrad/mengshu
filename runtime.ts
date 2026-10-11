@@ -76,6 +76,11 @@ import {
 import { decideAdmissionWithBreakdown } from
   "./packages/core/src/lifecycle/admission-decision.js";
 import {
+  CompositeAdmissionDecisionReceiptRepository,
+  InMemoryAdmissionDecisionReceiptRepository,
+  type AdmissionDecisionReceiptRepository,
+} from "./packages/core/src/lifecycle/admission-decision-receipt.js";
+import {
   computeCandidateMaximumSimilarity,
   evaluateCandidateDedup,
   type CandidateDedupComparable,
@@ -313,6 +318,8 @@ export interface MengshuRuntime {
   knowledgeResources?: KnowledgeResourceCapability;
   /** F1 durable session assembly explain capability; PostgreSQL schema v22+. */
   contextAssemblyReceipts?: ContextAssemblyReceiptRepository;
+  /** P1 admission decision receipts (Postgres v39+ primary; in-memory always). */
+  admissionDecisionReceipts?: AdmissionDecisionReceiptRepository;
   /** M1 exact-private temporal version/history facade; feature-off by default. */
   memoryEvolution?: MemoryEvolutionService;
   /** M2 exact-session Working Set facade; feature-off by default. */
@@ -844,6 +851,20 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
       db instanceof PostgresProvider
     ? db.createContextAssemblyReceiptRepository()
     : undefined;
+  const admissionDecisionReceiptMirror = new InMemoryAdmissionDecisionReceiptRepository();
+  let admissionDecisionReceipts: AdmissionDecisionReceiptRepository = admissionDecisionReceiptMirror;
+  if (options.config.dbType === "postgres" && db instanceof PostgresProvider) {
+    try {
+      const primary = db.createAdmissionDecisionReceiptRepository();
+      admissionDecisionReceipts = new CompositeAdmissionDecisionReceiptRepository(
+        primary,
+        admissionDecisionReceiptMirror,
+      );
+    } catch {
+      // Schema <39 or capability unavailable: keep in-memory last-decision only.
+      admissionDecisionReceipts = admissionDecisionReceiptMirror;
+    }
+  }
   const knowledgeResources = options.config.dbType === "postgres" &&
       db instanceof PostgresProvider
     ? db.createKnowledgeResourceCapability()
@@ -1352,6 +1373,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
   const memoryWriteKernel = memoryWriteKernelTransactions
     ? new MemoryWriteKernel({
         ...createMemoryWriteDependencies(),
+        admissionDecisionReceipts,
         transaction: (work) => memoryWriteKernelTransactions.transaction(work),
       })
     : undefined;
@@ -1549,6 +1571,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         maintenanceHost: { activity: evolutionActivity!, backgroundMode: () => backgroundWork?.snapshot().mode ?? "paused" },
         kernelDependencies: (verified) => ({
           ...createMemoryWriteDependencies(verified),
+          admissionDecisionReceipts,
           // Raw imports and canonical writes request selectors; identity remains host-owned.
           resolveAuthority: ({ serverAuthority, clientScope }) =>
             Object.freeze(resolveAuthorityScope(serverAuthority as AuthorityScope, clientScope)),
@@ -2217,6 +2240,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     ...(agentLoadouts ? { agentLoadouts } : {}),
     ...(knowledgeResources ? { knowledgeResources } : {}),
     ...(contextAssemblyReceipts ? { contextAssemblyReceipts } : {}),
+    admissionDecisionReceipts,
     ...(memoryEvolution ? { memoryEvolution } : {}),
     ...(continuousEvolutionRuntime ? { continuousMemoryEvolution: continuousEvolutionRuntime.capability } : {}),
     ...(sessionWorkingSet ? { sessionWorkingSet } : {}),

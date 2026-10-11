@@ -27,7 +27,7 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 |------|------|------|
 | 1 | `memory_context_fast` | 任务启动拉 **5 槽位**上下文（优先） |
 | 2 | `memory_recall` / `memory_lookup` | 槽位不够时按查询深挖 |
-| 3 | `memory_explain` | 解释已存记忆，或对候选做准入 **dry-run** |
+| 3 | `memory_explain` | 已存 why / 候选 dry-run / **`lastDecision` 落库收据** |
 | 4 | `memory_save` / `memory_observe` | 确认后的 governed 写入（须带 `semanticType`） |
 | 5 | `memory_observe_light` | 运行中轻量观察 / 证据（异步抽候选；非直接当事实） |
 | 6 | `memory_forget` | 用户明确要求撤销/归档/删除时（须 `idempotencyKey`） |
@@ -73,6 +73,17 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 - 禁止为「显得有记性」而写入密钥、token、隐私、一次性构建日志。  
 - 禁止在无 authority / 用户未授权时擅自 `ms init` 扩大范围或绕过 fail-closed。  
 - 禁止假设 LanceDB-only 拥有与 Postgres 同等的治理 capability。
+
+## 会话 / Compact 钩子（推荐触发）
+
+| 时机 | 动作 |
+|------|------|
+| 开任务 / 会话开始 | `memory_context_fast` |
+| 宿主即将压缩长上下文 | 仅 flush 已验证 5type → `memory_observe` / `memory_save` |
+| 任务完成 / 会话结束 | 同上；不要整段 transcript 入库 |
+| 写入被拒 | `memory_explain({ lastDecision: true })` 或 candidate dry-run |
+
+OpenClaw 真实事件：`before_prompt_build`（召回）、`agent_end`（捕获）。Codex/Claude 无原生 PreCompact 时按本表用 MCP。详见 [agent-session-hooks.md](../../docs/guides/agent-session-hooks.md)。
 
 ## Fail-closed 要点（对用户怎么说）
 

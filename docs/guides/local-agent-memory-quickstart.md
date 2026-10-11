@@ -82,3 +82,9 @@ ms recall "query" --explain
 ms why <memoryId>
 ms doctor
 ```
+
+## 8. 会话钩子与 admission 收据
+
+- 钩子推荐表：[agent-session-hooks.md](./agent-session-hooks.md)
+- 写入后可用 `memory_explain({ lastDecision: true })` 查看最近一次 accept/reject 收据（Postgres v39+ 耐久；LanceDB 仅当前进程）。
+

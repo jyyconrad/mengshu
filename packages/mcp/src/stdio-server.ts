@@ -94,6 +94,8 @@ export interface McpStdioServerOptions {
   memoryPolicy?: MemoryPolicyCapability;
   /** Optional v22 exact-session assembly receipt read capability. */
   sessionReceipts?: Pick<ContextAssemblyReceiptRepository, "getLatest">;
+  /** Optional admission decision receipt store (last accept/reject). */
+  admissionDecisionReceipts?: import("../../core/src/lifecycle/admission-decision-receipt.js").AdmissionDecisionReceiptRepository;
   namespaces?: string[];
   /** 注入后 memory_ingest 走真实持久化链路 */
   pipeline?: IngestionPipeline;

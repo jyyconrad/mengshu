@@ -910,3 +910,45 @@ describe("MemoryWriteKernel", () => {
     expect(receipt?.result.status).toBe("persisted");
   });
 });
+
+describe("admission decision receipts on drop and accept", () => {
+  test("records reject when admission drops and accept when write persists", async () => {
+    const { InMemoryAdmissionDecisionReceiptRepository } = await import(
+      "../lifecycle/admission-decision-receipt.js"
+    );
+    const dropStore = new InMemoryAdmissionDecisionReceiptRepository({
+      now: () => 1_720_000_000_000,
+    });
+    const dropped = harness({
+      scoreAdmission: async () => ({ route: "drop", valueScore: 0.1, reason: "low_value" }),
+      admissionDecisionReceipts: dropStore,
+    });
+    await expect(dropped.kernel.execute(saveCommand({
+      text: "合并前必须跑完整 vitest，不要跳过。",
+      semanticType: "rules",
+      idempotencyKey: "receipt-drop",
+    }))).resolves.toMatchObject({ status: "rejected", reason: "low_value" });
+    const afterDrop = await dropStore.getLatest(scope);
+    expect(afterDrop?.decision).toBe("rejected");
+    expect(afterDrop?.semanticType).toBe("rules");
+    expect(afterDrop?.reasonCodes.some((code) => code.includes("low_value"))).toBe(true);
+
+    const acceptStore = new InMemoryAdmissionDecisionReceiptRepository({
+      now: () => 1_720_000_000_100,
+    });
+    const accepted = harness({
+      scoreAdmission: async () => ({ route: "active", valueScore: 0.95, reason: "explicit_remember" }),
+      admissionDecisionReceipts: acceptStore,
+    });
+    await expect(accepted.kernel.execute(saveCommand({
+      text: "合并前必须跑完整 vitest，不要跳过。",
+      semanticType: "rules",
+      idempotencyKey: "receipt-accept",
+    }))).resolves.toMatchObject({ status: "persisted", route: "active" });
+    const afterAccept = await acceptStore.getLatest(scope);
+    expect(afterAccept?.decision).toBe("accepted");
+    expect(afterAccept?.route).toBe("active");
+    expect(afterAccept?.memoryId).toBe("memory-1");
+  });
+});
+

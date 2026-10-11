@@ -192,7 +192,20 @@ describe("schema migration registry", () => {
     expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
   });
 
+  test("v39 expand-only persists admission decision receipts", () => {
+    const v39 = SCHEMA_MIGRATIONS.find((item) => item.version === 39);
+    const sql = v39?.statements.join("\n") ?? "";
+    expect(v39?.name).toBe("add-admission-decision-receipts");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS mengshu_admission_decision_receipts");
+    expect(sql).toContain("candidate_hash TEXT NOT NULL");
+    expect(sql).toContain("decision TEXT NOT NULL");
+    expect(sql).toContain("semantic_type TEXT NOT NULL");
+    expect(sql).toContain("receipt JSONB NOT NULL");
+    expect(sql).not.toMatch(/\b(?:DROP|DELETE|TRUNCATE|UPDATE|RENAME)\b/i);
+  });
+
   test("v22 expand-only persists exact-session context assembly receipts", () => {
+
     const v22 = SCHEMA_MIGRATIONS.find((item) => item.version === 22);
     const sql = v22?.statements.join("\n") ?? "";
     expect(v22?.name).toBe("add-context-assembly-receipts");

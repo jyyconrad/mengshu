@@ -27,6 +27,11 @@ import type {
 } from "../domain/types.js";
 import type { DataType, TableName } from "../db/types.js";
 import type { ValueScoreSignalProvenance } from "../scoring/value-score-signals.js";
+import {
+  createAdmissionDecisionReceipt,
+  recordAdmissionDecisionBestEffort,
+  type AdmissionDecisionReceiptRepository,
+} from "../lifecycle/admission-decision-receipt.js";
 
 export type WriteAdmissionRoute =
   | "drop"
@@ -287,6 +292,11 @@ export interface MemoryWriteKernelDependencies {
   }): Promise<void> | void;
   createId(): string;
   now(): number;
+  /**
+   * Optional admission decision receipt store (Postgres primary + in-memory mirror).
+   * Persistence is best-effort and must never fail-closed the write.
+   */
+  admissionDecisionReceipts?: AdmissionDecisionReceiptRepository;
 }
 
 export interface WritePipelineInput {
@@ -682,6 +692,11 @@ export class MemoryWriteKernel {
         vector,
     });
     if (!validation.accepted) {
+      await this.recordAdmissionReceipt(command, scope, normalized, {
+        decision: "rejected",
+        reasonCodes: [validation.reason],
+        rejectedReason: validation.reason,
+      });
       return { status: "rejected", reason: validation.reason };
     }
 
@@ -693,7 +708,14 @@ export class MemoryWriteKernel {
         candidate: validation.candidate,
     });
     if (admission.route === "drop") {
-      return { status: "rejected", reason: admission.reason ?? "admission_drop" };
+      const reason = admission.reason ?? "admission_drop";
+      await this.recordAdmissionReceipt(command, scope, normalized, {
+        decision: "rejected",
+        reasonCodes: [reason, `route:drop`],
+        rejectedReason: reason,
+        route: "drop",
+      });
+      return { status: "rejected", reason };
     }
     const pipelineInput: WritePipelineInput = {
         command,
@@ -776,6 +798,49 @@ export class MemoryWriteKernel {
         ...(command.type === "importEvidence" ? { sourceId: command.sourceId } : {}),
         ...(temporal === undefined ? {} : { temporal }),
     };
+    await this.recordAdmissionReceipt(command, scope, normalized, {
+      decision: "accepted",
+      reasonCodes: [
+        admission.reason ?? `route:${route}`,
+        `route:${route}`,
+        ...(command.semanticType ? [`semanticType:${command.semanticType}`] : []),
+      ],
+      route,
+      memoryId,
+    });
     return this.commitDurable(command, memory, identity, fingerprint);
+  }
+
+  private async recordAdmissionReceipt(
+    command: MemoryWriteCommand,
+    scope: WriteScope,
+    normalized: NormalizedWrite,
+    input: {
+      decision: "accepted" | "rejected";
+      reasonCodes: readonly string[];
+      route?: WriteAdmissionRoute;
+      memoryId?: string;
+      rejectedReason?: string;
+    },
+  ): Promise<void> {
+    const semanticType = "semanticType" in command ? command.semanticType : undefined;
+    if (!semanticType || !normalized.text) return;
+    const receipt = createAdmissionDecisionReceipt({
+      scope,
+      text: normalized.text,
+      semanticType,
+      decision: input.decision,
+      reasonCodes: input.reasonCodes,
+      source: "write_kernel",
+      ...(input.route === undefined ? {} : { route: input.route }),
+      ...(input.memoryId === undefined ? {} : { memoryId: input.memoryId }),
+      ...(input.rejectedReason === undefined ? {} : { rejectedReason: input.rejectedReason }),
+      now: this.dependencies.now(),
+    });
+    await recordAdmissionDecisionBestEffort(
+      this.dependencies.admissionDecisionReceipts,
+      scope,
+      receipt,
+    );
   }
 }

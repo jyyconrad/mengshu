@@ -16,9 +16,9 @@
 | L3 | P0 **不重写** RuntimeHost / Write Kernel / D-01~D-23 | 缺口在门面、连续性、Skill、默认路径，不在算法 |
 | L4 | MCP 工具 **只藏不删**；`MENGSHU_MCP_TOOL_MODE=default\|minimal\|full` | 对齐 Cognee tool modes / FactMem 少工具面 |
 | L5 | 五槽响应 **五键恒在**；空槽 `nodeCount=0` + `empty_slot:` reason；prompt 仍跳过空槽 | 现状 `SlotContextBuilder` 只输出有数据的 key，Agent 无法稳定依赖 schema |
-| L6 | `memory_explain` = 已存 why **或** 候选 admission **dry-run**（不造假 last-decision 库） | CLI 已有 `ms why`；admission 有 `reason`；缺 MCP 门面 |
+| L6 | `memory_explain` = 已存 why **或** 候选 dry-run **或** 落库 last-decision（P1） | P0 仅 dry-run；P1 收据表 v39 |
 | L7 | 交付物必须含可安装用法 Skill：`.agents/skills/mengshu/SKILL.md`（name: `mengshu`） | 用户硬性要求；对齐 Mem0 SKILL 分发 |
-| L8 | 本轮 **不 push / 不发 npm / 不打正式 tag** | 用户未授权 |
+| L8 | P0 当时不 push；**1.0.7 线已授权 push**；仍不发 npm / 不打正式 release tag（除非另嘱） | 用户后续授权推 1.0.7 |
 
 ---
 
@@ -125,10 +125,10 @@ mengshu **不是** Mem0 式「最大生态记忆 API」，也 **不是** Letta �
 
 ### P1
 
-- 会话结束 / compact 前 / 任务完成钩子（FactMem PreCompact 对齐）  
-- admission 短时收据落库（真 last-decision by id）  
-- README「拦下 vs 通过」对照  
-- CI + npm 发布 / `v1.0.7` tag（成熟度）
+- [x] 会话结束 / compact 前 / 任务完成钩子（OpenClaw 真实 hook + MCP/Skill 适配；不发明 flush-plan 形状）— `agent-session-hooks.ts` + `docs/guides/agent-session-hooks.md`  
+- [x] admission 短时收据落库（真 last-decision by candidateHash/id）— schema v39 + write-kernel + `memory_explain({ lastDecision })`  
+- [x] README「升级前后对照」  
+- [ ] CI + npm 发布 / `v1.0.7` tag（成熟度；另嘱）
 
 ### P2
 
@@ -185,6 +185,10 @@ frontmatter：`name: mengshu`
 | 11 | `docker-compose.postgres.yml` | pgvector | ✅ |
 | 12 | `docs/guides/local-agent-memory-quickstart.md` | 快路径 | ✅ |
 | 13 | vitest：continuity / tool-mode / explain；修旧断言 | | ✅ |
+| 14 | `admission-decision-receipt` + postgres + schema v39 | last-decision 落库 | ✅ |
+| 15 | write-kernel 挂钩 + MCP `lastDecision` | | ✅ |
+| 16 | `agent-session-hooks` + guide + OpenClaw 注释/提示 | | ✅ |
+| 17 | README 升级前后对照；Skill/quickstart | | ✅ |
 
 ---
 
@@ -225,7 +229,14 @@ npx vitest run packages/mcp/src/tools.test.ts
 ## 11. P0 验收报告（2026-10-11）
 
 - **实现**：P0-1~P0-5 均已合入 `maintain/upgrade-local-agent-memory-20261011` @ `eaef4dc`（Skill / MCP default 门面 / 五槽连续性 / memory_explain / compose+quickstart）。
-- **延期（P1）**：会话钩子、admission 收据落库、README 拦下 vs 通过对照、CI + npm/`v1.0.7` tag。
+- **P1（本轮已完成）**：会话钩子、admission 收据落库、README 升级前后对照。仍延期：CI + npm/`v1.0.7` tag。
 - **五槽如何强制**：`SlotContextBuilder` 返回前调用 `ensureFiveSlots`；空槽 `nodeCount=0` + `empty_slot:<reason>`；`packSlotsToPrompt` 仍跳过空槽。
 - **残留风险**：按 L8 未 push；LanceDB-only 治理 capability 仍 fail-closed；与本轮无关的 authority 竞态旧测可能 flaky。
 - **复验（本 wake）**：聚焦 vitest 6 个文件共 158 tests passed；工作树干净（已丢弃无关 package-lock optional peer 噪声）。
+
+## 12. P1 验收报告（2026-10-11）
+
+- **会话钩子**：`packages/core/src/runtime/agent-session-hooks.ts` + `docs/guides/agent-session-hooks.md`；OpenClaw 继续用真实 `before_prompt_build`/`agent_end`；`registerMemoryFlushPlan` 仍返回 `null`（不发明 API）。
+- **Admission 收据**：`mengshu_admission_decision_receipts`（schema v39）；write-kernel best-effort 记录 accept/reject；`memory_explain({ lastDecision: true | candidateHash })` 可读；LanceDB = in-memory only。
+- **README**：增加「本地治理记忆：升级前后对照（P0 + P1）」并链到 quickstart / plan / Skill。
+- **仍延期**：CI、npm 正式发布、git `v1.0.7` tag、`main` 快进。

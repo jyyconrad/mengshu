@@ -19,6 +19,28 @@ mengshu 用于在 OpenClaw、Codex、Claude Code、MCP 客户端、REST 服务�
 - **跨项目不串场**：通用偏好和经验可以复用，具体任务状态和项目资源保持隔离。
 - **把经验沉淀成方法**：反复验证有效的做法会变成可复用经验，帮助 Agent 在相似任务中直接走成熟路径。
 
+
+## 本地治理记忆：升级前后对照（P0 + P1）
+
+面向编码 / 工作 Agent 的默认体验变化（相对 1.0.6 基线）。细节见 [本地快路径](docs/guides/local-agent-memory-quickstart.md) 与 [升级方案](docs/plans/upgrade-local-agent-memory-5type-20261011.md)。
+
+| 维度 | 升级前 | 升级后 |
+|------|--------|--------|
+| MCP 工具面 | ListTools 暴露大量 `memory_*`，Agent 易选错 | 默认 `MENGSHU_MCP_TOOL_MODE=default` 主工具门面；`memory_tools_discover` 可查隐藏工具；`full` 恢复全量 |
+| 五槽连续性 | `memory_context_fast` 可能省略空槽 key | **五键恒在**；空槽 `nodeCount=0` + `empty_slot:` reason；prompt 仍跳过空槽 |
+| 准入可解释 | 多靠 CLI `ms why`；MCP 难演示拦下原因 | `memory_explain`：已存 why / 候选 dry-run / **`lastDecision` 读落库收据** |
+| Admission 收据 | 无持久 last-decision | 写入主链 best-effort 落库（**Postgres schema v39+**）；LanceDB 仅进程内 |
+| Agent 用法入口 | 分散文档 + Codex 专用 skill | 可安装 Skill：`.agents/skills/mengshu`（`name: mengshu`） |
+| 会话 / compact | OpenClaw 有 hook，缺统一推荐表 | [会话钩子指南](docs/guides/agent-session-hooks.md)：session_start / pre_compact / task_complete / session_end；不伪造宿主 API |
+| 一键本地 | 无仓库级 compose | `docker compose -f docker-compose.postgres.yml up -d` |
+
+**Skill 安装**
+
+```bash
+mkdir -p ~/.codex/skills
+ln -sfn /path/to/mengshu/.agents/skills/mengshu ~/.codex/skills/mengshu
+```
+
 ## 快速开始
 
 ### 安装

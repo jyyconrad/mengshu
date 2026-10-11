@@ -52,6 +52,7 @@ export interface McpMemoryServerOptions {
   memoryAssets?: MemoryAssetReadCapability;
   knowledgeResources?: MemoryKnowledgeResourceCapability;
   sessionReceipts?: MemorySessionReceiptCapability;
+  admissionDecisionReceipts?: import("../../core/src/lifecycle/admission-decision-receipt.js").AdmissionDecisionReceiptRepository;
   temporalMemory?: MemoryTemporalCapability;
   sessionWorkingSet?: MemoryWorkingSetCapability;
   sessionWorkingSetBridge?: MemoryWorkingSetBridgeCapability;

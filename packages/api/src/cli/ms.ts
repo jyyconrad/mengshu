@@ -517,6 +517,9 @@ export function createCliMcpStdioServerOptions(
     ...(runtime.contextAssemblyReceipts
       ? { sessionReceipts: runtime.contextAssemblyReceipts }
       : {}),
+    ...(runtime.admissionDecisionReceipts
+      ? { admissionDecisionReceipts: runtime.admissionDecisionReceipts }
+      : {}),
     namespaces: ["memories", "knowledge"],
     pipeline: runtime.ingestionPipeline,
     llmClient: runtime.llmClient,

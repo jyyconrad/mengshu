@@ -2685,6 +2685,27 @@ ON mengshu_source_captures (occurred_at, capture_id)
 WHERE status = 'captured' AND outbox_status = 'pending'`,
     ],
   },
+  {
+    version: 39,
+    name: "add-admission-decision-receipts",
+    kind: "expand",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS mengshu_admission_decision_receipts (
+  receipt_id TEXT PRIMARY KEY CHECK (receipt_id ~ '^[0-9a-f]{64}$'),
+  scope_fingerprint TEXT NOT NULL CHECK (scope_fingerprint ~ '^[0-9a-f]{64}$'),
+  candidate_hash TEXT NOT NULL CHECK (candidate_hash ~ '^[0-9a-f]{64}$'),
+  decision TEXT NOT NULL CHECK (decision IN ('accepted', 'rejected')),
+  semantic_type TEXT NOT NULL CHECK (semantic_type IN ('profile', 'task_context', 'rules', 'experience', 'resource')),
+  receipt JSONB NOT NULL CHECK (jsonb_typeof(receipt) = 'object'),
+  created_at BIGINT NOT NULL CHECK (created_at >= 0),
+  expires_at BIGINT NOT NULL CHECK (expires_at >= created_at)
+)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_admission_decision_receipts_scope_idx
+ON mengshu_admission_decision_receipts (scope_fingerprint, created_at DESC, receipt_id DESC)`,
+      `CREATE INDEX IF NOT EXISTS mengshu_admission_decision_receipts_candidate_idx
+ON mengshu_admission_decision_receipts (scope_fingerprint, candidate_hash, created_at DESC, receipt_id DESC)`,
+    ],
+  },
 ];
 
 export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = Object.freeze(

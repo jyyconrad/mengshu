@@ -670,12 +670,17 @@ function registerOpenClawMemoryRuntime(api: OpenClawPluginApi, runtime: MengshuR
         "## Mengshu Memory",
         "Use the memory_recall or memory_context_fast tools to retrieve durable user preferences, project decisions, and reusable working context before acting.",
         "Use memory_store only for stable, verified facts or preferences that should persist across OpenClaw, Codex, and other agents sharing ~/.mengshu.",
+        "Before context compaction or session end, flush only verified 5type facts (profile/task_context/rules/experience/resource); do not dump the whole transcript.",
+        "If a write is rejected, call memory_explain (lastDecision or candidate dry-run) instead of inventing a memory id.",
         "",
       ];
     });
   }
 
   if (typeof memoryApi.registerMemoryFlushPlan === "function") {
+    // Host exposes the registration point; OpenClaw has not published a stable
+    // flush-plan object contract in-tree. Returning null avoids inventing fields.
+    // Pre-compact capture: see docs/guides/agent-session-hooks.md + mengshu Skill.
     memoryApi.registerMemoryFlushPlan(() => null);
   }
 
