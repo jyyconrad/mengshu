@@ -10,6 +10,10 @@
  *   recommended triggers below.
  */
 
+import { createHash } from "node:crypto";
+
+import type { MemorySemanticType } from "../domain/types.js";
+
 export type AgentSessionHookTrigger =
   | "session_start"
   | "session_end"
@@ -31,6 +35,132 @@ export interface AgentSessionHookRecommendation {
   /** OpenClaw host event name when a real binding exists; otherwise null. */
   readonly openClawEvent: "before_prompt_build" | "agent_end" | null;
 }
+
+export type SessionHookKind = "recall" | "typed_capture";
+
+export type SessionHookHost = "openclaw" | "codex" | "claude-code" | "cursor";
+
+export type SessionHookBindingKind = "native" | "skill-only";
+
+export interface SessionEvent {
+  readonly trigger: AgentSessionHookTrigger;
+  readonly runId: string;
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly user: string;
+  readonly transcriptSummary?: string;
+}
+
+export type SessionEventSkipReason =
+  | "missing_trigger"
+  | "unknown_trigger"
+  | "missing_runId"
+  | "missing_sessionId"
+  | "missing_projectId"
+  | "missing_user"
+  | "duplicate_session_hash";
+
+export type ParseSessionEventResult =
+  | { readonly ok: true; readonly event: SessionEvent }
+  | {
+      readonly ok: false;
+      readonly skipped: true;
+      readonly reason: Exclude<SessionEventSkipReason, "duplicate_session_hash">;
+    };
+
+export type SessionHookReady = {
+  readonly status: "ready";
+  readonly kind: SessionHookKind;
+  readonly event: SessionEvent;
+  readonly recommendation: AgentSessionHookRecommendation;
+  readonly dedupKey: string;
+};
+
+export type SessionHookSkipped = {
+  readonly status: "skipped";
+  readonly skipped: true;
+  readonly reason: Exclude<SessionEventSkipReason, "duplicate_session_hash">;
+  readonly blocking: false;
+};
+
+export type SessionHookDuplicate = {
+  readonly status: "duplicate";
+  readonly skipped: true;
+  readonly reason: "duplicate_session_hash";
+  readonly blocking: false;
+  readonly dedupKey: string;
+};
+
+export type SessionHookFailed = {
+  readonly status: "failed";
+  readonly kind: SessionHookKind;
+  readonly event: SessionEvent;
+  readonly reason: string;
+  readonly blocking: false;
+};
+
+export type SessionHookOk = {
+  readonly status: "ok";
+  readonly kind: SessionHookKind;
+  readonly event: SessionEvent;
+  readonly recommendation: AgentSessionHookRecommendation;
+  readonly dedupKey: string;
+  readonly blocking: false;
+};
+
+export type SessionHookResolution =
+  | SessionHookReady
+  | SessionHookSkipped
+  | SessionHookDuplicate;
+
+export type SessionHookDispatchResult =
+  | SessionHookOk
+  | SessionHookSkipped
+  | SessionHookDuplicate
+  | SessionHookFailed;
+
+export interface SessionHookHandlers {
+  readonly recall?: (event: SessionEvent) => Promise<void> | void;
+  readonly typedCapture?: (event: SessionEvent) => Promise<void> | void;
+}
+
+export interface SessionHookHostBinding {
+  readonly host: SessionHookHost;
+  readonly trigger: AgentSessionHookTrigger;
+  readonly binding: SessionHookBindingKind;
+  readonly nativeEvent: string | null;
+  readonly flushPlan: null;
+}
+
+export const SESSION_HOOK_WRITE_DISCIPLINE = Object.freeze({
+  dumpWholeTranscript: false,
+  requireVerifiedSemanticType: true,
+  allowedSemanticTypes: Object.freeze([
+    "profile",
+    "task_context",
+    "rules",
+    "experience",
+    "resource",
+  ] as const satisfies readonly MemorySemanticType[]),
+  silentAdd: false,
+  inventFlushPlan: false,
+  blockTurnOnFailure: false,
+});
+
+const TRIGGERS = new Set<AgentSessionHookTrigger>([
+  "session_start",
+  "session_end",
+  "pre_compact",
+  "task_complete",
+]);
+
+const SKILL_ONLY_HOSTS = ["codex", "claude-code", "cursor"] as const satisfies readonly SessionHookHost[];
+const TRIGGER_ORDER = [
+  "session_start",
+  "pre_compact",
+  "task_complete",
+  "session_end",
+] as const satisfies readonly AgentSessionHookTrigger[];
 
 const TABLE: Readonly<Record<AgentSessionHookTrigger, AgentSessionHookRecommendation>> =
   Object.freeze({
@@ -100,4 +230,209 @@ export function mapOpenClawEventToSessionHooks(
     return Object.freeze(["session_start"] as const);
   }
   return Object.freeze(["session_end", "task_complete"] as const);
+}
+
+const HOST_BINDINGS: readonly SessionHookHostBinding[] = Object.freeze([
+  Object.freeze({
+    host: "openclaw" as const,
+    trigger: "session_start" as const,
+    binding: "native" as const,
+    nativeEvent: "before_prompt_build",
+    flushPlan: null,
+  }),
+  Object.freeze({
+    host: "openclaw" as const,
+    trigger: "session_start" as const,
+    binding: "native" as const,
+    nativeEvent: "before_agent_start",
+    flushPlan: null,
+  }),
+  Object.freeze({
+    host: "openclaw" as const,
+    trigger: "task_complete" as const,
+    binding: "native" as const,
+    nativeEvent: "agent_end",
+    flushPlan: null,
+  }),
+  Object.freeze({
+    host: "openclaw" as const,
+    trigger: "session_end" as const,
+    binding: "native" as const,
+    nativeEvent: "agent_end",
+    flushPlan: null,
+  }),
+  Object.freeze({
+    host: "openclaw" as const,
+    trigger: "pre_compact" as const,
+    binding: "skill-only" as const,
+    nativeEvent: null,
+    flushPlan: null,
+  }),
+  ...SKILL_ONLY_HOSTS.flatMap((host) =>
+    TRIGGER_ORDER.map((trigger) =>
+      Object.freeze({
+        host,
+        trigger,
+        binding: "skill-only" as const,
+        nativeEvent: null,
+        flushPlan: null,
+      }),
+    ),
+  ),
+]);
+
+export function listSessionHookHostBindings(): readonly SessionHookHostBinding[] {
+  return HOST_BINDINGS;
+}
+
+export function mapHostEventToSessionTriggers(
+  host: SessionHookHost,
+  nativeEvent: string,
+): readonly AgentSessionHookTrigger[] {
+  if (host === "openclaw" &&
+      (nativeEvent === "before_prompt_build" ||
+        nativeEvent === "before_agent_start" ||
+        nativeEvent === "agent_end")) {
+    return mapOpenClawEventToSessionHooks(nativeEvent);
+  }
+  return Object.freeze([]);
+}
+
+/** OpenClaw exposes a flush-plan slot; mengshu never invents a plan object. */
+export function sessionHookFlushPlan(): null {
+  return null;
+}
+
+function readRequiredString(
+  record: Record<string, unknown>,
+  key: "runId" | "sessionId" | "projectId" | "user",
+): string | undefined {
+  const value = record[key];
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function hookKind(trigger: AgentSessionHookTrigger): SessionHookKind {
+  return trigger === "session_start" ? "recall" : "typed_capture";
+}
+
+export function parseSessionEvent(input: unknown): ParseSessionEventResult {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, skipped: true, reason: "missing_trigger" };
+  }
+  const record = input as Record<string, unknown>;
+  const triggerValue = record.trigger;
+  if (typeof triggerValue !== "string" || triggerValue.trim().length === 0) {
+    return { ok: false, skipped: true, reason: "missing_trigger" };
+  }
+  if (!TRIGGERS.has(triggerValue as AgentSessionHookTrigger)) {
+    return { ok: false, skipped: true, reason: "unknown_trigger" };
+  }
+  const trigger = triggerValue as AgentSessionHookTrigger;
+  const runId = readRequiredString(record, "runId");
+  if (!runId) return { ok: false, skipped: true, reason: "missing_runId" };
+  const sessionId = readRequiredString(record, "sessionId");
+  if (!sessionId) return { ok: false, skipped: true, reason: "missing_sessionId" };
+  const projectId = readRequiredString(record, "projectId");
+  if (!projectId) return { ok: false, skipped: true, reason: "missing_projectId" };
+  const user = readRequiredString(record, "user");
+  if (!user) return { ok: false, skipped: true, reason: "missing_user" };
+
+  const summaryValue = record.transcriptSummary;
+  const transcriptSummary = typeof summaryValue === "string" && summaryValue.trim().length > 0
+    ? summaryValue.trim()
+    : undefined;
+
+  return {
+    ok: true,
+    event: Object.freeze({
+      trigger,
+      runId,
+      sessionId,
+      projectId,
+      user,
+      ...(transcriptSummary === undefined ? {} : { transcriptSummary }),
+    }),
+  };
+}
+
+export function sessionEventDedupKey(event: SessionEvent): string {
+  return createHash("sha256")
+    .update(
+      [event.sessionId, event.trigger, event.runId, event.transcriptSummary ?? ""].join("\0"),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+export function resolveSessionEvent(
+  input: unknown,
+  options: { readonly seen?: ReadonlySet<string> } = {},
+): SessionHookResolution {
+  const parsed = parseSessionEvent(input);
+  if (!parsed.ok) {
+    return {
+      status: "skipped",
+      skipped: true,
+      reason: parsed.reason,
+      blocking: false,
+    };
+  }
+  const dedupKey = sessionEventDedupKey(parsed.event);
+  if (options.seen?.has(dedupKey)) {
+    return {
+      status: "duplicate",
+      skipped: true,
+      reason: "duplicate_session_hash",
+      blocking: false,
+      dedupKey,
+    };
+  }
+  return {
+    status: "ready",
+    kind: hookKind(parsed.event.trigger),
+    event: parsed.event,
+    recommendation: TABLE[parsed.event.trigger],
+    dedupKey,
+  };
+}
+
+function failureReason(error: unknown): string {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message;
+  }
+  return "session_hook_failed";
+}
+
+export async function dispatchSessionEvent(
+  input: unknown,
+  handlers: SessionHookHandlers = {},
+  options: { readonly seen?: Set<string> } = {},
+): Promise<SessionHookDispatchResult> {
+  const resolved = resolveSessionEvent(input, options);
+  if (resolved.status !== "ready") {
+    return resolved;
+  }
+  const handler = resolved.kind === "recall" ? handlers.recall : handlers.typedCapture;
+  try {
+    await handler?.(resolved.event);
+    options.seen?.add(resolved.dedupKey);
+    return {
+      status: "ok",
+      kind: resolved.kind,
+      event: resolved.event,
+      recommendation: resolved.recommendation,
+      dedupKey: resolved.dedupKey,
+      blocking: false,
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      kind: resolved.kind,
+      event: resolved.event,
+      reason: failureReason(error),
+      blocking: false,
+    };
+  }
 }

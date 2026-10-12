@@ -8,6 +8,7 @@ export * from "./service/memory-service.js";
 export * from "./runtime/paths.js";
 export * from "./runtime/registry.js";
 export * from "./runtime/host-contract.js";
+export * from "./runtime/agent-session-hooks.js";
 export * from "./runtime/jobs.js";
 export * from "./temporal/types.js";
 export * from "./temporal/repository.js";

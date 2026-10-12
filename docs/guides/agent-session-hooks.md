@@ -1,17 +1,56 @@
 # 编码 Agent 会话 / Compact 钩子（推荐触发）
 
-目标：在**不发明宿主假 API**的前提下，让会话开始、压缩前、任务完成、会话结束时，记忆召回/落库按同一套建议执行。
+目标：在**不发明宿主假 API**的前提下，让会话开始、压缩前、任务完成、会话结束时，记忆召回/落库按同一套建议执行。失败可观测、不阻断回合。
 
-真源推荐表见 `packages/core/src/runtime/agent-session-hooks.ts`（`recommendAgentSessionHook`）。
+真源：`packages/core/src/runtime/agent-session-hooks.ts`。
+
+- 推荐动作：`recommendAgentSessionHook`
+- 可调用入口：`parseSessionEvent` / `resolveSessionEvent` / `dispatchSessionEvent`
+- 宿主映射表：`listSessionHookHostBindings`
+- flush-plan：`sessionHookFlushPlan()` **恒为 `null`**
 
 ## 触发与动作
 
-| 触发 | 建议 MCP 动作 | OpenClaw 真实事件 | Codex / Claude Code / Cursor |
-|------|---------------|-------------------|------------------------------|
-| `session_start` | `memory_context_fast` → 必要时 `memory_recall` | `before_prompt_build` / `before_agent_start` | Skill 指引：开任务先 context_fast |
-| `pre_compact` | `memory_observe` / `memory_save`（仅已验证 5type） | **无稳定 flush-plan 形状**：`registerMemoryFlushPlan` 已注册但返回 `null` | Skill：压缩/摘要前先 flush 耐久结论 |
-| `task_complete` | `memory_observe` / `memory_save` | `agent_end`（同轮结束） | Skill：任务收尾时写入 experience/rules |
-| `session_end` | `memory_observe` / `memory_save` | `agent_end` | Skill：会话结束前捕获偏好/决策 |
+| 触发 | 建议 MCP 动作 | 种类 | OpenClaw 真实事件 | Codex / Claude Code / Cursor |
+|------|---------------|------|-------------------|------------------------------|
+| `session_start` | `memory_context_fast` → 必要时 `memory_recall` | 召回 | `before_prompt_build` / `before_agent_start` | Skill 指引：开任务先 context_fast |
+| `pre_compact` | `memory_observe` / `memory_save`（仅已验证 5type） | typed capture | **无稳定 flush-plan 形状**：`sessionHookFlushPlan()` 返回 `null` | Skill：压缩/摘要前先 flush 耐久结论 |
+| `task_complete` | `memory_observe` / `memory_save` | typed capture | `agent_end`（同轮结束） | Skill：任务收尾时写入 experience/rules |
+| `session_end` | `memory_observe` / `memory_save` | typed capture | `agent_end` | Skill：会话结束前捕获偏好/决策 |
+
+## SessionEvent 载荷合同
+
+可调用入口只接受这一组最小字段。缺字段则 **skip** 并记下 reason，不写库、不抛错阻断回合。
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `trigger` | 是 | `session_start` / `pre_compact` / `task_complete` / `session_end` |
+| `runId` | 是 | 本轮 / 本次运行 id |
+| `sessionId` | 是 | 会话 id |
+| `projectId` | 是 | 项目 id |
+| `user` | 是 | 用户标识 |
+| `transcriptSummary` | 否 | 已整理的结论摘要；**禁止**整段 transcript |
+
+skip reason：`missing_trigger` / `unknown_trigger` / `missing_runId` / `missing_sessionId` / `missing_projectId` / `missing_user`。同一 `sessionId` + 内容哈希重复到达时为 `duplicate_session_hash`（避免与 MCP 双写）。
+
+`dispatchSessionEvent` 永不抛给宿主：handler 失败返回 `{ status: "failed", blocking: false, reason }`。
+
+OpenClaw 原生 `before_prompt_build` / `agent_end` 仍走插件现有 auto-recall / auto-capture（宿主事件形状不同），不把缺字段的宿主事件硬套进 SessionEvent。Skill / 其它宿主用上述合同。
+
+## 宿主映射表
+
+| host | 触发 | 绑定 | 原生事件 | flush-plan |
+|------|------|------|----------|------------|
+| openclaw | `session_start` | native | `before_prompt_build` / `before_agent_start` | `null` |
+| openclaw | `task_complete` / `session_end` | native | `agent_end` | `null` |
+| openclaw | `pre_compact` | skill-only | 无 | `null` |
+| codex / claude-code / cursor | 四个触发 | skill-only | 无 | `null` |
+
+## 写入纪律
+
+- 只写已验证 5type（`profile` / `task_context` / `rules` / `experience` / `resource`）。
+- 不整段 transcript 入库；不静默 ADD；不发明 flush-plan 字段。
+- 失败记日志 / 收据，不弹窗、不阻断回合。
 
 ## OpenClaw
 

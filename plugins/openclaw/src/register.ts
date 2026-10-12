@@ -47,6 +47,7 @@ import {
 } from "./plugin-id.js";
 import { describeOpenClawEmbeddingStatus } from "./embedding-status.js";
 import type { AuthorityScope } from "../../../packages/core/src/domain/authority-scope.js";
+import { sessionHookFlushPlan } from "../../../packages/core/src/runtime/agent-session-hooks.js";
 import type {
   AuthorityScopedForgetService,
   MemoryService,
@@ -681,7 +682,7 @@ function registerOpenClawMemoryRuntime(api: OpenClawPluginApi, runtime: MengshuR
     // Host exposes the registration point; OpenClaw has not published a stable
     // flush-plan object contract in-tree. Returning null avoids inventing fields.
     // Pre-compact capture: see docs/guides/agent-session-hooks.md + mengshu Skill.
-    memoryApi.registerMemoryFlushPlan(() => null);
+    memoryApi.registerMemoryFlushPlan(sessionHookFlushPlan);
   }
 
   if (typeof memoryApi.registerMemoryRuntime === "function") {

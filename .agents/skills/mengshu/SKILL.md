@@ -85,7 +85,16 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 | 任务完成 / 会话结束 | 同上；不要整段 transcript 入库 |
 | 写入被拒 | `memory_explain({ lastDecision: true })` 或 candidate dry-run |
 
-OpenClaw 真实事件：`before_prompt_build`（召回）、`agent_end`（捕获）。Codex/Claude 无原生 PreCompact 时按本表用 MCP。详见 [agent-session-hooks.md](../../docs/guides/agent-session-hooks.md)。
+**被动写入纪律**
+
+- 载荷最小字段：`trigger`、`runId`、`sessionId`、`projectId`、`user`；可选 `transcriptSummary`。缺字段则 skip，记下 reason，**不编造字段、不写库、不阻断回合**。
+- 只写已验证 5type；不要 dump 整段 transcript；不要静默 ADD。
+- 同一 session + 内容哈希已由 MCP 写过则不要再 hook 写一遍。
+- 密钥 / token / 隐私仍走上面的禁止事项。
+- OpenClaw 真实事件：`before_prompt_build`（召回）、`agent_end`（捕获）。`registerMemoryFlushPlan` 保持 `null`，不要发明 flush-plan。
+- Codex / Claude Code / Cursor 无原生 PreCompact：按本表用 MCP。
+
+详见 [agent-session-hooks.md](../../docs/guides/agent-session-hooks.md)。
 
 ## Fail-closed 要点（对用户怎么说）
 

@@ -14,6 +14,10 @@ import { PostgresProvider } from "../../../packages/core/src/db/providers/postgr
 import { createNativeDurableJobV2ServeCapability } from "../../../server/runtime-host-factory.js";
 import { createAuthoritativeDurableJobV2WorkerHandlerRegistry } from "../../../server/workers-v2.js";
 import { createExactOpenClawAuthority } from "./authority.js";
+import {
+  listSessionHookHostBindings,
+  sessionHookFlushPlan,
+} from "../../../packages/core/src/runtime/agent-session-hooks.js";
 
 class FakeDb implements DatabaseProvider {
   initialize = vi.fn(async () => {});
@@ -407,6 +411,12 @@ describe("registerOpenClawAdapter", () => {
     ]);
     expect(clis).toHaveLength(1);
     expect(hooks.map((hook) => hook.name).sort()).toEqual(["agent_end", "before_prompt_build"]);
+    const nativeOpenClawEvents = listSessionHookHostBindings()
+      .filter((row) => row.host === "openclaw" && row.binding === "native")
+      .map((row) => row.nativeEvent);
+    expect(hooks.every((hook) => nativeOpenClawEvents.includes(hook.name))).toBe(true);
+    expect(memoryFlushPlans[0]).toBe(sessionHookFlushPlan);
+    expect(sessionHookFlushPlan()).toBeNull();
     expect(services).toHaveLength(1);
     expect(services[0].id).toBe(OPENCLAW_MEMORY_PLUGIN_ID);
     expect(memoryPromptSections).toHaveLength(1);
