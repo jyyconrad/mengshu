@@ -1080,9 +1080,9 @@ function applyMcpToolFacade(
           kind: "stored_why",
           found: true,
           details: extractWhyDetails(record as never),
-          report: formatWhyReport(record as never, hit?.scoreBreakdown),
+          report: formatWhyReport(record as never, hit ? requireRecallHitReceipt(hit) : undefined),
           semanticType: (record as { semanticType?: string }).semanticType,
-          scoreBreakdown: hit?.scoreBreakdown,
+          scoreBreakdown: hit ? requireRecallHitReceipt(hit) : undefined,
         };
       },
     });

@@ -40,3 +40,7 @@ coverage
 .internal/
 CLAUDE.local.md
 AGENTS.local.md
+
+# Local Grok/orchestrator scratch
+work/
+.zcodeignore
