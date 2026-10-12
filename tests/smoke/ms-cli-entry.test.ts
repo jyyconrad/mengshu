@@ -30,7 +30,7 @@ describe("ms CLI entry", () => {
     await expect(runMengshuCli(["node", "ms", "--help"])).resolves.toBeUndefined();
     expect(process.exitCode).toBeUndefined();
     const output = log.mock.calls.map((call) => String(call[0])).join("\n");
-    expect(output).toContain("scan <directory>");
+    expect(output).toContain("scan [options] <directory>");
     expect(output).toContain("embedding-space");
     expect(output).toContain("serve");
     expect(output).toContain("project");

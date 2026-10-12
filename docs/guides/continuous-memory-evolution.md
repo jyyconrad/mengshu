@@ -43,7 +43,7 @@
 
 `changed/due` 的默认 native provider 已接入选择与确认端口；自定义 host 必须提供同一组合，不能仅声明枚举。预览不消费事件；进化自身生成的 outbox 不再次作为外部变化触发循环。冻结集合还受 checkpoint 大小约束，未纳入的事件留给后续新批次，不表示全部增量已处理。`propose` 的确认只证明提案已持久化，不证明内容已应用。
 
-`ms scan` 与 `ms project ingest-history` 属于其他摄入/验证流程，不等同于本指南的进化批次。`ms evolve scan` 不接受位置路径、`--scope`、`--model` 或 `--api-key`。
+`ms scan` 是通用目录摄入：默认 dry-run，`--apply` 才经记忆 admission 入库。它与 `ms project ingest-history` 都不等同于本指南的进化批次。对照表见 [目录扫描](directory-scan.md)。`ms evolve scan` 不接受位置路径、`--scope`、`--model` 或 `--api-key`。
 
 ## 预览、提案与受控应用
 

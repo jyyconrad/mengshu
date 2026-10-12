@@ -12,7 +12,7 @@
 | `ms search <query>` | 生成 embedding 并做向量搜索 |
 | `ms query` | 用 JSON filter 做高级查询 |
 | `ms export` | 导出 JSON 或 CSV |
-| `ms scan <directory>` | 扫描 Markdown 目录并进入 ingestion pipeline |
+| `ms scan <directory>` | 分析 Markdown 目录并预览 5type 准入；默认 dry-run，`--apply` 才入库 |
 | `ms evolve inventory/scan` | host-bound 批次的预览、隔离提案与受控门禁，默认预览 |
 | `ms evolve status/resume <batch-id>` | 查询批次或显式开启一个有限恢复段 |
 | `ms evolve control/undo-preview/undo-approve` | 独立 owner 的来源对账、支持关系撤销与精确治理撤销 |
@@ -144,32 +144,29 @@ ms export --category 知识库 --format csv --output knowledge.csv
 
 ## `ms scan`
 
+目录治理入口。默认 dry-run：读 `.md` / `.mdx`，输出文件数、扩展名、5type 标注、拟写入类型、拒绝预览和指纹去重，不写库。`--apply` 才把通过预览的提案送进记忆写入内核。操作说明见 [目录扫描](../guides/directory-scan.md)。
+
 ```bash
 ms scan ./docs --ignore node_modules dist
-ms scan ./notes --category 核心记忆
+ms scan ./notes --json
+ms scan ./notes --apply --category 知识库
 ```
 
 | 参数 | 必填 | 说明 |
 |------|------|------|
 | `<directory>` | 是 | 要扫描的目录 |
-| `--ignore <paths...>` | 否 | 额外忽略路径 |
-| `--category <name>` | 否 | 存储分类，默认 `知识库` |
+| `--ignore <paths...>` | 否 | 额外忽略路径，会与扫描器默认忽略项合并 |
+| `--ignore-rule <rules...>` | 否 | 额外 gitignore 风格规则 |
+| `--category <name>` | 否 | 仅 `--apply` 使用的存储分类，默认 `知识库` |
+| `--chunk-size <n>` | 否 | 把长正文切成多条提案；每条仍单独准入 |
+| `--include-hidden` | 否 | 包含隐藏 Markdown |
+| `--dry-run` | 否 | 显式预览。不写库。这是默认行为 |
+| `--apply` | 否 | 经写入内核入库。需要 server authority，不能与 `--dry-run` 同用 |
+| `--json` | 否 | 打印 JSON 报告 |
 
-扫描当前走 v4 ingestion pipeline，输出会包含 legacy 统计和新 pipeline 统计：
+没有 authority，或当前 runtime 没有记忆写入内核时，`--apply` 失败并拒绝绕过 admission。`ms scan` 接收目录路径；`ms evolve scan --source-id` 只处理 host 已注册来源，不接收目录路径。
 
-```text
-Scan completed:
-- Total files: 10
-- Processed: 10
-- Failed: 0
-- Total chunks: 42
-- Stored: 40
-- Duplicates skipped: 2
-- Jobs queued: 40
-- Chunks admitted: 40
-- Chunks dropped: 0
-```
-
+本阶段不导入代码或结构化文件。扩展文件类型时仍走同一套 admission。
 ## `ms cleanup`
 
 ```bash

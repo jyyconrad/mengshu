@@ -27,6 +27,7 @@
 
 - [配置说明](guides/configuration.md) - 配置文件详解
 - [持续记忆进化](guides/continuous-memory-evolution.md) - 有限批次、owner 来源对账/撤销与受控复用、维护阻断、E3 经验来源及验证边界
+- [目录扫描](guides/directory-scan.md) - `ms scan` 的 ignore、dry-run、apply 与 authority
 - [集成指南](guides/integration.md) - 如何集成到你的项目
 - [最佳实践](guides/best-practices.md) - 使用建议
 

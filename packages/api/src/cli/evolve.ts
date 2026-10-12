@@ -125,7 +125,9 @@ export function registerEvolutionCliCommands(program: Command, options: {
       }
       await run({ mode: "inventory", selection: flags.selection as string }, flags);
     });
-  actions(evolve.command("scan").description("Process a host-registered directory source"))
+  actions(evolve.command("scan").description(
+    "Process a host-registered directory source. Not a filesystem path; use `ms scan <directory>` for general directory ingest.",
+  ))
     .requiredOption("--source-id <id>", "Host-registered source identifier")
     .action(async (flags: Record<string, unknown>) => {
       const sourceId = identifier(flags.sourceId);

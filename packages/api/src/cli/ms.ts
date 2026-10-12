@@ -16,7 +16,6 @@ import {
   type MengshuRuntime,
 } from "../../../../runtime.js";
 import type { DatabaseProvider } from "../../../core/src/db/types.js";
-import { ingestMarkdownDirectory } from "../../../../ingest/adapters/file-system.js";
 import {
   registerMemoryServerCliCommands,
   type RegisterMemoryServerCliOptions,
@@ -28,7 +27,15 @@ import { registerProjectCliCommands } from "./project.js";
 import { registerRecallCliCommands } from "../../../../adapters/openclaw/cli-recall.js";
 import { runInteractiveSetup } from "../../../../adapters/openclaw/cli-setup.js";
 import { registerWhyCliCommands } from "../../../../adapters/openclaw/cli-why.js";
-import { resolveCategoryName, resolveTableName } from "../../../../adapters/openclaw/tools.js";
+import { resolveCategoryLabel, resolveDataType, resolveTableName } from "../../../../adapters/openclaw/tools.js";
+import {
+  DIRECTORY_SCAN_APPLY_AUTHORITY_ERROR,
+  DIRECTORY_SCAN_APPLY_CAPABILITY_ERROR,
+  DIRECTORY_SCAN_APPLY_CONFLICT_ERROR,
+  buildDirectoryScanWriteCommand,
+  configureDirectoryScanCommand,
+  registerDirectoryScanCommand,
+} from "./scan.js";
 import {
   createServeRuntimeHost,
   type ServeRuntimeHostSource,
@@ -262,7 +269,7 @@ function printConfiglessHelp(argv: string[]): void {
   program.command("cost").description("Show the local append-only runtime cost ledger");
   program.command("stats").description("Show memory statistics");
   program.command("search <query>").description("Search memories");
-  program.command("scan <directory>").description("Scan a directory of Markdown files into memory");
+  configureDirectoryScanCommand(program.command("scan <directory>"));
   program.command("embedding-space").description("Inspect or explicitly activate the embedding space");
   const selectedCommand = program.commands.find((command) => command.name() === argv[2]);
   console.log(selectedCommand?.helpInformation() ?? program.helpInformation());
@@ -461,6 +468,7 @@ export async function dispatchHistoryRebuildAndDrainTrees(
 export function requiresServerAuthority(argv: string[]): boolean {
   const command = argv[2] ?? "";
   if (SERVER_AUTHORITY_COMMANDS.has(command)) return true;
+  if (command === "scan" && argv.includes("--apply")) return true;
   return command === "project" && ["context", "lookup"].includes(argv[3] ?? "");
 }
 
@@ -840,6 +848,10 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
     return;
   }
 
+  if (argv[2] === "scan" && argv.includes("--apply") && argv.includes("--dry-run")) {
+    throw new Error(DIRECTORY_SCAN_APPLY_CONFLICT_ERROR);
+  }
+
   // Project identity is local metadata. It must remain usable before config,
   // provider, runtime, or any product-specific authority is constructed.
   if (argv[2] === "init") {
@@ -924,6 +936,16 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
 
   const rawConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const cfg = memoryConfigSchema.parse(rawConfig);
+
+  if (argv[2] === "scan" && !argv.includes("--apply")) {
+    const scanProgram = new Command().name("ms").exitOverride();
+    registerDirectoryScanCommand(scanProgram, {
+      extraIgnorePaths: cfg.scanner?.defaultIgnorePaths ?? [],
+      extraIgnoreRules: cfg.scanner?.customIgnoreRules ?? [],
+    });
+    await scanProgram.parseAsync(argv);
+    return;
+  }
 
   if (argv[2] === "evolve") {
     const { resolveMcpRuntimeUrl, resolveMcpRuntimeSocketPath } =
@@ -1137,77 +1159,40 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
       : undefined,
   });
 
-  program
-    .command("scan <directory>")
-    .description("Scan a directory of Markdown files into memory")
-    .option("--ignore <paths...>", "Paths to ignore")
-    .option("--ignore-rule <rules...>", "Additional gitignore-style ignore rules")
-    .option("--category <name>", "Storage category: 核心记忆 | 知识库 (default: 知识库)", "知识库")
-    .option("--chunk-size <n>", "Maximum characters per chunk")
-    .option("--include-hidden", "Include hidden files", false)
-    .action(async (
-      directory: string,
-      options: {
-        ignore?: string[];
-        ignoreRule?: string[];
-        category?: string;
-        chunkSize?: string;
-        includeHidden?: boolean;
-      } = {},
-    ) => {
-      const resolvedDir = resolveMaybeRelative(directory, process.cwd());
-      const tableName = resolveTableName(options.category ?? "知识库");
-      const chunkSize = options.chunkSize ? Number.parseInt(options.chunkSize, 10) : undefined;
-      if (chunkSize !== undefined && (!Number.isFinite(chunkSize) || chunkSize <= 0)) {
-        throw new Error("--chunk-size must be a positive integer");
-      }
-
-      console.log(`Scanning directory: ${resolvedDir}`);
-      console.log(`Storage category: ${resolveCategoryName(tableName)}`);
-
-      const result = await ingestMarkdownDirectory({
-        directory: resolvedDir,
-        scope: {
-          ...defaultScope,
-          namespace: tableName,
-        },
-        pipeline: runtime.ingestionPipeline,
-        scannerOptions: {
-          ignorePaths: [
-            ...(options.ignore ?? []),
-            ...(cfg.scanner?.defaultIgnorePaths ?? []),
-          ],
-          ignoreRules: [
-            ...(options.ignoreRule ?? []),
-            ...(cfg.scanner?.customIgnoreRules ?? []),
-          ],
-          includeHidden: options.includeHidden ?? false,
-        },
-        chunkSize,
-        targetTable: tableName,
-        autoEnrichMetadata: cfg.scanner?.autoEnrichMetadata,
-      });
-
-      console.log("\nScan completed:");
-      console.log(`- Total files: ${result.totalFiles}`);
-      console.log(`- Processed: ${result.processedFiles}`);
-      console.log(`- Failed: ${result.failedFiles}`);
-      console.log(`- Total chunks: ${result.totalChunks}`);
-      console.log(`- Stored: ${result.storedChunks}`);
-      console.log(`- Duplicates skipped: ${result.duplicateChunks}`);
-      console.log(`- Jobs queued: ${result.jobsQueued}`);
-      console.log(`- Chunks admitted: ${result.chunksAdmitted}`);
-      console.log(`- Chunks dropped: ${result.chunksDropped}`);
-      if (result.totalFiles === 0) {
-        console.log("\nNo Markdown files found. `ms scan` currently imports .md and .mdx files.");
-      }
-      if (result.errors.length > 0) {
-        console.log("\nErrors:");
-        for (const error of result.errors) {
-          console.log(`- ${error.filePath}: ${error.error}`);
+  registerDirectoryScanCommand(program, {
+    extraIgnorePaths: cfg.scanner?.defaultIgnorePaths ?? [],
+    extraIgnoreRules: cfg.scanner?.customIgnoreRules ?? [],
+    createWriter: ({ category }) => {
+      if (!serverAuthority) throw new Error(DIRECTORY_SCAN_APPLY_AUTHORITY_ERROR);
+      const executeMemoryWrite = runtime.executeMemoryWrite;
+      if (!executeMemoryWrite) throw new Error(DIRECTORY_SCAN_APPLY_CAPABILITY_ERROR);
+      const tableName = resolveTableName(category);
+      return async (proposal) => {
+        const result = await executeMemoryWrite(buildDirectoryScanWriteCommand({
+          proposal,
+          serverAuthority: serverAuthority.authority,
+          clientScope: serverAuthority.defaultScope,
+          category: resolveCategoryLabel(category),
+          dataType: resolveDataType(tableName),
+          tableName,
+        }));
+        if (result.status === "persisted") {
+          return { status: "persisted" as const, memoryId: result.memoryId };
         }
-      }
-    });
+        if (result.status === "duplicate") {
+          return {
+            status: "duplicate" as const,
+            reason: result.kind,
+            memoryId: result.duplicateOf,
+          };
+        }
+        if (result.status === "rejected") {
+          return { status: "rejected" as const, reason: result.reason };
+        }
+        return { status: "ignored" as const };
+      };
+    },
+  });
 
   program
     .command("stats")

@@ -34,7 +34,7 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 | — | `memory_health` / `memory_namespaces` | 探活与命名空间 |
 | — | `memory_tools_discover` | 列出当前 mode 未广告的工具 |
 
-目录扫盘、evolve、ingest、working set 不在 default List。目录入库用 CLI `ms scan`。Skill artifact 只在 discover/full 列出，没有可执行 runner。
+目录扫盘、evolve、ingest、working set 不在 default List。目录入库用 CLI `ms scan`：默认 dry-run，不写库；`--apply` 才经 admission 写入。Skill artifact 只在 discover/full 列出，没有可执行 runner。
 
 **推荐启动序列**
 
