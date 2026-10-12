@@ -1054,7 +1054,8 @@ describe("MCP memory tools", () => {
       properties: {
         scope: {
           properties: {
-            appId: { enum: string[] };
+            appId: { enum: string[]; description: string };
+            projectId: { description: string };
             agentId: { enum: string[] };
             visibility: { enum: string[]; description: string };
           };
@@ -1063,6 +1064,9 @@ describe("MCP memory tools", () => {
     };
 
     expect(schema.properties.scope.properties.appId.enum).toEqual(["mengshu"]);
+    expect(schema.properties.scope.properties.appId.description).toContain("复用");
+    expect(schema.properties.scope.properties.projectId.description).toContain("kb-pilot-283dc0a5b96f");
+    expect(save.description).toContain("先从 scope.projectId");
     expect(schema.properties.scope.properties.agentId.enum).toEqual(["agent-1"]);
     expect(schema.properties.scope.properties.visibility.enum).toEqual(["private"]);
     expect(schema.properties.scope.properties.visibility.description).toContain("omit");
@@ -1076,6 +1080,7 @@ describe("MCP memory tools", () => {
         filterProject: { description: string };
         filterProduct: { description: string };
         projectPattern: { description: string };
+        recallBoundary: { description: string; enum: string[] };
         format: { description: string };
         raw: { description: string };
         explain: { description: string };
@@ -1083,8 +1088,12 @@ describe("MCP memory tools", () => {
     };
 
     expect(schema.properties.filterProject.description).toContain("scopeFilterMode='hard'");
+    expect(schema.properties.filterProject.description).toContain("kb-pilot-283dc0a5b96f");
+    expect(recall.description).toContain("先从 scope.projectId");
     expect(schema.properties.filterProduct.description).toContain("scopeFilterMode='hard'");
     expect(schema.properties.projectPattern.description).toContain("scopeFilterMode='hard'");
+    expect(schema.properties.recallBoundary.enum).toEqual(["project", "authority"]);
+    expect(schema.properties.recallBoundary.description).toContain("authority");
     expect(schema.properties.format.description).not.toContain("完整结构化结果");
     expect(schema.properties.raw.description).toContain("complete six-factor scoreBreakdown");
     expect(schema.properties.explain.description).toContain("six-factor");

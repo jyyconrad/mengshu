@@ -79,6 +79,18 @@ export MENGSHU_AUTHORITY_FILE="$HOME/.mengshu/authority.json"
 `defaultScope` 必须完全落在 `authority.allow` 中。`tenantId/userId` 必须与 authority
 一致；客户端只允许在 `appId/projectId/agentId/namespace/visibility` 的 allowlist 内收窄。
 
+## 按项目或按 authority 召回
+
+`memory_recall` 的 `recallBoundary` 决定这次召回看哪一块已授权数据：
+
+| 值 | 结果 |
+|----|------|
+| `project` | 只返回 `scope.projectId`。该项目在 allowlist 里的 knowledge 与 working-context 都算这个项目。 |
+| `authority` | 返回当前 authority 允许的全部项目。请求里的项目只影响排序，不把其他已授权项目滤掉。 |
+| 不传 | 仍按五类复用：profile / rules / experience 可在同 workspace 跨项目，task_context / resource 留在当前项目。 |
+
+allowlist 由服务端从 authority 写入。调用方传入的 allowlist 会被忽略。`authority` 模式没有服务端 allowlist 时返回空结果，不扩大到任意 tenant/user。
+
 ## 各产品如何接入
 
 ### Codex

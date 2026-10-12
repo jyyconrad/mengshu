@@ -63,14 +63,16 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 
 ## 5type 召回规则
 
-- 优先信 `memory_context_fast` 的结构化 `slots`：键名固定为五 type。  
+- 优先信 `memory_context_fast` 的结构化 `slots`：键名固定为五 type。
+- `memory_recall` 可用 `recallBoundary`：`project` 只召回 `scope.projectId`（含该项目的 knowledge 与 working-context）；`authority` 召回当前 authority 允许的全部项目。不传时仍按五类复用策略。调用方不能自己传 allowlist。  
 - **空槽**（`nodeCount === 0` 且可能有 `empty_slot: …`）表示「该类暂无活跃记忆」或被策略过滤，**不是** MCP 失败。  
 - Prompt 注入会跳过空槽；不要为填满五槽而编造内容。  
 - 需要证据链时用 `memory_lookup` / `memory_explain`，不要臆造 `memoryId`。
 
 ## 禁止事项
 
-- 禁止编造记忆正文、id、provenance、admission 结果。  
+- 禁止编造记忆正文、id、provenance、admission 结果。
+- 禁止新造 `kb-pilot-283dc0a5b96f` 这类带哈希或运行号的应用名、项目名。先复用 MCP `scope.projectId` enum 里已有且合适的项目；都不合适时，才用新的稳定可读名称存储。  
 - 禁止把候选区 / observe_light 结果当成已 active 事实执行。  
 - 禁止为「显得有记性」而写入密钥、token、隐私、一次性构建日志。  
 - 禁止在无 authority / 用户未授权时擅自 `ms init` 扩大范围或绕过 fail-closed。  

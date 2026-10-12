@@ -991,6 +991,101 @@ describe("DefaultMemoryService", () => {
     expect(result.hits[0].scoreBreakdown?.sourceSignals?.vector).toBe(0.8);
   });
 
+  test("recallBoundary=authority 返回 allowlist 内各项目，project 只返回当前项目", async () => {
+    const scopeA = {
+      tenantId: "local",
+      appId: "mengshu",
+      userId: "default",
+      projectId: "memory-autodb",
+      agentId: "default",
+      namespace: "working-context",
+      visibility: "private" as const,
+    };
+    const allow = {
+      appIds: ["mengshu"],
+      projectIds: ["memory-autodb", "kb-pilot", "ubrio-agent"],
+      agentIds: ["default"],
+      namespaces: ["working-context", "knowledge"],
+      visibilities: ["private" as const],
+    };
+    const current = makeRecord({
+      id: "current",
+      semanticType: "resource",
+      scope: scopeA,
+    });
+    const pilot = makeRecord({
+      id: "pilot",
+      semanticType: "resource",
+      scope: { ...scopeA, projectId: "kb-pilot", namespace: "knowledge" },
+      contentHash: "pilot",
+    });
+    const ubrio = makeRecord({
+      id: "ubrio",
+      semanticType: "rules",
+      scope: { ...scopeA, projectId: "ubrio-agent", namespace: "knowledge" },
+      contentHash: "ubrio",
+    });
+    const outside = makeRecord({
+      id: "outside",
+      semanticType: "resource",
+      scope: { ...scopeA, projectId: "Ubrio", namespace: "knowledge" },
+      contentHash: "outside",
+    });
+    const repository = new FakeRepository([
+      { ...outside, score: 0.99 },
+      { ...pilot, score: 0.9 },
+      { ...ubrio, score: 0.8 },
+      { ...current, score: 0.7 },
+    ]);
+    const service = new DefaultMemoryService({ repository, embeddings: new FakeEmbeddings() });
+
+    const byAuthority = await service.recall({
+      query: "wiki",
+      scope: scopeA,
+      recallBoundary: "authority",
+      authorityAllow: allow,
+    });
+    expect(byAuthority.hits.map((hit) => hit.record.id).sort()).toEqual([
+      "current",
+      "pilot",
+      "ubrio",
+    ]);
+    const currentHit = byAuthority.hits.find((hit) => hit.record.id === "current");
+    const ubrioHit = byAuthority.hits.find((hit) => hit.record.id === "ubrio");
+    expect(currentHit?.scoreBreakdown?.factors?.scopeFit).toBeGreaterThan(
+      ubrioHit?.scoreBreakdown?.factors?.scopeFit ?? 1,
+    );
+
+    const byProject = await service.recall({
+      query: "wiki",
+      scope: scopeA,
+      recallBoundary: "project",
+      authorityAllow: allow,
+    });
+    expect(byProject.hits.map((hit) => hit.record.id)).toEqual(["current"]);
+    expect(repository.queryCalls.at(-1)).toMatchObject({
+      filter: { _projectName: "memory-autodb" },
+    });
+  });
+
+  test("recallBoundary=authority 缺少 allowlist 时 fail-closed", async () => {
+    const repository = new FakeRepository();
+    const embeddings = new FakeEmbeddings();
+    const service = new DefaultMemoryService({ repository, embeddings });
+
+    const result = await service.recall({
+      query: "wiki",
+      scope: makeRecord().scope,
+      recallBoundary: "authority",
+    });
+
+    expect(result.hits).toEqual([]);
+    expect(result.retrievalMode).toBe("fail-closed");
+    expect(result.embeddingPolicyReason).toBe("authority-allowlist-required");
+    expect(embeddings.texts).toEqual([]);
+    expect(repository.queryCalls).toEqual([]);
+  });
+
   test("100 组跨 tenant/user provider 污染结果在返回文本和 ID 前全部剔除，limit 后置正确", async () => {
     const authorityScope = {
       tenantId: "tenant-authority",

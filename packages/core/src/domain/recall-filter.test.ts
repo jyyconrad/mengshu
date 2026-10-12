@@ -7,11 +7,13 @@
 
 import { describe, expect, test } from "vitest";
 import type { MemoryRecord, MemoryScope } from "../../../../core/types.js";
+import { DEFAULT_SLOT_REUSE_POLICY } from "./scope-policy.js";
 import {
   filterContextEligibleRecords,
   filterRecallEligibleRecords,
   filterRecallRecords,
   DEFAULT_SALIENCE_THRESHOLD,
+  type RecallBoundaryAllow,
 } from "./recall-filter.js";
 
 const requestScope: MemoryScope = {
@@ -227,6 +229,64 @@ describe("filterRecallEligibleRecords - F0 hard eligibility", () => {
       requestScope,
     )
       .map((record) => record.id)).toEqual(["private-sensitive"]);
+  });
+
+  test("project 边界只保留请求项目，并包含该项目的 knowledge namespace", () => {
+    const allow: RecallBoundaryAllow = {
+      appIds: ["a"],
+      projectIds: ["p", "other"],
+      agentIds: ["ag"],
+      namespaces: ["memories", "knowledge"],
+      visibilities: ["private"],
+    };
+    const sameProjectKnowledge = makeRecord({
+      id: "wiki",
+      semanticType: "resource",
+      scope: { ...requestScope, namespace: "knowledge" },
+    });
+    const otherProject = makeRecord({
+      id: "other",
+      semanticType: "resource",
+      scope: { ...requestScope, projectId: "other", namespace: "knowledge" },
+      contentHash: "other",
+    });
+
+    expect(filterRecallEligibleRecords(
+      [sameProjectKnowledge, otherProject],
+      requestScope,
+      DEFAULT_SLOT_REUSE_POLICY,
+      { boundary: "project", allow },
+    ).map((record) => record.id)).toEqual(["wiki"]);
+  });
+
+  test("authority 边界保留 allowlist 内其他项目的 resource，并拒绝名单外项目", () => {
+    const allow: RecallBoundaryAllow = {
+      appIds: ["a"],
+      projectIds: ["p", "kb-pilot"],
+      agentIds: ["ag", "default"],
+      namespaces: ["memories", "knowledge"],
+      visibilities: ["private"],
+    };
+    const current = makeRecord({ id: "current", semanticType: "resource" });
+    const formal = makeRecord({
+      id: "kb-pilot",
+      semanticType: "resource",
+      scope: { ...requestScope, projectId: "kb-pilot", namespace: "knowledge", agentId: "default" },
+      contentHash: "kb",
+    });
+    const outside = makeRecord({
+      id: "outside",
+      semanticType: "resource",
+      scope: { ...requestScope, projectId: "Ubrio", namespace: "knowledge" },
+      contentHash: "out",
+    });
+
+    expect(filterRecallEligibleRecords(
+      [current, formal, outside],
+      requestScope,
+      DEFAULT_SLOT_REUSE_POLICY,
+      { boundary: "authority", allow },
+    ).map((record) => record.id)).toEqual(["current", "kb-pilot"]);
   });
 });
 

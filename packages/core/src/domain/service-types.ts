@@ -63,6 +63,19 @@ export interface RecallInput {
   scopeFilterMode?: "soft" | "hard";
   /** 项目相似检索（LIKE pattern，如 "openclaw%"）。与 filterProject 互斥。 */
   projectPattern?: string;
+  /**
+   * 显式召回边界。project=只返回 scope.projectId；
+   * authority=返回 authorityAllow 中的全部项目。不传时仍走 semanticType 复用策略。
+   */
+  recallBoundary?: "project" | "authority";
+  /** 服务端写入的 authority allowlist。客户端不得自行扩大。 */
+  authorityAllow?: {
+    readonly appIds: readonly string[];
+    readonly projectIds: readonly string[];
+    readonly agentIds: readonly string[];
+    readonly namespaces: readonly string[];
+    readonly visibilities: readonly string[];
+  };
 }
 
 export interface BuildContextInput extends RecallInput {

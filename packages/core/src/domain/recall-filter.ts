@@ -72,11 +72,70 @@ function recallScopeEligible(
   return applyScopeReusePolicy([record], requestScope, policy).reusable.length === 1;
 }
 
+/** project：只看请求的项目。authority：看 authority allowlist 里的全部项目。 */
+export type RecallBoundary = "project" | "authority";
+
+export interface RecallBoundaryAllow {
+  readonly appIds: readonly string[];
+  readonly projectIds: readonly string[];
+  readonly agentIds: readonly string[];
+  readonly namespaces: readonly string[];
+  readonly visibilities: readonly string[];
+}
+
+export interface RecallEligibilityOptions {
+  readonly boundary?: RecallBoundary;
+  readonly allow?: RecallBoundaryAllow;
+}
+
+function scopeValue(value: string | undefined): string {
+  return value ?? "";
+}
+
+function allowlisted(allow: readonly string[] | undefined, value: string): boolean {
+  return allow?.includes(value) === true;
+}
+
+/**
+ * 显式召回边界。project 不按 semanticType 做跨项目复用，也不把 namespace 当成第二道项目墙。
+ * authority 只放行 allowlist 中的 app/project/agent/namespace/visibility，tenant/user 仍然硬隔离。
+ */
+export function matchesRecallBoundary(
+  record: MemoryRecord,
+  requestScope: MemoryScope,
+  boundary: RecallBoundary,
+  allow?: RecallBoundaryAllow,
+): boolean {
+  if (record.scope.tenantId !== requestScope.tenantId) return false;
+  if (record.scope.userId !== requestScope.userId) return false;
+  const projectId = scopeValue(record.scope.projectId);
+  const appId = scopeValue(record.scope.appId);
+  const agentId = scopeValue(record.scope.agentId);
+  const namespace = scopeValue(record.scope.namespace);
+  const visibility = record.scope.visibility ?? "private";
+  if (boundary === "project") {
+    if (projectId !== scopeValue(requestScope.projectId)) return false;
+    if (!allow) return true;
+    return allowlisted(allow.projectIds, projectId)
+      && allowlisted(allow.appIds, appId)
+      && allowlisted(allow.agentIds, agentId)
+      && allowlisted(allow.namespaces, namespace)
+      && allowlisted(allow.visibilities, visibility);
+  }
+  if (!allow) return false;
+  return allowlisted(allow.projectIds, projectId)
+    && allowlisted(allow.appIds, appId)
+    && allowlisted(allow.agentIds, agentId)
+    && allowlisted(allow.namespaces, namespace)
+    && allowlisted(allow.visibilities, visibility);
+}
+
 /** F0 生产召回硬过滤：只返回受治理、可检索且未扩大 scope 的 MemoryRecord。 */
 export function filterRecallEligibleRecords<T extends MemoryRecord>(
   records: readonly T[],
   requestScope: MemoryScope,
   policy: SlotReusePolicy = DEFAULT_SLOT_REUSE_POLICY,
+  options?: RecallEligibilityOptions,
 ): T[] {
   return records.filter((record) => {
     const route = record.metadata?.admissionRoute;
@@ -120,6 +179,9 @@ export function filterRecallEligibleRecords<T extends MemoryRecord>(
       riskFlags.includes("conflict_possible");
     if (unresolvedConflict && !lookupOnly) return false;
 
+    if (options?.boundary) {
+      return matchesRecallBoundary(record, requestScope, options.boundary, options.allow);
+    }
     return recallScopeEligible(record, requestScope, policy);
   });
 }
@@ -129,8 +191,9 @@ export function filterContextEligibleRecords<T extends MemoryRecord>(
   records: readonly T[],
   requestScope: MemoryScope,
   policy: SlotReusePolicy = DEFAULT_SLOT_REUSE_POLICY,
+  options?: RecallEligibilityOptions,
 ): T[] {
-  return filterRecallEligibleRecords(records, requestScope, policy).filter((record) => {
+  return filterRecallEligibleRecords(records, requestScope, policy, options).filter((record) => {
     const route = record.metadata?.admissionRoute;
     if (route === "lookup_only") return false;
     return route === undefined || route === "active";

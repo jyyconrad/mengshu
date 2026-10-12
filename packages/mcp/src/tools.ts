@@ -263,14 +263,29 @@ function withUntrustedHeader(content: string): string {
   return `${INGEST_UNTRUSTED_HEADER}\n\n${content}`;
 }
 
+/**
+ * 写在每个带 scope 的工具上，避免 Agent 把评测运行号当成新应用或新项目。
+ * 已有项目看本字段 enum；没有合适项时才用稳定可读的新名称。
+ */
+const PROJECT_IDENTITY_RULE =
+  "项目身份：先从 scope.projectId / scope.appId 的 enum（已授权项目和应用）里选合适的复用。禁止新造带哈希、uuid 或运行号后缀的应用名或项目名，例如 kb-pilot-283dc0a5b96f、mengshu-eval。已有项目都不合适时，才使用新的稳定可读名称去存储，只用字母、数字和连字符，不要把评测批次或随机后缀拼进名称。enum 里没有这个名称时，不要改写成带哈希的别名。";
+
 /** 通用 scope 字段定义，多个工具复用 */
 const scopeSchema: JsonSchemaObject = {
   type: "object",
   description:
-    "Optional memory scope. Omit fields you do not need; tenant, user, and defaults are server-owned.",
+    `Optional memory scope. Omit fields you do not need; tenant, user, and defaults are server-owned. ${PROJECT_IDENTITY_RULE}`,
   properties: {
-    appId: { type: "string" },
-    projectId: { type: "string" },
+    appId: {
+      type: "string",
+      description:
+        "应用名。只能复用 enum 中的已有应用。禁止自造 mengshu-eval，或在应用名后拼接哈希、uuid、运行号。",
+    },
+    projectId: {
+      type: "string",
+      description:
+        "项目名。先复用 enum 中已有且合适的项目。禁止生成 kb-pilot-283dc0a5b96f 这类带哈希或运行号的新项目名。没有合适的已有项目时，才用新的稳定可读项目名存储。",
+    },
     agentId: { type: "string" },
     namespace: { type: "string" },
     visibility: {
@@ -298,12 +313,12 @@ const recallInputSchema: JsonSchemaObject = {
     filterProject: {
       type: "string",
       description:
-        "按项目精确筛选（如 'memory-autodb'）；必须同时设置 scopeFilterMode='hard' 才生效。",
+        "按项目精确筛选（如 'memory-autodb'）；必须同时设置 scopeFilterMode='hard' 才生效。先复用已有项目名。禁止填写 kb-pilot-283dc0a5b96f 这类带哈希或运行号的新名称；没有合适的已有项目时，才用新的稳定可读项目名。",
     },
     filterProduct: {
       type: "string",
       description:
-        "按产品精确筛选（如 'codex' / 'claude-code'）；必须同时设置 scopeFilterMode='hard' 才生效。",
+        "按产品精确筛选（如 'codex' / 'claude-code'）；必须同时设置 scopeFilterMode='hard' 才生效。只能复用已有应用名，禁止自造带哈希或运行号的应用名。",
     },
     scopeFilterMode: {
       type: "string",
@@ -315,6 +330,12 @@ const recallInputSchema: JsonSchemaObject = {
       type: "string",
       description:
         "项目相似检索（LIKE pattern，如 'openclaw%'）；必须同时设置 scopeFilterMode='hard'。",
+    },
+    recallBoundary: {
+      type: "string",
+      enum: ["project", "authority"],
+      description:
+        "project=只召回 scope.projectId，包含该项目 allowlist 内的全部 namespace。authority=召回当前 authority 允许的全部项目。不传时仍按 semanticType 复用。服务端使用 authority allowlist，调用方不能自行扩大。",
     },
     format: {
       type: "string",
@@ -827,7 +848,7 @@ function buildIngestTool(
   return {
     name: "memory_ingest",
     description:
-      "Ingest external text or a local file (.txt/.md/.json) into persistent memory. Supports dryRun chunk preview.",
+      `Ingest external text or a local file (.txt/.md/.json) into persistent memory. Supports dryRun chunk preview. ${PROJECT_IDENTITY_RULE}`,
     inputSchema,
     execute: async (input) => {
       const source = typeof input.source === "string" ? input.source : "";
@@ -1248,18 +1269,37 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     {
       name: "memory_save",
       description:
-        "Save one memory. Prefer top-level `text`; `content` and nested `record` remain compatibility inputs for cached clients.",
+        `Save one memory. Prefer top-level \`text\`; \`content\` and nested \`record\` remain compatibility inputs for cached clients. ${PROJECT_IDENTITY_RULE}`,
       inputSchema: storeToolInputSchema,
       execute: async (input) => executeWrite("saveExplicit", input),
     },
     {
       name: "memory_recall",
       description:
-        "Recall relevant memories as concise Markdown, or raw structured hits with the complete six-factor score breakdown. Empty results are JSON with recallStatus ok-empty, authority-filtered, or not-ready; do not invent memories. Directory scan is CLI `ms scan`, not this tool.",
+        `Recall relevant memories as concise Markdown, or raw structured hits with the complete six-factor score breakdown. Empty results are JSON with recallStatus ok-empty, authority-filtered, or not-ready; do not invent memories. Directory scan is CLI \`ms scan\`, not this tool. ${PROJECT_IDENTITY_RULE}`,
       inputSchema: recallToolInputSchema,
       execute: async (input) => {
-        const merged = { ...input, scope: mergeScope(input.scope as Record<string, unknown> | undefined) };
         const query = typeof input.query === "string" ? input.query : "";
+        const recallBoundary = input.recallBoundary === "project" || input.recallBoundary === "authority"
+          ? input.recallBoundary
+          : undefined;
+        const { authorityAllow: _clientAllow, recallBoundary: _clientBoundary, ...clientInput } = input;
+        void _clientAllow;
+        void _clientBoundary;
+        const merged = {
+          ...clientInput,
+          scope: mergeScope(input.scope as Record<string, unknown> | undefined),
+          ...(recallBoundary ? { recallBoundary } : {}),
+          ...(recallBoundary && options.authority ? {
+            authorityAllow: {
+              appIds: options.authority.allow.appIds,
+              projectIds: options.authority.allow.projectIds,
+              agentIds: options.authority.allow.agentIds,
+              namespaces: options.authority.allow.namespaces,
+              visibilities: options.authority.allow.visibilities,
+            },
+          } : {}),
+        };
         try {
           const result = await options.service.recall(merged as unknown as RecallInput);
           return presentRecallResult(options.service, result, input);
@@ -1271,7 +1311,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     },
     {
       name: "memory_context",
-      description: "Build a prompt-safe context block from recalled memories.",
+      description: `Build a prompt-safe context block from recalled memories. ${PROJECT_IDENTITY_RULE}`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1291,7 +1331,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     {
       name: "memory_observe",
       description:
-        "Observe and save one memory. Prefer top-level `text`; `content` and nested `record` remain compatibility inputs for cached clients.",
+        `Observe and save one memory. Prefer top-level \`text\`; \`content\` and nested \`record\` remain compatibility inputs for cached clients. ${PROJECT_IDENTITY_RULE}`,
       inputSchema: observeToolInputSchema,
       execute: async (input) => executeWrite("observeAuto", input),
     },
@@ -1466,7 +1506,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
   const fastPathTools: McpMemoryTool[] = [
     {
       name: "memory_context_fast",
-      description: "Fetch the 5-slot agent task context for task startup.",
+      description: `Fetch the 5-slot agent task context for task startup. ${PROJECT_IDENTITY_RULE}`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1489,7 +1529,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     },
     {
       name: "memory_observe_light",
-      description: "Submit a lightweight observation during a running task.",
+      description: `Submit a lightweight observation during a running task. ${PROJECT_IDENTITY_RULE}`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1529,7 +1569,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     {
       name: "memory_lookup",
       description:
-        "On-demand fast lookup during a running task. Empty hits include recallStatus ok-empty, authority-filtered, or not-ready; do not invent memories.",
+        `On-demand fast lookup during a running task. Empty hits include recallStatus ok-empty, authority-filtered, or not-ready; do not invent memories. ${PROJECT_IDENTITY_RULE}`,
       inputSchema: {
         type: "object",
         properties: {

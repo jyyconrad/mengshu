@@ -14,7 +14,9 @@ import { computeRecallScoreBreakdown } from "../domain/recall-scoring.js";
 import {
   filterContextEligibleRecords,
   filterRecallEligibleRecords,
+  matchesRecallBoundary,
 } from "../domain/recall-filter.js";
+import { DEFAULT_SLOT_REUSE_POLICY } from "../domain/scope-policy.js";
 import type {
   GovernedRetrievalCandidateSource,
   GovernedRetrievalEngine,
@@ -125,7 +127,8 @@ export type EmbeddingRecallResult = RecallResult & {
   readonly retrievalMode?: "same-space-ann" | "fail-closed";
   readonly embeddingPolicyReason?:
     | EmbeddingRecallPolicyDecision["reasonCode"]
-    | "caller-space-filter-conflict";
+    | "caller-space-filter-conflict"
+    | "authority-allowlist-required";
 };
 
 function validateSingleStoreOutcome(
@@ -296,12 +299,27 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
       };
     }
 
+    if (input.recallBoundary === "authority" && input.authorityAllow === undefined) {
+      return {
+        scope,
+        query: input.query,
+        hits: [],
+        retrievalMode: "fail-closed",
+        embeddingPolicyReason: "authority-allowlist-required",
+      };
+    }
+
     // D-25：硬过滤模式时，把项目/产品维度注入 filter（通过内部 key 传递给 adapter）
     let filter = input.filter;
-    if (input.scopeFilterMode === "hard") {
+    const projectBoundary = input.recallBoundary === "project";
+    if (input.scopeFilterMode === "hard" || projectBoundary) {
       // 优先用显式传入的 filterProject/filterProduct，回退当前 scope（如果不是 default）
-      const project = input.filterProject ?? (scope.projectId !== "default" ? scope.projectId : undefined);
-      const product = input.filterProduct ?? (scope.appId !== "default" ? scope.appId : undefined);
+      const project = input.filterProject
+        ?? (projectBoundary || scope.projectId !== "default" ? scope.projectId : undefined);
+      // project 边界只锁项目。产品硬过滤仍留给显式 hard 模式，避免换 app 后看不到同一项目。
+      const product = projectBoundary
+        ? input.filterProduct
+        : input.filterProduct ?? (scope.appId !== "default" ? scope.appId : undefined);
 
       if (project || product || input.projectPattern) {
         filter = { ...input.filter };  // 仅在有硬过滤时才复制 filter
@@ -367,9 +385,22 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
       record.scope?.tenantId === scope.tenantId && record.scope?.userId === scope.userId,
     );
 
+    const eligibilityOptions = input.recallBoundary
+      ? { boundary: input.recallBoundary, allow: input.authorityAllow }
+      : undefined;
     const eligibleRecords = intent === "context"
-      ? filterContextEligibleRecords(authorityRecords, scope)
-      : filterRecallEligibleRecords(authorityRecords, scope);
+      ? filterContextEligibleRecords(
+          authorityRecords,
+          scope,
+          DEFAULT_SLOT_REUSE_POLICY,
+          eligibilityOptions,
+        )
+      : filterRecallEligibleRecords(
+          authorityRecords,
+          scope,
+          DEFAULT_SLOT_REUSE_POLICY,
+          eligibilityOptions,
+        );
     const supplementalCandidates = this.governedRetrieval && this.governedCandidateSource &&
         input.query.trim().length > 0
       ? await this.governedCandidateSource.search({
@@ -441,7 +472,15 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
         };
         return hit;
       });
-    const hits: RecallHit[] = [...governedHits, ...localHits]
+    const boundedHits = input.recallBoundary
+      ? [...governedHits, ...localHits].filter((hit) => matchesRecallBoundary(
+          hit.record,
+          scope,
+          input.recallBoundary!,
+          input.authorityAllow,
+        ))
+      : [...governedHits, ...localHits];
+    const hits: RecallHit[] = boundedHits
       // 综合分降序：同 authority 内，同 scope（高 scopeFit）排前，跨 project 等靠后。
       // 综合分相同时按向量相似度兜底（保持相关性优先的稳定排序）。
       .sort((a, b) => {
