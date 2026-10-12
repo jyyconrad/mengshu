@@ -31,3 +31,9 @@
 ## 明确不做
 
 npm 发布、Graphiti 桥、自动可执行 Skill、静默 ADD、重写 D-01~D-23。
+
+## Grok workflow 执行
+
+- Workflow 定义：`.grok/workflows/mengshu-p2.rhai`（`/mengshu-p2`）
+- 启动方式：短指令「运行 mengshu-p2 workflow」，由 Grok 读本文件分阶段执行；不要把全文粘进 prompt。
+- 盯梢：每小时检查 commits / 进程；挂死后只重启当前阶段。
