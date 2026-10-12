@@ -11,6 +11,9 @@ import {
 import type { MemoryVisibility } from "./packages/core/src/domain/types.js";
 import { parseRuntimeBackgroundWork, type RuntimeBackgroundWorkConfig } from "./packages/core/src/runtime/background-work.js";
 import { fingerprintTargetProfile, type TargetExecutionProfile } from "./packages/core/src/evolution/reuse/target-compatibility.js";
+import { parseWikiConfig, type WikiConfig } from "./packages/core/src/wiki/root.js";
+
+export type { WikiConfig };
 
 /**
  * 路由规则配置
@@ -259,6 +262,12 @@ export type MemoryConfig = {
     /** 是否启用冲突自动降级（默认 true） */
     autoConflictDowngrade?: boolean;
   };
+  /**
+   * 本地 wiki 工作区。`memoryConfigSchema.parse` 总会填上默认值。
+   * `root` 为绝对路径（展开 `~`）。数据库仍是 record of record；
+   * `metadata.wikiPath` 只存相对 root 的正斜杠路径。
+   */
+  wiki?: WikiConfig;
 };
 
 /**
@@ -727,7 +736,7 @@ export const memoryConfigSchema = {
     const cfg = value as Record<string, unknown>;
     assertAllowedKeys(
       cfg,
-      ["embedding", "authority", "defaultAgentId", "llm", "mode", "server", "features", "temporalMemory", "evolution", "sessionWorkingSet", "skillArtifacts", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree"],
+      ["embedding", "authority", "defaultAgentId", "llm", "mode", "server", "features", "temporalMemory", "evolution", "sessionWorkingSet", "skillArtifacts", "dbType", "dbPath", "supabase", "postgres", "scanner", "batchProcessing", "autoCapture", "autoRecall", "recallIncludeDocuments", "captureMaxChars", "tables", "knowledgeBases", "routingRules", "tree", "wiki"],
       "memory config",
     );
 
@@ -1110,6 +1119,8 @@ export const memoryConfigSchema = {
       }
     }
 
+    const wiki = parseWikiConfig(cfg.wiki);
+
     const captureMaxChars =
       typeof cfg.captureMaxChars === "number" ? Math.floor(cfg.captureMaxChars) : undefined;
     if (
@@ -1241,6 +1252,7 @@ export const memoryConfigSchema = {
           failAction: "fallback_extractive",
         },
       } : undefined,
+      wiki,
     };
   },
   uiHints: {
@@ -1410,6 +1422,34 @@ export const memoryConfigSchema = {
       help: "Maximum message length eligible for auto-capture",
       advanced: true,
       placeholder: String(DEFAULT_CAPTURE_MAX_CHARS),
+    },
+    "wiki.root": {
+      label: "Wiki Root",
+      placeholder: "~/.mengshu/wiki",
+      advanced: true,
+      help: "Absolute wiki workspace path. ~ is expanded. Defaults to ~/.mengshu/wiki",
+    },
+    "wiki.entriesDirName": {
+      label: "Wiki Entries Directory",
+      placeholder: "entries",
+      advanced: true,
+      help: "Single path segment under pages/<slug>/ for entry material",
+    },
+    "wiki.writeEntriesOnPersist": {
+      label: "Write Wiki Entries On Persist",
+      advanced: true,
+      help: "When false, skip writing entry markdown after a successful persist",
+    },
+    "wiki.indexUpdate": {
+      label: "Wiki Index Update",
+      placeholder: "sync-ancestors",
+      advanced: true,
+      help: "sync-ancestors updates affected ancestor INDEX pages; off disables that",
+    },
+    "wiki.updateCompletion": {
+      label: "Update Wiki Completion",
+      advanced: true,
+      help: "When true, entry writes may record completion status=entry",
     },
   },
 };

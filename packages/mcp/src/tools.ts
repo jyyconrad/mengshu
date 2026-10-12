@@ -114,6 +114,12 @@ import {
   recallStatusMessage,
   type RecallAvailabilityStatus,
 } from "./recall-status.js";
+import {
+  relativeWikiPathFromMetadata,
+  resolveWikiRoot,
+  WikiPathError,
+} from "../../core/src/wiki/root.js";
+import { readWikiMarkdown, WikiReadError } from "../../core/src/wiki/wiki-read.js";
 
 
 /** JSON Schema 对象（MCP inputSchema 形态，保持宽松类型） */
@@ -238,6 +244,11 @@ export interface McpMemoryToolsOptions {
    * full = advertise every registered tool; default/minimal = curated ListTools.
    */
   toolMode?: McpToolMode;
+  /**
+   * Absolute wiki root for memory_wiki_read. Defaults to ~/.mengshu/wiki.
+   * Clients cannot override it. Stored wikiPath values stay relative.
+   */
+  wikiRoot?: string;
 }
 
 /**
@@ -676,13 +687,15 @@ function formatRecallAsText(result: RecallResult, input: Record<string, unknown>
       text: compactRecallText(recallHitText(hit), maxChars),
       score: Number.isFinite(hit.score) ? hit.score.toFixed(3) : "0.000",
       breakdown: requireRecallBreakdown(hit),
+      wikiPath: recallHitWikiPath(hit),
     }))
     .filter((hit) => hit.text.length > 0)
     .map((hit, index) => {
       const explanation = input.explain === true
         ? `\n\n${indentMarkdown(formatRecallBreakdown(hit.breakdown))}`
         : "";
-      return `${index + 1}. **相关度：${hit.score}**\n\n${indentMarkdown(hit.text)}${explanation}`;
+      const wiki = hit.wikiPath ? `\n${indentMarkdown(`wiki: ${hit.wikiPath}`)}` : "";
+      return `${index + 1}. **相关度：${hit.score}**\n\n${indentMarkdown(hit.text)}${wiki}${explanation}`;
     });
 
   if (lines.length === 0) {
@@ -703,6 +716,14 @@ function formatRecallBreakdown(breakdown: CompleteRecallScoreBreakdown): string 
     `total: ${breakdown.score.toFixed(3)}`,
   ].join("\n");
 }
+
+function recallHitWikiPath(hit: RecallHit): string | undefined {
+  const metadata = "metadata" in hit.record ? hit.record.metadata : undefined;
+  return relativeWikiPathFromMetadata(metadata);
+}
+
+const WIKI_READ_TOOL_TEXT =
+  "wiki_read is file drill-down and memory_knowledge_read stays the DB projection.";
 
 function usableRecallHitCount(result: RecallResult): number {
   return result.hits.filter((hit) => recallHitText(hit).trim().length > 0).length;
@@ -770,6 +791,7 @@ function formatRecallAsRaw(
     score: number;
     source: RecallHit["source"];
     scoreBreakdown: CompleteRecallScoreBreakdown;
+    wikiPath?: string;
   }>;
   filtered?: RecallResult["filtered"];
 } {
@@ -777,12 +799,16 @@ function formatRecallAsRaw(
   return {
     query: result.query,
     hits: result.hits
-      .map((hit) => ({
-        text: compactRecallText(recallHitText(hit), maxChars),
-        score: hit.score,
-        source: hit.source,
-        scoreBreakdown: requireRecallBreakdown(hit),
-      }))
+      .map((hit) => {
+        const wikiPath = recallHitWikiPath(hit);
+        return {
+          text: compactRecallText(recallHitText(hit), maxChars),
+          score: hit.score,
+          source: hit.source,
+          scoreBreakdown: requireRecallBreakdown(hit),
+          ...(wikiPath ? { wikiPath } : {}),
+        };
+      })
       .filter((hit) => hit.text.length > 0),
     ...(result.filtered === undefined ? {} : { filtered: result.filtered }),
   };
@@ -1276,7 +1302,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
     {
       name: "memory_recall",
       description:
-        `Recall relevant memories as concise Markdown, or raw structured hits with the complete six-factor score breakdown. Empty results are JSON with recallStatus ok-empty, authority-filtered, or not-ready; do not invent memories. Directory scan is CLI \`ms scan\`, not this tool. ${PROJECT_IDENTITY_RULE}`,
+        `Recall relevant memories as concise Markdown, or raw structured hits with the complete six-factor score breakdown. A hit with metadata.wikiPath includes a relative wiki: line in text mode and wikiPath in raw mode. Empty results are JSON with recallStatus ok-empty, authority-filtered, or not-ready; do not invent memories. Directory scan is CLI \`ms scan\`, not this tool. ${PROJECT_IDENTITY_RULE}`,
       inputSchema: recallToolInputSchema,
       execute: async (input) => {
         const query = typeof input.query === "string" ? input.query : "";
@@ -1309,6 +1335,7 @@ export function createMcpMemoryTools(options: McpMemoryToolsOptions): McpMemoryT
         }
       },
     },
+    buildWikiReadTool(options),
     {
       name: "memory_context",
       description: `Build a prompt-safe context block from recalled memories. ${PROJECT_IDENTITY_RULE}`,
@@ -2418,6 +2445,51 @@ function buildMemoryTemporalTools(
   return tools;
 }
 
+function buildWikiReadTool(options: McpMemoryToolsOptions): McpMemoryTool {
+  return {
+    name: "memory_wiki_read",
+    description:
+      `Read one markdown file under the configured wiki root by relative path. ${WIKI_READ_TOOL_TEXT} Does not write files or change committed memories.`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          minLength: 1,
+          description: "Relative wiki path using forward slashes, for example pages/default-knowledge/page-019.md.",
+        },
+        maxChars: {
+          type: "integer",
+          minimum: 1,
+          description: "Optional maximum number of characters to return from the file body.",
+        },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+    execute: async (input) => {
+      exactToolInput(
+        input,
+        ["path", "maxChars"],
+        "memory_wiki_read accepts only path and maxChars",
+      );
+      if (typeof input.path !== "string" || input.path.length === 0) {
+        throw new McpInvalidRequestError("memory_wiki_read requires a relative markdown path");
+      }
+      try {
+        return await readWikiMarkdown(resolveWikiRoot(options.wikiRoot), input.path, {
+          ...(input.maxChars === undefined ? {} : { maxChars: input.maxChars as number }),
+        });
+      } catch (error) {
+        if (error instanceof WikiPathError || error instanceof WikiReadError) {
+          throw new McpInvalidRequestError(`${error.code}: ${error.message}`);
+        }
+        throw error;
+      }
+    },
+  };
+}
+
 function buildMemoryKnowledgeTools(
   capability: MemoryKnowledgeResourceCapability,
   mergeScope: (clientScope?: Record<string, unknown>) => Record<string, unknown>,
@@ -2453,7 +2525,8 @@ function buildMemoryKnowledgeTools(
     },
     {
       name: "memory_knowledge_read",
-      description: "Read one bounded, revision-pinned authorized Knowledge resource.",
+      description:
+        `Read one bounded, revision-pinned authorized Knowledge resource. ${WIKI_READ_TOOL_TEXT}`,
       inputSchema: {
         type: "object",
         properties: {

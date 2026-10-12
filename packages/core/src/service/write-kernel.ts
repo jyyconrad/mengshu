@@ -17,7 +17,13 @@ import {
   type WriteIdempotencyIdentity,
 } from "./write-kernel-transaction.js";
 import { authorityScopeFingerprint } from "../domain/authority-scope-fingerprint.js";
+import { scopeToKey } from "../domain/scope.js";
 import type { MemoryVersionTransitionReceipt } from "../temporal/types.js";
+import {
+  mirrorPersistedWikiEntry,
+  wikiMirrorTable,
+  type WikiEntryMirrorConfig,
+} from "../wiki/persist-mirror.js";
 import type { MemoryCategory } from "../../../../config.js";
 import type {
   MemoryContainer,
@@ -297,6 +303,12 @@ export interface MemoryWriteKernelDependencies {
    * Persistence is best-effort and must never fail-closed the write.
    */
   admissionDecisionReceipts?: AdmissionDecisionReceiptRepository;
+  /**
+   * Optional Track E mirror. Invoked only after a memories or knowledge row commits.
+   * Absent config skips the mirror. `writeEntriesOnPersist: false` skips it too.
+   * Wiki IO failures are logged and do not reject the committed write.
+   */
+  wikiEntries?: WikiEntryMirrorConfig;
 }
 
 export interface WritePipelineInput {
@@ -531,11 +543,15 @@ export class MemoryWriteKernel {
     fingerprint: string,
   ): Promise<Extract<MemoryWriteKernelResult, { status: "persisted" }>> {
     // Final short transaction performs the concurrency second-check and all durable mutation.
+    let persistedContentId: string | undefined;
     const committedReceipt = await this.dependencies.transaction(async (transaction) => {
       const winner = await transaction.getReceipt(identity);
       if (winner) return this.validateExistingReceipt(winner, identity, fingerprint);
 
       const mutation = await transaction.writeMemory(memory);
+      if (mutation.stored && memory.mutation === "content" && isMemoryRoute(memory.route)) {
+        persistedContentId = mutation.memoryId;
+      }
       if (typeof mutation.memoryId !== "string" || mutation.memoryId.length === 0 ||
           typeof mutation.stored !== "boolean") {
         throw new Error("write transaction returned an invalid mutation result");
@@ -610,7 +626,38 @@ export class MemoryWriteKernel {
       return proposedReceipt;
     });
 
+    if (persistedContentId !== undefined && memory.mutation === "content") {
+      await this.mirrorCommittedWiki(memory, persistedContentId);
+    }
     return this.acknowledge(command, committedReceipt);
+  }
+
+  /**
+   * Track E side effect. The row is already committed; this must not throw.
+   * Candidates and lifecycle changes are not mirrored here.
+   */
+  private async mirrorCommittedWiki(
+    memory: Extract<WriteMemoryRecord, { mutation: "content" }>,
+    id: string,
+  ): Promise<void> {
+    const wiki = this.dependencies.wikiEntries;
+    if (!wiki) return;
+    const table = wikiMirrorTable(memory);
+    if (!table) return;
+    const metadata = memory.metadata;
+    await mirrorPersistedWikiEntry({
+      id,
+      kind: table.kind,
+      tableName: table.tableName,
+      scopeKey: scopeToKey(memory.scope),
+      semanticType: memory.semanticType,
+      text: memory.text,
+      title: typeof metadata.title === "string" ? metadata.title : undefined,
+      updatedAt: memory.createdAt,
+      source: typeof memory.provenance.source === "string" ? memory.provenance.source : undefined,
+      admissionRoute: memory.route,
+      wikiPath: typeof metadata.wikiPath === "string" ? metadata.wikiPath : undefined,
+    }, wiki);
   }
 
   async execute(command: MemoryWriteCommand): Promise<MemoryWriteKernelResult> {

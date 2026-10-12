@@ -147,6 +147,39 @@ describe("registerRecallCliCommands", () => {
     expect(out).toContain("beta");
   });
 
+  test("普通模式与 --explain 打印相对 wikiPath，并省略绝对路径", async () => {
+    const fused = "pages/default-knowledge/page-019.md";
+    const entry = "pages/default-memories/entries/experience/11111111-1111-4111-8111-111111111111.md";
+    const { commander, commands } = makeFakeCommander();
+    registerRecallCliCommands(commander, {
+      service: makeFakeService([
+        { record: makeRecord("fused", { text: "fused-body", metadata: { wikiPath: fused } }), score: 0.9 },
+        { record: makeRecord("entry", { text: "entry-body", metadata: { wikiPath: entry } }), score: 0.8 },
+        {
+          record: makeRecord("abs", {
+            text: "absolute-body",
+            metadata: { wikiPath: "/tmp/secret-wiki/page.md" },
+          }),
+          score: 0.7,
+        },
+      ]),
+      defaultScope: scope,
+    });
+    const recall = commands.find((c) => c.name.startsWith("recall"))!;
+    await recall.action!("q", { limit: "10", minScore: "0.3", explain: false });
+    const plain = loggedOutput();
+    expect(plain).toContain(`wiki: ${fused}`);
+    expect(plain).toContain(`wiki: ${entry}`);
+    expect(plain).not.toContain("/tmp/secret-wiki");
+
+    logSpy.mockClear();
+    await recall.action!("q", { limit: "10", minScore: "0.3", explain: true });
+    const explained = loggedOutput();
+    expect(explained).toContain(`wiki: ${fused}`);
+    expect(explained).toContain(`wiki: ${entry}`);
+    expect(explained).not.toContain("/tmp/secret-wiki");
+  });
+
   test("--explain 打印 6 因子明细", async () => {
     const { commander, commands } = makeFakeCommander();
     registerRecallCliCommands(commander, {

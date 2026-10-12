@@ -24,6 +24,7 @@ export interface McpToolDescriptor {
 export const MCP_DEFAULT_TOOL_NAMES: readonly string[] = [
   "memory_context_fast",
   "memory_recall",
+  "memory_wiki_read",
   "memory_lookup",
   "memory_observe",
   "memory_save",

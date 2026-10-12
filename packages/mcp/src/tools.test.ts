@@ -693,6 +693,7 @@ describe("MCP memory tools", () => {
     expect(tools.map((tool) => tool.name)).toEqual([
       "memory_save",
       "memory_recall",
+      "memory_wiki_read",
       "memory_context",
       "memory_observe",
       "memory_ingest",
@@ -762,6 +763,68 @@ describe("MCP memory tools", () => {
     expect(result).not.toContain("scoreBreakdown");
     expect(result).not.toContain("\"record\"");
     expect(result).not.toContain("scope");
+    expect(result).not.toContain("wiki:");
+  });
+
+  test("memory_recall shows relative fused and entry wiki paths and omits absolute paths", async () => {
+    const fused = "pages/default-knowledge/page-019.md";
+    const entry = "pages/default-memories/entries/rules/6f0c0c2a-1b2c-4d5e-8f90-aabbccddeeff.md";
+    const service = new FakeMemoryService();
+    service.recall = (async () => ({
+      scope,
+      query: "wiki",
+      hits: [
+        {
+          record: { ...record, id: "fused", text: "fused page", metadata: { wikiPath: fused } },
+          score: scoreBreakdown.score,
+          source: "vector",
+          scoreBreakdown,
+        },
+        {
+          record: { ...record, id: "entry", text: "entry page", metadata: { wikiPath: entry } },
+          score: scoreBreakdown.score,
+          source: "vector",
+          scoreBreakdown,
+        },
+        {
+          record: {
+            ...record,
+            id: "absolute",
+            text: "absolute page",
+            metadata: { wikiPath: "/Users/secret/.mengshu/wiki/pages/secret.md" },
+          },
+          score: scoreBreakdown.score,
+          source: "vector",
+          scoreBreakdown,
+        },
+        {
+          record: {
+            ...record,
+            id: "escape",
+            text: "escape page",
+            metadata: { wikiPath: "pages/../../outside.md" },
+          },
+          score: scoreBreakdown.score,
+          source: "vector",
+          scoreBreakdown,
+        },
+      ],
+    })) as unknown as typeof service.recall;
+    const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service, wikiRoot: os.tmpdir() });
+    const recall = tools.find((tool) => tool.name === "memory_recall")!;
+
+    const text = await recall.execute({ query: "wiki" });
+    expect(text).toContain(`wiki: ${fused}`);
+    expect(text).toContain(`wiki: ${entry}`);
+    expect(text).not.toContain("/Users/secret");
+    expect(text).not.toContain("outside.md");
+    expect(String(text).split("wiki:").length - 1).toBe(2);
+
+    const raw = await recall.execute({ query: "wiki", raw: true }) as {
+      hits: Array<{ text: string; wikiPath?: string }>;
+    };
+    expect(raw.hits.map((hit) => hit.wikiPath)).toEqual([fused, entry, undefined, undefined]);
+    expect(JSON.stringify(raw)).not.toContain("/Users/secret");
   });
 
   test("memory_recall raw preserves the complete production score breakdown without vectors", async () => {
@@ -1349,7 +1412,8 @@ describe("MCP memory tools", () => {
 
   test("keeps 7 safe base tools when no agentFastPath is injected", () => {
     const tools = createMcpMemoryTools({ unsafeLegacyScope: true, service: new FakeMemoryService() });
-    expect(tools).toHaveLength(9);
+    expect(tools).toHaveLength(10);
+    expect(tools.map((tool) => tool.name)).toContain("memory_wiki_read");
     expect(tools.map((tool) => tool.name)).not.toContain("memory_context_fast");
   });
 
@@ -1386,7 +1450,7 @@ describe("MCP memory tools", () => {
       >[0]["agentFastPath"],
     });
 
-    expect(tools).toHaveLength(14);
+    expect(tools).toHaveLength(15);
     const names = tools.map((tool) => tool.name);
     expect(names).toContain("memory_context_fast");
     expect(names).toContain("memory_observe_light");
@@ -1819,6 +1883,7 @@ describe("MCP memory tools", () => {
     expect(listToolsForMode(tools, "default").map((tool) => tool.name)).toEqual([
       "memory_context_fast",
       "memory_recall",
+      "memory_wiki_read",
       "memory_lookup",
       "memory_observe",
       "memory_save",

@@ -26,6 +26,7 @@ import {
   requireRecallHitReceipt,
   requireRecallResultReceipts,
 } from "../../../../packages/core/src/domain/recall-receipt-validation.js";
+import { relativeWikiPathFromMetadata } from "../../../../packages/core/src/wiki/root.js";
 
 /** recall 命令依赖注入。 */
 export interface RecallCliDeps {
@@ -49,6 +50,11 @@ const EXPLAIN_CANDIDATE_MULTIPLIER = 3;
 function hitText(record: RecallHit["record"]): string {
   const r = record as { text?: string; summary?: string; title?: string };
   return r.text ?? r.summary ?? r.title ?? "";
+}
+
+function hitWikiPath(record: RecallHit["record"]): string | undefined {
+  const metadata = "metadata" in record ? record.metadata : undefined;
+  return relativeWikiPathFromMetadata(metadata);
 }
 
 /**
@@ -134,6 +140,8 @@ export function registerRecallCliCommands(memory: CommanderLike, deps: RecallCli
         console.log(`Found ${result.hits.length} results:\n`);
         for (const hit of result.hits) {
           console.log(`[${fmt(hit.score)}] ${hitText(hit.record)}`);
+          const wikiPath = hitWikiPath(hit.record);
+          if (wikiPath) console.log(`  wiki: ${wikiPath}`);
         }
         return;
       }
@@ -165,6 +173,8 @@ export function registerRecallCliCommands(memory: CommanderLike, deps: RecallCli
       console.log(`保留 ${kept.length} 条：`);
       for (const { hit, breakdown } of kept) {
         console.log(`\n  [total=${fmt(breakdown.score)}] ${hitText(hit.record)}`);
+        const wikiPath = hitWikiPath(hit.record);
+        if (wikiPath) console.log(`    wiki: ${wikiPath}`);
         printBreakdown(breakdown);
       }
 
@@ -173,6 +183,8 @@ export function registerRecallCliCommands(memory: CommanderLike, deps: RecallCli
         for (const { hit, breakdown } of filtered) {
           const filteredReason = `total score ${fmt(breakdown.score)} < min-score ${fmt(minScore)}`;
           console.log(`\n  [total=${fmt(breakdown.score)}] ${hitText(hit.record)}`);
+          const wikiPath = hitWikiPath(hit.record);
+          if (wikiPath) console.log(`    wiki: ${wikiPath}`);
           console.log(`    filteredReason: ${filteredReason}`);
           printBreakdown(breakdown);
         }

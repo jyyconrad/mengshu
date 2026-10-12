@@ -124,6 +124,32 @@ PostgreSQL 存储依赖 `pgvector`，初始化时会执行 `CREATE EXTENSION IF 
 
 Supabase 配置需要 service role key，而不是 anon key；建议通过环境变量引用，避免明文写入 `config.json`。
 
+### Wiki 工作区
+
+`wiki.root` 是本地 wiki 工作区的绝对路径。省略整个 `wiki` 对象时默认 `~/.mengshu/wiki`。`~` 会展开；相对路径会被拒绝。配置解析不创建目录。数据库仍是记忆与知识的 record of record。日后写入的 `metadata.wikiPath` 只保存相对 `wiki.root` 的正斜杠路径；路径校验拒绝 `..`、逃出根目录的绝对路径、符号链接和非 `.md` 文件。wiki 文件写失败不得回滚已经提交的记忆。
+
+```json
+{
+  "wiki": {
+    "root": "~/.mengshu/wiki",
+    "entriesDirName": "entries",
+    "writeEntriesOnPersist": true,
+    "indexUpdate": "sync-ancestors",
+    "updateCompletion": true
+  }
+}
+```
+
+| 字段 | 说明 | 默认值 |
+|------|------|--------|
+| `root` | 绝对路径；支持 `~` | `~/.mengshu/wiki` |
+| `entriesDirName` | `pages/<slug>/` 下的条目目录名，单个路径段 | `entries` |
+| `writeEntriesOnPersist` | 持久化成功后是否写条目素材；测试可关 | `true` |
+| `indexUpdate` | `sync-ancestors` 或 `off` | `sync-ancestors` |
+| `updateCompletion` | 是否把 entry 状态写入 completion | `true` |
+
+`root` 可以改成 `~/.mengshu/wiki` 以外的另一个绝对目录。Track F 融合页是 `pages/<slug>/page-NNN.md`（离线；本机 `STYLE-GUIDE.md` 只约束这一轨）。Track E 条目是 `pages/<slug>/entries/<semanticType>/<id>.md`。召回可能带回相对 `wikiPath`；读文件用 `memory_wiki_read` 或 `ms wiki read`，不要用 `memory_knowledge_read`（后者按 UUID 与 revision 读库内投影）。轨道合同见 [wiki-entries.md](./wiki-entries.md)。
+
 ### Runtime 与 Server
 
 ```json

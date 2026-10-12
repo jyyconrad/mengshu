@@ -27,6 +27,7 @@ import {
   type ValidatedWriteCandidate,
   type WriteScope,
 } from "./packages/core/src/service/write-kernel.js";
+import type { WikiEntryMirrorConfig } from "./packages/core/src/wiki/persist-mirror.js";
 import type { PostgresEvolutionVerifiedInput } from "./packages/core/src/evolution/governed-writer.js";
 import { resolveAuthorityScope, type AuthorityScope } from "./packages/core/src/domain/authority-scope.js";
 import { authorityScopeFingerprint } from "./packages/core/src/domain/authority-scope-fingerprint.js";
@@ -451,6 +452,36 @@ function defaultScope(appId: string): MemoryScope {
     agentId: "default",
     namespace: appId === "mengshu" || appId === "cli" ? "working-context" : "default",
     visibility: "private",
+  };
+}
+
+function wikiEntryMirror(
+  config: MemoryConfig,
+  db: DatabaseProvider,
+  logger?: RuntimeLogger,
+): WikiEntryMirrorConfig | undefined {
+  const wiki = config.wiki;
+  if (!wiki) return undefined;
+  const updateMetadata = db.updateMetadata;
+  return {
+    root: wiki.root,
+    entriesDirName: wiki.entriesDirName,
+    writeEntriesOnPersist: wiki.writeEntriesOnPersist,
+    indexUpdate: wiki.indexUpdate,
+    ...(logger?.warn
+      ? { logger: { warn: (message: string) => logger.warn?.(message) } }
+      : {}),
+    ...(typeof updateMetadata === "function"
+      ? {
+          recordMetadata: async (input: {
+            id: string;
+            tableName: "memories" | "knowledge" | `knowledge_${string}`;
+            patch: Readonly<Record<string, string>>;
+          }) => {
+            await updateMetadata.call(db, input.id, { ...input.patch }, input.tableName);
+          },
+        }
+      : {}),
   };
 }
 
@@ -1068,6 +1099,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         db.createGovernedRetrievalCandidateSource(),
       )
     : undefined);
+  const wikiEntries = wikiEntryMirror(options.config, db, options.logger);
   const memoryService = new DefaultMemoryService({
     repository: memoryRepository,
     embeddings,
@@ -1077,6 +1109,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
     forgetTransactions,
     governedRetrieval,
     governedCandidateSource,
+    ...(wikiEntries ? { wikiEntries } : {}),
     embeddingReadGuard,
     // 与 candidate/document/chunk/observation 共用同一 mutable registry gate；
     // public REST/MCP/script/doctor 经 memoryService 写入时不再有 vector 旁路。
@@ -1369,6 +1402,7 @@ export function createMengshuRuntime(options: RuntimeOptions): MengshuRuntime {
         ack: () => undefined,
         createId: randomUUID,
         now: Date.now,
+        ...(wikiEntries ? { wikiEntries } : {}),
       });
   const memoryWriteKernel = memoryWriteKernelTransactions
     ? new MemoryWriteKernel({

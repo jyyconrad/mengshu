@@ -60,6 +60,8 @@ export interface McpMemoryServerOptions {
   memoryPolicy?: MemoryPolicyCapability;
   pipeline?: IngestionPipeline;
   llmClient?: LlmClient;
+  /** Configured wiki root for memory_wiki_read. Defaults to ~/.mengshu/wiki. */
+  wikiRoot?: string;
   toolMode?: import("./tool-mode.js").McpToolMode;
 }
 

@@ -101,6 +101,8 @@ export interface McpStdioServerOptions {
   pipeline?: IngestionPipeline;
   /** 预留给 ingest 增强；当前热路径不调用 LLM */
   llmClient?: LlmClient;
+  /** Configured wiki root for memory_wiki_read. Defaults to ~/.mengshu/wiki. */
+  wikiRoot?: string;
   /** Postgres runtime 注入后启动 broad-authority supervisor；非 Postgres 明确省略。 */
   durableJobV2?: McpDurableJobV2Capability;
   /**

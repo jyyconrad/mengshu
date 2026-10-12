@@ -18,6 +18,13 @@
     "password": "${PG_PASSWORD}",
     "ssl": false
   },
+  "wiki": {
+    "root": "~/.mengshu/wiki",
+    "entriesDirName": "entries",
+    "writeEntriesOnPersist": true,
+    "indexUpdate": "sync-ancestors",
+    "updateCompletion": true
+  },
   "autoCapture": true,
   "autoRecall": true,
   "recallIncludeDocuments": false,

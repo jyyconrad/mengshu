@@ -15,6 +15,7 @@ import {
   createMengshuRuntime,
   type MengshuRuntime,
 } from "../../../../runtime.js";
+import { DatabaseFactory } from "../../../core/src/db/factory.js";
 import type { DatabaseProvider } from "../../../core/src/db/types.js";
 import {
   registerMemoryServerCliCommands,
@@ -69,6 +70,15 @@ import {
   type McpStdioServerOptions,
 } from "../../../mcp/src/stdio-server.js";
 import { PostgresProvider } from "../../../core/src/db/providers/postgres.js";
+import {
+  backfillWikiEntries,
+  loadWikiBackfillRows,
+  reindexWikiEntries,
+  type WikiBackfillKind,
+  type WikiBackfillSource,
+} from "../../../core/src/wiki/entry-backfill.js";
+import { resolveWikiRoot } from "../../../core/src/wiki/root.js";
+import { readWikiMarkdown, type WikiMarkdownRead } from "../../../core/src/wiki/wiki-read.js";
 import type { MemoryScope, MemorySemanticType } from "../../../core/src/domain/types.js";
 import type { AuthorityScope } from "../../../core/src/domain/authority-scope.js";
 import { resolveAuthorityScope } from "../../../core/src/domain/authority-scope.js";
@@ -269,6 +279,7 @@ function printConfiglessHelp(argv: string[]): void {
   program.command("cost").description("Show the local append-only runtime cost ledger");
   program.command("stats").description("Show memory statistics");
   program.command("search <query>").description("Search memories");
+  registerWikiCliCommands(program, { wikiRoot: resolveWikiRoot() });
   configureDirectoryScanCommand(program.command("scan <directory>"));
   program.command("embedding-space").description("Inspect or explicitly activate the embedding space");
   const selectedCommand = program.commands.find((command) => command.name() === argv[2]);
@@ -531,7 +542,137 @@ export function createCliMcpStdioServerOptions(
     namespaces: ["memories", "knowledge"],
     pipeline: runtime.ingestionPipeline,
     llmClient: runtime.llmClient,
+    ...(runtime.config?.wiki?.root ? { wikiRoot: runtime.config.wiki.root } : {}),
   };
+}
+
+const WIKI_READ_SURFACE_TEXT =
+  "wiki_read is file drill-down and memory_knowledge_read stays the DB projection.";
+
+export interface WikiReadCliInput {
+  readonly wikiRoot: string;
+  readonly path: string;
+  readonly maxChars?: number;
+}
+
+/** Read one jailed wiki markdown file. Does not open the database. */
+export async function readWikiCli(input: WikiReadCliInput): Promise<WikiMarkdownRead> {
+  return readWikiMarkdown(
+    input.wikiRoot,
+    input.path,
+    input.maxChars === undefined ? {} : { maxChars: input.maxChars },
+  );
+}
+
+export interface WikiCliCommandOptions {
+  readonly wikiRoot: string;
+  readonly home?: string;
+  readonly entriesDirName?: string;
+  readonly writeLine?: (line: string) => void;
+  /** Opens the database only when `backfill-entries` runs. Read and reindex do not call it. */
+  loadBackfillSource?(input: { readonly kind: WikiBackfillKind }): Promise<WikiBackfillSource>;
+}
+
+export function registerWikiCliCommands(
+  program: Command,
+  options: WikiCliCommandOptions,
+): void {
+  const writeLine = options.writeLine ?? ((line: string) => console.log(line));
+  const wiki = program
+    .command("wiki")
+    .description(`Read local wiki markdown, reindex Track E indexes, or backfill entry files. ${WIKI_READ_SURFACE_TEXT}`);
+  wiki
+    .command("read <relpath>")
+    .description(`Read one relative .md path under wikiRoot. ${WIKI_READ_SURFACE_TEXT}`)
+    .allowExcessArguments(false)
+    .option("--max-chars <n>", "Truncate the file body to this many characters")
+    .action(async (relpath: string, flags: { maxChars?: string }) => {
+      const read = await readWikiCli({
+        wikiRoot: options.wikiRoot,
+        path: relpath,
+        maxChars: cliMaxChars(flags.maxChars),
+      });
+      writeLine(JSON.stringify(read));
+    });
+  wiki
+    .command("reindex")
+    .description("Rebuild wiki indexes")
+    .command("entries")
+    .description("Rebuild Track E indexes and the root Entries section. Does not recompute fused totals.")
+    .allowExcessArguments(false)
+    .action(() => {
+      const reindexed = reindexWikiEntries({
+        wikiRoot: options.wikiRoot,
+        ...(options.home === undefined ? {} : { home: options.home }),
+        ...(options.entriesDirName === undefined ? {} : { entriesDirName: options.entriesDirName }),
+      });
+      writeLine(JSON.stringify({ reindexed }));
+    });
+  wiki
+    .command("backfill-entries")
+    .description("Dry-run by default. --apply writes pages/<slug>/entries files for rows with no wikiPath or a missing file, skips fused pages/.../page-NNN.md paths, then reindexes entries.")
+    .allowExcessArguments(false)
+    .option("--kind <kind>", "all, memories, or knowledge", "all")
+    .option("--limit <n>", "Maximum eligible rows to report or write")
+    .option("--dry-run", "Report eligible rows without writing files or metadata", false)
+    .option("--apply", "Write missing entry files, patch metadata, and reindex entries", false)
+    .action(async (flags: { kind?: string; limit?: string; dryRun?: boolean; apply?: boolean }) => {
+      if (flags.apply === true && flags.dryRun === true) {
+        throw new Error("wiki backfill-entries accepts either --apply or --dry-run, not both");
+      }
+      const kind = cliBackfillKind(flags.kind);
+      const limit = cliBackfillLimit(flags.limit);
+      if (!options.loadBackfillSource) {
+        throw new Error("wiki backfill-entries requires a database row source");
+      }
+      const source = await options.loadBackfillSource({ kind });
+      try {
+        const report = await backfillWikiEntries({
+          wikiRoot: options.wikiRoot,
+          ...(options.home === undefined ? {} : { home: options.home }),
+          ...(options.entriesDirName === undefined ? {} : { entriesDirName: options.entriesDirName }),
+          rows: source.rows,
+          kind,
+          ...(limit === undefined ? {} : { limit }),
+          apply: flags.apply === true,
+          ...(source.recordMetadata ? { recordMetadata: source.recordMetadata } : {}),
+        });
+        writeLine(JSON.stringify(report));
+      } finally {
+        await source.close?.().catch(() => undefined);
+      }
+    });
+}
+
+function cliBackfillKind(value: string | undefined): WikiBackfillKind {
+  if (value === undefined || value === "all" || value === "memories" || value === "knowledge") {
+    return value ?? "all";
+  }
+  throw new Error("wiki backfill kind must be all, memories, or knowledge");
+}
+
+function cliBackfillLimit(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error("wiki backfill limit must be a positive integer");
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error("wiki backfill limit must be a positive integer");
+  }
+  return parsed;
+}
+
+function cliMaxChars(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error("maxChars must be a positive integer");
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error("maxChars must be a positive integer");
+  }
+  return parsed;
 }
 
 export interface MemoryAssetCliCapability extends Pick<
@@ -936,6 +1077,41 @@ export async function runMengshuCli(argv: string[] = process.argv): Promise<void
 
   const rawConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const cfg = memoryConfigSchema.parse(rawConfig);
+
+  // Read and reindex stay on the filesystem. backfill-entries opens the
+  // database only inside its action and must not roll back a committed row.
+  if (argv[2] === "wiki") {
+    const wikiProgram = new Command().name("ms").exitOverride();
+    const wikiRoot = cfg.wiki?.root ?? resolveWikiRoot();
+    registerWikiCliCommands(wikiProgram, {
+      wikiRoot,
+      ...(cfg.wiki?.entriesDirName ? { entriesDirName: cfg.wiki.entriesDirName } : {}),
+      loadBackfillSource: async ({ kind }) => {
+        const provider = DatabaseFactory.createProvider(cfg, resolveRuntimeDbPath(cfg, configPath));
+        try {
+          const rows = await loadWikiBackfillRows(provider, kind);
+          return {
+            rows,
+            recordMetadata: async ({ id, tableName, patch }) => {
+              if (!provider.updateMetadata) {
+                throw new Error("wiki metadata patch is not supported by this database");
+              }
+              const updated = await provider.updateMetadata(id, { ...patch }, tableName);
+              if (!updated) {
+                throw new Error("wiki metadata patch matched no committed row");
+              }
+            },
+            close: () => provider.close(),
+          };
+        } catch (error) {
+          await provider.close().catch(() => undefined);
+          throw error;
+        }
+      },
+    });
+    await wikiProgram.parseAsync(argv);
+    return;
+  }
 
   if (argv[2] === "scan" && !argv.includes("--apply")) {
     const scanProgram = new Command().name("ms").exitOverride();

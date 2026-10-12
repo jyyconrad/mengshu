@@ -233,7 +233,8 @@ describe("buildListToolsResult", () => {
     const { tools } = createMcpStdioServer({ authority, defaultScope, service: new FakeMemoryService() });
     const result = buildListToolsResult(tools);
 
-    expect(result.tools).toHaveLength(9);
+    expect(result.tools).toHaveLength(10);
+    expect(result.tools.map((tool) => tool.name)).toContain("memory_wiki_read");
     expect(result.tools.map((tool) => tool.name)).not.toContain("memory_forget");
     const health = result.tools.find((t) => t.name === "memory_health");
     expect(health).toBeDefined();
@@ -418,7 +419,7 @@ describe("createMcpStdioServer", () => {
     // tools/list
     await transport.inject({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const listResponse = transport.responseFor(2) as { result?: { tools?: unknown[] } };
-    expect(listResponse?.result?.tools).toHaveLength(9);
+    expect(listResponse?.result?.tools).toHaveLength(10);
 
     // tools/call
     await transport.inject({

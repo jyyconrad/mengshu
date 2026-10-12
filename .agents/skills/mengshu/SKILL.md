@@ -26,7 +26,8 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 | 顺序 | 工具 | 用途 |
 |------|------|------|
 | 1 | `memory_context_fast` | 任务启动拉 **5 槽位**上下文（优先） |
-| 2 | `memory_recall` / `memory_lookup` | 槽位不够时按查询深挖 |
+| 2 | `memory_recall` / `memory_lookup` | 槽位不够时按查询深挖；命中可能带相对 `wiki:` / `wikiPath` |
+| 2b | `memory_wiki_read` | 按该相对路径读 wiki 文件。**不是** `memory_knowledge_read` |
 | 3 | `memory_save` / `memory_observe` | 确认后的 governed 写入（须带 `semanticType`） |
 | 4 | `memory_explain` | 争议或被拒时：已存 why / 候选 dry-run / **`lastDecision` 落库收据** |
 | 5 | `memory_observe_light` | 运行中轻量观察 / 证据（异步抽候选；非直接当事实） |
@@ -39,7 +40,7 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 **推荐启动序列**
 
 1. `memory_context_fast`（`task` = 当前任务一句话）  
-2. 若某槽为空且任务确实需要该类信息 → `memory_recall` / `memory_lookup`。空结果看 `recallStatus`：`ok-empty` / `authority-filtered` / `not-ready`，都不要编造记忆。  
+2. 若某槽为空且任务确实需要该类信息 → `memory_recall` / `memory_lookup`。空结果看 `recallStatus`：`ok-empty` / `authority-filtered` / `not-ready`，都不要编造记忆。命中若有相对 `wiki:` / `wikiPath`，要原文就 `memory_wiki_read`（或 CLI `ms wiki read`），不要改走 `memory_knowledge_read`。  
 3. 仅当信息已验证或用户明示保存 → `memory_save` / `memory_observe`（带 5type）  
 4. 写入被拒或用户质疑 → `memory_explain`
 
@@ -68,6 +69,27 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 - **空槽**（`nodeCount === 0` 且可能有 `empty_slot: …`）表示「该类暂无活跃记忆」或被策略过滤，**不是** MCP 失败。  
 - Prompt 注入会跳过空槽；不要为填满五槽而编造内容。  
 - 需要证据链时用 `memory_lookup` / `memory_explain`，不要臆造 `memoryId`。
+- 命中可能多一个相对 wiki 路径（文本一行 `wiki: pages/...`，raw 字段 `wikiPath`）。没有就省略，不要编造路径。
+
+## Wiki 路径与原文
+
+`wiki.root` 默认 `~/.mengshu/wiki`，也可以改成另一个绝对目录（支持 `~`；相对路径会被拒绝）。召回里的地址相对这个根，只用正斜杠。数据库仍是 record of record；wiki 文件写失败不回滚已经提交的记忆。
+
+需要文件原文时，用召回给出的相对路径：
+
+- MCP：`memory_wiki_read`（只要 `path`，可选 `maxChars`）。默认工具列表里就有它。
+- CLI：`ms wiki read <relpath>`（可选 `--max-chars`）。只读文件，不开库。
+
+**这不是 `memory_knowledge_read`。** `memory_wiki_read` / `ms wiki read` 按路径钻取 wiki 里的 `.md`。`memory_knowledge_read` 按 UUID `ref` + `revision` 读库内 knowledge 投影。二者不能互相替代。
+
+同一根目录下有两条轨道，召回都可能带上，也都可以用上面的读法：
+
+| 轨道 | 路径 | 含义 |
+|------|------|------|
+| Track F | `pages/<slug>/page-NNN.md` | 离线融合正本。不要改页，也不要改同名 `.sources`。本机 `STYLE-GUIDE.md` 的四键 frontmatter 只约束这一轨 |
+| Track E | `pages/<slug>/entries/<semanticType>/<id>.md` | 条目素材，是数据库镜像，不是融合正本，也不取代数据库 |
+
+没有顶级 `material/`。ingest-wiki 仍只吃 Track F 的 `page-*.md`。合同见 [wiki-entries.md](../../docs/guides/wiki-entries.md)。
 
 ## 禁止事项
 
@@ -77,6 +99,8 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 - 禁止为「显得有记性」而写入密钥、token、隐私、一次性构建日志。  
 - 禁止在无 authority / 用户未授权时擅自 `ms init` 扩大范围或绕过 fail-closed。  
 - 禁止假设 LanceDB-only 拥有与 Postgres 同等的治理 capability。
+- 禁止把 `memory_knowledge_read` 当成按 wiki 路径读文件，也禁止改写 Track F 的 `page-NNN.md` / `.sources`。
+- 禁止因 wiki 文件缺失而把已提交记忆说成写入失败。
 
 ## 会话 / Compact 钩子（推荐触发）
 
@@ -126,4 +150,5 @@ Codex 插件内另有 `plugins/codex/skills/mengshu-memory`（产品包装）；
 1. 先 `context_fast`，再动手。  
 2. 写入必带 5type；不确定就 `explain` dry-run。  
 3. 空槽 ≠ 故障；编造 = 违规。  
-4. 治理失败要说清，不装成功。
+4. 治理失败要说清，不装成功。  
+5. 召回若有相对 `wiki:` 路径，用 `memory_wiki_read` 或 `ms wiki read` 读文件；那不是 `memory_knowledge_read`。

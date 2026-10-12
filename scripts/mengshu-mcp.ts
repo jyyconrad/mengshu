@@ -380,6 +380,7 @@ export function createStandaloneMcpStdioServerOptions(
     namespaces: ["memories", "knowledge"],
     pipeline: runtime.ingestionPipeline,
     llmClient: runtime.llmClient,
+    ...(runtime.config?.wiki?.root ? { wikiRoot: runtime.config.wiki.root } : {}),
   };
 }
 

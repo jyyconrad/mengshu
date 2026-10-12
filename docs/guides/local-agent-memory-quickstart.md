@@ -42,7 +42,7 @@ ms mcp
 MENGSHU_MCP_TOOL_MODE=full ms mcp
 ```
 
-主工具：`memory_context_fast`、`memory_recall`、`memory_save`、`memory_observe`、`memory_observe_light`、`memory_forget`、`memory_lookup`、`memory_explain`、`memory_tools_discover`、`memory_health`、`memory_namespaces`。
+主工具：`memory_context_fast`、`memory_recall`、`memory_wiki_read`、`memory_save`、`memory_observe`、`memory_observe_light`、`memory_forget`、`memory_lookup`、`memory_explain`、`memory_tools_discover`、`memory_health`、`memory_namespaces`。
 
 ## 4. 安装用法 Skill
 
@@ -56,9 +56,24 @@ Skill name：`mengshu`。Codex 插件包装：`plugins/codex/skills/mengshu-memo
 ## 5. Agent 最小闭环
 
 1. `memory_context_fast` — 确认五槽 key 都在（空槽 `nodeCount=0` 正常）。  
-2. 槽位不够时 `memory_recall` / `memory_lookup`。空结果看 `recallStatus`：`ok-empty`（确实没有）、`authority-filtered`（被治理滤空）、`not-ready`（服务未就绪）。三种都不要编造记忆。目录扫盘用 CLI `ms scan`：默认 dry-run，不写库；确认报告后再 `--apply`。  
+2. 槽位不够时 `memory_recall` / `memory_lookup`。空结果看 `recallStatus`：`ok-empty`（确实没有）、`authority-filtered`（被治理滤空）、`not-ready`（服务未就绪）。三种都不要编造记忆。命中可能带相对路径 `wiki: pages/...`（raw 字段 `wikiPath`）；要读文件用 `memory_wiki_read` 或 `ms wiki read`，不要用 `memory_knowledge_read`。目录扫盘用 CLI `ms scan`：默认 dry-run，不写库；确认报告后再 `--apply`。  
 3. 需要写入时 `memory_observe` / `memory_save`，带 `semanticType`（五选一）。  
 4. 被拒或用户质疑时 `memory_explain`（`lastDecision`、`candidateHash` 或候选 dry-run），不要编造。
+
+## 5.1 召回里的 wiki 路径
+
+`wiki.root` 默认 `~/.mengshu/wiki`，也可以指向另一个绝对目录。召回地址相对这个根，只用正斜杠。数据库仍是 record of record。
+
+| 轨道 | 路径 | 读的时候意味着什么 |
+|------|------|--------------------|
+| Track F | `pages/<slug>/page-NNN.md` | 离线融合正本。不要改页，也不要改 `.sources` |
+| Track E | `pages/<slug>/entries/<semanticType>/<id>.md` | 条目素材，是库的镜像，不是融合正本 |
+
+```bash
+ms wiki read pages/<slug>/page-019.md
+```
+
+MCP 用 `memory_wiki_read`（`path` + 可选 `maxChars`）。这是按路径读文件。`memory_knowledge_read` 是按 UUID `ref` + `revision` 读库内投影，二者不能互换。双轨、STYLE-GUIDE 边界和条目合同见 [wiki-entries.md](./wiki-entries.md)。
 
 ## 6. LanceDB-only：哪些治理 fail-closed
 
@@ -80,6 +95,7 @@ Skill name：`mengshu`。Codex 插件包装：`plugins/codex/skills/mengshu-memo
 
 ```bash
 ms recall "query" --explain
+ms wiki read pages/<slug>/entries/<semanticType>/<id>.md
 ms why <memoryId>
 ms doctor
 ```

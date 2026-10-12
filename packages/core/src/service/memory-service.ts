@@ -8,7 +8,7 @@
 
 import { packContext } from "../retrieval/context-packer.js";
 import { auditLifecycle } from "../../../../lifecycle/audit.js";
-import { normalizeScope, validateScopeForWrite } from "../domain/scope.js";
+import { normalizeScope, scopeToKey, validateScopeForWrite } from "../domain/scope.js";
 import { computeScopeFit } from "../domain/scope-fit.js";
 import { computeRecallScoreBreakdown } from "../domain/recall-scoring.js";
 import {
@@ -60,6 +60,11 @@ import {
   isProviderOwnedAtomicMemoryStorePort,
   type ProviderOwnedAtomicMemoryStorePort,
 } from "./write-kernel-transaction.js";
+import {
+  mirrorPersistedWikiEntry,
+  wikiMirrorTable,
+  type WikiEntryMirrorConfig,
+} from "../wiki/persist-mirror.js";
 
 export type {
   BuildContextInput,
@@ -121,6 +126,11 @@ export interface DefaultMemoryServiceOptions {
   governedRetrieval?: Pick<GovernedRetrievalEngine, "retrieve">;
   /** PostgreSQL multi-route producer; identities are rehydrated and governed by the engine above. */
   governedCandidateSource?: Pick<GovernedRetrievalCandidateSource, "search">;
+  /**
+   * Optional Track E mirror for memories and knowledge stored outside
+   * MemoryWriteKernel. Absent config skips it. Failures do not fail the store.
+   */
+  wikiEntries?: WikiEntryMirrorConfig;
 }
 
 export type EmbeddingRecallResult = RecallResult & {
@@ -171,6 +181,7 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
   private readonly stampEmbeddingMetadata?: DefaultMemoryServiceOptions["stampEmbeddingMetadata"];
   private readonly governedRetrieval?: DefaultMemoryServiceOptions["governedRetrieval"];
   private readonly governedCandidateSource?: DefaultMemoryServiceOptions["governedCandidateSource"];
+  private readonly wikiEntries?: WikiEntryMirrorConfig;
 
   constructor(options: DefaultMemoryServiceOptions) {
     this.repository = options.repository;
@@ -187,6 +198,7 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
     this.stampEmbeddingMetadata = options.stampEmbeddingMetadata;
     this.governedRetrieval = options.governedRetrieval;
     this.governedCandidateSource = options.governedCandidateSource;
+    this.wikiEntries = options.wikiEntries;
   }
 
   async storeMemory(input: StoreMemoryInput): Promise<StoreMemoryResult> {
@@ -239,6 +251,7 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
 
     if (this.atomicStore) {
       const outcome = await this.atomicStore.store(record);
+      await this.mirrorStoredRecord(record, outcome.id, outcome.stored);
       return {
         id: outcome.id,
         stored: outcome.stored,
@@ -269,6 +282,7 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
         targetId: persistedId,
       });
     }
+    await this.mirrorStoredRecord(record, persistedId, stored);
 
     return {
       id: persistedId,
@@ -277,6 +291,34 @@ export class DefaultMemoryService implements MemoryService, AuthorityScopedForge
         ? [DATABASE_STORE_CLEANUP_WARNING]
         : undefined,
     };
+  }
+
+  /**
+   * Knowledge (and memory) rows that never enter MemoryWriteKernel.
+   * The repository commit has already succeeded.
+   */
+  private async mirrorStoredRecord(
+    record: MemoryRecord,
+    id: string,
+    stored: boolean,
+  ): Promise<void> {
+    if (!stored || !this.wikiEntries) return;
+    const table = wikiMirrorTable(record);
+    if (!table) return;
+    const metadata = record.metadata ?? {};
+    await mirrorPersistedWikiEntry({
+      id,
+      kind: table.kind,
+      tableName: table.tableName,
+      scopeKey: scopeToKey(record.scope),
+      semanticType: record.semanticType,
+      text: record.text,
+      title: typeof metadata.title === "string" ? metadata.title : undefined,
+      updatedAt: record.updatedAt ?? record.createdAt,
+      source: typeof record.provenance?.source === "string" ? record.provenance.source : undefined,
+      admissionRoute: typeof metadata.admissionRoute === "string" ? metadata.admissionRoute : undefined,
+      wikiPath: typeof metadata.wikiPath === "string" ? metadata.wikiPath : undefined,
+    }, this.wikiEntries);
   }
 
   async recall(input: RecallInput): Promise<EmbeddingRecallResult> {
