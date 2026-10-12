@@ -809,7 +809,7 @@ const NOT_IMPLEMENTED_INGEST: McpMemoryTool = {
     status: "not_implemented",
     error: "memory_ingest 暂未开放（roadmap 功能，尚未接入持久化的 ingestion pipeline）。",
     hint:
-      "替代方案：单条记忆用 memory_observe / memory_save；批量文档用 CLI 'ms scan <dir> --target-table knowledge'。",
+      "替代方案：单条记忆用 memory_observe / memory_save；批量文档用 CLI `ms scan <dir>`（默认 dry-run，`--apply` 才写入）。",
   }),
 };
 

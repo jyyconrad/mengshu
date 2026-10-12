@@ -3,8 +3,10 @@
  *
  * Real host bindings (do not invent APIs):
  * - OpenClaw: `before_prompt_build` | `before_agent_start` (recall),
- *   `agent_end` (capture). `registerMemoryFlushPlan` exists but mengshu keeps
- *   returning null until OpenClaw documents a stable flush-plan object shape.
+ *   `agent_end` (one capture, mapped only to session_end). `task_complete`
+ *   stays skill-only so one host event is not written twice.
+ *   `registerMemoryFlushPlan` exists but mengshu keeps returning null until
+ *   OpenClaw documents a stable flush-plan object shape.
  * - Codex / Claude Code / Cursor: no native PreCompact plugin hook in this
  *   repo's plugin packs — use MCP tools via the `mengshu` Skill at the
  *   recommended triggers below.
@@ -13,6 +15,7 @@
 import { createHash } from "node:crypto";
 
 import type { MemorySemanticType } from "../domain/types.js";
+import { redactSecrets } from "../ingest/agent-history/redaction.js";
 
 export type AgentSessionHookTrigger =
   | "session_start"
@@ -58,6 +61,7 @@ export type SessionEventSkipReason =
   | "missing_sessionId"
   | "missing_projectId"
   | "missing_user"
+  | "handler_missing"
   | "duplicate_session_hash";
 
 export type ParseSessionEventResult =
@@ -201,9 +205,9 @@ const TABLE: Readonly<Record<AgentSessionHookTrigger, AgentSessionHookRecommenda
       actions: Object.freeze(["memory_observe", "memory_save"] as const),
       notes: Object.freeze([
         "Mark semanticType=experience or rules when causal lessons are confirmed.",
-        "OpenClaw agent_end also covers task completion when the host ends the turn.",
+        "OpenClaw agent_end captures once as session_end. Put task lessons in that write; do not dispatch task_complete as a second capture.",
       ]),
-      openClawEvent: "agent_end" as const,
+      openClawEvent: null,
     }),
   });
 
@@ -229,7 +233,7 @@ export function mapOpenClawEventToSessionHooks(
   if (event === "before_prompt_build" || event === "before_agent_start") {
     return Object.freeze(["session_start"] as const);
   }
-  return Object.freeze(["session_end", "task_complete"] as const);
+  return Object.freeze(["session_end"] as const);
 }
 
 const HOST_BINDINGS: readonly SessionHookHostBinding[] = Object.freeze([
@@ -250,8 +254,8 @@ const HOST_BINDINGS: readonly SessionHookHostBinding[] = Object.freeze([
   Object.freeze({
     host: "openclaw" as const,
     trigger: "task_complete" as const,
-    binding: "native" as const,
-    nativeEvent: "agent_end",
+    binding: "skill-only" as const,
+    nativeEvent: null,
     flushPlan: null,
   }),
   Object.freeze({
@@ -341,7 +345,7 @@ export function parseSessionEvent(input: unknown): ParseSessionEventResult {
 
   const summaryValue = record.transcriptSummary;
   const transcriptSummary = typeof summaryValue === "string" && summaryValue.trim().length > 0
-    ? summaryValue.trim()
+    ? redactSecrets(summaryValue.trim()).text
     : undefined;
 
   return {
@@ -399,10 +403,10 @@ export function resolveSessionEvent(
 }
 
 function failureReason(error: unknown): string {
-  if (error instanceof Error && error.message.trim().length > 0) {
-    return error.message;
-  }
-  return "session_hook_failed";
+  const raw = error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : "session_hook_failed";
+  return redactSecrets(raw).text;
 }
 
 export async function dispatchSessionEvent(
@@ -415,8 +419,16 @@ export async function dispatchSessionEvent(
     return resolved;
   }
   const handler = resolved.kind === "recall" ? handlers.recall : handlers.typedCapture;
+  if (!handler) {
+    return {
+      status: "skipped",
+      skipped: true,
+      reason: "handler_missing",
+      blocking: false,
+    };
+  }
   try {
-    await handler?.(resolved.event);
+    await handler(resolved.event);
     options.seen?.add(resolved.dedupKey);
     return {
       status: "ok",

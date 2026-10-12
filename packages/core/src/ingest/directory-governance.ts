@@ -6,7 +6,7 @@
  * separate step and must go through the memory write kernel.
  */
 
-import { readFile, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { MemorySemanticType } from "../domain/types.js";
 import {
@@ -14,9 +14,13 @@ import {
   type AdmissionExplainOutcome,
 } from "../lifecycle/admission-explain.js";
 import { computeCanonicalContentHash } from "../scoring/hash-utils.js";
+import { redactSecrets } from "./agent-history/redaction.js";
 import { FileScanner } from "./scanner/file-scanner.js";
 
 export const DIRECTORY_SCAN_MAX_PROPOSAL_CHARS = 8000;
+
+/** Refuse to read a single Markdown file larger than this. */
+export const DIRECTORY_SCAN_MAX_FILE_BYTES = 2_000_000;
 
 /** Preview matches `observeAuto` + `intent: remember` (persistent, salience 0.5). */
 export const DIRECTORY_SCAN_PREVIEW_SALIENCE = 0.5;
@@ -230,6 +234,22 @@ function slices(text: string, chunkSize: number | undefined): Array<{ text: stri
   return parts;
 }
 
+function withSecretReason(
+  admission: DirectoryScanAdmission,
+  secretsRedacted: boolean,
+): DirectoryScanAdmission {
+  if (!secretsRedacted || admission.reasonCodes.includes("secrets_redacted")) return admission;
+  return { ...admission, reasonCodes: [...admission.reasonCodes, "secrets_redacted"] };
+}
+
+function pathEscapesRoot(rootReal: string, candidateReal: string): boolean {
+  const relative = path.relative(rootReal, candidateReal);
+  return relative.length === 0
+    || relative === ".."
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative);
+}
+
 function persistedRoute(route: string | undefined): string | undefined {
   if (route === undefined) return undefined;
   // observeAuto never persists an active row. Preview the kernel downgrade.
@@ -274,6 +294,7 @@ export async function analyzeDirectory(input: AnalyzeDirectoryInput): Promise<Di
   if (!info.isDirectory()) {
     throw new Error(`ms scan directory is not a directory: ${input.directory}`);
   }
+  const rootReal = await realpath(input.directory);
 
   const scanner = new FileScanner({
     ignoreRules: [...(input.ignorePaths ?? []), ...(input.ignoreRules ?? [])],
@@ -291,9 +312,37 @@ export async function analyzeDirectory(input: AnalyzeDirectoryInput): Promise<Di
     const extension = path.extname(filePath).toLowerCase() || "(none)";
     extensionDistribution[extension] = (extensionDistribution[extension] ?? 0) + 1;
     const relativeFile = path.relative(input.directory, filePath).split(path.sep).join("/");
+    let readablePath: string;
+    try {
+      readablePath = await realpath(filePath);
+    } catch (error) {
+      errors.push({
+        filePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+    if (pathEscapesRoot(rootReal, readablePath)) {
+      errors.push({ filePath, error: "path_escapes_scan_root" });
+      continue;
+    }
+    let fileSize = 0;
+    try {
+      fileSize = (await stat(readablePath)).size;
+    } catch (error) {
+      errors.push({
+        filePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+    if (fileSize > DIRECTORY_SCAN_MAX_FILE_BYTES) {
+      errors.push({ filePath, error: "file_too_large" });
+      continue;
+    }
     let content: string;
     try {
-      content = await readFile(filePath, "utf8");
+      content = await readFile(readablePath, "utf8");
     } catch (error) {
       errors.push({
         filePath,
@@ -307,7 +356,10 @@ export async function analyzeDirectory(input: AnalyzeDirectoryInput): Promise<Di
     const parts = slices(canonical, input.chunkSize);
     parts.forEach((part, index) => {
       const relativePath = displayPath(relativeFile, index, parts.length);
-      const fingerprint = computeCanonicalContentHash(part.text);
+      const redacted = redactSecrets(part.text);
+      const text = redacted.text;
+      const secretsRedacted = redacted.redactedCount > 0;
+      const fingerprint = computeCanonicalContentHash(text);
       const duplicateOf = seenFingerprints.get(fingerprint);
       if (duplicateOf === undefined) seenFingerprints.set(fingerprint, relativePath);
 
@@ -319,7 +371,7 @@ export async function analyzeDirectory(input: AnalyzeDirectoryInput): Promise<Di
         annotatedSemanticType: annotation.annotatedSemanticType,
         annotationSource: annotation.annotationSource,
         ...(annotation.profileDimension ? { profileDimension: annotation.profileDimension } : {}),
-        text: part.text,
+        text,
         truncated: part.truncated,
       };
 
@@ -328,10 +380,10 @@ export async function analyzeDirectory(input: AnalyzeDirectoryInput): Promise<Di
           ...base,
           semanticType: annotation.annotatedSemanticType,
           duplicateOf,
-          admission: {
+          admission: withSecretReason({
             outcome: "skipped_duplicate",
             reasonCodes: ["fingerprint_duplicate"],
-          },
+          }, secretsRedacted),
         });
         return;
       }
@@ -339,17 +391,17 @@ export async function analyzeDirectory(input: AnalyzeDirectoryInput): Promise<Di
         proposals.push({
           ...base,
           semanticType: null,
-          admission: {
+          admission: withSecretReason({
             outcome: "skipped_invalid_type",
             reasonCodes: ["semantic_type_invalid"],
             rejectedReason: "semantic_type_invalid",
-          },
+          }, secretsRedacted),
         });
         return;
       }
 
       const explained = explainAdmissionCandidate({
-        text: part.text,
+        text,
         semanticType: annotation.annotatedSemanticType,
         temporality: "persistent",
         salience: DIRECTORY_SCAN_PREVIEW_SALIENCE,
@@ -357,9 +409,9 @@ export async function analyzeDirectory(input: AnalyzeDirectoryInput): Promise<Di
         crossContextual: true,
         targetScope: "project",
         ...(annotation.profileDimension ? { profileDimension: annotation.profileDimension } : {}),
-        sourceText: part.text,
+        sourceText: text,
       });
-      const admission = admissionFromExplain(explained);
+      const admission = withSecretReason(admissionFromExplain(explained), secretsRedacted);
       proposals.push({
         ...base,
         semanticType: explained.semanticType ?? annotation.annotatedSemanticType,
@@ -445,7 +497,7 @@ export async function applyDirectoryScan(
       items.push({
         relativePath: proposal.relativePath,
         status: "error",
-        reason: error instanceof Error ? error.message : String(error),
+        reason: redactSecrets(error instanceof Error ? error.message : String(error)).text,
       });
     }
   }

@@ -89,9 +89,9 @@ mengshu 是**本地治理记忆中间件**，不是通用「随便记一笔」�
 
 - 载荷最小字段：`trigger`、`runId`、`sessionId`、`projectId`、`user`；可选 `transcriptSummary`。缺字段则 skip，记下 reason，**不编造字段、不写库、不阻断回合**。
 - 只写已验证 5type；不要 dump 整段 transcript；不要静默 ADD。
-- 同一 session + 内容哈希已由 MCP 写过则不要再 hook 写一遍。
-- 密钥 / token / 隐私仍走上面的禁止事项。
-- OpenClaw 真实事件：`before_prompt_build`（召回）、`agent_end`（捕获）。`registerMemoryFlushPlan` 保持 `null`，不要发明 flush-plan。
+- 去重只在调用方传入的 `seen` 里生效，不会自动发现 MCP 已经写过的内容。
+- 密钥 / token / 隐私仍走上面的禁止事项。摘要和失败原因会先脱敏。
+- OpenClaw 真实事件：`before_prompt_build`（召回）、`agent_end`（只捕获一次 `session_end`）。不要把同一次 `agent_end` 再写成 `task_complete`。`registerMemoryFlushPlan` 保持 `null`，不要发明 flush-plan。
 - Codex / Claude Code / Cursor 无原生 PreCompact：按本表用 MCP。
 
 详见 [agent-session-hooks.md](../../docs/guides/agent-session-hooks.md)。

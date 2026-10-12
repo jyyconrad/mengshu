@@ -15,8 +15,8 @@
 |------|---------------|------|-------------------|------------------------------|
 | `session_start` | `memory_context_fast` → 必要时 `memory_recall` | 召回 | `before_prompt_build` / `before_agent_start` | Skill 指引：开任务先 context_fast |
 | `pre_compact` | `memory_observe` / `memory_save`（仅已验证 5type） | typed capture | **无稳定 flush-plan 形状**：`sessionHookFlushPlan()` 返回 `null` | Skill：压缩/摘要前先 flush 耐久结论 |
-| `task_complete` | `memory_observe` / `memory_save` | typed capture | `agent_end`（同轮结束） | Skill：任务收尾时写入 experience/rules |
-| `session_end` | `memory_observe` / `memory_save` | typed capture | `agent_end` | Skill：会话结束前捕获偏好/决策 |
+| `task_complete` | `memory_observe` / `memory_save` | typed capture | 无单独事件。不要再派发一次 | Skill：任务收尾时写入 experience/rules |
+| `session_end` | `memory_observe` / `memory_save` | typed capture | `agent_end`（只捕获这一次） | Skill：会话结束前捕获偏好/决策 |
 
 ## SessionEvent 载荷合同
 
@@ -29,9 +29,9 @@
 | `sessionId` | 是 | 会话 id |
 | `projectId` | 是 | 项目 id |
 | `user` | 是 | 用户标识 |
-| `transcriptSummary` | 否 | 已整理的结论摘要；**禁止**整段 transcript |
+| `transcriptSummary` | 否 | 已整理的结论摘要；**禁止**整段 transcript。解析时走 `redactSecrets`，密钥不会进 handler |
 
-skip reason：`missing_trigger` / `unknown_trigger` / `missing_runId` / `missing_sessionId` / `missing_projectId` / `missing_user`。同一 `sessionId` + 内容哈希重复到达时为 `duplicate_session_hash`（避免与 MCP 双写）。
+skip reason：`missing_trigger` / `unknown_trigger` / `missing_runId` / `missing_sessionId` / `missing_projectId` / `missing_user` / `handler_missing`。`duplicate_session_hash` 只在调用方传入的 `seen` 里生效，键是 `sessionId + trigger + runId + transcriptSummary`。它不查询 MCP，也不查询写入内核。没有对应 handler 时返回 `handler_missing`，不记成成功，也不占用去重键。失败原因同样脱敏。`agent_end` 只映射到 `session_end` 一次捕获。
 
 `dispatchSessionEvent` 永不抛给宿主：handler 失败返回 `{ status: "failed", blocking: false, reason }`。
 
@@ -42,7 +42,8 @@ OpenClaw 原生 `before_prompt_build` / `agent_end` 仍走插件现有 auto-reca
 | host | 触发 | 绑定 | 原生事件 | flush-plan |
 |------|------|------|----------|------------|
 | openclaw | `session_start` | native | `before_prompt_build` / `before_agent_start` | `null` |
-| openclaw | `task_complete` / `session_end` | native | `agent_end` | `null` |
+| openclaw | `session_end` | native | `agent_end`（一次捕获） | `null` |
+| openclaw | `task_complete` | skill-only | 无。任务结论放进同一次 `session_end` | `null` |
 | openclaw | `pre_compact` | skill-only | 无 | `null` |
 | codex / claude-code / cursor | 四个触发 | skill-only | 无 | `null` |
 

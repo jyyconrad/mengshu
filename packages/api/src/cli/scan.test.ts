@@ -179,6 +179,30 @@ describe("ms scan CLI", () => {
       kind: "knowledge",
       idempotencyKey: `scan:${"a".repeat(64)}`,
     });
+    const secret = "sk-scanwritecommandsecret1234567890";
+    const redacted = buildDirectoryScanWriteCommand({
+      proposal: proposal({ text: `The client token is ${secret} and retries 3 times.` }),
+      serverAuthority: { tenantId: "tenant" },
+      clientScope: { namespace: "working-context" },
+      category: "other",
+      dataType: "knowledge",
+      tableName: "knowledge",
+    });
+    expect(redacted.text).not.toContain(secret);
+    expect(redacted.text).toContain("[REDACTED:api_key]");
+    const homed = buildDirectoryScanWriteCommand({
+      proposal: proposal({ filePath: "/Users/alice/notes/api.md" }),
+      serverAuthority: { tenantId: "tenant" },
+      clientScope: { namespace: "working-context" },
+      category: "other",
+      dataType: "knowledge",
+      tableName: "knowledge",
+    });
+    expect(JSON.stringify(homed)).not.toContain("/Users/alice");
+    expect(homed.provenance).toMatchObject({
+      filePath: "/Users/<USER_HOME>/notes/api.md",
+      sourceId: "/Users/<USER_HOME>/notes/api.md",
+    });
     expect(() => buildDirectoryScanWriteCommand({
       proposal: proposal({
         semanticType: null,

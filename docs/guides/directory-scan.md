@@ -41,6 +41,10 @@ ms scan ./notes --apply --category 知识库
 - 拟写入的 semanticType 分布。这里只统计 dry-run 认为可以送去写入的提案，并且用准入校准后的类型。
 - 拒绝预览：缺类型、非法类型、正文过短、profile 维度不在白名单、以及 admission 给出的 `drop`。
 - 指纹和去重。同一规范化正文只保留路径排序后的第一条。
+- 正文里的密钥先脱敏，再进入提案、`--json` 和 `--apply`。命中时原因码含 `secrets_redacted`。
+- 符号链接若解析到扫描目录之外，不读取。错误为 `path_escapes_scan_root`。目录名里的 `*`、`?`、`[` 按字面路径扫描，不会扩到兄弟目录。
+- 单个文件超过 2_000_000 字节不读取，错误为 `file_too_large`。
+- `--apply` 写进记忆的来源路径会去掉家目录用户名。失败原因里的密钥也会脱敏。
 
 frontmatter 示例：
 

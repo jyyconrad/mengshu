@@ -1161,6 +1161,7 @@ describe("MCP memory tools", () => {
     expect(result.error).toMatch(/暂未开放|roadmap/i);
     // 必须给出可操作替代方案，避免调用方误判为配置错误。
     expect(result.hint).toMatch(/memory_observe|memory_save|ms scan/);
+    expect(result.hint).not.toContain("--target-table");
   });
 
   describe("memory_ingest with injected pipeline", () => {

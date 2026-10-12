@@ -16,6 +16,7 @@ import {
   type DirectoryScanProposal,
   type DirectoryScanWriter,
 } from "../../../core/src/ingest/directory-governance.js";
+import { redactHomePath, redactSecrets } from "../../../core/src/ingest/agent-history/redaction.js";
 import type { MemoryWriteCommand } from "../../../core/src/service/write-kernel.js";
 
 export const DIRECTORY_SCAN_DESCRIPTION =
@@ -89,7 +90,7 @@ export function buildDirectoryScanWriteCommand(input: {
     idempotencyKey: `scan:${input.proposal.fingerprint}`,
     serverAuthority: input.serverAuthority,
     clientScope: input.clientScope,
-    text: input.proposal.text,
+    text: redactSecrets(input.proposal.text).text,
     kind: kindFor(semanticType),
     semanticType,
     category: input.category,
@@ -108,8 +109,8 @@ export function buildDirectoryScanWriteCommand(input: {
     },
     provenance: {
       source: "scan",
-      sourceId: input.proposal.filePath,
-      filePath: input.proposal.filePath,
+      sourceId: redactHomePath(input.proposal.filePath),
+      filePath: redactHomePath(input.proposal.filePath),
     },
   };
 }

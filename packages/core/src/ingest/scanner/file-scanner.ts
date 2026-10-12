@@ -55,12 +55,16 @@ export class FileScanner {
    * @returns 符合条件的文件路径数组（绝对路径）
    */
   async scan(rootDir: string): Promise<string[]> {
-    const pattern = join(rootDir, "**", `*.{${this.options.extensions.map(ext => ext.replace('.', '')).join(',')}}`);
-
-    const files = await glob(pattern, {
+    // Keep the root out of the pattern. An absolute pattern treats `*`, `?`,
+    // and `[` in the directory name as globs, and `**` after a literal prefix
+    // follows one directory symlink. `cwd` makes `**` the first segment.
+    const extensions = this.options.extensions.map((ext) => ext.replace(".", "")).join(",");
+    const files = await glob(`**/*.{${extensions}}`, {
+      cwd: rootDir,
       absolute: true,
       dot: this.options.includeHidden,
       nodir: true,
+      follow: false,
     });
 
     // 应用忽略规则

@@ -32,7 +32,7 @@ describe("agent session hooks", () => {
   it("lists all triggers and maps OpenClaw events without inventing APIs", () => {
     expect(listAgentSessionHookRecommendations()).toHaveLength(4);
     expect(mapOpenClawEventToSessionHooks("before_prompt_build")).toEqual(["session_start"]);
-    expect(mapOpenClawEventToSessionHooks("agent_end")).toEqual(["session_end", "task_complete"]);
+    expect(mapOpenClawEventToSessionHooks("agent_end")).toEqual(["session_end"]);
   });
 });
 
@@ -100,7 +100,7 @@ describe("SessionEvent payload contract", () => {
     }
   });
 
-  it("dedupes the same session and content hash so MCP and hooks do not double-write", () => {
+  it("dedupes only inside the caller-supplied seen set", () => {
     const seen = new Set<string>();
     const capture = {
       ...VALID_EVENT,
@@ -157,6 +157,59 @@ describe("session hook dispatch", () => {
     });
   });
 
+  it("does not report success or consume dedup when the handler is missing", async () => {
+    const seen = new Set<string>();
+    const missing = await dispatchSessionEvent(VALID_EVENT, {}, { seen });
+    expect(missing).toMatchObject({
+      status: "skipped",
+      skipped: true,
+      reason: "handler_missing",
+      blocking: false,
+    });
+    expect(seen.size).toBe(0);
+    const recall = vi.fn();
+    const later = await dispatchSessionEvent(VALID_EVENT, { recall }, { seen });
+    expect(later.status).toBe("ok");
+    expect(recall).toHaveBeenCalledOnce();
+  });
+
+  it("redacts secrets in transcript summaries before handlers see them", async () => {
+    const secret = "sk-hooksummarysecretvalue1234567890";
+    const captured: string[] = [];
+    const parsed = parseSessionEvent({
+      ...VALID_EVENT,
+      trigger: "session_end",
+      transcriptSummary: `store ${secret} after the task`,
+    });
+    expect(JSON.stringify(parsed)).not.toContain(secret);
+    const result = await dispatchSessionEvent(
+      { ...VALID_EVENT, trigger: "session_end", transcriptSummary: `store ${secret} after the task` },
+      {
+        typedCapture: (event) => {
+          captured.push(event.transcriptSummary ?? "");
+        },
+      },
+    );
+    expect(result.status).toBe("ok");
+    expect(captured).toEqual([expect.stringContaining("[REDACTED:api_key]")]);
+    expect(captured.join("\n")).not.toContain(secret);
+  });
+
+  it("redacts secrets that a failed handler would otherwise echo", async () => {
+    const secret = "sk-hookfailsecretvalue1234567890";
+    const result = await dispatchSessionEvent(
+      { ...VALID_EVENT, trigger: "task_complete", transcriptSummary: `keep ${secret}` },
+      {
+        typedCapture: () => {
+          throw new Error(`admission rejected token ${secret}`);
+        },
+      },
+    );
+    expect(result).toMatchObject({ status: "failed", blocking: false });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(JSON.stringify(result)).toContain("[REDACTED:api_key]");
+  });
+
   it("never throws, even when the handler rejects", async () => {
     await expect(dispatchSessionEvent(null, {
       recall: async () => {
@@ -191,8 +244,8 @@ describe("host hook mapping matrix", () => {
       }),
       expect.objectContaining({
         trigger: "task_complete",
-        binding: "native",
-        nativeEvent: "agent_end",
+        binding: "skill-only",
+        nativeEvent: null,
       }),
       expect.objectContaining({
         trigger: "session_end",
@@ -207,7 +260,7 @@ describe("host hook mapping matrix", () => {
     ]));
 
     expect(mapHostEventToSessionTriggers("openclaw", "before_agent_start")).toEqual(["session_start"]);
-    expect(mapHostEventToSessionTriggers("openclaw", "agent_end")).toEqual(["session_end", "task_complete"]);
+    expect(mapHostEventToSessionTriggers("openclaw", "agent_end")).toEqual(["session_end"]);
     expect(mapHostEventToSessionTriggers("codex", "PreCompact")).toEqual([]);
   });
 
